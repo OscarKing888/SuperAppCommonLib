@@ -289,6 +289,7 @@ DEFAULT_METADATA_TAGS: list[str] = [
     "-XMP:City", "-XMP:State", "-XMP:Country",  # 锐度/美学/对焦（复用 LR 城市/省/国家字段）
     "-XMP-photoshop:City",
     "-XMP-photoshop:State",
+    "-XMP-photoshop:Country",  # 对焦状态（部分流程直接写在 photoshop:Country）
     "-XMP-photoshop:Country-PrimaryLocationName",
     "-IPTC:ObjectName",
     "-IPTC:City",
@@ -296,6 +297,24 @@ DEFAULT_METADATA_TAGS: list[str] = [
     "-IPTC:Country-PrimaryLocationName",
     "-IFD0:XPTitle",
 ]
+
+
+def _apply_browser_metadata_aliases(rec: dict) -> None:
+    """
+    补全文件浏览器依赖的规范键，兼容 exiftool/XMP sidecar 的不同命名。
+
+    当前重点：
+    - 对焦状态：XMP-photoshop:Country / Country-PrimaryLocationName -> XMP:Country
+    - 标题：XMP-dc:title -> XMP-dc:Title
+    """
+    if not isinstance(rec, dict):
+        return
+    if rec.get("XMP-photoshop:Country") and not rec.get("XMP:Country"):
+        rec["XMP:Country"] = rec["XMP-photoshop:Country"]
+    if rec.get("XMP-photoshop:Country-PrimaryLocationName") and not rec.get("XMP:Country"):
+        rec["XMP:Country"] = rec["XMP-photoshop:Country-PrimaryLocationName"]
+    if rec.get("XMP-dc:title") and not rec.get("XMP-dc:Title"):
+        rec["XMP-dc:Title"] = rec["XMP-dc:title"]
 
 
 def _xmp_rows_to_flat_dict(path: str, xmp_rows: list) -> dict:
@@ -308,10 +327,7 @@ def _xmp_rows_to_flat_dict(path: str, xmp_rows: list) -> dict:
     for group, name, value in xmp_rows:
         key = f"{group}:{name}"
         rec[key] = value
-    if rec.get("XMP-photoshop:Country-PrimaryLocationName") and not rec.get("XMP:Country"):
-        rec["XMP:Country"] = rec["XMP-photoshop:Country-PrimaryLocationName"]
-    if rec.get("XMP-dc:title") and not rec.get("XMP-dc:Title"):
-        rec["XMP-dc:Title"] = rec["XMP-dc:title"]
+    _apply_browser_metadata_aliases(rec)
     return rec
 
 
@@ -343,6 +359,7 @@ def _batch_read_exiftool(et_path: str, paths: list, extra_tags: list | None) -> 
             for rec in records:
                 src = os.path.normpath(rec.get("SourceFile", ""))
                 if src in paths_norm:
+                    _apply_browser_metadata_aliases(rec)
                     result[src] = rec
     except Exception:
         pass
@@ -433,6 +450,7 @@ def read_batch_metadata(paths: list, tags: list | None = None) -> dict:
         "XMP-xmp:Pick", "XMP-xmp:PickLabel", "XMP:Pick", "XMP:PickLabel",
         "XMP:City", "XMP:State", "XMP:Country",                        # 锐度/美学/对焦状态
         "XMP-photoshop:City", "XMP-photoshop:State",
+        "XMP-photoshop:Country",                                       # 对焦状态（photoshop:Country）
         "XMP-photoshop:Country-PrimaryLocationName",                   # 对焦状态（侧载常用）
         "IPTC:ObjectName", "IPTC:City", "IFD0:XPTitle",
     )
@@ -457,10 +475,7 @@ def read_batch_metadata(paths: list, tags: list | None = None) -> dict:
                 if not rec.get(key):
                     rec[key] = value
             # 保证文件列表「标题」「对焦状态」能从 sidecar 显示：补全浏览器使用的键名
-            if rec.get("XMP-photoshop:Country-PrimaryLocationName") and not rec.get("XMP:Country"):
-                rec["XMP:Country"] = rec["XMP-photoshop:Country-PrimaryLocationName"]
-            if rec.get("XMP-dc:title") and not rec.get("XMP-dc:Title"):
-                rec["XMP-dc:Title"] = rec["XMP-dc:title"]
+            _apply_browser_metadata_aliases(rec)
 
     for norm, rec in new_result.items():
         result[norm] = rec
@@ -474,4 +489,3 @@ def read_batch_metadata(paths: list, tags: list | None = None) -> dict:
             _METADATA_CACHE[norm] = rec.copy()
 
     return result
-

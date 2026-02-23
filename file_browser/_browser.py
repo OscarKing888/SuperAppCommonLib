@@ -541,6 +541,7 @@ class MetadataLoader(QThread):
         )
         country_raw = (
             rec.get("XMP:Country")
+            or rec.get("XMP-photoshop:Country")
             or rec.get("XMP-photoshop:Country-PrimaryLocationName")
             or rec.get("IPTC:Country-PrimaryLocationName") or ""
         )

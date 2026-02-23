@@ -6,6 +6,7 @@ exif_io：EXIF 配置、exiftool 路径、EXIF 读写（exiftool + piexif）。
 from __future__ import annotations
 
 from app_common.exif_io.exiftool_path import get_exiftool_executable_path
+from app_common.exif_io.reader import extract_many, extract_pillow_metadata
 from app_common.exif_io.writer import (
     run_exiftool_assignments,
     run_exiftool_json,
@@ -30,6 +31,8 @@ __all__ = [
     "_get_exiftool_tag_target",
     "find_xmp_sidecar",
     "read_xmp_sidecar",
-    "read_batch_metadata",      # 批量读取（自动 exiftool / XMP sidecar 回退）
-    "DEFAULT_METADATA_TAGS",    # 默认标签列表
+    "read_batch_metadata",
+    "DEFAULT_METADATA_TAGS",
+    "extract_many",
+    "extract_pillow_metadata",
 ]
