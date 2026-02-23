@@ -17,7 +17,6 @@ import io as _io
 import os
 import subprocess
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # ── Qt 导入 ───────────────────────────────────────────────────────────────────
@@ -443,15 +442,16 @@ class ThumbnailLoader(QThread):
 
 # ── 后台元数据加载线程 ─────────────────────────────────────────────────────────
 
-# 多线程元数据读取：每块最大文件数；线程数上限
+# 后台元数据读取：每块最大文件数（分块顺序读取，提升取消响应性）
 _METADATA_CHUNK_SIZE = 150
-_METADATA_MAX_WORKERS = 8
 
 
 class MetadataLoader(QThread):
     """
     批量读取图像文件的列表列元数据。
-    内部将路径分块，多线程并行调用 read_batch_metadata（exiftool / XMP sidecar），再合并解析。
+    内部将路径分块，在单个后台线程中顺序调用 read_batch_metadata（exiftool / XMP sidecar）。
+    说明：read_batch_metadata 本身已做批量读取与缓存；这里不再额外并行拆块，
+    避免递归过滤/快速切目录时堆积多路 exiftool 子进程，导致界面卡死。
     """
 
     all_metadata_ready = pyqtSignal(object)  # dict {norm_path: metadata_dict}
@@ -471,34 +471,28 @@ class MetadataLoader(QThread):
         if not self._paths or self._stop_flag:
             return
         try:
-            # 分块，多线程并行读取
+            # 分块顺序读取：兼顾进度更新与取消响应（切目录时最多等待当前分块完成）
             paths = self._paths
             chunk_size = max(1, _METADATA_CHUNK_SIZE)
             chunks = [
                 paths[i : i + chunk_size]
                 for i in range(0, len(paths), chunk_size)
             ]
-            workers = min(len(chunks), _METADATA_MAX_WORKERS)
             total = len(paths)
-            raw: dict = {}
-            if workers <= 1:
-                raw = read_batch_metadata(paths)
-                self.progress_updated.emit(len(raw), total)
-            else:
-                with ThreadPoolExecutor(max_workers=workers) as executor:
-                    futures = {executor.submit(read_batch_metadata, c): c for c in chunks}
-                    for fut in as_completed(futures):
-                        if self._stop_flag or self.isInterruptionRequested():
-                            return
-                        chunk_result = fut.result()
-                        raw.update(chunk_result)
-                        self.progress_updated.emit(len(raw), total)
-
             result: dict = {}
-            for norm, rec in raw.items():
+            processed = 0
+            for chunk in chunks:
                 if self._stop_flag or self.isInterruptionRequested():
                     return
-                result[norm] = self._parse_rec(rec)
+                chunk_raw = read_batch_metadata(chunk)
+                if self._stop_flag or self.isInterruptionRequested():
+                    return
+                for norm, rec in chunk_raw.items():
+                    if self._stop_flag or self.isInterruptionRequested():
+                        return
+                    result[norm] = self._parse_rec(rec)
+                processed += len(chunk)
+                self.progress_updated.emit(min(processed, total), total)
         except Exception:
             result = {}
         if not (self._stop_flag or self.isInterruptionRequested()):
