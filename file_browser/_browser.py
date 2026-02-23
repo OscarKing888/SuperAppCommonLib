@@ -496,6 +496,7 @@ class MetadataLoader(QThread):
             self.all_metadata_ready.emit(result)
 
     def _parse_rec(self, rec: dict) -> dict:
+        # 标题、对焦状态等支持 XMP sidecar（由 read_batch_metadata 合并），勿删以下键名
         # 标题：XMP dc:title（sidecar 多为小写 tag）、IFD0/XPTitle、IPTC
         title = (
             rec.get("XMP-dc:Title") or rec.get("XMP-dc:title")
@@ -738,8 +739,9 @@ class FileListPanel(QWidget):
         self._meta_progress.setMinimum(0)
         self._meta_progress.setMaximum(100)
         self._meta_progress.setValue(0)
-        self._meta_progress.setFixedHeight(6)
-        self._meta_progress.setTextVisible(False)
+        self._meta_progress.setFixedHeight(20)
+        self._meta_progress.setTextVisible(True)
+        self._meta_progress.setFormat("%v/%m")
         self._meta_progress.setStyleSheet(
             "QProgressBar { background: #333; border: none; border-radius: 3px; }"
             "QProgressBar::chunk { background: #3a7bd5; border-radius: 3px; }"

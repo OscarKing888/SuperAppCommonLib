@@ -278,8 +278,9 @@ _METADATA_CACHE_MAX = 20000  # 超过后按 FIFO 淘汰
 _METADATA_CACHE_LOCK = threading.Lock()  # 多线程读写缓存时加锁
 
 #: 文件列表视图默认读取的标签列表（exiftool -G1 风格）
+# 标题、对焦状态等依赖 XMP/侧载；与 _XMP_INDICATORS 一致，便于 exiftool 与 sidecar 合并。
 DEFAULT_METADATA_TAGS: list[str] = [
-    "-XMP-dc:Title",
+    "-XMP-dc:Title", "-XMP-dc:title",  # 标题（sidecar 常用小写 dc:title）
     "-XMP-xmp:Label",
     "-XMP-xmp:Rating",
     "-XMP-xmpDM:pick",        # 实际 XMP 结构 <xmpDM:pick>1</xmpDM:pick>（Dynamic Media）
@@ -301,11 +302,16 @@ def _xmp_rows_to_flat_dict(path: str, xmp_rows: list) -> dict:
     """
     将 read_xmp_sidecar 返回的 [(group, name, value), ...] 转换为
     exiftool -G1 风格的平坦字典 {"XMP-dc:Title": "...", ...}。
+    并补全文件列表「标题」「对焦状态」所需的规范键，便于浏览器统一读取。
     """
     rec: dict = {"SourceFile": path}
     for group, name, value in xmp_rows:
         key = f"{group}:{name}"
         rec[key] = value
+    if rec.get("XMP-photoshop:Country-PrimaryLocationName") and not rec.get("XMP:Country"):
+        rec["XMP:Country"] = rec["XMP-photoshop:Country-PrimaryLocationName"]
+    if rec.get("XMP-dc:title") and not rec.get("XMP-dc:Title"):
+        rec["XMP-dc:Title"] = rec["XMP-dc:title"]
     return rec
 
 
@@ -419,14 +425,15 @@ def read_batch_metadata(paths: list, tags: list | None = None) -> dict:
         sidecar_result = _batch_read_xmp_sidecar(missing)
         new_result.update(sidecar_result)
 
+    # 用于判断「是否需合并 XMP sidecar」；含标题、对焦状态等，缺一不可，勿删。
     _XMP_INDICATORS = (
-        "XMP-dc:Title", "XMP-dc:title",
+        "XMP-dc:Title", "XMP-dc:title",   # 标题
         "XMP-xmp:Label", "XMP-xmp:Rating",
         "XMP-xmpDM:pick", "XMP-xmpDM:Pick",
         "XMP-xmp:Pick", "XMP-xmp:PickLabel", "XMP:Pick", "XMP:PickLabel",
-        "XMP:City", "XMP:State", "XMP:Country",
+        "XMP:City", "XMP:State", "XMP:Country",                        # 锐度/美学/对焦状态
         "XMP-photoshop:City", "XMP-photoshop:State",
-        "XMP-photoshop:Country-PrimaryLocationName",
+        "XMP-photoshop:Country-PrimaryLocationName",                   # 对焦状态（侧载常用）
         "IPTC:ObjectName", "IPTC:City", "IFD0:XPTitle",
     )
     need_merge = [
@@ -449,6 +456,11 @@ def read_batch_metadata(paths: list, tags: list | None = None) -> dict:
                 key = f"{group}:{name}"
                 if not rec.get(key):
                     rec[key] = value
+            # 保证文件列表「标题」「对焦状态」能从 sidecar 显示：补全浏览器使用的键名
+            if rec.get("XMP-photoshop:Country-PrimaryLocationName") and not rec.get("XMP:Country"):
+                rec["XMP:Country"] = rec["XMP-photoshop:Country-PrimaryLocationName"]
+            if rec.get("XMP-dc:title") and not rec.get("XMP-dc:Title"):
+                rec["XMP-dc:Title"] = rec["XMP-dc:title"]
 
     for norm, rec in new_result.items():
         result[norm] = rec
