@@ -265,3 +265,133 @@ def write_meta_with_piexif(path: str, meta_tag_id: str, value: str) -> None:
         else:
             raise
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 批量元数据读取（外部 API：自动处理 exiftool 优先 + XMP sidecar 回退）
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: 文件列表视图默认读取的标签列表（exiftool -G1 风格）
+DEFAULT_METADATA_TAGS: list[str] = [
+    "-XMP-dc:Title",
+    "-XMP-xmp:Label",
+    "-XMP-xmp:Rating",
+    "-XMP-photoshop:City",
+    "-XMP-photoshop:State",
+    "-XMP-photoshop:Country-PrimaryLocationName",
+    "-IPTC:ObjectName",
+    "-IPTC:City",
+    "-IPTC:Province-State",
+    "-IPTC:Country-PrimaryLocationName",
+    "-IFD0:XPTitle",
+]
+
+
+def _xmp_rows_to_flat_dict(path: str, xmp_rows: list) -> dict:
+    """
+    将 read_xmp_sidecar 返回的 [(group, name, value), ...] 转换为
+    exiftool -G1 风格的平坦字典 {"XMP-dc:Title": "...", ...}。
+    """
+    rec: dict = {"SourceFile": path}
+    for group, name, value in xmp_rows:
+        key = f"{group}:{name}"
+        rec[key] = value
+    return rec
+
+
+def _batch_read_exiftool(et_path: str, paths: list, extra_tags: list | None) -> dict:
+    """
+    单次 exiftool 调用批量读取多个文件的元数据。
+    exiftool 默认会自动合并同名 XMP sidecar，无需额外处理。
+    返回 {os.path.normpath(path): raw_rec_dict}。
+    """
+    tag_args = ["-j", "-G1", "-charset", "filename=UTF8"]
+    tag_args += (extra_tags if extra_tags is not None else DEFAULT_METADATA_TAGS)
+    all_args = tag_args + [os.path.normpath(p) for p in paths]
+
+    fd, argfile = tempfile.mkstemp(suffix=".args", prefix="et_bm_")
+    result: dict = {}
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for a in all_args:
+                f.write(a + "\n")
+        fd = -1
+        cp = subprocess.run(
+            [et_path, "-@", argfile],
+            check=False, capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        if cp.returncode == 0 and (cp.stdout or "").strip():
+            records = json.loads(cp.stdout)
+            paths_norm = {os.path.normpath(p) for p in paths}
+            for rec in records:
+                src = os.path.normpath(rec.get("SourceFile", ""))
+                if src in paths_norm:
+                    result[src] = rec
+    except Exception:
+        pass
+    finally:
+        try:
+            if fd >= 0:
+                os.close(fd)
+            os.unlink(argfile)
+        except Exception:
+            pass
+    return result
+
+
+def _batch_read_xmp_sidecar(paths: list) -> dict:
+    """
+    逐文件读取 XMP sidecar，转换为 exiftool 风格平坦字典。
+    返回 {os.path.normpath(path): flat_dict}（无 sidecar 的文件也有空条目）。
+    """
+    from app_common.exif_io.xmp_sidecar import read_xmp_sidecar  # 局部导入避免循环
+
+    result: dict = {}
+    for path in paths:
+        norm = os.path.normpath(path)
+        try:
+            xmp_rows = read_xmp_sidecar(path)
+            result[norm] = _xmp_rows_to_flat_dict(path, xmp_rows) if xmp_rows else {"SourceFile": path}
+        except Exception:
+            result[norm] = {"SourceFile": path}
+    return result
+
+
+def read_batch_metadata(paths: list, tags: list | None = None) -> dict:
+    """
+    批量读取多个图像文件的元数据（API 透明，调用方无需感知数据来源）。
+
+    读取策略（内部自动选择）：
+    1. 若 exiftool 可用 → 单次批量调用，exiftool 会自动合并同名 .xmp sidecar；
+    2. 若 exiftool 不可用 → 逐文件读取 XMP sidecar；
+    3. exiftool 已返回结果但某些文件缺失（如无 EXIF 的文件） → 对缺失文件补充
+       读取 XMP sidecar（兜底）。
+
+    参数：
+        paths : 图像文件路径列表。
+        tags  : 要提取的 exiftool 标签（如 ["-XMP-dc:Title", "-XMP-xmp:Rating"]）；
+                None 表示使用 DEFAULT_METADATA_TAGS 预设列表。
+
+    返回：
+        dict  : { os.path.normpath(path) : flat_dict }
+                flat_dict 格式与 exiftool -j -G1 输出一致，
+                包含 "SourceFile" 键及各元数据标签键。
+    """
+    if not paths:
+        return {}
+
+    et = get_exiftool_executable_path()
+    if et:
+        result = _batch_read_exiftool(et, paths, tags)
+    else:
+        result = {}
+
+    # 对 exiftool 未返回数据的文件（exiftool 不可用 / 文件无嵌入元数据），
+    # 尝试读取 XMP sidecar 作为兜底
+    missing = [p for p in paths if os.path.normpath(p) not in result]
+    if missing:
+        sidecar_result = _batch_read_xmp_sidecar(missing)
+        result.update(sidecar_result)
+
+    return result
+
