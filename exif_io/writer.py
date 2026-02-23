@@ -61,6 +61,24 @@ def _format_process_message(stdout: str, stderr: str) -> str:
     return err or out or "未返回详细信息。"
 
 
+def _is_hidden_data_minor_copy_error(detail: str) -> bool:
+    text = str(detail or "").lower()
+    return ("error copying hidden data" in text) and ("minor" in text)
+
+
+def _cleanup_exiftool_temp_output(path_norm: str) -> None:
+    """
+    exiftool 在失败时可能遗留 ``<file>_exiftool_tmp``，会阻塞同路径重试写入。
+    仅在确认是可恢复的 minor hidden-data 错误时清理该临时文件。
+    """
+    temp_path = f"{path_norm}_exiftool_tmp"
+    try:
+        if os.path.isfile(temp_path):
+            os.unlink(temp_path)
+    except Exception:
+        pass
+
+
 def _normalize_rational_input(s: str) -> tuple[int, int]:
     txt = str(s or "").strip()
     if "(" in txt and ")" in txt and "/" in txt:
@@ -165,21 +183,47 @@ def run_exiftool_assignments(path: str, assignments: list[str]) -> None:
         )
     path_norm = os.path.normpath(path)
     args = ["-overwrite_original", "-charset", "filename=UTF8", *assignments, path_norm]
-    fd, argfile_path = tempfile.mkstemp(suffix=".args", prefix="exiftool_")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            for a in args:
-                f.write(a + "\n")
-        cmd = [exiftool_path, "-@", argfile_path]
-        cp = subprocess.run(cmd, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
-    finally:
+
+    def _invoke(*, ignore_minor: bool) -> subprocess.CompletedProcess:
+        fd, argfile_path = tempfile.mkstemp(suffix=".args", prefix="exiftool_")
         try:
-            os.unlink(argfile_path)
-        except OSError:
-            pass
-    if cp.returncode != 0:
-        detail = _format_process_message(cp.stdout or "", cp.stderr or "")
-        raise RuntimeError(f"ExifTool 写入失败：{detail}")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                for a in args:
+                    f.write(a + "\n")
+            cmd = [exiftool_path]
+            if ignore_minor:
+                # 针对 DxO 导出的部分 TIFF，写入时可能出现 [minor] Error copying hidden data。
+                # 加 -m 后会降级为 warning 并完成写入。
+                cmd.append("-m")
+            cmd.extend(["-@", argfile_path])
+            return subprocess.run(
+                cmd,
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        finally:
+            try:
+                os.unlink(argfile_path)
+            except OSError:
+                pass
+
+    cp = _invoke(ignore_minor=False)
+    if cp.returncode == 0:
+        return
+
+    detail = _format_process_message(cp.stdout or "", cp.stderr or "")
+    if _is_hidden_data_minor_copy_error(detail):
+        _cleanup_exiftool_temp_output(path_norm)
+        cp_retry = _invoke(ignore_minor=True)
+        if cp_retry.returncode == 0:
+            return
+        retry_detail = _format_process_message(cp_retry.stdout or "", cp_retry.stderr or "")
+        raise RuntimeError(f"ExifTool 写入失败：{retry_detail}")
+
+    raise RuntimeError(f"ExifTool 写入失败：{detail}")
 
 
 def write_exif_with_exiftool(path: str, ifd_name: str, tag_id: int, new_val: str, raw_value) -> None:

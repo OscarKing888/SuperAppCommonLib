@@ -6,11 +6,40 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 import sys
+from functools import lru_cache
 
 
 def _module_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
+
+
+@lru_cache(maxsize=32)
+def _is_usable_exiftool(executable_path: str) -> bool:
+    """
+    轻量健康检查：验证 exiftool 可执行文件能正常启动并返回版本号。
+    避免命中损坏的打包脚本（例如缺失 lib/Image/ExifTool.pm）。
+    """
+    p = str(executable_path or "").strip()
+    if not p or not os.path.isfile(p):
+        return False
+    try:
+        cp = subprocess.run(
+            [p, "-ver"],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=3,
+        )
+    except Exception:
+        return False
+    if cp.returncode != 0:
+        return False
+    version_text = (cp.stdout or "").strip()
+    return bool(version_text)
 
 
 def get_exiftool_executable_path() -> str | None:
@@ -48,12 +77,13 @@ def get_exiftool_executable_path() -> str | None:
     for base in search_dirs:
         for rel in rel_candidates:
             p = os.path.join(base, rel)
-            if os.path.isfile(p):
+            if _is_usable_exiftool(p):
                 return p
 
     p = shutil.which("exiftool")
     if p and os.path.isfile(p):
         if sys.platform.startswith("win") and (p or "").lower().endswith(".pl"):
             return None
-        return p
+        if _is_usable_exiftool(p):
+            return p
     return None

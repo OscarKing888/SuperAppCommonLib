@@ -35,6 +35,69 @@ _NS_PREFIXES: dict[str, str] = {
 
 _RDF_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
 
+_XMP_SUFFIX_CANDIDATES = (".xmp", ".XMP", ".Xmp")
+_DERIVED_EXPORT_DIR_NAMES = {
+    "dxo",
+    "dxo pureraw",
+    "pureraw",
+    "exports",
+    "export",
+}
+_DERIVED_STEM_SPLIT_MARKERS = (
+    "-DxO_",
+    "_DxO_",
+)
+
+
+def _candidate_sidecar_stems(image_path: Path) -> list[str]:
+    """生成 sidecar 匹配用的 stem 候选（含 DxO 导出文件名回溯原始 stem）。"""
+    stem = str(image_path.stem or "").strip()
+    if not stem:
+        return []
+    stems: list[str] = [stem]
+    for marker in _DERIVED_STEM_SPLIT_MARKERS:
+        pos = stem.find(marker)
+        if pos <= 0:
+            continue
+        base = stem[:pos].rstrip(" _-")
+        if base and base not in stems:
+            stems.append(base)
+    return stems
+
+
+def _candidate_sidecar_dirs(image_path: Path, stems: list[str]) -> list[Path]:
+    """生成 sidecar 查找目录候选：默认当前目录，必要时回查上一级导出源目录。"""
+    dirs: list[Path] = [image_path.parent]
+    parent = image_path.parent
+    stem_changed = any(stem != image_path.stem for stem in stems)
+    parent_name = str(parent.name or "").strip().lower()
+    if stem_changed or parent_name in _DERIVED_EXPORT_DIR_NAMES:
+        upper = parent.parent
+        if upper != parent and upper not in dirs:
+            dirs.append(upper)
+    return dirs
+
+
+def _find_xmp_by_stem_in_dir(dir_path: Path, stem: str) -> str | None:
+    if not stem:
+        return None
+    for suffix in _XMP_SUFFIX_CANDIDATES:
+        candidate = dir_path / f"{stem}{suffix}"
+        try:
+            if candidate.exists() and candidate.is_file():
+                return str(candidate)
+        except Exception:
+            continue
+    target_lower = f"{stem.lower()}.xmp"
+    try:
+        for entry in os.scandir(str(dir_path)):
+            name = entry.name
+            if name.lower() == target_lower and entry.is_file():
+                return entry.path
+    except (PermissionError, OSError):
+        return None
+    return None
+
 
 def find_xmp_sidecar(image_path: str) -> str | None:
     """
@@ -42,20 +105,14 @@ def find_xmp_sidecar(image_path: str) -> str | None:
     返回 sidecar 文件路径，找不到返回 None。
     """
     p = Path(image_path)
-    for suffix in (".xmp", ".XMP", ".Xmp"):
-        candidate = p.with_suffix(suffix)
-        if candidate.exists():
-            return str(candidate)
-    # 处理大小写不完全匹配的情况（部分文件系统区分大小写）
-    parent = p.parent
-    stem_lower = p.stem.lower()
-    try:
-        for entry in os.scandir(str(parent)):
-            name = entry.name
-            if name.lower() == stem_lower + ".xmp":
-                return entry.path
-    except (PermissionError, OSError):
-        pass
+    stems = _candidate_sidecar_stems(p)
+    if not stems:
+        return None
+    for dir_path in _candidate_sidecar_dirs(p, stems):
+        for stem in stems:
+            found = _find_xmp_by_stem_in_dir(dir_path, stem)
+            if found:
+                return found
     return None
 
 
