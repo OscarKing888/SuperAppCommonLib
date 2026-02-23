@@ -28,10 +28,12 @@ try:
         QMenu, QProgressBar, QToolButton, QHeaderView, QAbstractItemView,
         QTreeWidget, QTreeWidgetItem,
         QStyledItemDelegate, QStackedWidget, QSlider,
+        QApplication,
     )
-    from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal, QRect, QTimer
+    from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal, QRect, QTimer, QUrl, QMimeData
     from PyQt6.QtGui import (
         QPixmap, QImage, QFont, QColor, QIcon, QPainter, QBrush,
+        QKeySequence, QShortcut,
     )
 except ImportError:
     from PyQt5.QtWidgets import (
@@ -40,13 +42,15 @@ except ImportError:
         QMenu, QProgressBar, QToolButton, QHeaderView, QAbstractItemView,
         QTreeWidget, QTreeWidgetItem,
         QStyledItemDelegate, QStackedWidget, QSlider,
+        QApplication, QShortcut,
     )
-    from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal, QRect, QTimer
+    from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal, QRect, QTimer, QUrl, QMimeData
     from PyQt5.QtGui import (
         QPixmap, QImage, QFont, QColor, QIcon, QPainter, QBrush,
+        QKeySequence,
     )
 
-from app_common.exif_io import read_batch_metadata
+from app_common.exif_io import read_batch_metadata, find_xmp_sidecar
 
 # ── 支持的图像扩展名 ───────────────────────────────────────────────────────────
 IMAGE_EXTENSIONS = (
@@ -107,6 +111,11 @@ try:
     _SingleSelection = QAbstractItemView.SelectionMode.SingleSelection
 except AttributeError:
     _SingleSelection = QAbstractItemView.SingleSelection  # type: ignore[attr-defined]
+
+try:
+    _ExtendedSelection = QAbstractItemView.SelectionMode.ExtendedSelection
+except AttributeError:
+    _ExtendedSelection = QAbstractItemView.ExtendedSelection  # type: ignore[attr-defined]
 
 try:
     _QImageRGB888 = QImage.Format.Format_RGB888
@@ -701,18 +710,21 @@ class FileListPanel(QWidget):
         self._tree_widget.setRootIsDecorated(False)
         self._tree_widget.setUniformRowHeights(True)
         self._tree_widget.setAlternatingRowColors(True)
-        self._tree_widget.setSelectionMode(_SingleSelection)
+        self._tree_widget.setSelectionMode(_ExtendedSelection)  # Shift/Command 多选
         self._tree_widget.setStyleSheet("QTreeWidget { font-size: 12px; }")
         self._tree_widget.itemClicked.connect(self._on_tree_item_clicked)
         hdr = self._tree_widget.header()
         hdr.setSectionResizeMode(0, _ResizeInteractive)
-        hdr.setSectionResizeMode(1, _ResizeStretch)
+        hdr.setSectionResizeMode(1, _ResizeInteractive)
         hdr.setSectionResizeMode(2, _ResizeToContents)
         hdr.setSectionResizeMode(3, _ResizeToContents)
         hdr.setSectionResizeMode(4, _ResizeToContents)
         hdr.setSectionResizeMode(5, _ResizeToContents)
         hdr.setSectionResizeMode(6, _ResizeToContents)
-        self._tree_widget.setColumnWidth(0, 180)
+        fm = self._tree_widget.fontMetrics()
+        text_width = getattr(fm, "horizontalAdvance", None) or getattr(fm, "width")
+        self._tree_widget.setColumnWidth(0, text_width("DSC05250.ARW") + 28)
+        self._tree_widget.setColumnWidth(1, text_width("汉" * 6) + 28)
         self._tree_widget.setContextMenuPolicy(_CustomContextMenu)
         self._tree_widget.customContextMenuRequested.connect(self._on_tree_context_menu)
         self._stack.addWidget(self._tree_widget)
@@ -721,7 +733,7 @@ class FileListPanel(QWidget):
         self._list_widget = QListWidget()
         self._list_widget.setViewMode(_ViewModeIcon)
         self._list_widget.setItemDelegate(ThumbnailItemDelegate(self._list_widget))
-        self._list_widget.setSelectionMode(_SingleSelection)
+        self._list_widget.setSelectionMode(_ExtendedSelection)  # Shift/Command 多选
         self._list_widget.setResizeMode(
             QListView.ResizeMode.Adjust if hasattr(QListView, "ResizeMode")
             else QListView.Adjust  # type: ignore[attr-defined]
@@ -752,6 +764,26 @@ class FileListPanel(QWidget):
 
         self._stack.setCurrentIndex(0)
         self._update_size_controls()
+
+        # Cmd+C / Ctrl+C 复制选中文件到剪贴板
+        _copy_key = getattr(QKeySequence.StandardKey, "Copy", None) or getattr(QKeySequence, "Copy", QKeySequence("Ctrl+C"))
+        copy_shortcut = QShortcut(_copy_key, self)
+        try:
+            copy_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        except Exception:
+            pass
+        copy_shortcut.activated.connect(self._copy_current_selection_to_clipboard)
+
+    def _copy_current_selection_to_clipboard(self) -> None:
+        """将当前视图（列表/缩略图）中选中的文件路径复制到剪贴板。"""
+        w = self._stack.currentWidget()
+        if w is self._tree_widget:
+            paths = [it.data(0, _UserRole) for it in self._tree_widget.selectedItems() if it and it.data(0, _UserRole)]
+        elif w is self._list_widget:
+            paths = [it.data(_UserRole) for it in self._list_widget.selectedItems() if it and it.data(_UserRole)]
+        else:
+            paths = []
+        self._copy_paths_to_clipboard(paths)
 
     # ── 数据加载 ────────────────────────────────────────────────────────────────
     def _collect_image_files(self, dir_path: str, recursive: bool) -> list:
@@ -1087,30 +1119,87 @@ class FileListPanel(QWidget):
         if path and os.path.isfile(path):
             self.file_selected.emit(path)
 
+    def _copy_paths_to_clipboard(self, paths: list) -> None:
+        """将本地文件路径写入剪贴板；若存在同名 XMP sidecar 也一并复制。"""
+        expanded_paths: list[str] = []
+        seen: set[str] = set()
+
+        for p in paths:
+            if not p or not os.path.isfile(p):
+                continue
+            abs_path = os.path.abspath(p)
+            norm_key = os.path.normcase(os.path.normpath(abs_path))
+            if norm_key not in seen:
+                expanded_paths.append(abs_path)
+                seen.add(norm_key)
+
+            # 同步带上 sidecar（如 IMG_0001.CR3 -> IMG_0001.xmp）
+            try:
+                xmp_path = find_xmp_sidecar(abs_path)
+            except Exception:
+                xmp_path = None
+            if xmp_path and os.path.isfile(xmp_path):
+                abs_xmp = os.path.abspath(xmp_path)
+                xmp_key = os.path.normcase(os.path.normpath(abs_xmp))
+                if xmp_key not in seen:
+                    expanded_paths.append(abs_xmp)
+                    seen.add(xmp_key)
+
+        if not expanded_paths:
+            return
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(p) for p in expanded_paths])
+        QApplication.clipboard().setMimeData(mime)
+
     def _on_tree_context_menu(self, pos) -> None:
         item = self._tree_widget.itemAt(pos)
-        if item is None:
-            return
-        path = item.data(0, _UserRole)
-        if not path:
+        if item is not None and not item.isSelected():
+            self._tree_widget.clearSelection()
+            item.setSelected(True)
+            self._tree_widget.setCurrentItem(item)
+        selected = self._tree_widget.selectedItems()
+        paths = [it.data(0, _UserRole) for it in selected if it and it.data(0, _UserRole)]
+        if not paths and item:
+            p = item.data(0, _UserRole)
+            if p:
+                paths = [p]
+        if not paths:
             return
         menu = QMenu(self)
+        act_copy = menu.addAction("复制")
+        act_copy.triggered.connect(lambda: self._copy_paths_to_clipboard(paths))
+        menu.addSeparator()
         label = "在 Finder 中显示" if sys.platform == "darwin" else "在资源管理器中显示"
-        act = menu.addAction(label)
-        act.triggered.connect(lambda: _reveal_in_file_manager(path))
+        reveal_path = item.data(0, _UserRole) if item else (paths[0] if paths else None)
+        if reveal_path:
+            act_reveal = menu.addAction(label)
+            act_reveal.triggered.connect(lambda: _reveal_in_file_manager(reveal_path))
         _exec_menu(menu, self._tree_widget.viewport().mapToGlobal(pos))
+
 
     def _on_list_context_menu(self, pos) -> None:
         item = self._list_widget.itemAt(pos)
-        if item is None:
-            return
-        path = item.data(_UserRole)
-        if not path:
+        if item is not None and not item.isSelected():
+            self._list_widget.clearSelection()
+            item.setSelected(True)
+            self._list_widget.setCurrentItem(item)
+        selected = self._list_widget.selectedItems()
+        paths = [it.data(_UserRole) for it in selected if it and it.data(_UserRole)]
+        if not paths and item:
+            p = item.data(_UserRole)
+            if p:
+                paths = [p]
+        if not paths:
             return
         menu = QMenu(self)
+        act_copy = menu.addAction("复制")
+        act_copy.triggered.connect(lambda: self._copy_paths_to_clipboard(paths))
+        menu.addSeparator()
         label = "在 Finder 中显示" if sys.platform == "darwin" else "在资源管理器中显示"
-        act = menu.addAction(label)
-        act.triggered.connect(lambda: _reveal_in_file_manager(path))
+        reveal_path = item.data(_UserRole) if item else (paths[0] if paths else None)
+        if reveal_path:
+            act_reveal = menu.addAction(label)
+            act_reveal.triggered.connect(lambda: _reveal_in_file_manager(reveal_path))
         _exec_menu(menu, self._list_widget.viewport().mapToGlobal(pos))
 
 
