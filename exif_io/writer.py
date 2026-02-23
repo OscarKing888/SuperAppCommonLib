@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 
 import piexif
 
@@ -270,11 +271,21 @@ def write_meta_with_piexif(path: str, meta_tag_id: str, value: str) -> None:
 # 批量元数据读取（外部 API：自动处理 exiftool 优先 + XMP sidecar 回退）
 # ─────────────────────────────────────────────────────────────────────────────
 
+# 已读取过的元数据内存缓存，避免重复调用 exiftool / 读 XMP
+# 键: os.path.normpath(path)，值: exiftool 风格平坦 dict（副本）
+_METADATA_CACHE: dict[str, dict] = {}
+_METADATA_CACHE_MAX = 20000  # 超过后按 FIFO 淘汰
+_METADATA_CACHE_LOCK = threading.Lock()  # 多线程读写缓存时加锁
+
 #: 文件列表视图默认读取的标签列表（exiftool -G1 风格）
 DEFAULT_METADATA_TAGS: list[str] = [
     "-XMP-dc:Title",
     "-XMP-xmp:Label",
     "-XMP-xmp:Rating",
+    "-XMP-xmpDM:pick",        # 实际 XMP 结构 <xmpDM:pick>1</xmpDM:pick>（Dynamic Media）
+    "-XMP-xmp:Pick", "-XMP-xmp:PickLabel",
+    "-XMP:Pick", "-XMP:PickLabel",
+    "-XMP:City", "-XMP:State", "-XMP:Country",  # 锐度/美学/对焦（复用 LR 城市/省/国家字段）
     "-XMP-photoshop:City",
     "-XMP-photoshop:State",
     "-XMP-photoshop:Country-PrimaryLocationName",
@@ -361,37 +372,94 @@ def read_batch_metadata(paths: list, tags: list | None = None) -> dict:
     """
     批量读取多个图像文件的元数据（API 透明，调用方无需感知数据来源）。
 
-    读取策略（内部自动选择）：
-    1. 若 exiftool 可用 → 单次批量调用，exiftool 会自动合并同名 .xmp sidecar；
-    2. 若 exiftool 不可用 → 逐文件读取 XMP sidecar；
-    3. exiftool 已返回结果但某些文件缺失（如无 EXIF 的文件） → 对缺失文件补充
-       读取 XMP sidecar（兜底）。
+    已读取过的文件会缓存在内存中（normpath -> 元数据副本），下次同一路径直接返回缓存，
+    缓存条目上限为 _METADATA_CACHE_MAX，超出时按 FIFO 淘汰。
+
+    读取策略（对未命中缓存的路径）：
+    1. exiftool 可用 → 单次批量调用；
+    2. 完全缺失的文件 → 读 XMP sidecar；
+    3. 有记录但 XMP/IPTC 全空（如 ARW）→ 合并 sidecar 字段。
 
     参数：
         paths : 图像文件路径列表。
-        tags  : 要提取的 exiftool 标签（如 ["-XMP-dc:Title", "-XMP-xmp:Rating"]）；
-                None 表示使用 DEFAULT_METADATA_TAGS 预设列表。
+        tags  : 要提取的 exiftool 标签；None 表示使用 DEFAULT_METADATA_TAGS。
 
     返回：
-        dict  : { os.path.normpath(path) : flat_dict }
-                flat_dict 格式与 exiftool -j -G1 输出一致，
-                包含 "SourceFile" 键及各元数据标签键。
+        dict  : { os.path.normpath(path) : flat_dict }，flat_dict 为 exiftool -G1 风格。
     """
     if not paths:
         return {}
 
+    result = {}
+    uncached = []
+    with _METADATA_CACHE_LOCK:
+        seen = set()
+        for p in paths:
+            norm = os.path.normpath(p)
+            if norm in seen:
+                continue
+            seen.add(norm)
+            if norm in _METADATA_CACHE:
+                result[norm] = _METADATA_CACHE[norm].copy()
+            else:
+                uncached.append(p)
+
+    if not uncached:
+        return result
+
+    # 仅对未命中缓存的路径调用 exiftool / sidecar（不加锁，允许多线程并行 I/O）
     et = get_exiftool_executable_path()
     if et:
-        result = _batch_read_exiftool(et, paths, tags)
+        new_result = _batch_read_exiftool(et, uncached, tags)
     else:
-        result = {}
+        new_result = {}
 
-    # 对 exiftool 未返回数据的文件（exiftool 不可用 / 文件无嵌入元数据），
-    # 尝试读取 XMP sidecar 作为兜底
-    missing = [p for p in paths if os.path.normpath(p) not in result]
+    missing = [p for p in uncached if os.path.normpath(p) not in new_result]
     if missing:
         sidecar_result = _batch_read_xmp_sidecar(missing)
-        result.update(sidecar_result)
+        new_result.update(sidecar_result)
+
+    _XMP_INDICATORS = (
+        "XMP-dc:Title", "XMP-dc:title",
+        "XMP-xmp:Label", "XMP-xmp:Rating",
+        "XMP-xmpDM:pick", "XMP-xmpDM:Pick",
+        "XMP-xmp:Pick", "XMP-xmp:PickLabel", "XMP:Pick", "XMP:PickLabel",
+        "XMP:City", "XMP:State", "XMP:Country",
+        "XMP-photoshop:City", "XMP-photoshop:State",
+        "XMP-photoshop:Country-PrimaryLocationName",
+        "IPTC:ObjectName", "IPTC:City", "IFD0:XPTitle",
+    )
+    need_merge = [
+        p for p in uncached
+        if os.path.normpath(p) in new_result
+        and not any(new_result[os.path.normpath(p)].get(f) for f in _XMP_INDICATORS)
+    ]
+    if need_merge:
+        from app_common.exif_io.xmp_sidecar import read_xmp_sidecar
+        for path in need_merge:
+            norm = os.path.normpath(path)
+            try:
+                xmp_rows = read_xmp_sidecar(path)
+            except Exception:
+                continue
+            if not xmp_rows:
+                continue
+            rec = new_result[norm]
+            for group, name, value in xmp_rows:
+                key = f"{group}:{name}"
+                if not rec.get(key):
+                    rec[key] = value
+
+    for norm, rec in new_result.items():
+        result[norm] = rec
+
+    # 写入缓存（副本），超出上限时 FIFO 淘汰（加锁保证多线程安全）
+    with _METADATA_CACHE_LOCK:
+        while len(_METADATA_CACHE) + len(new_result) > _METADATA_CACHE_MAX:
+            first = next(iter(_METADATA_CACHE))
+            del _METADATA_CACHE[first]
+        for norm, rec in new_result.items():
+            _METADATA_CACHE[norm] = rec.copy()
 
     return result
 

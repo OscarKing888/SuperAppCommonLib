@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import io as _io
 import os
+import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # ── Qt 导入 ───────────────────────────────────────────────────────────────────
@@ -23,11 +25,11 @@ try:
     from PyQt6.QtWidgets import (
         QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
         QListWidget, QListWidgetItem, QListView,
-        QToolButton, QHeaderView, QAbstractItemView,
+        QMenu, QProgressBar, QToolButton, QHeaderView, QAbstractItemView,
         QTreeWidget, QTreeWidgetItem,
         QStyledItemDelegate, QStackedWidget, QSlider,
     )
-    from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal, QRect
+    from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal, QRect, QTimer
     from PyQt6.QtGui import (
         QPixmap, QImage, QFont, QColor, QIcon, QPainter, QBrush,
     )
@@ -35,11 +37,11 @@ except ImportError:
     from PyQt5.QtWidgets import (
         QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
         QListWidget, QListWidgetItem, QListView,
-        QToolButton, QHeaderView, QAbstractItemView,
+        QMenu, QProgressBar, QToolButton, QHeaderView, QAbstractItemView,
         QTreeWidget, QTreeWidgetItem,
         QStyledItemDelegate, QStackedWidget, QSlider,
     )
-    from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal, QRect
+    from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal, QRect, QTimer
     from PyQt5.QtGui import (
         QPixmap, QImage, QFont, QColor, QIcon, QPainter, QBrush,
     )
@@ -139,25 +141,99 @@ except AttributeError:
 _SortRole = int(_UserRole) + 10
 _MetaColorRole = int(_UserRole) + 1
 _MetaRatingRole = int(_UserRole) + 2
+_MetaPickRole = int(_UserRole) + 3    # Pick/Reject 旗标：1=精选, 0=无, -1=排除
 
 # 缩略图尺寸档位（像素）
 _THUMB_SIZE_STEPS = [128, 256, 512, 1024]
 
-# Lightroom 颜色标签 → (十六进制色, 中文简称)
+# Lightroom 颜色标签 → (十六进制色, 列表/缩略图显示文本)
+# 红=眼部对焦，绿=飞版；其余保持常规色名
 _COLOR_LABEL_COLORS: dict[str, tuple[str, str]] = {
-    "Red":    ("#c0392b", "红"),
+    "Red":    ("#c0392b", "眼部对焦"),
     "Yellow": ("#d4ac0d", "黄"),
-    "Green":  ("#27ae60", "绿"),
+    "Green":  ("#27ae60", "飞版"),
     "Blue":   ("#2980b9", "蓝"),
     "Purple": ("#8e44ad", "紫"),
     "White":  ("#bdc3c7", "白"),
     "Orange": ("#e67e22", "橙"),
+}
+
+# 对焦状态（XMP:Country 等）原始值 → 可读中文（精焦/合焦/偏移/失焦）
+_FOCUS_STATUS_DISPLAY: dict[str, str] = {
+    "BEST": "精焦",
+    "IN FOCUS": "合焦",
+    "OK": "合焦",
+    "GOOD": "合焦",
+    "OFF": "偏移",
+    "MISS": "失焦",
+    "OUT": "失焦",
+    "BAD": "失焦",
 }
 _COLOR_SORT_ORDER: dict[str, int] = {
     k: i for i, k in enumerate(
         ["Red", "Orange", "Yellow", "Green", "Blue", "Purple", "White", ""]
     )
 }
+
+
+def _format_optional_number(raw: str, fmt: str) -> str:
+    """若 raw 可解析为数字则按 fmt 格式化，否则返回 strip 后的原文。"""
+    s = str(raw).strip()
+    if not s:
+        return ""
+    try:
+        return fmt % float(s)
+    except (ValueError, TypeError):
+        return s
+
+
+def _focus_status_to_display(raw: str) -> str:
+    """对焦状态原始值 → 可读中文（精焦/合焦/偏移/失焦），已为中文则原样返回。"""
+    s = str(raw).strip()
+    if not s:
+        return ""
+    u = s.upper()
+    if u in _FOCUS_STATUS_DISPLAY:
+        return _FOCUS_STATUS_DISPLAY[u]
+    if s in ("精焦", "合焦", "偏移", "失焦"):
+        return s
+    return s
+
+
+# 右键菜单策略兼容常量
+try:
+    _CustomContextMenu = Qt.ContextMenuPolicy.CustomContextMenu
+except AttributeError:
+    _CustomContextMenu = Qt.CustomContextMenu  # type: ignore[attr-defined]
+
+# ── 系统文件管理器工具函数 ────────────────────────────────────────────────────────
+
+def _reveal_in_file_manager(path: str) -> None:
+    """
+    在系统文件管理器中定位并高亮显示指定文件或目录。
+    - macOS  : open -R <path>（在 Finder 中显示）
+    - Windows: explorer /select,<path>（在资源管理器中选中）
+    - Linux  : xdg-open 打开父目录
+    """
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", path])
+        elif os.name == "nt":
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+        else:
+            parent = os.path.dirname(path) if os.path.isfile(path) else path
+            subprocess.Popen(["xdg-open", parent])
+    except Exception:
+        pass
+
+
+def _exec_menu(menu: "QMenu", global_pos) -> None:
+    """兼容 PyQt5/6 的 QMenu.exec() 调用。"""
+    try:
+        menu.exec(global_pos)
+    except TypeError:
+        menu.exec_(global_pos)  # type: ignore[attr-defined]
+
 
 # ── RAW 缩略图工具函数 ─────────────────────────────────────────────────────────
 
@@ -262,9 +338,25 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
         super().paint(painter, option, index)
         color_label = index.data(_MetaColorRole)
         rating = index.data(_MetaRatingRole)
+        pick   = index.data(_MetaPickRole)
         has_color = bool(color_label and color_label in _COLOR_LABEL_COLORS)
-        has_rating = isinstance(rating, int) and rating > 0
-        if not has_color and not has_rating:
+        # 右下角内容：pick 旗标优先，其次星级
+        if pick == 1:
+            right_badge_text = "🏆"
+            right_badge_bg   = QColor(0, 0, 0, 160)
+            right_badge_fg   = QColor("#ffd700")
+        elif pick == -1:
+            right_badge_text = "🚫"
+            right_badge_bg   = QColor(0, 0, 0, 160)
+            right_badge_fg   = QColor("#ffffff")
+        elif isinstance(rating, int) and rating > 0:
+            right_badge_text = "★" * min(5, rating)
+            right_badge_bg   = QColor(0, 0, 0, 140)
+            right_badge_fg   = QColor("#ffd700")
+        else:
+            right_badge_text = ""
+        has_right = bool(right_badge_text)
+        if not has_color and not has_right:
             return
         painter.save()
         try:
@@ -274,6 +366,7 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
                 cell.left() + 3, cell.top() + 3,
                 cell.width() - 6, cell.height() - 25,
             )
+            # 左下角：颜色标签
             if has_color:
                 hex_c, cn = _COLOR_LABEL_COLORS[color_label]
                 bw, bh = 28, 15
@@ -288,26 +381,27 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
                 f.setPixelSize(9)
                 painter.setFont(f)
                 painter.drawText(badge, _AlignCenter, cn)
-            if has_rating:
-                n = min(5, rating)
-                stars = "★" * n
+            # 右下角：pick 旗标 / 星级
+            if has_right:
                 f2 = QFont()
-                f2.setPixelSize(10)
+                f2.setPixelSize(11)
                 painter.setFont(f2)
                 fm = painter.fontMetrics()
                 try:
-                    sw = fm.horizontalAdvance(stars)
+                    sw = fm.horizontalAdvance(right_badge_text)
                 except AttributeError:
-                    sw = fm.width(stars)
-                bw2, bh2 = sw + 6, 15
+                    sw = fm.width(right_badge_text)
+                bw2, bh2 = sw + 8, 16
                 badge2 = QRect(
-                    icon_rect.right() - bw2 - 2, icon_rect.bottom() - bh2 - 1, bw2, bh2,
+                    icon_rect.right() - bw2 - 2,
+                    icon_rect.bottom() - bh2 - 1,
+                    bw2, bh2,
                 )
-                painter.setBrush(QBrush(QColor(0, 0, 0, 140)))
+                painter.setBrush(QBrush(right_badge_bg))
                 painter.setPen(_NoPen)
                 painter.drawRoundedRect(badge2, 4, 4)
-                painter.setPen(QColor("#ffd700"))
-                painter.drawText(badge2, _AlignCenter, stars)
+                painter.setPen(right_badge_fg)
+                painter.drawText(badge2, _AlignCenter, right_badge_text)
         finally:
             painter.restore()
 
@@ -340,13 +434,20 @@ class ThumbnailLoader(QThread):
 
 # ── 后台元数据加载线程 ─────────────────────────────────────────────────────────
 
+# 多线程元数据读取：每块最大文件数；线程数上限
+_METADATA_CHUNK_SIZE = 150
+_METADATA_MAX_WORKERS = 8
+
+
 class MetadataLoader(QThread):
     """
     批量读取图像文件的列表列元数据。
-    内部调用 read_batch_metadata（自动 exiftool 优先 + XMP sidecar 回退）。
+    内部将路径分块，多线程并行调用 read_batch_metadata（exiftool / XMP sidecar），再合并解析。
     """
 
     all_metadata_ready = pyqtSignal(object)  # dict {norm_path: metadata_dict}
+    # 进度更新（主线程槽更新 UI，Qt 跨线程信号自动排队，线程安全）
+    progress_updated = pyqtSignal(int, int)  # (current_count, total_count)
 
     def __init__(self, paths: list, parent=None) -> None:
         super().__init__(parent)
@@ -361,7 +462,29 @@ class MetadataLoader(QThread):
         if not self._paths or self._stop_flag:
             return
         try:
-            raw = read_batch_metadata(self._paths)
+            # 分块，多线程并行读取
+            paths = self._paths
+            chunk_size = max(1, _METADATA_CHUNK_SIZE)
+            chunks = [
+                paths[i : i + chunk_size]
+                for i in range(0, len(paths), chunk_size)
+            ]
+            workers = min(len(chunks), _METADATA_MAX_WORKERS)
+            total = len(paths)
+            raw: dict = {}
+            if workers <= 1:
+                raw = read_batch_metadata(paths)
+                self.progress_updated.emit(len(raw), total)
+            else:
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    futures = {executor.submit(read_batch_metadata, c): c for c in chunks}
+                    for fut in as_completed(futures):
+                        if self._stop_flag or self.isInterruptionRequested():
+                            return
+                        chunk_result = fut.result()
+                        raw.update(chunk_result)
+                        self.progress_updated.emit(len(raw), total)
+
             result: dict = {}
             for norm, rec in raw.items():
                 if self._stop_flag or self.isInterruptionRequested():
@@ -373,24 +496,66 @@ class MetadataLoader(QThread):
             self.all_metadata_ready.emit(result)
 
     def _parse_rec(self, rec: dict) -> dict:
-        title = (rec.get("XMP-dc:Title") or rec.get("IFD0:XPTitle")
-                 or rec.get("IPTC:ObjectName") or "")
+        # 标题：XMP dc:title（sidecar 多为小写 tag）、IFD0/XPTitle、IPTC
+        title = (
+            rec.get("XMP-dc:Title") or rec.get("XMP-dc:title")
+            or rec.get("IFD0:XPTitle") or rec.get("IPTC:ObjectName") or ""
+        )
         color = rec.get("XMP-xmp:Label") or ""
         try:
             rating = max(0, min(5, int(float(str(rec.get("XMP-xmp:Rating") or 0)))))
         except Exception:
             rating = 0
-        city    = rec.get("XMP-photoshop:City")  or rec.get("IPTC:City") or ""
-        state   = rec.get("XMP-photoshop:State") or rec.get("IPTC:Province-State") or ""
-        country = (rec.get("XMP-photoshop:Country-PrimaryLocationName")
-                   or rec.get("IPTC:Country-PrimaryLocationName") or "")
+        # Pick/Reject 旗标（1=精选🏆, 0=无旗标, -1=排除🚫）
+        # 实际 XMP 多为 <xmpDM:pick>1</xmpDM:pick>（Dynamic Media 命名空间），其次 xmp:Pick 等
+        pick_raw = (
+            rec.get("XMP-xmpDM:pick") or rec.get("XMP-xmpDM:Pick")
+            or rec.get("XMP-xmp:Pick") or rec.get("XMP-xmp:PickLabel")
+            or rec.get("XMP-1.0:Pick") or rec.get("XMP-1.0:PickLabel")
+            or rec.get("XMP-lr:Pick") or rec.get("XMP-lr:PickLabel")
+            or rec.get("XMP:Pick") or rec.get("XMP:PickLabel")
+            or ""
+        )
+        try:
+            s = str(pick_raw).strip().lower()
+            if s in ("true", "1", "yes"):
+                pick = 1
+            elif s in ("false", "0", "no", ""):
+                pick = 0
+            elif s in ("-1", "reject"):
+                pick = -1
+            else:
+                pick = max(-1, min(1, int(float(s))))
+        except Exception:
+            pick = 0
+
+        # 城市 = 锐度（XMP:City 数值），省/直辖市/自治区 = 美学评分（XMP:State 数值），国家/地区 = 对焦状态（XMP:Country）
+        city_raw = (
+            rec.get("XMP:City") or rec.get("XMP-photoshop:City")
+            or rec.get("IPTC:City") or ""
+        )
+        state_raw = (
+            rec.get("XMP:State") or rec.get("XMP-photoshop:State")
+            or rec.get("IPTC:Province-State") or ""
+        )
+        country_raw = (
+            rec.get("XMP:Country")
+            or rec.get("XMP-photoshop:Country-PrimaryLocationName")
+            or rec.get("IPTC:Country-PrimaryLocationName") or ""
+        )
+
+        city = _format_optional_number(city_raw, "%06.2f")    # 锐度
+        state = _format_optional_number(state_raw, "%05.2f") # 美学
+        country = _focus_status_to_display(country_raw)      # 对焦状态 → 精焦/合焦/偏移/失焦
+
         return {
             "title":   str(title).strip(),
             "color":   str(color).strip(),
             "rating":  rating,
-            "city":    str(city).strip(),
-            "state":   str(state).strip(),
-            "country": str(country).strip(),
+            "pick":    pick,
+            "city":    city,
+            "state":   state,
+            "country": country,
         }
 
 
@@ -421,23 +586,19 @@ class FileListPanel(QWidget):
         self._tree_item_map: dict = {}   # norm_path → SortableTreeItem (列表)
         self._meta_cache:    dict = {}   # norm_path → metadata dict
         self._pending_loaders: list = []
+        # 过滤状态
+        self._filter_pick: bool = False   # 只显示精选(🏆)
+        self._filter_min_rating: int = 0  # 最低星级(0=不限)
+        self._star_btns: list = []
         self._init_ui()
 
     # ── UI 初始化 ──────────────────────────────────────────────────────────────
     def _init_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(4)
+        layout.setSpacing(3)
 
-        # 过滤框
-        self._filter_edit = QLineEdit()
-        self._filter_edit.setPlaceholderText("过滤文件名…")
-        self._filter_edit.setClearButtonEnabled(True)
-        self._filter_edit.setStyleSheet("QLineEdit { padding: 4px; font-size: 12px; }")
-        self._filter_edit.textChanged.connect(self._apply_filter)
-        layout.addWidget(self._filter_edit)
-
-        # 工具栏
+        # ── 视图工具栏（视图切换 + 缩略图大小）──
         toolbar = QHBoxLayout()
         toolbar.setSpacing(3)
 
@@ -471,12 +632,51 @@ class FileListPanel(QWidget):
 
         toolbar.addWidget(self._btn_list)
         toolbar.addWidget(self._btn_thumb)
-        toolbar.addSpacing(6)
+        toolbar.addSpacing(4)
         toolbar.addWidget(QLabel("大小:"))
         toolbar.addWidget(self._size_slider)
         toolbar.addWidget(self._size_label)
         toolbar.addStretch()
         layout.addLayout(toolbar)
+
+        # ── 过滤栏（文件名 + 精选 + 星级）──
+        filter_bar = QHBoxLayout()
+        filter_bar.setSpacing(3)
+
+        self._filter_edit = QLineEdit()
+        self._filter_edit.setPlaceholderText("过滤文件名…")
+        self._filter_edit.setClearButtonEnabled(True)
+        self._filter_edit.setStyleSheet(
+            "QLineEdit { padding: 2px 4px; font-size: 12px; }"
+        )
+        self._filter_edit.textChanged.connect(lambda _: self._apply_filter())
+        filter_bar.addWidget(self._filter_edit, stretch=1)
+
+        # 精选按钮
+        self._btn_filter_pick = QToolButton()
+        self._btn_filter_pick.setText("🏆")
+        self._btn_filter_pick.setToolTip("只显示精选（Pick=1）")
+        self._btn_filter_pick.setCheckable(True)
+        self._btn_filter_pick.setFixedWidth(30)
+        self._btn_filter_pick.clicked.connect(self._on_pick_filter_toggled)
+        filter_bar.addWidget(self._btn_filter_pick)
+
+        # 星级按钮（1～5，单选，点击已激活按钮则取消）
+        star_widths = [22, 28, 34, 40, 46]
+        for n in range(1, 6):
+            btn = QToolButton()
+            btn.setText("★" * n)
+            btn.setToolTip(f"只显示 ≥{n} 星")
+            btn.setCheckable(True)
+            btn.setFixedWidth(star_widths[n - 1])
+            btn.setStyleSheet("QToolButton { font-size: 10px; padding: 1px; }")
+            btn.clicked.connect(
+                lambda checked, rating=n: self._on_rating_filter_changed(rating)
+            )
+            self._star_btns.append(btn)
+            filter_bar.addWidget(btn)
+
+        layout.addLayout(filter_bar)
 
         # 视图堆叠
         self._stack = QStackedWidget()
@@ -484,11 +684,16 @@ class FileListPanel(QWidget):
         # ── 列表模式：多列 QTreeWidget ──
         self._tree_widget = QTreeWidget()
         self._tree_widget.setColumnCount(7)
+        
+        # @Agents: 这个列名不要修改
+        # 城市 = 锐度值（越高越清晰）
+        # 省/直辖市/自治区 = 美学评分（越高越好看）
+        # 国家/地区 = 对焦状态（精焦/合焦/偏移/失焦）
+        # 🏳️ 白旗 = Pick 精选旗标（双维度都出色）
+        # 🟢 绿色标签 = 飞鸟
+        # 🔴 红色标签 = 精焦（对焦点在鸟头）
         self._tree_widget.setHeaderLabels([
-            "文件名", "标题", "颜色",
-            "星级", "城市",
-            "省/直辖市/自治区",
-            "国家/地区",
+            "文件名", "标题", "颜色", "星级", "锐度值", "美学评分", "对焦状态"
         ])
         self._tree_widget.setSortingEnabled(True)
         self._tree_widget.setRootIsDecorated(False)
@@ -506,6 +711,8 @@ class FileListPanel(QWidget):
         hdr.setSectionResizeMode(5, _ResizeToContents)
         hdr.setSectionResizeMode(6, _ResizeToContents)
         self._tree_widget.setColumnWidth(0, 180)
+        self._tree_widget.setContextMenuPolicy(_CustomContextMenu)
+        self._tree_widget.customContextMenuRequested.connect(self._on_tree_context_menu)
         self._stack.addWidget(self._tree_widget)
 
         # ── 缩略图模式：QListWidget ──
@@ -520,27 +727,72 @@ class FileListPanel(QWidget):
         self._list_widget.setUniformItemSizes(True)
         self._list_widget.setStyleSheet("QListWidget { font-size: 11px; }")
         self._list_widget.itemClicked.connect(self._on_list_item_clicked)
+        self._list_widget.setContextMenuPolicy(_CustomContextMenu)
+        self._list_widget.customContextMenuRequested.connect(self._on_list_context_menu)
         self._stack.addWidget(self._list_widget)
 
         layout.addWidget(self._stack, stretch=1)
+
+        # EXIF 读取进度条（由 progress_updated 信号在主线程更新，多线程安全）
+        self._meta_progress = QProgressBar()
+        self._meta_progress.setMinimum(0)
+        self._meta_progress.setMaximum(100)
+        self._meta_progress.setValue(0)
+        self._meta_progress.setFixedHeight(6)
+        self._meta_progress.setTextVisible(False)
+        self._meta_progress.setStyleSheet(
+            "QProgressBar { background: #333; border: none; border-radius: 3px; }"
+            "QProgressBar::chunk { background: #3a7bd5; border-radius: 3px; }"
+        )
+        self._meta_progress.hide()
+        layout.addWidget(self._meta_progress)
+
         self._stack.setCurrentIndex(0)
         self._update_size_controls()
 
     # ── 数据加载 ────────────────────────────────────────────────────────────────
-    def load_directory(self, path: str) -> None:
-        """扫描目录，加载所有支持的图像文件。"""
-        if path == self._current_dir:
+    def _collect_image_files(self, dir_path: str, recursive: bool) -> list:
+        """
+        收集目录下支持的图像文件路径。
+        recursive=True 时递归遍历所有子目录；否则仅当前目录。
+        """
+        files: list = []
+        try:
+            if recursive:
+                for root, _dirs, names in os.walk(dir_path, topdown=True):
+                    for name in sorted(names, key=str.lower):
+                        if Path(name).suffix.lower() in IMAGE_EXTENSIONS:
+                            files.append(os.path.join(root, name))
+            else:
+                for entry in sorted(os.scandir(dir_path), key=lambda e: e.name.lower()):
+                    if entry.is_file() and Path(entry.name).suffix.lower() in IMAGE_EXTENSIONS:
+                        files.append(entry.path)
+        except (PermissionError, OSError):
+            pass
+        return files
+
+    def _has_any_filter(self) -> bool:
+        """是否有任意过滤条件开启（文本 / 精选 / 星级）。"""
+        return (
+            bool(self._filter_edit.text().strip()) or
+            self._filter_pick or
+            self._filter_min_rating > 0
+        )
+
+    def load_directory(self, path: str, force_reload: bool = False) -> None:
+        """
+        扫描目录，加载支持的图像文件。
+        当任意过滤条件开启（文本 / 🏆精选 / 星级）时，递归遍历该目录及所有子目录，
+        收集图像后按当前过滤条件显示；否则仅当前目录。
+        force_reload=True 时忽略「当前目录未变」的短路，用于切换过滤后刷新列表。
+        """
+        if not force_reload and path == self._current_dir:
             return
         self._current_dir = path
         self._stop_all_loaders()
         self._meta_cache.clear()
-        files: list = []
-        try:
-            for entry in sorted(os.scandir(path), key=lambda e: e.name.lower()):
-                if entry.is_file() and Path(entry.name).suffix.lower() in IMAGE_EXTENSIONS:
-                    files.append(entry.path)
-        except (PermissionError, OSError):
-            pass
+        recursive = self._has_any_filter()
+        files = self._collect_image_files(path, recursive=recursive)
         self._all_files = files
         self._rebuild_views()
         if files:
@@ -577,8 +829,9 @@ class FileListPanel(QWidget):
             li.setData(_UserRole, path)
             li.setToolTip(path)
             if meta:
-                li.setData(_MetaColorRole, meta.get("color", ""))
+                li.setData(_MetaColorRole,  meta.get("color", ""))
                 li.setData(_MetaRatingRole, meta.get("rating", 0))
+                li.setData(_MetaPickRole,   meta.get("pick", 0))
             self._item_map[norm] = li
             self._list_widget.addItem(li)
 
@@ -587,37 +840,87 @@ class FileListPanel(QWidget):
         if self._view_mode == self._MODE_THUMB:
             self._start_thumbnail_loader()
 
-    def _apply_filter(self, text: str) -> None:
-        ft = text.strip().lower()
-        for i in range(self._tree_widget.topLevelItemCount()):
-            it = self._tree_widget.topLevelItem(i)
-            if it:
-                it.setHidden(bool(ft) and ft not in it.text(0).lower())
-        for i in range(self._list_widget.count()):
-            it = self._list_widget.item(i)
-            if it:
-                it.setHidden(bool(ft) and ft not in (it.text() or "").lower())
+    def _apply_filter(self) -> None:
+        """统一过滤：文件名文字 + 精选旗标 + 最低星级，三者 AND 组合。"""
+        ft = self._filter_edit.text().strip().lower()
+        fp = self._filter_pick
+        fr = self._filter_min_rating
+
+        for path in self._all_files:
+            norm = os.path.normpath(path)
+            name = Path(path).name
+            meta = self._meta_cache.get(norm, {})
+            pick   = meta.get("pick", 0)
+            rating = meta.get("rating", 0)
+
+            name_ok   = not ft or ft in name.lower()
+            pick_ok   = not fp or pick == 1
+            rating_ok = rating >= fr
+
+            hidden = not (name_ok and pick_ok and rating_ok)
+
+            ti = self._tree_item_map.get(norm)
+            if ti is not None:
+                ti.setHidden(hidden)
+            li = self._item_map.get(norm)
+            if li is not None:
+                li.setHidden(hidden)
+
+    def _on_pick_filter_toggled(self) -> None:
+        """切换精选过滤：只显示 Pick=1 的文件。有任意过滤时递归子目录，无过滤时仅当前目录。"""
+        self._filter_pick = self._btn_filter_pick.isChecked()
+        if self._current_dir and os.path.isdir(self._current_dir):
+            self.load_directory(self._current_dir, force_reload=True)
+        else:
+            self._apply_filter()
+
+    def _on_rating_filter_changed(self, n: int) -> None:
+        """切换最低星级过滤：点击已激活的按钮则取消。有任意过滤时递归子目录，无过滤时仅当前目录。"""
+        if self._filter_min_rating == n:
+            self._filter_min_rating = 0
+        else:
+            self._filter_min_rating = n
+        for i, btn in enumerate(self._star_btns):
+            btn.setChecked(i + 1 == self._filter_min_rating)
+        if self._current_dir and os.path.isdir(self._current_dir):
+            self.load_directory(self._current_dir, force_reload=True)
+        else:
+            self._apply_filter()
 
     def _apply_meta_to_tree_item(self, item: SortableTreeItem, meta: dict) -> None:
         title   = meta.get("title", "")
         color   = meta.get("color", "")
         rating  = meta.get("rating", 0)
+        pick    = meta.get("pick", 0)
         city    = meta.get("city", "")
         state   = meta.get("state", "")
         country = meta.get("country", "")
 
         item.setText(1, title);  item.setData(1, _SortRole, title.lower())
-        item.setText(2, color);  item.setData(2, _SortRole, _COLOR_SORT_ORDER.get(color, 99))
+        color_display = (_COLOR_LABEL_COLORS.get(color, ("", ""))[1] or color)
+        item.setText(2, color_display);  item.setData(2, _SortRole, _COLOR_SORT_ORDER.get(color, 99))
         if color in _COLOR_LABEL_COLORS:
             hex_c, _ = _COLOR_LABEL_COLORS[color]
             item.setBackground(2, QBrush(QColor(hex_c)))
             item.setForeground(2, QBrush(QColor(
                 "#333" if color in ("Yellow", "White") else "#fff"
             )))
-        stars = "★" * rating if rating > 0 else ""
-        item.setText(3, stars);  item.setData(3, _SortRole, rating)
-        item.setText(4, city);   item.setData(4, _SortRole, city.lower())
-        item.setText(5, state);  item.setData(5, _SortRole, state.lower())
+
+        # 星级列：pick 旗标优先于星级显示
+        # 排序键：精选=10 > 5星=5 > ... > 未标=0 > 排除=-1
+        if pick == 1:
+            star_text = "🏆"
+            sort_val  = 10
+        elif pick == -1:
+            star_text = "🚫"
+            sort_val  = -1
+        else:
+            star_text = "★" * rating if rating > 0 else ""
+            sort_val  = rating
+        item.setText(3, star_text); item.setData(3, _SortRole, sort_val)
+
+        item.setText(4, city);    item.setData(4, _SortRole, city.lower())
+        item.setText(5, state);   item.setData(5, _SortRole, state.lower())
         item.setText(6, country); item.setData(6, _SortRole, country.lower())
 
     # ── 视图模式切换 ────────────────────────────────────────────────────────────
@@ -682,7 +985,14 @@ class FileListPanel(QWidget):
 
     def _start_metadata_loader(self, paths: list) -> None:
         self._stop_metadata_loader()
+        total = len(paths)
+        if total <= 0:
+            return
+        self._meta_progress.setMaximum(total)
+        self._meta_progress.setValue(0)
+        self._meta_progress.show()
         loader = MetadataLoader(paths)
+        loader.progress_updated.connect(self._on_metadata_progress)
         loader.all_metadata_ready.connect(self._on_metadata_ready)
         self._metadata_loader = loader
         loader.start()
@@ -694,7 +1004,14 @@ class FileListPanel(QWidget):
                 self._metadata_loader.all_metadata_ready,
                 self._on_metadata_ready,
             )
+            try:
+                self._metadata_loader.progress_updated.disconnect(
+                    self._on_metadata_progress
+                )
+            except Exception:
+                pass
             self._metadata_loader = None
+        self._meta_progress.hide()
 
     def _detach_loader(self, loader, signal, slot) -> None:
         loader.stop()
@@ -726,11 +1043,21 @@ class FileListPanel(QWidget):
         item.setIcon(QIcon(QPixmap.fromImage(qimg)))
         meta = self._meta_cache.get(norm, {})
         if meta:
-            item.setData(_MetaColorRole, meta.get("color", ""))
+            item.setData(_MetaColorRole,  meta.get("color", ""))
             item.setData(_MetaRatingRole, meta.get("rating", 0))
+            item.setData(_MetaPickRole,   meta.get("pick", 0))
+
+    def _on_metadata_progress(self, current: int, total: int) -> None:
+        """主线程槽：由 progress_updated 信号触发，安全更新进度条。"""
+        if total <= 0:
+            return
+        self._meta_progress.setMaximum(total)
+        self._meta_progress.setValue(min(current, total))
 
     def _on_metadata_ready(self, meta_dict: dict) -> None:
         self._meta_cache.update(meta_dict)
+        self._meta_progress.setValue(self._meta_progress.maximum())
+        QTimer.singleShot(400, self._meta_progress.hide)
         self._tree_widget.setSortingEnabled(False)
         for norm_path, meta in meta_dict.items():
             ti = self._tree_item_map.get(norm_path)
@@ -738,10 +1065,14 @@ class FileListPanel(QWidget):
                 self._apply_meta_to_tree_item(ti, meta)
             li = self._item_map.get(norm_path)
             if li:
-                li.setData(_MetaColorRole, meta.get("color", ""))
+                li.setData(_MetaColorRole,  meta.get("color", ""))
                 li.setData(_MetaRatingRole, meta.get("rating", 0))
+                li.setData(_MetaPickRole,   meta.get("pick", 0))
         self._tree_widget.setSortingEnabled(True)
         self._list_widget.viewport().update()
+        # 元数据加载完成后，根据最新 meta_cache 重新应用过滤
+        if self._filter_pick or self._filter_min_rating > 0:
+            self._apply_filter()
 
     def _on_tree_item_clicked(self, item, column) -> None:
         path = item.data(0, _UserRole)
@@ -752,6 +1083,32 @@ class FileListPanel(QWidget):
         path = item.data(_UserRole)
         if path and os.path.isfile(path):
             self.file_selected.emit(path)
+
+    def _on_tree_context_menu(self, pos) -> None:
+        item = self._tree_widget.itemAt(pos)
+        if item is None:
+            return
+        path = item.data(0, _UserRole)
+        if not path:
+            return
+        menu = QMenu(self)
+        label = "在 Finder 中显示" if sys.platform == "darwin" else "在资源管理器中显示"
+        act = menu.addAction(label)
+        act.triggered.connect(lambda: _reveal_in_file_manager(path))
+        _exec_menu(menu, self._tree_widget.viewport().mapToGlobal(pos))
+
+    def _on_list_context_menu(self, pos) -> None:
+        item = self._list_widget.itemAt(pos)
+        if item is None:
+            return
+        path = item.data(_UserRole)
+        if not path:
+            return
+        menu = QMenu(self)
+        label = "在 Finder 中显示" if sys.platform == "darwin" else "在资源管理器中显示"
+        act = menu.addAction(label)
+        act.triggered.connect(lambda: _reveal_in_file_manager(path))
+        _exec_menu(menu, self._list_widget.viewport().mapToGlobal(pos))
 
 
 # ── 目录树浏览器 ───────────────────────────────────────────────────────────────
@@ -790,6 +1147,8 @@ class DirectoryBrowserWidget(QWidget):
         )
         self._tree.itemExpanded.connect(self._on_expanded)
         self._tree.itemClicked.connect(self._on_clicked)
+        self._tree.setContextMenuPolicy(_CustomContextMenu)
+        self._tree.customContextMenuRequested.connect(self._on_dir_context_menu)
         layout.addWidget(self._tree)
 
         self._populate_roots()
@@ -861,3 +1220,16 @@ class DirectoryBrowserWidget(QWidget):
         path = item.data(0, _UserRole)
         if path and os.path.isdir(path):
             self.directory_selected.emit(path)
+
+    def _on_dir_context_menu(self, pos) -> None:
+        item = self._tree.itemAt(pos)
+        if item is None:
+            return
+        path = item.data(0, _UserRole)
+        if not path:
+            return
+        menu = QMenu(self)
+        label = "在 Finder 中显示" if sys.platform == "darwin" else "在资源管理器中显示"
+        act = menu.addAction(label)
+        act.triggered.connect(lambda: _reveal_in_file_manager(path))
+        _exec_menu(menu, self._tree.viewport().mapToGlobal(pos))

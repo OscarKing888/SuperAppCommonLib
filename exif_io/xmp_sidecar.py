@@ -9,11 +9,12 @@ import os
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-# 常见 XMP 命名空间 URL → 短前缀映射
+# 常见 XMP 命名空间 URL → 短前缀映射（含无尾斜杠变体，便于属性匹配）
 _NS_PREFIXES: dict[str, str] = {
     "http://www.w3.org/1999/02/22-rdf-syntax-ns#": "rdf",
     "http://purl.org/dc/elements/1.1/": "dc",
     "http://ns.adobe.com/xap/1.0/": "xmp",
+    "http://ns.adobe.com/xap/1.0": "xmp",   # 无尾斜杠（部分 XMP 属性写法）
     "http://ns.adobe.com/xap/1.0/rights/": "xmpRights",
     "http://ns.adobe.com/xap/1.0/mm/": "xmpMM",
     "http://ns.adobe.com/exif/1.0/": "exif",
@@ -25,6 +26,7 @@ _NS_PREFIXES: dict[str, str] = {
     "http://ns.adobe.com/xap/1.0/bj/": "xmpBJ",
     "http://ns.adobe.com/xap/1.0/t/pg/": "xmpTPg",
     "http://ns.adobe.com/xap/1.0/g/img/": "xmpGImg",
+    "http://ns.adobe.com/xmp/1.0/DynamicMedia/": "xmpDM",  # xmpDM:pick = Pick 旗标（1=精选）
     "http://iptc.org/std/Iptc4xmpExt/2008-02-29/": "Iptc4xmpExt",
     "http://ns.useplus.org/ldf/xmp/1.0/": "plus",
     "http://ns.adobe.com/exif/1.0/aux/": "aux",
