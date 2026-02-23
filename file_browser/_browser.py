@@ -1289,6 +1289,108 @@ class DirectoryBrowserWidget(QWidget):
             item.addChild(QTreeWidgetItem([self._PLACEHOLDER]))
         return item
 
+    @staticmethod
+    def _path_key(path: str) -> str:
+        """路径归一化键（兼容 Windows 大小写不敏感文件系统）。"""
+        return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+
+    def _is_same_or_parent_path(self, parent: str, child: str) -> bool:
+        """判断 parent 是否为 child 本身或祖先目录。"""
+        try:
+            parent_abs = os.path.normpath(os.path.abspath(parent))
+            child_abs = os.path.normpath(os.path.abspath(child))
+            if self._path_key(parent_abs) == self._path_key(child_abs):
+                return True
+            common = os.path.commonpath([parent_abs, child_abs])
+            return self._path_key(common) == self._path_key(parent_abs)
+        except Exception:
+            return False
+
+    def _find_best_root_item(self, target_path: str) -> QTreeWidgetItem | None:
+        """从顶层 root 中找到最匹配 target_path 的节点（最长前缀）。"""
+        best_item = None
+        best_len = -1
+        for i in range(self._tree.topLevelItemCount()):
+            item = self._tree.topLevelItem(i)
+            root_path = item.data(0, _UserRole)
+            if not root_path or not self._is_same_or_parent_path(root_path, target_path):
+                continue
+            n = len(os.path.normpath(os.path.abspath(root_path)))
+            if n > best_len:
+                best_item = item
+                best_len = n
+        return best_item
+
+    def _ensure_children_loaded(self, item: QTreeWidgetItem) -> None:
+        """若节点仍是占位符状态，则同步加载其子目录。"""
+        if item.childCount() == 1 and item.child(0).text(0) == self._PLACEHOLDER:
+            self._on_expanded(item)
+
+    def _find_child_item_by_path(self, parent: QTreeWidgetItem, target_path: str) -> QTreeWidgetItem | None:
+        """在 parent 的直接子节点中按真实路径匹配目标目录。"""
+        target_key = self._path_key(target_path)
+        for i in range(parent.childCount()):
+            child = parent.child(i)
+            path = child.data(0, _UserRole)
+            if path and self._path_key(path) == target_key:
+                return child
+        return None
+
+    def select_directory(self, path: str, emit_signal: bool = True) -> bool:
+        """
+        按路径展开目录树并选中目标目录。
+        返回是否成功定位到目标目录节点。
+        """
+        if not path:
+            return False
+        try:
+            target_path = os.path.normpath(os.path.abspath(path))
+        except Exception:
+            return False
+        if not os.path.isdir(target_path):
+            return False
+
+        root_item = self._find_best_root_item(target_path)
+        if root_item is None:
+            return False
+
+        root_path = root_item.data(0, _UserRole)
+        if not root_path:
+            return False
+        root_path = os.path.normpath(os.path.abspath(root_path))
+
+        chain: list[str] = [target_path]
+        cur = target_path
+        while self._path_key(cur) != self._path_key(root_path):
+            parent = os.path.dirname(cur)
+            if not parent or self._path_key(parent) == self._path_key(cur):
+                return False
+            chain.append(parent)
+            cur = parent
+        chain.reverse()  # root -> ... -> target
+
+        current = root_item
+        self._tree.expandItem(current)
+        for sub_path in chain[1:]:
+            self._ensure_children_loaded(current)
+            self._tree.expandItem(current)
+            nxt = self._find_child_item_by_path(current, sub_path)
+            if nxt is None:
+                return False
+            current = nxt
+
+        self._tree.expandItem(current)
+        self._tree.setCurrentItem(current)
+        self._tree.clearSelection()
+        current.setSelected(True)
+        try:
+            self._tree.scrollToItem(current)
+        except Exception:
+            pass
+        if emit_signal:
+            self.directory_selected.emit(target_path)
+        return True
+
     def _on_expanded(self, item: QTreeWidgetItem) -> None:
         """懒加载：展开时填充子目录。"""
         if item.childCount() > 0 and item.child(0).text(0) != self._PLACEHOLDER:
