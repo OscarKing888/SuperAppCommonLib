@@ -41,12 +41,12 @@ from typing import Callable
 try:
     from PyQt6.QtCore import QPointF, QRectF, Qt
     from PyQt6.QtGui import QColor, QPainter, QPen, QPixmap
-    from PyQt6.QtWidgets import QLabel, QWidget
+    from PyQt6.QtWidgets import QLabel, QVBoxLayout, QWidget
     _QRect_or_QRectF = "QRect | QRectF"
 except ImportError:
     from PyQt5.QtCore import QPointF, QRectF, Qt  # type: ignore[no-reattr]
     from PyQt5.QtGui import QColor, QPainter, QPen, QPixmap  # type: ignore[no-reattr]
-    from PyQt5.QtWidgets import QLabel, QWidget  # type: ignore[no-reattr]
+    from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget  # type: ignore[no-reattr]
     _QRect_or_QRectF = "QRect | QRectF"
 
 # Type alias for overlay callables registered at runtime.
@@ -536,3 +536,101 @@ class PreviewCanvas(QLabel):
             inn2.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
             painter.setPen(inn2)
             painter.drawRect(left + 3, top + 3, bw - 6, bh - 6)
+
+
+# ---------------------------------------------------------------------------
+# PreviewWithStatusBar – canvas + status bar (open/closed for extension)
+# ---------------------------------------------------------------------------
+
+class PreviewWithStatusBar(QWidget):
+    """Composite: a PreviewCanvas (or subclass) plus a status bar below.
+
+    The status bar shows resolution info by default. Subclasses can extend
+    the status content by overriding ``_get_status_segments()`` (open/closed).
+
+    Usage::
+        w = PreviewWithStatusBar(canvas=EditorPreviewCanvas())
+        w.set_source_pixmap(pixmap)
+        w.set_original_size(4000, 3000)   # optional, for "原始分辨率"
+        w.set_source_mode("原图")          # optional, appended to status
+        w.set_focus_box(...)               # forwarded to canvas
+    """
+
+    def __init__(
+        self,
+        parent: "QWidget | None" = None,
+        *,
+        canvas: "PreviewCanvas | None" = None,
+    ) -> None:
+        super().__init__(parent)
+        self._canvas: "PreviewCanvas" = canvas if canvas is not None else PreviewCanvas()
+        self._status_label = QLabel("原始分辨率: - | 当前预览分辨率: -")
+        self._display_pixmap: "QPixmap | None" = None
+        self._original_size: "tuple[int, int] | None" = None
+        self._source_mode: str = ""
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        layout.addWidget(self._canvas, stretch=1)
+        layout.addWidget(self._status_label)
+
+    @property
+    def canvas(self) -> "PreviewCanvas":
+        """The inner canvas (e.g. for direct access if needed)."""
+        return self._canvas
+
+    def set_source_pixmap(
+        self,
+        pixmap: "QPixmap | None",
+        *,
+        reset_view: bool = False,
+        preserve_view: bool = False,
+        preserve_scale: bool = False,
+    ) -> None:
+        self._display_pixmap = pixmap
+        self._canvas.set_source_pixmap(
+            pixmap,
+            reset_view=reset_view,
+            preserve_view=preserve_view,
+            preserve_scale=preserve_scale,
+        )
+        self._refresh_status_bar()
+
+    def set_original_size(self, width: int | None, height: int | None) -> None:
+        """Set the 'original' resolution line (e.g. source image before crop)."""
+        if width is not None and height is not None:
+            self._original_size = (int(width), int(height))
+        else:
+            self._original_size = None
+        self._refresh_status_bar()
+
+    def set_source_mode(self, mode: str) -> None:
+        """Set a short mode suffix (e.g. '原图' or '预览图') for the status bar."""
+        self._source_mode = str(mode).strip()
+        self._refresh_status_bar()
+
+    def _refresh_status_bar(self) -> None:
+        segments = self._get_status_segments()
+        self._status_label.setText(" | ".join(s for s in segments if s))
+
+    def _get_status_segments(self) -> list[str]:
+        """Build status bar segments. Override in subclass to extend (open/closed)."""
+        orig_str = "-"
+        if self._original_size is not None:
+            orig_str = f"{self._original_size[0]}x{self._original_size[1]}"
+        elif self._display_pixmap is not None and not self._display_pixmap.isNull():
+            orig_str = f"{self._display_pixmap.width()}x{self._display_pixmap.height()}"
+
+        cur_str = "-"
+        if self._display_pixmap is not None and not self._display_pixmap.isNull():
+            cur_str = f"{self._display_pixmap.width()}x{self._display_pixmap.height()}"
+
+        out = [f"原始分辨率: {orig_str}", f"当前预览分辨率: {cur_str}"]
+        if self._source_mode:
+            out.append(f"({self._source_mode})")
+        return out
+
+    def __getattr__(self, name: str):
+        """Forward other attributes/methods to the inner canvas."""
+        return getattr(self._canvas, name)
