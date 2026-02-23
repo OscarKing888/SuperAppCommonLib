@@ -1,0 +1,267 @@
+# -*- coding: utf-8 -*-
+"""
+EXIF 写入：exiftool 与 piexif。依赖模块内 exiftool_path 与 piexif。
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+import piexif
+
+from app_common.exif_io.exiftool_path import get_exiftool_executable_path
+
+# 与 main 中一致的常量（写入用）
+META_TITLE_TAG_ID = "Title"
+META_DESCRIPTION_TAG_ID = "Description"
+EXIFTOOL_IFD_GROUP_MAP = {
+    "0th": "IFD0",
+    "Exif": "EXIF",
+    "GPS": "GPS",
+    "1st": "IFD1",
+    "Interop": "InteropIFD",
+}
+
+
+def _sanitize(s: str) -> str:
+    if not s:
+        return s
+    result = []
+    for c in s:
+        code = ord(c)
+        if code == 0:
+            result.append(" ")
+        elif code < 32 and c not in "\t\n\r":
+            result.append(" ")
+        else:
+            result.append(c)
+    return "".join(result).strip()
+
+
+def _tuple_as_bytes(value: tuple) -> bytes | None:
+    if not value:
+        return None
+    try:
+        if all(isinstance(x, int) and 0 <= x <= 255 for x in value):
+            return bytes(value)
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _format_process_message(stdout: str, stderr: str) -> str:
+    out = _sanitize((stdout or "").strip())
+    err = _sanitize((stderr or "").strip())
+    if err and out:
+        return f"{err}\n{out}"
+    return err or out or "未返回详细信息。"
+
+
+def _normalize_rational_input(s: str) -> tuple[int, int]:
+    txt = str(s or "").strip()
+    if "(" in txt and ")" in txt and "/" in txt:
+        txt = txt.split("(", 1)[0].strip()
+    if "/" in txt:
+        a, _, b = txt.partition("/")
+        num = int(a.strip())
+        den = int(b.strip()) if b.strip() else 1
+        if den == 0:
+            raise ValueError("分母不能为 0。")
+        return num, den
+    from fractions import Fraction
+    f = float(txt)
+    fr = Fraction(f).limit_denominator(10000)
+    if fr.denominator == 0:
+        raise ValueError("分母不能为 0。")
+    return fr.numerator, fr.denominator
+
+
+def _ensure_utf8_for_exiftool(s: str) -> str:
+    if not s:
+        return s
+    return s.encode("utf-8", errors="replace").decode("utf-8")
+
+
+def _get_exiftool_tag_target(ifd_name: str, tag_id: int) -> str | None:
+    info = piexif.TAGS.get(ifd_name, {}).get(tag_id)
+    if not isinstance(info, dict):
+        return None
+    raw_name = _sanitize(str(info.get("name", "")).strip())
+    if not raw_name:
+        return None
+    group = EXIFTOOL_IFD_GROUP_MAP.get(ifd_name)
+    if not group:
+        return raw_name
+    return f"{group}:{raw_name}"
+
+
+def _convert_value_for_exiftool(new_val: str, raw_value) -> str:
+    txt = _sanitize(str(new_val or "").strip())
+    txt = _ensure_utf8_for_exiftool(txt)
+    if raw_value is None:
+        return txt
+    if isinstance(raw_value, int):
+        return str(int(txt))
+    if isinstance(raw_value, float):
+        return str(float(txt))
+    if isinstance(raw_value, tuple):
+        if len(raw_value) == 2 and isinstance(raw_value[0], int) and isinstance(raw_value[1], int):
+            num, den = _normalize_rational_input(txt)
+            return f"{num}/{den}"
+        b = _tuple_as_bytes(raw_value)
+        if b is not None:
+            return txt
+        if all(isinstance(x, int) for x in raw_value):
+            parts = txt.replace(",", " ").split()
+            if not parts:
+                raise ValueError("请输入整数数组。")
+            return " ".join(str(int(x)) for x in parts)
+        return txt
+    return txt
+
+
+def run_exiftool_json(path: str) -> list[dict]:
+    """用 exiftool -j -G1 读取文件元数据，返回 JSON 数组；失败返回 []。"""
+    exiftool_path = get_exiftool_executable_path()
+    if not exiftool_path:
+        return []
+    path_norm = os.path.normpath(path)
+    use_argfile = sys.platform.startswith("win") and any(ord(c) > 127 for c in path_norm)
+    try:
+        if use_argfile:
+            fd, argfile_path = tempfile.mkstemp(suffix=".args", prefix="exiftool_")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(path_norm + "\n")
+                cmd = [exiftool_path, "-charset", "filename=UTF8", "-j", "-G1", "-@", argfile_path]
+                cp = subprocess.run(cmd, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            finally:
+                try:
+                    os.unlink(argfile_path)
+                except OSError:
+                    pass
+        else:
+            cmd = [exiftool_path, "-j", "-G1", path_norm]
+            cp = subprocess.run(cmd, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if cp.returncode != 0 or not (cp.stdout or "").strip():
+            return []
+        out = json.loads(cp.stdout)
+        return out if isinstance(out, list) else [out] if isinstance(out, dict) else []
+    except Exception:
+        return []
+
+
+def run_exiftool_assignments(path: str, assignments: list[str]) -> None:
+    """按给定赋值参数调用 exiftool。"""
+    exiftool_path = get_exiftool_executable_path()
+    if not exiftool_path:
+        raise RuntimeError(
+            "未找到 exiftool 可执行文件，请检查 exif_io 内 exiftools_mac/exiftools_win 是否完整，"
+            "或将 exiftool 加入系统 PATH。"
+        )
+    path_norm = os.path.normpath(path)
+    args = ["-overwrite_original", "-charset", "filename=UTF8", *assignments, path_norm]
+    fd, argfile_path = tempfile.mkstemp(suffix=".args", prefix="exiftool_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for a in args:
+                f.write(a + "\n")
+        cmd = [exiftool_path, "-@", argfile_path]
+        cp = subprocess.run(cmd, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    finally:
+        try:
+            os.unlink(argfile_path)
+        except OSError:
+            pass
+    if cp.returncode != 0:
+        detail = _format_process_message(cp.stdout or "", cp.stderr or "")
+        raise RuntimeError(f"ExifTool 写入失败：{detail}")
+
+
+def write_exif_with_exiftool(path: str, ifd_name: str, tag_id: int, new_val: str, raw_value) -> None:
+    """使用 exiftool 写入单个标签。"""
+    tag_target = _get_exiftool_tag_target(ifd_name, tag_id)
+    if not tag_target:
+        raise RuntimeError(f"不支持写入该标签：{ifd_name}:{tag_id}")
+    value = _convert_value_for_exiftool(new_val, raw_value)
+    run_exiftool_assignments(path, [f"-{tag_target}={value}"])
+
+
+def write_exif_with_exiftool_by_key(path: str, tag_key: str, value: str) -> None:
+    """使用 exiftool 按 Group:Tag 键写入单个标签。"""
+    value = _ensure_utf8_for_exiftool(_sanitize(str(value or "")))
+    run_exiftool_assignments(path, [f"-{tag_key}={value}"])
+
+
+def write_meta_with_exiftool(path: str, meta_tag_id: str, value: str) -> None:
+    """使用 exiftool 写入标题/描述元数据。"""
+    value = _ensure_utf8_for_exiftool(_sanitize(str(value or "")))
+    if meta_tag_id == META_TITLE_TAG_ID:
+        assignments = [
+            f"-XMP-dc:Title={value}",
+            f"-IFD0:XPTitle={value}",
+            f"-IFD0:DocumentName={value}",
+        ]
+    elif meta_tag_id == META_DESCRIPTION_TAG_ID:
+        assignments = [
+            f"-XMP-dc:Description={value}",
+            f"-IFD0:XPComment={value}",
+            f"-IFD0:ImageDescription={value}",
+            f"-EXIF:UserComment={value}",
+        ]
+    else:
+        raise RuntimeError(f"未知元数据标签：{meta_tag_id}")
+    run_exiftool_assignments(path, assignments)
+
+
+def _encode_xp_text_value(text: str) -> bytes:
+    if not text:
+        return b""
+    return text.encode("utf-16-le") + b"\x00\x00"
+
+
+def _set_or_clear_exif_tag(ifd_data: dict, tag_id: int, value) -> None:
+    if not isinstance(ifd_data, dict):
+        return
+    if value is None:
+        ifd_data.pop(tag_id, None)
+    else:
+        ifd_data[tag_id] = value
+
+
+def write_meta_with_piexif(path: str, meta_tag_id: str, value: str) -> None:
+    """使用 piexif 写入标题/描述元数据。"""
+    data = piexif.load(path)
+    ifd0 = data.get("0th")
+    if not isinstance(ifd0, dict):
+        ifd0 = {}
+        data["0th"] = ifd0
+    exif_ifd = data.get("Exif")
+    if not isinstance(exif_ifd, dict):
+        exif_ifd = {}
+        data["Exif"] = exif_ifd
+    if meta_tag_id == META_TITLE_TAG_ID:
+        _set_or_clear_exif_tag(ifd0, 40091, _encode_xp_text_value(value) if value else None)
+        _set_or_clear_exif_tag(ifd0, 269, value.encode("utf-8") if value else None)
+    elif meta_tag_id == META_DESCRIPTION_TAG_ID:
+        _set_or_clear_exif_tag(ifd0, 40092, _encode_xp_text_value(value) if value else None)
+        _set_or_clear_exif_tag(ifd0, 270, value.encode("utf-8") if value else None)
+        _set_or_clear_exif_tag(
+            exif_ifd,
+            37510,
+            (b"ASCII\x00\x00\x00" + value.encode("utf-8")) if value else None,
+        )
+    else:
+        raise RuntimeError(f"未知元数据标签：{meta_tag_id}")
+    try:
+        exif_bytes = piexif.dump(data)
+        piexif.insert(exif_bytes, path)
+    except Exception as e:
+        if type(e).__name__ == "InvalidImageDataError" and get_exiftool_executable_path():
+            write_meta_with_exiftool(path, meta_tag_id, value)
+        else:
+            raise
+
