@@ -15,6 +15,7 @@ from app_common.exif_io.writer import (
     write_meta_with_piexif,
 )
 from app_common.exif_io.writer import _get_exiftool_tag_target  # 供 main 读路径使用
+from app_common.exif_io.xmp_sidecar import find_xmp_sidecar, read_xmp_sidecar
 
 __all__ = [
     "get_exiftool_executable_path",
@@ -25,4 +26,6 @@ __all__ = [
     "write_meta_with_exiftool",
     "write_meta_with_piexif",
     "_get_exiftool_tag_target",
+    "find_xmp_sidecar",
+    "read_xmp_sidecar",
 ]
