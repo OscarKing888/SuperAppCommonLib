@@ -564,7 +564,7 @@ class PreviewWithStatusBar(QWidget):
     ) -> None:
         super().__init__(parent)
         self._canvas: "PreviewCanvas" = canvas if canvas is not None else PreviewCanvas()
-        self._status_label = QLabel("原始分辨率: - | 当前预览分辨率: -")
+        self._status_label = QLabel("原始分辨率: -")
         self._display_pixmap: "QPixmap | None" = None
         self._original_size: "tuple[int, int] | None" = None
         self._source_mode: str = ""
@@ -622,11 +622,7 @@ class PreviewWithStatusBar(QWidget):
         elif self._display_pixmap is not None and not self._display_pixmap.isNull():
             orig_str = f"{self._display_pixmap.width()}x{self._display_pixmap.height()}"
 
-        cur_str = "-"
-        if self._display_pixmap is not None and not self._display_pixmap.isNull():
-            cur_str = f"{self._display_pixmap.width()}x{self._display_pixmap.height()}"
-
-        out = [f"原始分辨率: {orig_str}", f"当前预览分辨率: {cur_str}"]
+        out = [f"原始分辨率: {orig_str}"]
         if self._source_mode:
             out.append(f"({self._source_mode})")
         return out
