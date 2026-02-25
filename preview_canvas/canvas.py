@@ -36,6 +36,7 @@ Open/Closed extension points
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Callable
 
 try:
@@ -51,6 +52,28 @@ except ImportError:
 
 # Type alias for overlay callables registered at runtime.
 OverlayLayer = Callable[["QPainter", "QRectF", "object"], None]
+NormalizedBox = tuple[float, float, float, float]
+
+
+@dataclass(slots=True)
+class PreviewOverlayState:
+    """Built-in overlay state for ``PreviewCanvas``.
+
+    Subclasses can extend this dataclass to carry extra overlay payloads
+    without changing the base API (open/closed).
+    """
+
+    focus_box: "NormalizedBox | None" = None
+
+
+@dataclass(slots=True)
+class PreviewOverlayOptions:
+    """Built-in overlay options for ``PreviewCanvas``.
+
+    Subclasses can extend this dataclass to add more toggles/parameters.
+    """
+
+    show_focus_box: bool = True
 
 # ---------------------------------------------------------------------------
 # Checker background helper (self-contained, no external deps)
@@ -121,17 +144,38 @@ class PreviewCanvas(QLabel):
         self._overlay_layers: list[OverlayLayer] = []
 
     # ------------------------------------------------------------------
+    # Public API – batched overlay state / options (open/closed)
+    # ------------------------------------------------------------------
+
+    def apply_overlay_state(self, state: "PreviewOverlayState | None") -> None:
+        """Apply built-in (and subclass-extended) overlay payloads in one call."""
+        target = state if state is not None else PreviewOverlayState()
+        if self._apply_overlay_state_data(target):
+            self.update()
+
+    def apply_overlay_options(self, options: "PreviewOverlayOptions | None") -> None:
+        """Apply built-in (and subclass-extended) overlay options in one call."""
+        target = options if options is not None else PreviewOverlayOptions()
+        if self._apply_overlay_options_data(target):
+            self.update()
+
+    # ------------------------------------------------------------------
     # Public API – focus box
     # ------------------------------------------------------------------
 
-    def set_focus_box(self, focus_box: "tuple[float, float, float, float] | None") -> None:
+    def set_focus_box(self, focus_box: "NormalizedBox | None") -> None:
         """Set the focus-box in normalised [0, 1] image coordinates."""
+        if self._focus_box == focus_box:
+            return
         self._focus_box = focus_box
         self.update()
 
     def set_show_focus_box(self, enabled: bool) -> None:
         """Show or hide the focus-box overlay."""
-        self._show_focus_box = bool(enabled)
+        parsed = bool(enabled)
+        if self._show_focus_box == parsed:
+            return
+        self._show_focus_box = parsed
         self.update()
 
     # ------------------------------------------------------------------
@@ -265,6 +309,23 @@ class PreviewCanvas(QLabel):
     # Extension hooks (override in subclass – do NOT call super() unless
     # you explicitly want both the base behaviour and your own)
     # ------------------------------------------------------------------
+
+    def _apply_overlay_state_data(self, state: "PreviewOverlayState") -> bool:
+        """Subclass hook: apply overlay payloads, return whether anything changed.
+
+        Override to extend ``apply_overlay_state`` with new fields while reusing
+        the single repaint trigger in the public method (open/closed).
+        """
+        changed = self._focus_box != state.focus_box
+        self._focus_box = state.focus_box
+        return changed
+
+    def _apply_overlay_options_data(self, options: "PreviewOverlayOptions") -> bool:
+        """Subclass hook: apply overlay options, return whether anything changed."""
+        show_focus_box = bool(options.show_focus_box)
+        changed = self._show_focus_box != show_focus_box
+        self._show_focus_box = show_focus_box
+        return changed
 
     def _paint_overlays(
         self,
@@ -609,6 +670,14 @@ class PreviewWithStatusBar(QWidget):
         """Set a short mode suffix (e.g. '原图' or '预览图') for the status bar."""
         self._source_mode = str(mode).strip()
         self._refresh_status_bar()
+
+    def apply_overlay_state(self, state: "PreviewOverlayState | None") -> None:
+        """Forward batched overlay payloads to the inner canvas."""
+        self._canvas.apply_overlay_state(state)
+
+    def apply_overlay_options(self, options: "PreviewOverlayOptions | None") -> None:
+        """Forward batched overlay options to the inner canvas."""
+        self._canvas.apply_overlay_options(options)
 
     def _refresh_status_bar(self) -> None:
         segments = self._get_status_segments()

@@ -19,6 +19,10 @@ PreviewWithStatusBar
 draw_checker_background
     Stand-alone helper: draw a Photoshop-style checkerboard via a QPainter.
 
+PreviewOverlayState / PreviewOverlayOptions
+    Base dataclasses for batched overlay payloads and overlay options.
+    Subclasses can extend them to keep the public API open for new overlays.
+
 Example::
 
     from app_common.preview_canvas import PreviewCanvas
@@ -28,6 +32,18 @@ Example::
     canvas.set_show_focus_box(True)
     canvas.set_focus_box((0.3, 0.4, 0.7, 0.6))
 """
-from app_common.preview_canvas.canvas import PreviewCanvas, PreviewWithStatusBar, draw_checker_background
+from app_common.preview_canvas.canvas import (
+    PreviewCanvas,
+    PreviewOverlayOptions,
+    PreviewOverlayState,
+    PreviewWithStatusBar,
+    draw_checker_background,
+)
 
-__all__ = ["PreviewCanvas", "PreviewWithStatusBar", "draw_checker_background"]
+__all__ = [
+    "PreviewCanvas",
+    "PreviewOverlayState",
+    "PreviewOverlayOptions",
+    "PreviewWithStatusBar",
+    "draw_checker_background",
+]
