@@ -95,22 +95,15 @@ COLUMN_NAMES = {col[0] for col in PHOTO_COLUMNS}
 # 控制开关：True = 仅从 report.db 读取 EXIF，不读文件；False = report 优先，未命中再读文件
 EXIF_ONLY_FROM_REPORT_DB = True
 
-# HIF/HEIC/HEIF 等非 RAW：预览时优先使用 report 中的 temp_jpeg_path
-_HEIF_LIKE_EXTENSIONS = frozenset({".hif", ".heic", ".heif"})
-
-
 def get_preview_path_for_file(path: str, current_dir: str, report_cache: Dict[str, Any]) -> str:
     """
-    对 HIF/HEIC/HEIF 等格式，若 report 中有该文件（按文件名 stem 匹配）且存在 temp_jpeg_path，
-    则返回该 JPEG 路径用于预览，避免重复解码；否则返回原 path。
-    current_dir 用于解析相对路径的 temp_jpeg_path。
+    若 report 中有该文件（按文件名 stem 匹配）且存在 temp_jpeg_path（相对 current_dir，如 .superpicky\\cache\\temp_preview\\xxx.jpg），
+    则返回拼出的完整路径用于预览/缩略图，避免重复解码；否则返回原 path。
+    current_dir 为选中目录（含 .superpicky 的父目录），用于解析相对路径的 temp_jpeg_path。
     """
     _log.debug("[get_preview_path_for_file] path=%r current_dir=%r cache_keys=%s", path, current_dir, len(report_cache) if isinstance(report_cache, dict) else 0)
     if not path or not report_cache or not current_dir:
         _log.debug("[get_preview_path_for_file] 跳过 path=%r", path)
-        return path
-    ext = os.path.splitext(path)[1].lower()
-    if ext not in _HEIF_LIKE_EXTENSIONS:
         return path
     stem = os.path.splitext(os.path.basename(path))[0]
     row = report_cache.get(stem) if isinstance(report_cache, dict) else None

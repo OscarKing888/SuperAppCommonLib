@@ -316,7 +316,15 @@ def _load_thumbnail_image(path: str, size: int) -> "QImage | None":
             img = bg
         elif img.mode != "RGB":
             img = img.convert("RGB")
+        # 贴到 size×size 正方形画布上，预览图缩放居中，避免列表里被拉成条
         w, h = img.size
+        if (w, h) != (size, size):
+            canvas = Image.new("RGB", (size, size), (45, 45, 45))
+            x = (size - w) // 2
+            y = (size - h) // 2
+            canvas.paste(img, (x, y))
+            img = canvas
+            w, h = size, size
         data = img.tobytes("raw", "RGB")
         qimg = QImage(data, w, h, w * 3, _QImageRGB888)
         return qimg.copy()
@@ -374,10 +382,11 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
         try:
             painter.setRenderHint(_PainterAntialiasing)
             cell = option.rect
-            icon_rect = QRect(
-                cell.left() + 3, cell.top() + 3,
-                cell.width() - 6, cell.height() - 25,
-            )
+            # 缩略图区域按正方形算，与 setIconSize(s,s) 一致，徽章贴正方形底部
+            side = min(cell.width(), cell.height()) - 6
+            if side <= 0:
+                side = cell.width() - 6
+            icon_rect = QRect(cell.left() + 3, cell.top() + 3, side, side)
             # 左下角：颜色标签
             if has_color:
                 hex_c, cn = _COLOR_LABEL_COLORS[color_label]
@@ -487,13 +496,19 @@ class DirectoryScanWorker(QThread):
             return
         files: list = []
         if report_cache:
-            # 当 report.db 有记录时，直接用 DB 中 original_path 构建 files，跳过文件系统扫描
+            # 当 report.db 有记录时，用 DB 中 current_path（相对选中目录）拼出完整路径，扩展名用 original_path 的（如 .ARW）
             for stem, row in sorted(report_cache.items(), key=lambda kv: (kv[0].lower() if kv[0] else "")):
-                op = row.get("original_path")
-                if op and str(op).strip():
-                    files.append(str(op).strip())
+                cp = row.get("current_path")
+                if cp and str(cp).strip():
+                    full_path = os.path.normpath(os.path.join(self._path, str(cp).strip()))
+                    op = row.get("original_path")
+                    if op and str(op).strip():
+                        ext_orig = Path(str(op).strip()).suffix
+                        if ext_orig:
+                            full_path = str(Path(full_path).with_suffix(ext_orig))
+                    files.append(full_path)
             _log.info(
-                "[DirectoryScanWorker.run] 使用 DB original_path 构建文件列表 files=%s（跳过文件系统扫描）",
+                "[DirectoryScanWorker.run] 使用 DB current_path 拼出完整路径构建文件列表 files=%s（跳过文件系统扫描）",
                 len(files),
             )
         else:
@@ -1147,7 +1162,9 @@ class FileListPanel(QWidget):
     def _update_thumb_display(self) -> None:
         s = self._thumb_size
         self._list_widget.setIconSize(QSize(s, s))
-        self._list_widget.setGridSize(QSize(s + 20, s + 36))
+        # 网格设为正方形，使每个缩略图格子为正方形，预览图已在加载时缩放到 s×s 内
+        cell = s + 28
+        self._list_widget.setGridSize(QSize(cell, cell))
         self._list_widget.setSpacing(4)
 
     # ── 加载器管理 ──────────────────────────────────────────────────────────────
