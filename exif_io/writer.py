@@ -533,3 +533,15 @@ def read_batch_metadata(paths: list, tags: list | None = None) -> dict:
             _METADATA_CACHE[norm] = rec.copy()
 
     return result
+
+
+def inject_metadata_cache(path: str, rec: dict) -> None:
+    """
+    将单条元数据写入全局 _METADATA_CACHE（供 report.db 等外部数据源注入，与 read_batch_metadata 行为一致）。
+    """
+    norm = os.path.normpath(path)
+    with _METADATA_CACHE_LOCK:
+        while len(_METADATA_CACHE) + 1 > _METADATA_CACHE_MAX:
+            first = next(iter(_METADATA_CACHE))
+            del _METADATA_CACHE[first]
+        _METADATA_CACHE[norm] = rec.copy()

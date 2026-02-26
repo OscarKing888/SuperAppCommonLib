@@ -20,6 +20,7 @@ from app_common.exif_io.writer import (
     write_meta_with_exiftool,
     write_meta_with_piexif,
     read_batch_metadata,
+    inject_metadata_cache,
     DEFAULT_METADATA_TAGS,
 )
 from app_common.exif_io.writer import _get_exiftool_tag_target  # 供 main 读路径使用
@@ -37,6 +38,7 @@ __all__ = [
     "find_xmp_sidecar",
     "read_xmp_sidecar",
     "read_batch_metadata",
+    "inject_metadata_cache",
     "DEFAULT_METADATA_TAGS",
     "extract_many",
     "extract_many_with_xmp_priority",
