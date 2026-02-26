@@ -14,6 +14,9 @@ import threading
 import piexif
 
 from app_common.exif_io.exiftool_path import get_exiftool_executable_path
+from app_common.log import get_logger
+
+_log = get_logger("exif_io")
 
 # 与 main 中一致的常量（写入用）
 META_TITLE_TAG_ID = "Title"
@@ -435,6 +438,15 @@ def _batch_read_xmp_sidecar(paths: list) -> dict:
     return result
 
 
+def _summarize_rec_for_log(rec: dict) -> str:
+    """用于日志：从 flat_dict 提取标题、Rating、Pick 等简要信息。"""
+    title = rec.get("XMP-dc:Title") or rec.get("XMP-dc:title") or rec.get("IFD0:XPTitle") or rec.get("IPTC:ObjectName") or ""
+    rating = rec.get("XMP-xmp:Rating") or ""
+    pick = rec.get("XMP-xmpDM:pick") or rec.get("XMP-xmpDM:Pick") or rec.get("XMP-xmp:Pick") or ""
+    key_count = len([k for k in rec if isinstance(k, str) and ":" in k and k != "SourceFile"])
+    return "键数=%s 标题=%r Rating=%s Pick=%s" % (key_count, (title[:40] + "..." if title and len(str(title)) > 40 else title), rating, pick)
+
+
 def read_batch_metadata(paths: list, tags: list | None = None) -> dict:
     """
     批量读取多个图像文件的元数据（API 透明，调用方无需感知数据来源）。
@@ -471,6 +483,13 @@ def read_batch_metadata(paths: list, tags: list | None = None) -> dict:
             else:
                 uncached.append(p)
 
+    cached_norms = set(result.keys())
+    _log.info("[read_batch_metadata] 批量查询 paths=%s 缓存命中=%s 未命中=%s", len(paths), len(cached_norms), len(uncached))
+    for norm in cached_norms:
+        rec = result.get(norm)
+        if rec:
+            _log.info("[read_batch_metadata] path=%r 来源=缓存 %s", norm, _summarize_rec_for_log(rec))
+
     if not uncached:
         return result
 
@@ -478,11 +497,15 @@ def read_batch_metadata(paths: list, tags: list | None = None) -> dict:
     et = get_exiftool_executable_path()
     if et:
         new_result = _batch_read_exiftool(et, uncached, tags)
+        _log.info("[read_batch_metadata] exiftool 返回 path数=%s", len(new_result))
     else:
         new_result = {}
+        _log.info("[read_batch_metadata] 无 exiftool，跳过文件内读取")
 
+    exiftool_norms = set(new_result.keys())
     missing = [p for p in uncached if os.path.normpath(p) not in new_result]
     if missing:
+        _log.info("[read_batch_metadata] exiftool 未返回 改用 XMP sidecar paths=%s", [os.path.normpath(p) for p in missing])
         sidecar_result = _batch_read_xmp_sidecar(missing)
         new_result.update(sidecar_result)
 
@@ -504,6 +527,7 @@ def read_batch_metadata(paths: list, tags: list | None = None) -> dict:
         and not any(new_result[os.path.normpath(p)].get(f) for f in _XMP_INDICATORS)
     ]
     if need_merge:
+        _log.info("[read_batch_metadata] 合并 XMP sidecar 补全 paths=%s", [os.path.normpath(p) for p in need_merge])
         from app_common.exif_io.xmp_sidecar import read_xmp_sidecar
         for path in need_merge:
             norm = os.path.normpath(path)
@@ -521,8 +545,14 @@ def read_batch_metadata(paths: list, tags: list | None = None) -> dict:
             # 保证文件列表「标题」「对焦状态」能从 sidecar 显示：补全浏览器使用的键名
             _apply_browser_metadata_aliases(rec)
 
+    need_merge_norms = {os.path.normpath(p) for p in need_merge}
     for norm, rec in new_result.items():
         result[norm] = rec
+        if norm in exiftool_norms:
+            source = "文件内+XMP合并" if norm in need_merge_norms else "文件内(exiftool)"
+        else:
+            source = "XMP"
+        _log.info("[read_batch_metadata] path=%r 来源=%s %s", norm, source, _summarize_rec_for_log(rec))
 
     # 写入缓存（副本），超出上限时 FIFO 淘汰（加锁保证多线程安全）
     with _METADATA_CACHE_LOCK:
@@ -532,6 +562,7 @@ def read_batch_metadata(paths: list, tags: list | None = None) -> dict:
         for norm, rec in new_result.items():
             _METADATA_CACHE[norm] = rec.copy()
 
+    _log.info("[read_batch_metadata] 批量查询完成 结果总数=%s", len(result))
     return result
 
 

@@ -486,24 +486,36 @@ class DirectoryScanWorker(QThread):
             _log.info("[DirectoryScanWorker.run] interrupted after report")
             return
         files: list = []
-        try:
-            if self._recursive:
-                for root, dirs, names in os.walk(self._path, topdown=True):
-                    if self.isInterruptionRequested():
-                        _log.info("[DirectoryScanWorker.run] interrupted during walk")
-                        return
-                    dirs[:] = [d for d in dirs if not d.startswith(".")]
-                    for name in sorted(names, key=str.lower):
-                        if Path(name).suffix.lower() in IMAGE_EXTENSIONS:
-                            files.append(os.path.join(root, name))
-            else:
-                for entry in sorted(os.scandir(self._path), key=lambda e: e.name.lower()):
-                    if self.isInterruptionRequested():
-                        return
-                    if entry.is_file() and Path(entry.name).suffix.lower() in IMAGE_EXTENSIONS:
-                        files.append(entry.path)
-        except (PermissionError, OSError) as e:
-            _log.warning("[DirectoryScanWorker.run] scan error: %s", e)
+        if report_cache:
+            # 当 report.db 有记录时，直接用 DB 中 original_path 构建 files，跳过文件系统扫描
+            for stem, row in sorted(report_cache.items(), key=lambda kv: (kv[0].lower() if kv[0] else "")):
+                op = row.get("original_path")
+                if op and str(op).strip():
+                    files.append(str(op).strip())
+            _log.info(
+                "[DirectoryScanWorker.run] 使用 DB original_path 构建文件列表 files=%s（跳过文件系统扫描）",
+                len(files),
+            )
+        else:
+            try:
+                if self._recursive:
+                    for root, dirs, names in os.walk(self._path, topdown=True):
+                        if self.isInterruptionRequested():
+                            _log.info("[DirectoryScanWorker.run] interrupted during walk")
+                            return
+                        dirs[:] = [d for d in dirs if not d.startswith(".")]
+                        for name in sorted(names, key=str.lower):
+                            if Path(name).suffix.lower() in IMAGE_EXTENSIONS:
+                                files.append(os.path.join(root, name))
+                else:
+                    for entry in sorted(os.scandir(self._path), key=lambda e: e.name.lower()):
+                        if self.isInterruptionRequested():
+                            return
+                        if entry.is_file() and Path(entry.name).suffix.lower() in IMAGE_EXTENSIONS:
+                            files.append(entry.path)
+            except (PermissionError, OSError) as e:
+                _log.warning("[DirectoryScanWorker.run] scan error: %s", e)
+        _log.info("[DirectoryScanWorker.run] 目录扫描完成：列出 %s 个图像文件，report_cache %s 条，即将通知主线程加载 EXIF", len(files), len(report_cache))
         _log.info("[DirectoryScanWorker.run] scan done files=%s", len(files))
         if not self.isInterruptionRequested():
             self.scan_finished.emit(self._path, files, report_cache)
@@ -564,7 +576,12 @@ class MetadataLoader(QThread):
                     row = self._report_cache[stem]
                     flat = report_row_to_exiftool_style(row, path)
                     inject_metadata_cache(path, flat)
-                    result[norm] = self._parse_rec(flat)
+                    meta = self._parse_rec(flat)
+                    result[norm] = meta
+                    _log.info(
+                        "[MetadataLoader.run] path=%r 来源=DB stem=%r 解析 title=%r rating=%s pick=%s",
+                        path, stem, meta.get("title", ""), meta.get("rating"), meta.get("pick"),
+                    )
                 else:
                     uncached.append(path)
             processed = total - len(uncached)
@@ -586,7 +603,12 @@ class MetadataLoader(QThread):
                     for norm, rec in chunk_raw.items():
                         if self._stop_flag or self.isInterruptionRequested():
                             return
-                        result[norm] = self._parse_rec(rec)
+                        meta = self._parse_rec(rec)
+                        result[norm] = meta
+                        _log.info(
+                            "[MetadataLoader.run] path=%r 来源=read_batch 解析 title=%r rating=%s pick=%s",
+                            norm, meta.get("title", ""), meta.get("rating"), meta.get("pick"),
+                        )
                     processed += len(chunk)
                     self.progress_updated.emit(min(processed, total), total)
         except Exception as e:
@@ -899,6 +921,7 @@ class FileListPanel(QWidget):
         当任意过滤条件开启（文本 / 🏆精选 / 星级）时，递归遍历该目录及所有子目录（不进入 . 开头目录）；
         否则仅当前目录。force_reload=True 时忽略「当前目录未变」的短路，用于切换过滤后刷新列表。
         """
+        _log.info("[load_directory] 选中目录，将扫描并列出图像文件、随后查询 EXIF path=%r force_reload=%s", path, force_reload)
         _log.info("[load_directory] START path=%r force_reload=%s", path, force_reload)
         if not force_reload and path == self._current_dir:
             _log.info("[load_directory] SKIP same dir")
@@ -933,18 +956,22 @@ class FileListPanel(QWidget):
         self._directory_scan_worker = None
 
     def _on_directory_scan_finished(self, path: str, files: list, report_cache: dict) -> None:
+        _log.info("[_on_directory_scan_finished] 收到目录扫描结果 path=%r files=%s report_entries=%s，开始列出文件并查询 EXIF", path, len(files), len(report_cache))
         _log.info("[_on_directory_scan_finished] path=%r _current_dir=%r files=%s report_entries=%s", path, self._current_dir, len(files), len(report_cache))
         if path != self._current_dir:
             _log.info("[_on_directory_scan_finished] IGNORE stale path")
             return
         self._report_cache = report_cache
         self._all_files = files
+        _log.info("[_on_directory_scan_finished] 已列出 %s 个文件，重建列表/缩略图视图", len(files))
         _log.info("[_on_directory_scan_finished] _rebuild_views START")
         self._rebuild_views()
         _log.info("[_on_directory_scan_finished] _rebuild_views END")
         if files:
-            _log.info("[_on_directory_scan_finished] _start_metadata_loader %s files", len(files))
+            _log.info("[_on_directory_scan_finished] 为当前目录下列出的 %s 个文件启动 EXIF 查询（report_cache=%s 条，未命中走 exiftool/XMP）", len(files), len(report_cache))
             self._start_metadata_loader(files)
+        else:
+            _log.info("[_on_directory_scan_finished] 当前目录无图像文件，跳过 EXIF 查询")
         self._directory_scan_worker = None
         _log.info("[_on_directory_scan_finished] END")
 
@@ -1159,6 +1186,7 @@ class FileListPanel(QWidget):
         self._pending_loaders = [l for l in self._pending_loaders if l.isRunning()]
 
     def _start_metadata_loader(self, paths: list) -> None:
+        _log.info("[_start_metadata_loader] 为目录文件列表查询 EXIF paths=%s report_cache=%s", len(paths), len(self._report_cache))
         _log.info("[_start_metadata_loader] START paths=%s", len(paths))
         self._stop_metadata_loader()
         total = len(paths)
@@ -1177,7 +1205,7 @@ class FileListPanel(QWidget):
         loader.all_metadata_ready.connect(self._on_metadata_ready)
         self._metadata_loader = loader
         loader.start()
-        _log.info("[_start_metadata_loader] END loader.started")
+        _log.info("[_start_metadata_loader] MetadataLoader 已启动，EXIF 将来自 DB(report_cache) 或 read_batch(exiftool/XMP)")
 
     def _stop_metadata_loader(self) -> None:
         if self._metadata_loader:
@@ -1237,6 +1265,7 @@ class FileListPanel(QWidget):
         self._meta_progress.setValue(min(current, total))
 
     def _on_metadata_ready(self, meta_dict: dict) -> None:
+        _log.info("[_on_metadata_ready] 当前目录 EXIF 查询完成，共 %s 条，更新列表与缩略图", len(meta_dict))
         _log.info("[_on_metadata_ready] START entries=%s", len(meta_dict))
         self._meta_cache.update(meta_dict)
         self._meta_progress.setValue(self._meta_progress.maximum())
@@ -1257,16 +1286,18 @@ class FileListPanel(QWidget):
         if self._filter_pick or self._filter_min_rating > 0:
             _log.info("[_on_metadata_ready] _apply_filter")
             self._apply_filter()
-        _log.info("[_on_metadata_ready] END")
+        _log.info("[_on_metadata_ready] 目录文件列表 EXIF 已全部就绪 END")
 
     def _on_tree_item_clicked(self, item, column) -> None:
         path = item.data(0, _UserRole)
         if path and os.path.isfile(path):
+            _log.info("[_on_tree_item_clicked] 选中照片，触发 EXIF 查询 path=%r", path)
             self.file_selected.emit(path)
 
     def _on_list_item_clicked(self, item) -> None:
         path = item.data(_UserRole)
         if path and os.path.isfile(path):
+            _log.info("[_on_list_item_clicked] 选中照片，触发 EXIF 查询 path=%r", path)
             self.file_selected.emit(path)
 
     def _copy_paths_to_clipboard(self, paths: list) -> None:

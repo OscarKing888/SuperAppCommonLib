@@ -18,6 +18,9 @@ import threading
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 from .file_utils import ensure_hidden_directory
+from .log import get_logger
+
+_log = get_logger("report_db")
 
 
 # Schema 版本，用于未来升级
@@ -102,7 +105,9 @@ def get_preview_path_for_file(path: str, current_dir: str, report_cache: Dict[st
     则返回该 JPEG 路径用于预览，避免重复解码；否则返回原 path。
     current_dir 用于解析相对路径的 temp_jpeg_path。
     """
+    _log.debug("[get_preview_path_for_file] path=%r current_dir=%r cache_keys=%s", path, current_dir, len(report_cache) if isinstance(report_cache, dict) else 0)
     if not path or not report_cache or not current_dir:
+        _log.debug("[get_preview_path_for_file] 跳过 path=%r", path)
         return path
     ext = os.path.splitext(path)[1].lower()
     if ext not in _HEIF_LIKE_EXTENSIONS:
@@ -117,7 +122,9 @@ def get_preview_path_for_file(path: str, current_dir: str, report_cache: Dict[st
     temp_path = str(temp_path).strip()
     resolved = os.path.normpath(os.path.join(current_dir, temp_path)) if not os.path.isabs(temp_path) else os.path.normpath(temp_path)
     if os.path.isfile(resolved):
+        _log.debug("[get_preview_path_for_file] 使用 temp_jpeg_path path=%r resolved=%r", path, resolved)
         return resolved
+    _log.debug("[get_preview_path_for_file] temp 文件不存在 使用原 path=%r", path)
     return path
 
 
@@ -134,8 +141,10 @@ def report_row_to_exiftool_style(row: Dict[str, Any], source_file: str) -> Dict[
         exiftool 风格 dict，包含 SourceFile 及 XMP-dc:Title、XMP-xmp:Rating、
         XMP:City/State/Country、ExifIFD:ISO、Composite:ShutterSpeed 等键
     """
+    _log.debug("[report_row_to_exiftool_style] source_file=%r row_keys=%s", source_file, len(row) if isinstance(row, dict) else 0)
     out: Dict[str, Any] = {"SourceFile": source_file}
     if not isinstance(row, dict):
+        _log.debug("[report_row_to_exiftool_style] row 非 dict 返回仅 SourceFile")
         return out
 
     def _set(k: str, v: Any) -> None:
@@ -233,6 +242,7 @@ def report_row_to_exiftool_style(row: Dict[str, Any], source_file: str) -> Dict[
         _set("Composite:GPSAltitude", alt)
         _set("EXIF:GPSAltitude", alt)
 
+    _log.debug("[report_row_to_exiftool_style] 完成 out_keys=%s", len(out))
     return out
 
 
@@ -256,6 +266,7 @@ class ReportDB:
             directory: 照片目录路径（数据库存储在 .superpicky/ 子目录下）
             create_if_missing: 若 True，确保 .superpicky 存在并创建库；若 False，仅当 report.db 已存在时打开，否则抛出 FileNotFoundError
         """
+        _log.info("[ReportDB.__init__] directory=%r create_if_missing=%s", directory, create_if_missing)
         self.directory = directory
         self._superpicky_dir = os.path.join(directory, ".superpicky")
         self.db_path = os.path.join(self._superpicky_dir, self.DB_FILENAME)
@@ -285,6 +296,7 @@ class ReportDB:
 
         # 初始化 Schema
         self._init_schema()
+        _log.info("[ReportDB.__init__] 完成 db_path=%r", self.db_path)
 
     @classmethod
     def open_if_exists(cls, directory: str) -> Optional["ReportDB"]:
@@ -293,15 +305,21 @@ class ReportDB:
         用于只读加载缓存，不会创建目录或数据库文件。
         """
         db_path = os.path.join(directory, ".superpicky", cls.DB_FILENAME)
+        _log.info("[ReportDB.open_if_exists] directory=%r db_path=%r", directory, db_path)
         if not os.path.isfile(db_path):
+            _log.info("[ReportDB.open_if_exists] 文件不存在 返回 None")
             return None
         try:
-            return cls(directory, create_if_missing=False)
-        except Exception:
+            db = cls(directory, create_if_missing=False)
+            _log.info("[ReportDB.open_if_exists] 打开成功")
+            return db
+        except Exception as e:
+            _log.warning("[ReportDB.open_if_exists] 打开失败: %s", e)
             return None
 
     def _init_schema(self):
         """创建表和索引（如果不存在）。"""
+        _log.info("[ReportDB._init_schema] START")
         # 构建 CREATE TABLE 语句
         col_defs = []
         for name, type_def, _ in PHOTO_COLUMNS:
@@ -352,9 +370,11 @@ class ReportDB:
 
         # Schema 升级在独立事务中执行，避免嵌套 commit 冲突
         self._upgrade_schema_if_needed()
-    
+        _log.info("[ReportDB._init_schema] END")
+
     def _upgrade_schema_if_needed(self):
         """检查并升级数据库 Schema（支持连续升级 v1 -> v2 -> v3 -> v4）"""
+        _log.debug("[ReportDB._upgrade_schema_if_needed] START")
         with self._lock:
             # 获取当前 schema 版本
             cursor = self._conn.execute(
@@ -367,7 +387,7 @@ class ReportDB:
             #  Upgrade: v1 -> v2 (EXIF metadata)
             # ----------------------------------------------------------------------
             if current_version == "1":
-                print("🔄 Upgrading database schema from v1 to v2...")
+                _log.info("[ReportDB._upgrade_schema_if_needed] 升级 v1 -> v2")
                 new_columns = [
                     ("iso", "INTEGER"),
                     ("shutter_speed", "TEXT"),
@@ -400,13 +420,13 @@ class ReportDB:
                             pass  # 列已存在，跳过
                     self._update_schema_version("2")
                 current_version = "2"
-                print("✅ Database schema upgraded to v2")
+                _log.info("[ReportDB._upgrade_schema_if_needed] 已升级到 v2")
 
             # ----------------------------------------------------------------------
             #  Upgrade: v2 -> v3 (File paths)
             # ----------------------------------------------------------------------
             if current_version == "2":
-                print("🔄 Upgrading database schema from v2 to v3...")
+                _log.info("[ReportDB._upgrade_schema_if_needed] 升级 v2 -> v3")
                 new_columns_v3 = [
                     ("original_path", "TEXT"),
                     ("current_path", "TEXT"),
@@ -423,13 +443,13 @@ class ReportDB:
                             pass  # 列已存在，跳过
                     self._update_schema_version("3")
                 current_version = "3"
-                print("✅ Database schema upgraded to v3")
+                _log.info("[ReportDB._upgrade_schema_if_needed] 已升级到 v3")
 
             # ----------------------------------------------------------------------
             #  Upgrade: v3 -> v4 (Check debug images)
             # ----------------------------------------------------------------------
             if current_version == "3":
-                print("🔄 Upgrading database schema from v3 to v4...")
+                _log.info("[ReportDB._upgrade_schema_if_needed] 升级 v3 -> v4")
                 new_columns_v4 = [
                     ("yolo_debug_path", "TEXT"),
                 ]
@@ -443,10 +463,12 @@ class ReportDB:
                             pass  # 列已存在，跳过
                     self._update_schema_version("4")
                 current_version = "4"
-                print("✅ Database schema upgraded to v4")
+                _log.info("[ReportDB._upgrade_schema_if_needed] 已升级到 v4")
+        _log.debug("[ReportDB._upgrade_schema_if_needed] END current_version=%s", current_version)
 
     def _update_schema_version(self, version):
         """更新数据库中的版本号（由调用方负责提交事务）"""
+        _log.debug("[ReportDB._update_schema_version] version=%s", version)
         with self._lock:
             self._conn.execute(
                 "UPDATE meta SET value = ? WHERE key = 'schema_version'",
@@ -467,6 +489,8 @@ class ReportDB:
         Args:
             data: 照片数据字典，键为列名
         """
+        filename = data.get("filename", "")
+        _log.info("[ReportDB.insert_photo] filename=%r", filename)
         cleaned = self._clean_data(data)
         now = _now_iso()
         cleaned.setdefault("created_at", now)
@@ -492,6 +516,7 @@ class ReportDB:
         with self._lock:
             self._conn.execute(sql, values)
             self._safe_commit()
+        _log.info("[ReportDB.insert_photo] 完成 filename=%r", filename)
 
     def insert_photos_batch(self, photos: List[dict]) -> int:
         """
@@ -505,7 +530,9 @@ class ReportDB:
         Returns:
             成功插入/更新的记录数
         """
+        _log.info("[ReportDB.insert_photos_batch] photos_count=%s", len(photos))
         if not photos:
+            _log.info("[ReportDB.insert_photos_batch] 空列表 返回 0")
             return 0
 
         now = _now_iso()
@@ -536,6 +563,7 @@ class ReportDB:
                     self._conn.execute(sql, values)
                     count += 1
 
+        _log.info("[ReportDB.insert_photos_batch] 完成 count=%s", count)
         return count
 
     # ==========================================================================
@@ -552,12 +580,15 @@ class ReportDB:
         Returns:
             照片数据字典，未找到返回 None
         """
+        _log.debug("[ReportDB.get_photo] filename=%r", filename)
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT * FROM photos WHERE filename = ?", (filename,)
             )
             row = cursor.fetchone()
-            return dict(row) if row else None
+            result = dict(row) if row else None
+        _log.debug("[ReportDB.get_photo] 完成 found=%s", result is not None)
+        return result
 
     def get_all_photos(self) -> List[dict]:
         """
@@ -566,9 +597,12 @@ class ReportDB:
         Returns:
             照片数据字典列表
         """
+        _log.debug("[ReportDB.get_all_photos]")
         with self._lock:
             cursor = self._conn.execute("SELECT * FROM photos ORDER BY filename")
-            return [dict(row) for row in cursor.fetchall()]
+            rows = [dict(row) for row in cursor.fetchall()]
+        _log.debug("[ReportDB.get_all_photos] 完成 count=%s", len(rows))
+        return rows
 
     def get_bird_photos(self) -> List[dict]:
         """
@@ -577,11 +611,14 @@ class ReportDB:
         Returns:
             有鸟照片数据字典列表
         """
+        _log.debug("[ReportDB.get_bird_photos]")
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT * FROM photos WHERE has_bird = 1 ORDER BY filename"
             )
-            return [dict(row) for row in cursor.fetchall()]
+            rows = [dict(row) for row in cursor.fetchall()]
+        _log.debug("[ReportDB.get_bird_photos] 完成 count=%s", len(rows))
+        return rows
 
     def get_photos_by_rating(self, rating: int) -> List[dict]:
         """
@@ -593,12 +630,15 @@ class ReportDB:
         Returns:
             照片数据字典列表
         """
+        _log.debug("[ReportDB.get_photos_by_rating] rating=%s", rating)
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT * FROM photos WHERE rating = ? ORDER BY filename",
                 (rating,)
             )
-            return [dict(row) for row in cursor.fetchall()]
+            rows = [dict(row) for row in cursor.fetchall()]
+        _log.debug("[ReportDB.get_photos_by_rating] 完成 count=%s", len(rows))
+        return rows
 
     def get_distinct_species(self, use_en: bool = False) -> List[str]:
         """
@@ -610,6 +650,7 @@ class ReportDB:
         Returns:
             鸟种名称列表（已去重、去空值）
         """
+        _log.debug("[ReportDB.get_distinct_species] use_en=%s", use_en)
         column = "bird_species_en" if use_en else "bird_species_cn"
         assert column in {"bird_species_en", "bird_species_cn"}, f"Invalid column: {column}"
         order_clause = f"{column} COLLATE NOCASE" if use_en else column
@@ -624,7 +665,9 @@ class ReportDB:
                 ORDER BY {order_clause}
                 """
             )
-            return [row[0] for row in cursor.fetchall()]
+            species_list = [row[0] for row in cursor.fetchall()]
+        _log.debug("[ReportDB.get_distinct_species] 完成 count=%s", len(species_list))
+        return species_list
 
     def get_photos_by_filters(self, filters: Optional[dict] = None) -> List[dict]:
         """
@@ -637,6 +680,7 @@ class ReportDB:
             - bird_species_cn / bird_species_en: str
             - sort_by: filename | sharpness_desc | aesthetic_desc
         """
+        _log.debug("[ReportDB.get_photos_by_filters] filters=%s", filters)
         filters = filters or {}
 
         where_clauses = []
@@ -696,7 +740,9 @@ class ReportDB:
 
         with self._lock:
             cursor = self._conn.execute(sql, params)
-            return [dict(row) for row in cursor.fetchall()]
+            rows = [dict(row) for row in cursor.fetchall()]
+        _log.debug("[ReportDB.get_photos_by_filters] 完成 count=%s", len(rows))
+        return rows
 
     def get_statistics(self) -> dict:
         """
@@ -711,6 +757,7 @@ class ReportDB:
                 "by_rating": {0: 50, 1: 60, 2: 45, 3: 25}
             }
         """
+        _log.debug("[ReportDB.get_statistics]")
         stats = {}
 
         with self._lock:
@@ -736,16 +783,21 @@ class ReportDB:
             )
             stats["by_rating"] = {row[0]: row[1] for row in cursor.fetchall()}
 
+        _log.debug("[ReportDB.get_statistics] 完成 total=%s", stats.get("total"))
         return stats
 
     def count(self) -> int:
         """返回总记录数。"""
+        _log.debug("[ReportDB.count]")
         with self._lock:
             row = self._conn.execute("SELECT COUNT(*) FROM photos").fetchone()
-            return row[0]
+            n = row[0]
+        _log.debug("[ReportDB.count] 完成 n=%s", n)
+        return n
 
     def exists(self) -> bool:
         """数据库文件是否存在。"""
+        _log.debug("[ReportDB.exists] db_path=%r", self.db_path)
         return os.path.exists(self.db_path)
 
     # ==========================================================================
@@ -763,12 +815,14 @@ class ReportDB:
         Returns:
             是否成功更新
         """
+        _log.info("[ReportDB.update_photo] filename=%r", filename)
         cleaned = self._clean_data(data)
         cleaned["updated_at"] = _now_iso()
 
         # 仅保留合法列，排除 filename 和 id
         columns = [k for k in cleaned if k in COLUMN_NAMES and k not in ("filename", "id")]
         if not columns:
+            _log.info("[ReportDB.update_photo] 无有效列 返回 False")
             return False
 
         values = [cleaned[k] for k in columns]
@@ -780,7 +834,9 @@ class ReportDB:
         with self._lock:
             cursor = self._conn.execute(sql, values)
             self._safe_commit()
-            return cursor.rowcount > 0
+            updated = cursor.rowcount > 0
+        _log.info("[ReportDB.update_photo] 完成 filename=%r updated=%s", filename, updated)
+        return updated
 
     def update_ratings_batch(self, updates: List[dict]) -> int:
         """
@@ -795,6 +851,7 @@ class ReportDB:
         Returns:
             成功更新的记录数
         """
+        _log.info("[ReportDB.update_ratings_batch] updates_count=%s", len(updates))
         if not updates:
             return 0
 
@@ -825,16 +882,20 @@ class ReportDB:
                     if cursor.rowcount > 0:
                         count += 1
 
+        _log.info("[ReportDB.update_ratings_batch] 完成 count=%s", count)
         return count
 
     def clear_cache_paths(self) -> int:
         """清空缓存相关路径字段（临时 JPG、调试裁切、YOLO 调试图）。"""
+        _log.info("[ReportDB.clear_cache_paths]")
         with self._lock:
             cursor = self._conn.execute(
                 "UPDATE photos SET debug_crop_path = NULL, temp_jpeg_path = NULL, yolo_debug_path = NULL"
             )
             self._safe_commit()
-            return cursor.rowcount
+            n = cursor.rowcount
+        _log.info("[ReportDB.clear_cache_paths] 完成 rowcount=%s", n)
+        return n
 
     # ==========================================================================
     #  元数据操作
@@ -842,21 +903,26 @@ class ReportDB:
 
     def get_meta(self, key: str) -> Optional[str]:
         """获取元数据值。"""
+        _log.debug("[ReportDB.get_meta] key=%r", key)
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT value FROM meta WHERE key = ?", (key,)
             )
             row = cursor.fetchone()
-            return row[0] if row else None
+            result = row[0] if row else None
+        _log.debug("[ReportDB.get_meta] 完成 key=%r has_value=%s", key, result is not None)
+        return result
 
     def set_meta(self, key: str, value: str) -> None:
         """设置元数据值。"""
+        _log.debug("[ReportDB.set_meta] key=%r", key)
         with self._lock:
             self._conn.execute(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
                 (key, value)
             )
             self._safe_commit()
+        _log.debug("[ReportDB.set_meta] 完成")
 
     # ==========================================================================
     #  同步预留
@@ -872,12 +938,15 @@ class ReportDB:
         Returns:
             更新记录列表
         """
+        _log.debug("[ReportDB.get_updated_since] since=%r", since)
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT * FROM photos WHERE updated_at > ? ORDER BY updated_at",
                 (since,)
             )
-            return [dict(row) for row in cursor.fetchall()]
+            rows = [dict(row) for row in cursor.fetchall()]
+        _log.debug("[ReportDB.get_updated_since] 完成 count=%s", len(rows))
+        return rows
 
     # ==========================================================================
     #  连接管理
@@ -885,15 +954,19 @@ class ReportDB:
 
     def close(self) -> None:
         """关闭数据库连接。"""
+        _log.info("[ReportDB.close] db_path=%r", getattr(self, "db_path", None))
         with self._lock:
             if self._conn:
                 self._conn.close()
                 self._conn = None
+        _log.info("[ReportDB.close] 完成")
 
     def __enter__(self):
+        _log.debug("[ReportDB.__enter__]")
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        _log.debug("[ReportDB.__exit__] exc_type=%s", exc_type)
         self.close()
         return False
 
@@ -903,6 +976,7 @@ class ReportDB:
 
     def _safe_commit(self) -> None:
         """仅在存在活动事务时提交，兼容 autocommit 场景。"""
+        _log.debug("[ReportDB._safe_commit]")
         if not self._conn:
             return
         try:
@@ -911,6 +985,7 @@ class ReportDB:
         except sqlite3.OperationalError as e:
             # 某些运行时在 autocommit 下会抛 "no transaction is active"
             if "no transaction is active" in str(e).lower():
+                _log.debug("[ReportDB._safe_commit] 无活动事务 跳过")
                 return
             raise
 
@@ -924,6 +999,7 @@ class ReportDB:
         - "-" 或空字符串 → None
         - 数值字符串 → 对应的 float/int
         """
+        _log.debug("[ReportDB._clean_data] input_keys=%s", len(data) if data else 0)
         cleaned = {}
         for key, value in data.items():
             # 跳过非法列名
@@ -972,9 +1048,12 @@ class ReportDB:
             # date_time_original, bird_species_cn, bird_species_en, exposure_status
             cleaned[key] = value
 
+        _log.debug("[ReportDB._clean_data] 完成 output_keys=%s", len(cleaned))
         return cleaned
 
 
 def _now_iso() -> str:
     """返回当前 UTC 时间的 ISO 8601 字符串。"""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    s = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _log.debug("[_now_iso] %s", s)
+    return s
