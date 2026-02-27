@@ -188,6 +188,47 @@ def _focus_box_from_numbers(
     return _focus_box_from_center(center_x, center_y, span_x, span_y)
 
 
+_SONY_MAKERNOTE_FOCUS_BLOCK_KEYS: tuple[str, ...] = (
+    "makernote tag 0x2027",
+    "makernote tag 0x204a",
+)
+
+
+def _focus_point_from_dimension_prefixed_block(numbers: list[float]) -> tuple[float, float] | None:
+    """
+    解析 Sony MakerNote 里常见的 [block_w, block_h, x, y, ...] 结构。
+    block_w/block_h 是坐标系尺寸，x/y 为焦点中心（像素）。
+    """
+    if len(numbers) < 4:
+        return None
+    block_w = float(numbers[0])
+    block_h = float(numbers[1])
+    x = float(numbers[2])
+    y = float(numbers[3])
+    if block_w <= 0 or block_h <= 0:
+        return None
+    return (clamp01(x / block_w), clamp01(y / block_h))
+
+
+def _focus_box_from_dimension_prefixed_block(
+    numbers: list[float],
+    fallback_span_px: tuple[float, float] | None = None,
+) -> tuple[float, float, float, float] | None:
+    """
+    解析 Sony MakerNote 焦点块 [block_w, block_h, x, y, (opt)w, (opt)h]。
+    """
+    if len(numbers) < 4:
+        return None
+    block_w = int(round(float(numbers[0])))
+    block_h = int(round(float(numbers[1])))
+    if block_w <= 0 or block_h <= 0:
+        return None
+    payload = [float(numbers[0]), float(numbers[1]), float(numbers[2]), float(numbers[3])]
+    if len(numbers) >= 6:
+        payload.extend([float(numbers[4]), float(numbers[5])])
+    return _focus_box_from_numbers(payload, block_w, block_h, fallback_span_px=fallback_span_px)
+
+
 def _normalize_camera_model_key(value: Any) -> str:
     text = _clean_text(value)
     if not text:
@@ -267,6 +308,12 @@ def _extract_focus_point_sony(raw: dict[str, Any], width: int, height: int) -> t
                 if x > 1.0 or y > 1.0:
                     return (clamp01(x / float(width)), clamp01(y / float(height)))
                 return (clamp01(x), clamp01(y))
+    for key in _SONY_MAKERNOTE_FOCUS_BLOCK_KEYS:
+        if key not in lookup:
+            continue
+        point = _focus_point_from_dimension_prefixed_block(_extract_numbers(lookup[key]))
+        if point is not None:
+            return point
     for key in ("subjectarea", "subjectlocation", "focuslocation", "focuslocation2", "afpoint"):
         if key not in lookup:
             continue
@@ -294,6 +341,15 @@ def _extract_focus_box_sony(raw: dict[str, Any], width: int, height: int) -> tup
     subject_area = lookup.get("subjectarea")
     if subject_area is not None:
         box = _focus_box_from_numbers(_extract_numbers(subject_area), width, height, fallback_span_px=focus_frame_span_px)
+        if box is not None:
+            return box
+    for key in _SONY_MAKERNOTE_FOCUS_BLOCK_KEYS:
+        if key not in lookup:
+            continue
+        box = _focus_box_from_dimension_prefixed_block(
+            _extract_numbers(lookup[key]),
+            fallback_span_px=focus_frame_span_px,
+        )
         if box is not None:
             return box
     box_key_groups = [
