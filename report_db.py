@@ -95,6 +95,33 @@ COLUMN_NAMES = {col[0] for col in PHOTO_COLUMNS}
 # 控制开关：True = 仅从 report.db 读取 EXIF，不读文件；False = report 优先，未命中再读文件
 EXIF_ONLY_FROM_REPORT_DB = True
 
+
+def find_report_root(directory: str) -> Optional[str]:
+    """
+    从给定目录开始向上查找，返回最近一个包含 .superpicky/report.db 的目录路径。
+    若未找到则返回 None。
+    """
+    if not directory:
+        return None
+    try:
+        cur = os.path.normpath(directory)
+        last = None
+        while cur and cur != last:
+            db_path = os.path.join(cur, ".superpicky", ReportDB.DB_FILENAME)
+            if os.path.isfile(db_path):
+                _log.info("[find_report_root] 命中 root=%r db_path=%r", cur, db_path)
+                return cur
+            last = cur
+            parent = os.path.dirname(cur)
+            if not parent or parent == cur:
+                break
+            cur = parent
+    except Exception as e:
+        _log.warning("[find_report_root] 失败 directory=%r: %s", directory, e)
+    _log.info("[find_report_root] 未找到 report.db directory=%r", directory)
+    return None
+
+
 def get_preview_path_for_file(path: str, current_dir: str, report_cache: Dict[str, Any]) -> str:
     """
     若 report 中有该文件（按文件名 stem 匹配）且存在 temp_jpeg_path（相对 current_dir，如 .superpicky\\cache\\temp_preview\\xxx.jpg），
@@ -191,7 +218,12 @@ def report_row_to_exiftool_style(row: Dict[str, Any], source_file: str) -> Dict[
     r = row.get("rating")
     if r is not None:
         try:
-            out["XMP-xmp:Rating"] = max(0, min(5, int(r)))
+            rv = int(float(str(r)))
+            if rv < 0:
+                out["XMP-xmpDM:pick"] = -1
+                out["XMP-xmpDM:Pick"] = -1
+            else:
+                out["XMP-xmp:Rating"] = max(0, min(5, rv))
         except (TypeError, ValueError):
             pass
 

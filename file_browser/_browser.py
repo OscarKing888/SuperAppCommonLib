@@ -17,6 +17,7 @@ import io as _io
 import os
 import subprocess
 import sys
+import time as _time
 from pathlib import Path
 
 # ── Qt 导入 ───────────────────────────────────────────────────────────────────
@@ -51,7 +52,13 @@ except ImportError:
 
 from app_common.exif_io import read_batch_metadata, find_xmp_sidecar, inject_metadata_cache
 from app_common.log import get_logger
-from app_common.report_db import ReportDB, report_row_to_exiftool_style, EXIF_ONLY_FROM_REPORT_DB, get_preview_path_for_file
+from app_common.report_db import (
+    ReportDB,
+    report_row_to_exiftool_style,
+    EXIF_ONLY_FROM_REPORT_DB,
+    get_preview_path_for_file,
+    find_report_root,
+)
 
 _log = get_logger("file_browser")
 
@@ -219,6 +226,59 @@ except AttributeError:
     _CustomContextMenu = Qt.CustomContextMenu  # type: ignore[attr-defined]
 
 # ── 系统文件管理器工具函数 ────────────────────────────────────────────────────────
+
+def _path_key(path: str) -> str:
+    """Normalize path for case-insensitive comparison on Windows."""
+    return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+
+
+def _is_same_or_child_path(parent: str, child: str) -> bool:
+    """Whether child is parent itself or under parent."""
+    try:
+        parent_abs = os.path.normpath(os.path.abspath(parent))
+        child_abs = os.path.normpath(os.path.abspath(child))
+        if _path_key(parent_abs) == _path_key(child_abs):
+            return True
+        common = os.path.commonpath([parent_abs, child_abs])
+        return _path_key(common) == _path_key(parent_abs)
+    except Exception:
+        return False
+
+
+def _resolve_report_full_path(row: dict, report_root: str, fallback_dir: str) -> str | None:
+    """Resolve full file path from report row current_path/original_path."""
+    cp = row.get("current_path")
+    if not cp or not str(cp).strip():
+        return None
+
+    cp_text = str(cp).strip()
+    if os.path.isabs(cp_text):
+        full_path = os.path.normpath(cp_text)
+    else:
+        base_dir = report_root or fallback_dir
+        full_path = os.path.normpath(os.path.join(base_dir, cp_text))
+
+    op = row.get("original_path")
+    if op and str(op).strip():
+        ext_orig = Path(str(op).strip()).suffix
+        if ext_orig:
+            full_path = str(Path(full_path).with_suffix(ext_orig))
+    return full_path
+
+
+def _norm_rel_path_for_match(path_text: str) -> str:
+    """Normalize relative path text for prefix matching."""
+    s = str(path_text or "").strip()
+    if not s:
+        return ""
+    s = s.replace("/", os.sep).replace("\\", os.sep)
+    s = os.path.normpath(s)
+    while s.startswith("." + os.sep):
+        s = s[2:]
+    if s == ".":
+        s = ""
+    return os.path.normcase(s)
+
 
 def _reveal_in_file_manager(path: str) -> None:
     """
@@ -469,16 +529,23 @@ class DirectoryScanWorker(QThread):
 
     scan_finished = pyqtSignal(str, object, object)  # (path, files_list, report_cache_dict)
 
-    def __init__(self, path: str, recursive: bool, parent=None) -> None:
+    def __init__(self, path: str, recursive: bool, report_root: str | None = None, parent=None) -> None:
         super().__init__(parent)
         self._path = path
         self._recursive = recursive
+        self._report_root = report_root
 
     def run(self) -> None:
-        _log.info("[DirectoryScanWorker.run] START path=%r recursive=%s", self._path, self._recursive)
+        _log.info(
+            "[DirectoryScanWorker.run] START path=%r recursive=%s report_root=%r",
+            self._path,
+            self._recursive,
+            self._report_root,
+        )
         report_cache: dict = {}
         try:
-            db = ReportDB.open_if_exists(self._path)
+            db_dir = self._report_root or self._path
+            db = ReportDB.open_if_exists(db_dir)
             if db:
                 try:
                     for row in db.get_all_photos():
@@ -497,16 +564,34 @@ class DirectoryScanWorker(QThread):
         files: list = []
         if report_cache:
             # 当 report.db 有记录时，用 DB 中 current_path（相对选中目录）拼出完整路径，扩展名用 original_path 的（如 .ARW）
+            selected_dir = os.path.normpath(self._path)
+            report_root = os.path.normpath(self._report_root or self._path)
+            selected_rel = ""
+            if _is_same_or_child_path(report_root, selected_dir):
+                try:
+                    selected_rel = os.path.relpath(selected_dir, report_root)
+                except Exception:
+                    selected_rel = ""
+            selected_rel_norm = _norm_rel_path_for_match(selected_rel)
+            selected_report_cache: dict = {}
             for stem, row in sorted(report_cache.items(), key=lambda kv: (kv[0].lower() if kv[0] else "")):
-                cp = row.get("current_path")
-                if cp and str(cp).strip():
-                    full_path = os.path.normpath(os.path.join(self._path, str(cp).strip()))
-                    op = row.get("original_path")
-                    if op and str(op).strip():
-                        ext_orig = Path(str(op).strip()).suffix
-                        if ext_orig:
-                            full_path = str(Path(full_path).with_suffix(ext_orig))
-                    files.append(full_path)
+                cp_text = str(row.get("current_path") or "").strip()
+                if selected_rel_norm and cp_text and not os.path.isabs(cp_text):
+                    cp_norm = _norm_rel_path_for_match(cp_text)
+                    if cp_norm != selected_rel_norm and not cp_norm.startswith(selected_rel_norm + os.sep):
+                        continue
+                full_path = _resolve_report_full_path(row, report_root, self._path)
+                if not full_path:
+                    continue
+                if not _is_same_or_child_path(selected_dir, full_path):
+                    continue
+                files.append(full_path)
+                selected_report_cache[stem] = row
+            report_cache = selected_report_cache
+            _log.info(
+                "[DirectoryScanWorker.run] selected scope files=%s selected_report_cache=%s selected_dir=%r selected_rel=%r report_root=%r",
+                len(files), len(report_cache), selected_dir, selected_rel_norm or ".", report_root,
+            )
             _log.info(
                 "[DirectoryScanWorker.run] 使用 DB current_path 拼出完整路径构建文件列表 files=%s（跳过文件系统扫描）",
                 len(files),
@@ -541,6 +626,23 @@ class DirectoryScanWorker(QThread):
 
 # 后台元数据读取：每块最大文件数（分块顺序读取，提升取消响应性）
 _METADATA_CHUNK_SIZE = 150
+# 主线程元数据显示分批大小（越小越流畅，越大越快）
+_META_APPLY_BATCH_SIZE = 64
+_META_APPLY_TIME_BUDGET_MS = 12.0
+
+
+def _env_int(name: str, default: int = 0) -> int:
+    try:
+        v = os.environ.get(name, "")
+        if v is None or str(v).strip() == "":
+            return default
+        return int(str(v).strip())
+    except Exception:
+        return default
+
+
+_DEBUG_FILE_LIST_LIMIT = max(0, _env_int("SUPEREXIF_DEBUG_FILE_LIST_LIMIT", 0))
+_DEBUG_FILE_LIST_MATCH = (os.environ.get("SUPEREXIF_DEBUG_FILE_LIST_MATCH", "") or "").strip().lower()
 
 
 class MetadataLoader(QThread):
@@ -570,6 +672,58 @@ class MetadataLoader(QThread):
         self._stop_flag = True
         self.requestInterruption()
 
+    @staticmethod
+    def _report_row_needs_file_fallback(row: dict) -> bool:
+        """
+        某些 report.db 仅保存路径/评分，缺少标题、锐度、对焦等展示字段。
+        这类行需要再走一次 read_batch_metadata（文件 + sidecar）补齐。
+        """
+        if not isinstance(row, dict):
+            return True
+
+        cp = row.get("current_path")
+        if isinstance(cp, str) and cp.strip().lower().endswith(".xmp"):
+            # report 里 current_path 指向 sidecar 的场景，通常依赖文件/XMP补全展示字段
+            return True
+
+        def _has_value(v) -> bool:
+            if v is None:
+                return False
+            if isinstance(v, str):
+                return v.strip() != ""
+            return True
+
+        rich_keys = (
+            "title",
+            "bird_species_cn",
+            "caption",
+            "city",
+            "state_province",
+            "country",
+            "focus_status",
+            "adj_sharpness",
+            "adj_topiq",
+            "head_sharp",
+            "left_eye",
+            "right_eye",
+        )
+        for k in rich_keys:
+            if _has_value(row.get(k)):
+                return False
+
+        # rating>0 / is_flying==1 也视为已有有效展示信息
+        try:
+            if int(float(str(row.get("rating") or 0))) > 0:
+                return False
+        except Exception:
+            pass
+        try:
+            if int(float(str(row.get("is_flying") or 0))) == 1:
+                return False
+        except Exception:
+            pass
+        return True
+
     def run(self) -> None:
         if not self._paths or self._stop_flag:
             _log.debug("[MetadataLoader.run] no paths or stopped")
@@ -580,6 +734,7 @@ class MetadataLoader(QThread):
             total = len(paths)
             result: dict = {}
             uncached: list = []
+            fallback_paths: list = []
             # 先按 path 分流：命中 report 的立即填 result 并注入 writer 缓存，未命中进 uncached
             for path in paths:
                 if self._stop_flag or self.isInterruptionRequested():
@@ -590,9 +745,14 @@ class MetadataLoader(QThread):
                 if stem in self._report_cache:
                     row = self._report_cache[stem]
                     flat = report_row_to_exiftool_style(row, path)
-                    inject_metadata_cache(path, flat)
+                    needs_fallback = self._report_row_needs_file_fallback(row)
+                    # 仅当不需要文件回退时才注入缓存，避免 read_batch 直接命中“空DB记录”
+                    if not needs_fallback:
+                        inject_metadata_cache(path, flat)
                     meta = self._parse_rec(flat)
                     result[norm] = meta
+                    if needs_fallback:
+                        fallback_paths.append(path)
                     _log.info(
                         "[MetadataLoader.run] path=%r 来源=DB stem=%r 解析 title=%r rating=%s pick=%s",
                         path, stem, meta.get("title", ""), meta.get("rating"), meta.get("pick"),
@@ -600,17 +760,72 @@ class MetadataLoader(QThread):
                 else:
                     uncached.append(path)
             processed = total - len(uncached)
-            _log.info("[MetadataLoader.run] report done result=%s uncached=%s", len(result), len(uncached))
+            _log.info(
+                "[MetadataLoader.run] report done result=%s uncached=%s fallback=%s",
+                len(result), len(uncached), len(fallback_paths)
+            )
             if processed > 0:
                 self.progress_updated.emit(processed, total)
-            # 当未开启「仅从 DB 读」时，对未命中 report 的路径分块调用 read_batch_metadata
+            # 命中 DB 但信息稀疏的路径，始终回退读文件/XMP；
+            # 未命中 DB 的路径，仅在 EXIF_ONLY_FROM_REPORT_DB=False 时回退。
+            # 注意：当目标源图不存在且 report.current_path 指向 .xmp 时，
+            # 读取查询路径应改为 sidecar(.xmp)，但结果要映射回目标图片路径。
+            read_query_by_key: dict = {}            # normcase(query_norm) -> query_norm
+            read_targets_by_query_key: dict = {}    # normcase(query_norm) -> set(target_norm)
+            fallback_target_norms: set = set()
+
+            def _plan_read(query_path: str, target_norm: str) -> None:
+                qn = os.path.normpath(query_path)
+                qk = os.path.normcase(qn)
+                read_query_by_key.setdefault(qk, qn)
+                targets = read_targets_by_query_key.setdefault(qk, set())
+                targets.add(target_norm)
+
+            if fallback_paths:
+                for target_path in fallback_paths:
+                    target_norm = os.path.normpath(target_path)
+                    fallback_target_norms.add(target_norm)
+                    query_path = target_path
+
+                    stem = Path(target_path).stem
+                    row = self._report_cache.get(stem)
+                    if isinstance(row, dict):
+                        cp_text = str(row.get("current_path") or "").strip()
+                        if cp_text and self._current_dir:
+                            if os.path.isabs(cp_text):
+                                cp_abs = os.path.normpath(cp_text)
+                            else:
+                                cp_abs = os.path.normpath(os.path.join(self._current_dir, cp_text))
+                            if (
+                                cp_abs.lower().endswith(".xmp")
+                                and os.path.isfile(cp_abs)
+                            ):
+                                query_path = cp_abs
+                                _log.debug(
+                                    "[MetadataLoader.run] fallback prefer report current_path xmp: target=%r query=%r",
+                                    target_path,
+                                    query_path,
+                                )
+
+                    _plan_read(query_path, target_norm)
+
             if not EXIF_ONLY_FROM_REPORT_DB and uncached:
+                for p in uncached:
+                    norm = os.path.normpath(p)
+                    _plan_read(p, norm)
+
+            dedup_read = list(read_query_by_key.values())
+            if dedup_read:
+                _log.info(
+                    "[MetadataLoader.run] read_batch planned total=%s fallback=%s uncached=%s exif_only=%s",
+                    len(dedup_read), len(fallback_paths), len(uncached), EXIF_ONLY_FROM_REPORT_DB
+                )
                 chunk_size = max(1, _METADATA_CHUNK_SIZE)
-                for i in range(0, len(uncached), chunk_size):
+                for i in range(0, len(dedup_read), chunk_size):
                     if self._stop_flag or self.isInterruptionRequested():
                         _log.info("[MetadataLoader.run] interrupted in read_batch loop")
                         return
-                    chunk = uncached[i : i + chunk_size]
+                    chunk = dedup_read[i : i + chunk_size]
                     _log.debug("[MetadataLoader.run] read_batch chunk %s-%s", i, i + len(chunk))
                     chunk_raw = read_batch_metadata(chunk)
                     if self._stop_flag or self.isInterruptionRequested():
@@ -618,12 +833,19 @@ class MetadataLoader(QThread):
                     for norm, rec in chunk_raw.items():
                         if self._stop_flag or self.isInterruptionRequested():
                             return
+                        norm_key = os.path.normpath(norm)
+                        query_key = os.path.normcase(norm_key)
+                        target_norms = read_targets_by_query_key.get(query_key)
+                        if not target_norms:
+                            target_norms = {norm_key}
                         meta = self._parse_rec(rec)
-                        result[norm] = meta
-                        _log.info(
-                            "[MetadataLoader.run] path=%r 来源=read_batch 解析 title=%r rating=%s pick=%s",
-                            norm, meta.get("title", ""), meta.get("rating"), meta.get("pick"),
-                        )
+                        for target_norm in target_norms:
+                            result[target_norm] = meta
+                            src = "read_batch_fallback" if target_norm in fallback_target_norms else "read_batch"
+                            _log.info(
+                                "[MetadataLoader.run] query=%r target=%r 来源=%s 解析 title=%r rating=%s pick=%s",
+                                norm_key, target_norm, src, meta.get("title", ""), meta.get("rating"), meta.get("pick"),
+                            )
                     processed += len(chunk)
                     self.progress_updated.emit(min(processed, total), total)
         except Exception as e:
@@ -642,10 +864,12 @@ class MetadataLoader(QThread):
             or rec.get("IFD0:XPTitle") or rec.get("IPTC:ObjectName") or ""
         )
         color = rec.get("XMP-xmp:Label") or ""
+        rating_raw = rec.get("XMP-xmp:Rating")
         try:
-            rating = max(0, min(5, int(float(str(rec.get("XMP-xmp:Rating") or 0)))))
+            rating_num = int(float(str(rating_raw or 0)))
         except Exception:
-            rating = 0
+            rating_num = 0
+        rating = max(0, min(5, rating_num))
         # Pick/Reject 旗标（1=精选🏆, 0=无旗标, -1=排除🚫）
         # 实际 XMP 多为 <xmpDM:pick>1</xmpDM:pick>（Dynamic Media 命名空间），其次 xmp:Pick 等
         pick_raw = (
@@ -668,6 +892,8 @@ class MetadataLoader(QThread):
                 pick = max(-1, min(1, int(float(s))))
         except Exception:
             pick = 0
+        if pick == 0 and rating_num < 0:
+            pick = -1
 
         # 城市 = 锐度（XMP:City 数值），省/直辖市/自治区 = 美学评分（XMP:State 数值），国家/地区 = 对焦状态（XMP:Country）
         city_raw = (
@@ -719,6 +945,7 @@ class FileListPanel(QWidget):
         super().__init__(parent)
         self._all_files: list = []
         self._current_dir = ""
+        self._report_root_dir: str | None = None  # 当前使用的 report 根目录（含 .superpicky 的目录）
         self._view_mode = self._MODE_LIST
         self._thumb_size = 128
         self._thumbnail_loader: ThumbnailLoader | None = None
@@ -729,6 +956,16 @@ class FileListPanel(QWidget):
         self._meta_cache:    dict = {}   # norm_path → metadata dict
         self._report_cache:  dict = {}   # stem → report row (当前目录 .superpicky/report.db 缓存)
         self._pending_loaders: list = []
+        self._meta_apply_timer: QTimer | None = None
+        self._meta_apply_items: list = []
+        self._meta_apply_index: int = 0
+        self._meta_apply_total: int = 0
+        self._meta_apply_started_at: float = 0.0
+        self._meta_apply_loop_started_at: float = 0.0
+        self._meta_apply_tree_hits: int = 0
+        self._meta_apply_list_hits: int = 0
+        self._meta_apply_needs_filter: bool = False
+        self._tree_header_fast_mode: bool = False
         # 过滤状态
         self._filter_pick: bool = False   # 只显示精选(🏆)
         self._filter_min_rating: int = 0  # 最低星级(0=不限)
@@ -942,6 +1179,9 @@ class FileListPanel(QWidget):
             _log.info("[load_directory] SKIP same dir")
             return
         self._current_dir = path
+        # 选择目录后，向上查找最近的 report 根目录；子目录共用同一个 report.db
+        self._report_root_dir = find_report_root(path)
+        _log.info("[load_directory] report_root_dir=%r", self._report_root_dir)
         _log.info("[load_directory] _stop_all_loaders")
         self._stop_all_loaders()
         _log.info("[load_directory] _stop_directory_scan_worker")
@@ -952,8 +1192,12 @@ class FileListPanel(QWidget):
         _log.info("[load_directory] _rebuild_views (empty)")
         self._rebuild_views()
         recursive = self._has_any_filter()
-        _log.info("[load_directory] starting DirectoryScanWorker recursive=%s", recursive)
-        self._directory_scan_worker = DirectoryScanWorker(path, recursive, self)
+        _log.info(
+            "[load_directory] starting DirectoryScanWorker recursive=%s report_root_dir=%r",
+            recursive,
+            self._report_root_dir,
+        )
+        self._directory_scan_worker = DirectoryScanWorker(path, recursive, self._report_root_dir, self)
         self._directory_scan_worker.scan_finished.connect(self._on_directory_scan_finished)
         self._directory_scan_worker.start()
         _log.info("[load_directory] END worker.started")
@@ -976,6 +1220,34 @@ class FileListPanel(QWidget):
         if path != self._current_dir:
             _log.info("[_on_directory_scan_finished] IGNORE stale path")
             return
+        if _DEBUG_FILE_LIST_LIMIT > 0 and len(files) > _DEBUG_FILE_LIST_LIMIT:
+            selected_files = files
+            if _DEBUG_FILE_LIST_MATCH:
+                matched = [p for p in files if _DEBUG_FILE_LIST_MATCH in str(p).lower()]
+                if matched:
+                    matched_set = set(matched)
+                    selected_files = matched + [p for p in files if p not in matched_set]
+                    _log.warning(
+                        "[DEBUG] SUPEREXIF_DEBUG_FILE_LIST_MATCH=%r matched=%s (prioritized)",
+                        _DEBUG_FILE_LIST_MATCH,
+                        len(matched),
+                    )
+                else:
+                    _log.warning(
+                        "[DEBUG] SUPEREXIF_DEBUG_FILE_LIST_MATCH=%r no match in current files",
+                        _DEBUG_FILE_LIST_MATCH,
+                    )
+            limited_files = selected_files[:_DEBUG_FILE_LIST_LIMIT]
+            keep_stems = {Path(p).stem for p in limited_files}
+            report_cache = {k: v for k, v in report_cache.items() if k in keep_stems}
+            _log.warning(
+                "[DEBUG] SUPEREXIF_DEBUG_FILE_LIST_LIMIT=%s active: files %s -> %s, report_entries -> %s",
+                _DEBUG_FILE_LIST_LIMIT,
+                len(files),
+                len(limited_files),
+                len(report_cache),
+            )
+            files = limited_files
         self._report_cache = report_cache
         self._all_files = files
         _log.info("[_on_directory_scan_finished] 已列出 %s 个文件，重建列表/缩略图视图", len(files))
@@ -1040,9 +1312,10 @@ class FileListPanel(QWidget):
             added += 1
 
         self._tree_widget.setSortingEnabled(True)
-        _log.info("[_rebuild_views] added %s items, _update_thumb_display", added)
-        self._update_thumb_display()
+        _log.info("[_rebuild_views] added %s items", added)
         if self._view_mode == self._MODE_THUMB:
+            _log.info("[_rebuild_views] thumb mode: update thumb display + start loader")
+            self._update_thumb_display()
             self._start_thumbnail_loader()
         _log.info("[_rebuild_views] END")
 
@@ -1052,8 +1325,11 @@ class FileListPanel(QWidget):
         fp = self._filter_pick
         fr = self._filter_min_rating
         _log.info("[_apply_filter] START files=%s pick=%s min_rating=%s", len(self._all_files), fp, fr)
+        t0 = _time.perf_counter()
+        total = len(self._all_files)
+        visible = 0
 
-        for path in self._all_files:
+        for idx, path in enumerate(self._all_files, 1):
             norm = os.path.normpath(path)
             name = Path(path).name
             meta = self._meta_cache.get(norm, {})
@@ -1065,6 +1341,8 @@ class FileListPanel(QWidget):
             rating_ok = rating >= fr
 
             hidden = not (name_ok and pick_ok and rating_ok)
+            if not hidden:
+                visible += 1
 
             ti = self._tree_item_map.get(norm)
             if ti is not None:
@@ -1072,7 +1350,19 @@ class FileListPanel(QWidget):
             li = self._item_map.get(norm)
             if li is not None:
                 li.setHidden(hidden)
-        _log.info("[_apply_filter] END")
+            if idx % 2000 == 0:
+                _log.info(
+                    "[STAT][_apply_filter] progress=%s/%s elapsed=%.3fs",
+                    idx,
+                    total,
+                    _time.perf_counter() - t0,
+                )
+        _log.info(
+            "[_apply_filter] END visible=%s hidden=%s elapsed=%.3fs",
+            visible,
+            max(0, total - visible),
+            _time.perf_counter() - t0,
+        )
 
     def _on_pick_filter_toggled(self) -> None:
         """切换精选过滤：只显示 Pick=1 的文件。有任意过滤时递归子目录，无过滤时仅当前目录。"""
@@ -1139,7 +1429,10 @@ class FileListPanel(QWidget):
         self._stack.setCurrentIndex(0 if mode == self._MODE_LIST else 1)
         self._update_size_controls()
         if mode == self._MODE_THUMB:
+            self._update_thumb_display()
             self._start_thumbnail_loader()
+        else:
+            self._stop_thumbnail_loader()
 
     def _update_size_controls(self) -> None:
         enabled = self._view_mode == self._MODE_THUMB
@@ -1170,6 +1463,9 @@ class FileListPanel(QWidget):
     # ── 加载器管理 ──────────────────────────────────────────────────────────────
     def _start_thumbnail_loader(self) -> None:
         _log.info("[_start_thumbnail_loader] START")
+        if self._view_mode != self._MODE_THUMB:
+            _log.info("[_start_thumbnail_loader] skip: not in thumb mode")
+            return
         self._stop_thumbnail_loader()
         paths = [
             self._list_widget.item(i).data(_UserRole)
@@ -1181,11 +1477,12 @@ class FileListPanel(QWidget):
             _log.info("[_start_thumbnail_loader] no visible paths, return")
             return
         _log.info("[_start_thumbnail_loader] loading %s thumbnails", len(paths))
+        preview_base_dir = self._report_root_dir or self._current_dir
         loader = ThumbnailLoader(
             paths,
             self._thumb_size,
             report_cache=self._report_cache,
-            current_dir=self._current_dir,
+            current_dir=preview_base_dir,
         )
         loader.thumbnail_ready.connect(self._on_thumbnail_ready)
         self._thumbnail_loader = loader
@@ -1213,10 +1510,11 @@ class FileListPanel(QWidget):
         self._meta_progress.setMaximum(total)
         self._meta_progress.setValue(0)
         self._meta_progress.show()
+        metadata_base_dir = self._report_root_dir or self._current_dir
         loader = MetadataLoader(
             paths,
             report_cache=self._report_cache,
-            current_dir=self._current_dir,
+            current_dir=metadata_base_dir,
         )
         loader.progress_updated.connect(self._on_metadata_progress)
         loader.all_metadata_ready.connect(self._on_metadata_ready)
@@ -1258,11 +1556,185 @@ class FileListPanel(QWidget):
             pass
 
     def _stop_all_loaders(self) -> None:
+        self._stop_pending_meta_apply()
         self._stop_thumbnail_loader()
         self._stop_metadata_loader()
 
+    def _ensure_meta_apply_timer(self) -> None:
+        if self._meta_apply_timer is not None:
+            return
+        timer = QTimer(self)
+        timer.setSingleShot(False)
+        timer.timeout.connect(self._apply_meta_batch_tick)
+        self._meta_apply_timer = timer
+
+    def _stop_pending_meta_apply(self) -> None:
+        if self._meta_apply_timer is not None and self._meta_apply_timer.isActive():
+            self._meta_apply_timer.stop()
+        self._meta_apply_items = []
+        self._meta_apply_index = 0
+        self._meta_apply_total = 0
+        self._meta_apply_started_at = 0.0
+        self._meta_apply_loop_started_at = 0.0
+        self._meta_apply_tree_hits = 0
+        self._meta_apply_list_hits = 0
+        self._meta_apply_needs_filter = False
+        self._set_tree_header_fast_mode(False)
+
+    def _set_tree_header_fast_mode(self, enabled: bool) -> None:
+        """批量更新期间临时关闭 ResizeToContents，避免 O(N^2) 级重算。"""
+        if enabled == self._tree_header_fast_mode:
+            return
+        hdr = self._tree_widget.header()
+        try:
+            if enabled:
+                for col in (2, 3, 4, 5, 6):
+                    hdr.setSectionResizeMode(col, _ResizeInteractive)
+                self._tree_header_fast_mode = True
+            else:
+                hdr.setSectionResizeMode(0, _ResizeInteractive)
+                hdr.setSectionResizeMode(1, _ResizeInteractive)
+                hdr.setSectionResizeMode(2, _ResizeToContents)
+                hdr.setSectionResizeMode(3, _ResizeToContents)
+                hdr.setSectionResizeMode(4, _ResizeToContents)
+                hdr.setSectionResizeMode(5, _ResizeToContents)
+                hdr.setSectionResizeMode(6, _ResizeToContents)
+                self._tree_header_fast_mode = False
+        except Exception:
+            pass
+
+    def _order_meta_items_by_file_list(self, meta_dict: dict) -> list:
+        ordered: list = []
+        seen: set = set()
+        for p in self._all_files:
+            norm = os.path.normpath(p)
+            if norm in meta_dict:
+                ordered.append((norm, meta_dict[norm]))
+                seen.add(norm)
+        for norm, meta in meta_dict.items():
+            if norm in seen:
+                continue
+            ordered.append((norm, meta))
+        return ordered
+
+    def _start_meta_apply(self, meta_dict: dict) -> None:
+        self._stop_pending_meta_apply()
+        self._ensure_meta_apply_timer()
+        self._meta_apply_items = self._order_meta_items_by_file_list(meta_dict)
+        self._meta_apply_total = len(self._meta_apply_items)
+        self._meta_apply_index = 0
+        self._meta_apply_tree_hits = 0
+        self._meta_apply_list_hits = 0
+        self._meta_apply_started_at = _time.perf_counter()
+        self._meta_apply_loop_started_at = self._meta_apply_started_at
+        self._meta_apply_needs_filter = bool(self._filter_pick or self._filter_min_rating > 0)
+
+        self._set_tree_header_fast_mode(True)
+        self._tree_widget.setSortingEnabled(False)
+        self._meta_progress.setMaximum(max(1, self._meta_apply_total))
+        self._meta_progress.setValue(0)
+        self._meta_progress.show()
+        _log.info(
+            "[STAT][_on_metadata_ready] apply_meta begin tree_items=%s list_items=%s batch=%s",
+            len(self._tree_item_map),
+            len(self._item_map),
+            _META_APPLY_BATCH_SIZE,
+        )
+        if self._meta_apply_timer is not None:
+            self._meta_apply_timer.start(1)
+
+    def _finish_meta_apply(self) -> None:
+        sort_t0 = _time.perf_counter()
+        _log.info("[STAT][_on_metadata_ready] enabling tree sorting")
+        self._set_tree_header_fast_mode(False)
+        self._tree_widget.setSortingEnabled(True)
+        _log.info("[STAT][_on_metadata_ready] tree sorting enabled elapsed=%.3fs", _time.perf_counter() - sort_t0)
+
+        if self._view_mode == self._MODE_THUMB:
+            paint_t0 = _time.perf_counter()
+            self._list_widget.viewport().update()
+            _log.info("[STAT][_on_metadata_ready] list viewport updated elapsed=%.3fs", _time.perf_counter() - paint_t0)
+
+        if self._meta_apply_needs_filter:
+            _log.info("[_on_metadata_ready] _apply_filter")
+            filter_t0 = _time.perf_counter()
+            self._apply_filter()
+            _log.info("[STAT][_on_metadata_ready] _apply_filter elapsed=%.3fs", _time.perf_counter() - filter_t0)
+
+        self._meta_progress.setValue(self._meta_progress.maximum())
+        QTimer.singleShot(400, self._meta_progress.hide)
+        _log.info(
+            "[STAT][_on_metadata_ready] total elapsed=%.3fs",
+            _time.perf_counter() - self._meta_apply_started_at,
+        )
+        _log.info("[_on_metadata_ready] 目录文件列表 EXIF 已全部就绪 END")
+        self._stop_pending_meta_apply()
+
+    def _apply_meta_batch_tick(self) -> None:
+        total = self._meta_apply_total
+        if total <= 0:
+            self._finish_meta_apply()
+            return
+
+        start = self._meta_apply_index
+        i = start
+        tick_t0 = _time.perf_counter()
+        max_batch = max(1, _META_APPLY_BATCH_SIZE)
+        budget_s = max(1.0, _META_APPLY_TIME_BUDGET_MS) / 1000.0
+        while i < total:
+            if (i - start) >= max_batch:
+                break
+            if (i - start) >= 8 and (_time.perf_counter() - tick_t0) >= budget_s:
+                break
+            norm_path, meta = self._meta_apply_items[i]
+            ti = self._tree_item_map.get(norm_path)
+            if ti:
+                self._meta_apply_tree_hits += 1
+                if _DEBUG_FILE_LIST_LIMIT == 1:
+                    _log.info("[DEBUG][_apply_meta] norm=%r meta=%r", norm_path, meta)
+                self._apply_meta_to_tree_item(ti, meta)
+                if _DEBUG_FILE_LIST_LIMIT == 1:
+                    _log.info(
+                        "[DEBUG][_apply_meta] row_texts name=%r title=%r color=%r star=%r sharp=%r aesthetic=%r focus=%r",
+                        ti.text(0), ti.text(1), ti.text(2), ti.text(3), ti.text(4), ti.text(5), ti.text(6),
+                    )
+            if self._view_mode == self._MODE_THUMB:
+                li = self._item_map.get(norm_path)
+                if li:
+                    self._meta_apply_list_hits += 1
+                    li.setData(_MetaColorRole,  meta.get("color", ""))
+                    li.setData(_MetaRatingRole, meta.get("rating", 0))
+                    li.setData(_MetaPickRole,   meta.get("pick", 0))
+            i += 1
+
+        end = i
+        self._meta_apply_index = end
+        self._meta_progress.setValue(end)
+        if end % 1000 == 0 or end >= total:
+            _log.info(
+                "[STAT][_on_metadata_ready] apply_meta progress=%s/%s tree_hits=%s list_hits=%s elapsed=%.3fs",
+                end,
+                total,
+                self._meta_apply_tree_hits,
+                self._meta_apply_list_hits,
+                _time.perf_counter() - self._meta_apply_loop_started_at,
+            )
+
+        if end >= total:
+            _log.info(
+                "[STAT][_on_metadata_ready] apply_meta end tree_hits=%s list_hits=%s elapsed=%.3fs",
+                self._meta_apply_tree_hits,
+                self._meta_apply_list_hits,
+                _time.perf_counter() - self._meta_apply_loop_started_at,
+            )
+            if self._meta_apply_timer is not None:
+                self._meta_apply_timer.stop()
+            self._finish_meta_apply()
+
     # ── Slots ─────────────────────────────────────────────────────────────────
     def _on_thumbnail_ready(self, path: str, qimg) -> None:
+        if self._view_mode != self._MODE_THUMB:
+            return
         norm = os.path.normpath(path)
         item = self._item_map.get(norm)
         if item is None:
@@ -1284,26 +1756,47 @@ class FileListPanel(QWidget):
     def _on_metadata_ready(self, meta_dict: dict) -> None:
         _log.info("[_on_metadata_ready] 当前目录 EXIF 查询完成，共 %s 条，更新列表与缩略图", len(meta_dict))
         _log.info("[_on_metadata_ready] START entries=%s", len(meta_dict))
+        t0 = _time.perf_counter()
+        total = len(meta_dict)
         self._meta_cache.update(meta_dict)
-        self._meta_progress.setValue(self._meta_progress.maximum())
-        QTimer.singleShot(400, self._meta_progress.hide)
-        self._tree_widget.setSortingEnabled(False)
-        for norm_path, meta in meta_dict.items():
-            ti = self._tree_item_map.get(norm_path)
-            if ti:
-                self._apply_meta_to_tree_item(ti, meta)
-            li = self._item_map.get(norm_path)
-            if li:
-                li.setData(_MetaColorRole,  meta.get("color", ""))
-                li.setData(_MetaRatingRole, meta.get("rating", 0))
-                li.setData(_MetaPickRole,   meta.get("pick", 0))
-        self._tree_widget.setSortingEnabled(True)
-        self._list_widget.viewport().update()
-        # 元数据加载完成后，根据最新 meta_cache 重新应用过滤
-        if self._filter_pick or self._filter_min_rating > 0:
-            _log.info("[_on_metadata_ready] _apply_filter")
-            self._apply_filter()
-        _log.info("[_on_metadata_ready] 目录文件列表 EXIF 已全部就绪 END")
+        title_cnt = 0
+        color_cnt = 0
+        rating_pos_cnt = 0
+        city_cnt = 0
+        state_cnt = 0
+        country_cnt = 0
+        for m in meta_dict.values():
+            try:
+                if str(m.get("title", "")).strip():
+                    title_cnt += 1
+                if str(m.get("color", "")).strip():
+                    color_cnt += 1
+                if int(float(str(m.get("rating", 0) or 0))) > 0:
+                    rating_pos_cnt += 1
+                if str(m.get("city", "")).strip():
+                    city_cnt += 1
+                if str(m.get("state", "")).strip():
+                    state_cnt += 1
+                if str(m.get("country", "")).strip():
+                    country_cnt += 1
+            except Exception:
+                pass
+        _log.info(
+            "[STAT][_on_metadata_ready] meta_cache updated entries=%s cache_size=%s elapsed=%.3fs",
+            total,
+            len(self._meta_cache),
+            _time.perf_counter() - t0,
+        )
+        _log.info(
+            "[STAT][_on_metadata_ready] richness title=%s color=%s rating>0=%s city=%s state=%s country=%s",
+            title_cnt,
+            color_cnt,
+            rating_pos_cnt,
+            city_cnt,
+            state_cnt,
+            country_cnt,
+        )
+        self._start_meta_apply(meta_dict)
 
     def _on_tree_item_clicked(self, item, column) -> None:
         path = item.data(0, _UserRole)
