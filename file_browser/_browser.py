@@ -13,6 +13,7 @@ file_browser._browser
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 import html
 import io as _io
 import os
@@ -535,6 +536,35 @@ class SortableTreeItem(QTreeWidgetItem):
 
 
 # ── 缩略图 delegate（颜色标签 + 星级徽章）─────────────────────────────────────
+
+@dataclass(frozen=True)
+class ThumbViewportEntry:
+    path: str
+    item: QListWidgetItem
+
+
+@dataclass(frozen=True)
+class ThumbViewportRange:
+    thumb_size: int
+    start_row: int
+    end_row: int
+    grid_width: int
+    grid_height: int
+    total_items: int
+    entries: tuple[ThumbViewportEntry, ...]
+
+    @property
+    def signature(self) -> tuple:
+        return (
+            self.thumb_size,
+            self.start_row,
+            self.end_row,
+            len(self.entries),
+            self.total_items,
+            self.grid_width,
+            self.grid_height,
+        )
+
 
 class ThumbnailItemDelegate(QStyledItemDelegate):
     """Custom thumbnail delegate with aspect-fit preview and lightweight badges."""
@@ -1258,7 +1288,7 @@ class FileListPanel(QWidget):
         self._tree_header_fast_mode: bool = False
         self._thumb_viewport_timer: QTimer | None = None
         self._thumb_visible_signature: tuple | None = None
-        self._thumb_visible_items: list[tuple[str, QListWidgetItem]] = []
+        self._thumb_visible_range: ThumbViewportRange | None = None
         # 过滤状态
         self._filter_pick: bool = False   # 只显示精选(🏆)
         self._filter_min_rating: int = 0  # 最低星级(0=不限)
@@ -2091,6 +2121,30 @@ class FileListPanel(QWidget):
         )
         return final_path
 
+    def _apply_thumb_meta_to_item(self, item: QListWidgetItem, meta: dict | None) -> None:
+        meta = meta or {}
+        item.setData(_MetaColorRole, meta.get("color", ""))
+        item.setData(_MetaRatingRole, meta.get("rating", 0))
+        item.setData(_MetaPickRole, meta.get("pick", 0))
+
+    def _clear_thumb_pixmap_for_item(self, item: QListWidgetItem) -> None:
+        item.setIcon(QIcon())
+        item.setData(_ThumbPixmapRole, None)
+        item.setData(_ThumbSizeRole, 0)
+
+    def _reset_thumb_item_state(self, item: QListWidgetItem, meta: dict | None = None) -> None:
+        self._clear_thumb_pixmap_for_item(item)
+        self._apply_thumb_meta_to_item(item, meta)
+
+    def _thumb_item_has_current_pixmap(self, item: QListWidgetItem) -> bool:
+        pixmap = item.data(_ThumbPixmapRole)
+        thumb_size = item.data(_ThumbSizeRole)
+        try:
+            thumb_size_ok = int(thumb_size or 0) == int(self._thumb_size)
+        except Exception:
+            thumb_size_ok = False
+        return isinstance(pixmap, QPixmap) and not pixmap.isNull() and thumb_size_ok
+
     def _rebuild_views(self) -> None:
         """从文件列表重建列表视图和缩略图视图。"""
         _log.info("[_rebuild_views] START _all_files=%s", len(self._all_files))
@@ -2125,13 +2179,8 @@ class FileListPanel(QWidget):
             # 缩略图节点
             li = QListWidgetItem(name)
             li.setData(_UserRole, path)
-            li.setData(_ThumbPixmapRole, None)
-            li.setData(_ThumbSizeRole, 0)
             li.setToolTip(self._build_path_tooltip(path))
-            if meta:
-                li.setData(_MetaColorRole,  meta.get("color", ""))
-                li.setData(_MetaRatingRole, meta.get("rating", 0))
-                li.setData(_MetaPickRole,   meta.get("pick", 0))
+            self._reset_thumb_item_state(li, meta)
             self._item_map[norm] = li
             self._apply_path_status_to_items(norm)
             self._list_widget.addItem(li)
@@ -2277,20 +2326,20 @@ class FileListPanel(QWidget):
 
     def _invalidate_visible_thumbnail_signature(self) -> None:
         self._thumb_visible_signature = None
-        self._thumb_visible_items = []
+        self._thumb_visible_range = None
 
     def _build_visible_thumbnail_data_source(
         self,
         overscan_rows: int = 1,
-    ) -> tuple[list[tuple[str, QListWidgetItem]], tuple | None]:
+    ) -> ThumbViewportRange | None:
         if self._view_mode != self._MODE_THUMB or self._list_widget.count() <= 0:
-            self._thumb_visible_items = []
-            return [], None
+            self._thumb_visible_range = None
+            return None
         viewport = self._list_widget.viewport()
         rect = viewport.rect()
         if rect.width() <= 0 or rect.height() <= 0:
-            self._thumb_visible_items = []
-            return [], None
+            self._thumb_visible_range = None
+            return None
 
         margin = 8
         sample_points = [
@@ -2307,8 +2356,8 @@ class FileListPanel(QWidget):
             if idx.isValid():
                 rows.append(idx.row())
         if not rows:
-            self._thumb_visible_items = []
-            return [], None
+            self._thumb_visible_range = None
+            return None
 
         grid = self._list_widget.gridSize()
         grid_w = max(1, grid.width())
@@ -2318,7 +2367,7 @@ class FileListPanel(QWidget):
         start = max(0, min(rows) - overscan)
         end = min(self._list_widget.count() - 1, max(rows) + overscan)
 
-        entries: list[tuple[str, QListWidgetItem]] = []
+        entries: list[ThumbViewportEntry] = []
         for i in range(start, end + 1):
             item = self._list_widget.item(i)
             if item is None or item.isHidden():
@@ -2326,29 +2375,34 @@ class FileListPanel(QWidget):
             path = item.data(_UserRole)
             if not path:
                 continue
-            entries.append((os.path.normpath(path), item))
+            entries.append(ThumbViewportEntry(os.path.normpath(path), item))
 
-        signature = (self._thumb_size, start, end, len(entries), self._list_widget.count(), grid_w, grid_h)
-        self._thumb_visible_items = entries
-        return entries, signature
+        visible_range = ThumbViewportRange(
+            thumb_size=self._thumb_size,
+            start_row=start,
+            end_row=end,
+            grid_width=grid_w,
+            grid_height=grid_h,
+            total_items=self._list_widget.count(),
+            entries=tuple(entries),
+        )
+        self._thumb_visible_range = visible_range
+        return visible_range
 
     def _collect_missing_visible_thumbnail_paths(
         self,
-        entries: list[tuple[str, QListWidgetItem]] | None = None,
+        visible_range: ThumbViewportRange | None = None,
     ) -> list[str]:
         requested_paths: list[str] = []
         seen: set[str] = set()
-        for norm, item in (entries if entries is not None else self._thumb_visible_items):
+        range_data = visible_range if visible_range is not None else self._thumb_visible_range
+        for entry in (range_data.entries if range_data is not None else ()):
+            norm = entry.path
+            item = entry.item
             if norm in seen or item is None or item.isHidden():
                 continue
             seen.add(norm)
-            pixmap = item.data(_ThumbPixmapRole)
-            thumb_size = item.data(_ThumbSizeRole)
-            try:
-                thumb_size_ok = int(thumb_size or 0) == int(self._thumb_size)
-            except Exception:
-                thumb_size_ok = False
-            if isinstance(pixmap, QPixmap) and not pixmap.isNull() and thumb_size_ok:
+            if self._thumb_item_has_current_pixmap(item):
                 continue
             requested_paths.append(norm)
         return requested_paths
@@ -2363,13 +2417,13 @@ class FileListPanel(QWidget):
     def _update_visible_thumbnail_range(self) -> None:
         if self._view_mode != self._MODE_THUMB:
             return
-        entries, signature = self._build_visible_thumbnail_data_source()
-        if not entries or signature is None:
+        visible_range = self._build_visible_thumbnail_data_source()
+        if visible_range is None or not visible_range.entries:
             return
 
-        missing_paths = self._collect_missing_visible_thumbnail_paths(entries)
-        same_signature = signature == self._thumb_visible_signature
-        self._thumb_visible_signature = signature
+        missing_paths = self._collect_missing_visible_thumbnail_paths(visible_range)
+        same_signature = visible_range.signature == self._thumb_visible_signature
+        self._thumb_visible_signature = visible_range.signature
         if same_signature:
             if not missing_paths:
                 return
@@ -2378,9 +2432,9 @@ class FileListPanel(QWidget):
         else:
             _log.info(
                 "[_update_visible_thumbnail_range] visible rows=%s-%s items=%s missing=%s size=%s",
-                signature[1],
-                signature[2],
-                len(entries),
+                visible_range.start_row,
+                visible_range.end_row,
+                len(visible_range.entries),
                 len(missing_paths),
                 self._thumb_size,
             )
@@ -2417,9 +2471,7 @@ class FileListPanel(QWidget):
                 for i in range(self._list_widget.count()):
                     it = self._list_widget.item(i)
                     if it:
-                        it.setIcon(QIcon())
-                        it.setData(_ThumbPixmapRole, None)
-                        it.setData(_ThumbSizeRole, 0)
+                        self._clear_thumb_pixmap_for_item(it)
                 self._update_thumb_display()
                 self._schedule_visible_thumbnail_update()
 
@@ -2442,9 +2494,9 @@ class FileListPanel(QWidget):
             _log.info("[_start_thumbnail_loader] skip: not in thumb mode")
             return
         if paths is None:
-            if not self._thumb_visible_items:
+            if self._thumb_visible_range is None:
                 self._build_visible_thumbnail_data_source()
-            paths = [path for path, _item in self._thumb_visible_items]
+            paths = [entry.path for entry in (self._thumb_visible_range.entries if self._thumb_visible_range else ())]
         requested_paths: list[str] = []
         seen: set[str] = set()
         for path in paths or []:
@@ -2455,13 +2507,7 @@ class FileListPanel(QWidget):
             item = self._item_map.get(norm)
             if item is None or item.isHidden():
                 continue
-            pixmap = item.data(_ThumbPixmapRole)
-            thumb_size = item.data(_ThumbSizeRole)
-            try:
-                thumb_size_ok = int(thumb_size or 0) == int(self._thumb_size)
-            except Exception:
-                thumb_size_ok = False
-            if isinstance(pixmap, QPixmap) and not pixmap.isNull() and thumb_size_ok:
+            if self._thumb_item_has_current_pixmap(item):
                 continue
             requested_paths.append(norm)
         if not requested_paths:
@@ -2702,9 +2748,7 @@ class FileListPanel(QWidget):
                 li = self._item_map.get(norm_path)
                 if li:
                     self._meta_apply_list_hits += 1
-                    li.setData(_MetaColorRole,  meta.get("color", ""))
-                    li.setData(_MetaRatingRole, meta.get("rating", 0))
-                    li.setData(_MetaPickRole,   meta.get("pick", 0))
+                    self._apply_thumb_meta_to_item(li, meta)
             i += 1
 
         end = i
@@ -2740,14 +2784,10 @@ class FileListPanel(QWidget):
         if item is None:
             return
         pixmap = QPixmap.fromImage(qimg)
-        item.setIcon(QIcon())
         item.setData(_ThumbPixmapRole, pixmap)
         item.setData(_ThumbSizeRole, int(self._thumb_size))
         meta = self._meta_cache.get(norm, {})
-        if meta:
-            item.setData(_MetaColorRole,  meta.get("color", ""))
-            item.setData(_MetaRatingRole, meta.get("rating", 0))
-            item.setData(_MetaPickRole,   meta.get("pick", 0))
+        self._apply_thumb_meta_to_item(item, meta)
         rect = self._list_widget.visualItemRect(item)
         if rect.isValid():
             self._list_widget.viewport().update(rect)
