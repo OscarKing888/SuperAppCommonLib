@@ -27,11 +27,11 @@ try:
         QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
         QListWidget, QListWidgetItem, QListView,
         QMenu, QProgressBar, QToolButton, QHeaderView, QAbstractItemView,
-        QTreeWidget, QTreeWidgetItem,
+        QTreeWidget, QTreeWidgetItem, QStyleOptionViewItem, QStyle,
         QStyledItemDelegate, QStackedWidget, QSlider,
         QApplication,
     )
-    from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal, QRect, QTimer, QUrl, QMimeData
+    from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal, QRect, QTimer, QUrl, QMimeData, QPoint, QEvent
     from PyQt6.QtGui import (
         QPixmap, QImage, QFont, QColor, QIcon, QPainter, QBrush,
         QKeySequence, QShortcut,
@@ -41,11 +41,11 @@ except ImportError:
         QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
         QListWidget, QListWidgetItem, QListView,
         QMenu, QProgressBar, QToolButton, QHeaderView, QAbstractItemView,
-        QTreeWidget, QTreeWidgetItem,
+        QTreeWidget, QTreeWidgetItem, QStyleOptionViewItem, QStyle,
         QStyledItemDelegate, QStackedWidget, QSlider,
         QApplication, QShortcut,
     )
-    from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal, QRect, QTimer, QUrl, QMimeData
+    from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal, QRect, QTimer, QUrl, QMimeData, QPoint, QEvent
     from PyQt5.QtGui import (
         QPixmap, QImage, QFont, QColor, QIcon, QPainter, QBrush,
         QKeySequence,
@@ -130,6 +130,11 @@ except AttributeError:
     _ExtendedSelection = QAbstractItemView.ExtendedSelection  # type: ignore[attr-defined]
 
 try:
+    _ScrollPerPixel = QAbstractItemView.ScrollMode.ScrollPerPixel
+except AttributeError:
+    _ScrollPerPixel = QAbstractItemView.ScrollPerPixel  # type: ignore[attr-defined]
+
+try:
     _QImageRGB888 = QImage.Format.Format_RGB888
 except AttributeError:
     _QImageRGB888 = QImage.Format_RGB888  # type: ignore[attr-defined]
@@ -163,6 +168,8 @@ _SortRole = int(_UserRole) + 10
 _MetaColorRole = int(_UserRole) + 1
 _MetaRatingRole = int(_UserRole) + 2
 _MetaPickRole = int(_UserRole) + 3    # Pick/Reject 旗标：1=精选, 0=无, -1=排除
+_ThumbPixmapRole = int(_UserRole) + 20
+_ThumbSizeRole = int(_UserRole) + 21
 
 # 缩略图尺寸档位（像素）
 _THUMB_SIZE_STEPS = [128, 256, 512, 1024]
@@ -233,6 +240,25 @@ try:
     _CustomContextMenu = Qt.ContextMenuPolicy.CustomContextMenu
 except AttributeError:
     _CustomContextMenu = Qt.CustomContextMenu  # type: ignore[attr-defined]
+
+try:
+    _EventResize = QEvent.Type.Resize
+    _EventShow = QEvent.Type.Show
+except AttributeError:
+    _EventResize = QEvent.Resize  # type: ignore[attr-defined]
+    _EventShow = QEvent.Show  # type: ignore[attr-defined]
+
+try:
+    _StateSelected = QStyle.StateFlag.State_Selected
+    _StateMouseOver = QStyle.StateFlag.State_MouseOver
+except AttributeError:
+    _StateSelected = QStyle.State_Selected  # type: ignore[attr-defined]
+    _StateMouseOver = QStyle.State_MouseOver  # type: ignore[attr-defined]
+
+try:
+    _ElideRight = Qt.TextElideMode.ElideRight
+except AttributeError:
+    _ElideRight = Qt.ElideRight  # type: ignore[attr-defined]
 
 # ── 系统文件管理器工具函数 ────────────────────────────────────────────────────────
 
@@ -483,15 +509,7 @@ def _load_thumbnail_image(path: str, size: int) -> "QImage | None":
             img = bg
         elif img.mode != "RGB":
             img = img.convert("RGB")
-        # 贴到 size×size 正方形画布上，预览图缩放居中，避免列表里被拉成条
         w, h = img.size
-        if (w, h) != (size, size):
-            canvas = Image.new("RGB", (size, size), (45, 45, 45))
-            x = (size - w) // 2
-            y = (size - h) // 2
-            canvas.paste(img, (x, y))
-            img = canvas
-            w, h = size, size
         data = img.tobytes("raw", "RGB")
         qimg = QImage(data, w, h, w * 3, _QImageRGB888)
         return qimg.copy()
@@ -519,82 +537,116 @@ class SortableTreeItem(QTreeWidgetItem):
 # ── 缩略图 delegate（颜色标签 + 星级徽章）─────────────────────────────────────
 
 class ThumbnailItemDelegate(QStyledItemDelegate):
-    """在缩略图左下角绘制颜色标签徽章，右下角绘制星级徽章。"""
+    """Custom thumbnail delegate with aspect-fit preview and lightweight badges."""
+
+    def sizeHint(self, option, index):
+        widget = option.widget
+        if widget is not None:
+            grid = widget.gridSize()
+            if grid.isValid():
+                return grid
+        return super().sizeHint(option, index)
 
     def paint(self, painter: QPainter, option, index) -> None:
-        super().paint(painter, option, index)
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        selected = bool(opt.state & _StateSelected)
+        hovered = bool(opt.state & _StateMouseOver)
+        name = str(index.data() or "")
         color_label = index.data(_MetaColorRole)
         rating = index.data(_MetaRatingRole)
-        pick   = index.data(_MetaPickRole)
-        has_color = bool(color_label and color_label in _COLOR_LABEL_COLORS)
-        # 右下角内容：pick 旗标优先，其次星级
-        if pick == 1:
-            right_badge_text = "🏆"
-            right_badge_bg   = QColor(0, 0, 0, 160)
-            right_badge_fg   = QColor("#ffd700")
-        elif pick == -1:
-            right_badge_text = "🚫"
-            right_badge_bg   = QColor(0, 0, 0, 160)
-            right_badge_fg   = QColor("#ffffff")
-        elif isinstance(rating, int) and rating > 0:
-            right_badge_text = "★" * min(5, rating)
-            right_badge_bg   = QColor(0, 0, 0, 140)
-            right_badge_fg   = QColor("#ffd700")
-        else:
-            right_badge_text = ""
-        has_right = bool(right_badge_text)
-        if not has_color and not has_right:
-            return
+        pick = index.data(_MetaPickRole)
+        pixmap = index.data(_ThumbPixmapRole)
+        if not isinstance(pixmap, QPixmap):
+            pixmap = None
+
         painter.save()
         try:
+            if selected:
+                painter.fillRect(opt.rect, opt.palette.highlight())
+            elif hovered:
+                painter.fillRect(opt.rect, QColor(255, 255, 255, 16))
+
             painter.setRenderHint(_PainterAntialiasing)
-            cell = option.rect
-            # 缩略图区域按正方形算，与 setIconSize(s,s) 一致，徽章贴正方形底部
-            side = min(cell.width(), cell.height()) - 6
-            if side <= 0:
-                side = cell.width() - 6
-            icon_rect = QRect(cell.left() + 3, cell.top() + 3, side, side)
-            # 左下角：颜色标签
+            cell = opt.rect.adjusted(6, 6, -6, -6)
+            fm = painter.fontMetrics()
+            text_height = fm.lineSpacing() + 6
+            thumb_rect = QRect(cell.left(), cell.top(), cell.width(), max(24, cell.height() - text_height - 6))
+            draw_rect = QRect(thumb_rect)
+
+            painter.setBrush(QBrush(QColor(45, 45, 45)))
+            painter.setPen(QColor(70, 70, 70))
+            painter.drawRoundedRect(thumb_rect, 6, 6)
+
+            if pixmap is not None and not pixmap.isNull():
+                pw = max(1, pixmap.width())
+                ph = max(1, pixmap.height())
+                scale = min(thumb_rect.width() / float(pw), thumb_rect.height() / float(ph))
+                draw_w = max(1, int(pw * scale))
+                draw_h = max(1, int(ph * scale))
+                draw_rect = QRect(
+                    thumb_rect.left() + (thumb_rect.width() - draw_w) // 2,
+                    thumb_rect.top() + (thumb_rect.height() - draw_h) // 2,
+                    draw_w,
+                    draw_h,
+                )
+                painter.drawPixmap(draw_rect, pixmap)
+
+            has_color = bool(color_label and color_label in _COLOR_LABEL_COLORS)
+            if pick == 1:
+                right_badge_text = "??"
+                right_badge_bg = QColor(0, 0, 0, 160)
+                right_badge_fg = QColor(COLORS["star_gold"])
+            elif pick == -1:
+                right_badge_text = "??"
+                right_badge_bg = QColor(0, 0, 0, 160)
+                right_badge_fg = QColor("#ffffff")
+            elif isinstance(rating, int) and rating > 0:
+                right_badge_text = "?" * min(5, rating)
+                right_badge_bg = QColor(0, 0, 0, 140)
+                right_badge_fg = QColor(COLORS["star_gold"])
+            else:
+                right_badge_text = ""
+
             if has_color:
                 hex_c, cn = _COLOR_LABEL_COLORS[color_label]
-                bw, bh = 28, 15
-                badge = QRect(
-                    icon_rect.left() + 2, icon_rect.bottom() - bh - 1, bw, bh,
-                )
+                bw, bh = 30, 16
+                badge = QRect(draw_rect.left() + 2, draw_rect.bottom() - bh - 2, bw, bh)
                 painter.setBrush(QBrush(QColor(hex_c)))
                 painter.setPen(_NoPen)
                 painter.drawRoundedRect(badge, 4, 4)
                 painter.setPen(QColor("#333" if color_label in ("Yellow", "White") else "#fff"))
-                f = QFont()
+                f = QFont(opt.font)
                 f.setPixelSize(9)
                 painter.setFont(f)
                 painter.drawText(badge, _AlignCenter, cn)
-            # 右下角：pick 旗标 / 星级
-            if has_right:
-                f2 = QFont()
+
+            if right_badge_text:
+                f2 = QFont(opt.font)
                 f2.setPixelSize(11)
                 painter.setFont(f2)
-                fm = painter.fontMetrics()
+                fm2 = painter.fontMetrics()
                 try:
-                    sw = fm.horizontalAdvance(right_badge_text)
+                    sw = fm2.horizontalAdvance(right_badge_text)
                 except AttributeError:
-                    sw = fm.width(right_badge_text)
-                bw2, bh2 = sw + 8, 16
-                badge2 = QRect(
-                    icon_rect.right() - bw2 - 2,
-                    icon_rect.bottom() - bh2 - 1,
-                    bw2, bh2,
-                )
+                    sw = fm2.width(right_badge_text)
+                bw2, bh2 = sw + 10, 16
+                badge2 = QRect(draw_rect.right() - bw2 - 2, draw_rect.bottom() - bh2 - 2, bw2, bh2)
                 painter.setBrush(QBrush(right_badge_bg))
                 painter.setPen(_NoPen)
                 painter.drawRoundedRect(badge2, 4, 4)
                 painter.setPen(right_badge_fg)
                 painter.drawText(badge2, _AlignCenter, right_badge_text)
+
+            text_rect = QRect(cell.left(), thumb_rect.bottom() + 6, cell.width(), text_height)
+            text_color = opt.palette.highlightedText().color() if selected else opt.palette.text().color()
+            painter.setPen(text_color)
+            painter.setFont(opt.font)
+            elided = fm.elidedText(name, _ElideRight, text_rect.width())
+            painter.drawText(text_rect, _AlignCenter, elided)
         finally:
             painter.restore()
 
-
-# ── 后台缩略图加载线程 ─────────────────────────────────────────────────────────
 
 class ThumbnailLoader(QThread):
     """后台缩略图加载线程，逐个生成缩略图并通过信号通知主线程。HIF/HEIC/HEIF 优先用 report 的 temp_jpeg_path。"""
@@ -1204,6 +1256,9 @@ class FileListPanel(QWidget):
         self._meta_apply_list_hits: int = 0
         self._meta_apply_needs_filter: bool = False
         self._tree_header_fast_mode: bool = False
+        self._thumb_viewport_timer: QTimer | None = None
+        self._thumb_visible_signature: tuple | None = None
+        self._thumb_visible_items: list[tuple[str, QListWidgetItem]] = []
         # 过滤状态
         self._filter_pick: bool = False   # 只显示精选(🏆)
         self._filter_min_rating: int = 0  # 最低星级(0=不限)
@@ -1348,11 +1403,35 @@ class FileListPanel(QWidget):
             QListView.ResizeMode.Adjust if hasattr(QListView, "ResizeMode")
             else QListView.Adjust  # type: ignore[attr-defined]
         )
+        try:
+            self._list_widget.setLayoutMode(
+                QListView.LayoutMode.Batched if hasattr(QListView, "LayoutMode")
+                else QListView.Batched  # type: ignore[attr-defined]
+            )
+        except Exception:
+            pass
+        try:
+            self._list_widget.setBatchSize(48)
+        except Exception:
+            pass
+        try:
+            self._list_widget.setMovement(
+                QListView.Movement.Static if hasattr(QListView, "Movement")
+                else QListView.Static  # type: ignore[attr-defined]
+            )
+        except Exception:
+            pass
         self._list_widget.setUniformItemSizes(True)
+        self._list_widget.setVerticalScrollMode(_ScrollPerPixel)
+        self._list_widget.setHorizontalScrollMode(_ScrollPerPixel)
+        self._list_widget.setWrapping(True)
         self._list_widget.setStyleSheet("QListWidget { font-size: 11px; }")
         self._list_widget.itemClicked.connect(self._on_list_item_clicked)
         self._list_widget.setContextMenuPolicy(_CustomContextMenu)
         self._list_widget.customContextMenuRequested.connect(self._on_list_context_menu)
+        self._list_widget.viewport().installEventFilter(self)
+        self._list_widget.verticalScrollBar().valueChanged.connect(self._schedule_visible_thumbnail_update)
+        self._list_widget.horizontalScrollBar().valueChanged.connect(self._schedule_visible_thumbnail_update)
         self._stack.addWidget(self._list_widget)
 
         layout.addWidget(self._stack, stretch=1)
@@ -2046,6 +2125,8 @@ class FileListPanel(QWidget):
             # 缩略图节点
             li = QListWidgetItem(name)
             li.setData(_UserRole, path)
+            li.setData(_ThumbPixmapRole, None)
+            li.setData(_ThumbSizeRole, 0)
             li.setToolTip(self._build_path_tooltip(path))
             if meta:
                 li.setData(_MetaColorRole,  meta.get("color", ""))
@@ -2059,9 +2140,10 @@ class FileListPanel(QWidget):
         self._tree_widget.setSortingEnabled(True)
         _log.info("[_rebuild_views] added %s items", added)
         if self._view_mode == self._MODE_THUMB:
-            _log.info("[_rebuild_views] thumb mode: update thumb display + start loader")
+            _log.info("[_rebuild_views] thumb mode: update thumb display + schedule visible loader")
+            self._invalidate_visible_thumbnail_signature()
             self._update_thumb_display()
-            self._start_thumbnail_loader()
+            self._schedule_visible_thumbnail_update()
         _log.info("[_rebuild_views] END")
 
     def _apply_filter(self) -> None:
@@ -2108,6 +2190,9 @@ class FileListPanel(QWidget):
             max(0, total - visible),
             _time.perf_counter() - t0,
         )
+        if self._view_mode == self._MODE_THUMB:
+            self._invalidate_visible_thumbnail_signature()
+            self._schedule_visible_thumbnail_update()
 
     def _on_pick_filter_toggled(self) -> None:
         """切换精选过滤：只显示 Pick=1 的文件。有任意过滤时递归子目录，无过滤时仅当前目录。"""
@@ -2172,15 +2257,148 @@ class FileListPanel(QWidget):
             item.setForeground(6, QBrush())
 
     # ── 视图模式切换 ────────────────────────────────────────────────────────────
+    def eventFilter(self, obj, event):
+        list_widget = getattr(self, "_list_widget", None)
+        viewport = list_widget.viewport() if list_widget is not None else None
+        if obj is viewport and event is not None:
+            et = event.type()
+            if et in (_EventResize, _EventShow):
+                self._invalidate_visible_thumbnail_signature()
+                self._schedule_visible_thumbnail_update()
+        return super().eventFilter(obj, event)
+
+    def _ensure_thumb_viewport_timer(self) -> None:
+        if self._thumb_viewport_timer is not None:
+            return
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(self._update_visible_thumbnail_range)
+        self._thumb_viewport_timer = timer
+
+    def _invalidate_visible_thumbnail_signature(self) -> None:
+        self._thumb_visible_signature = None
+        self._thumb_visible_items = []
+
+    def _build_visible_thumbnail_data_source(
+        self,
+        overscan_rows: int = 1,
+    ) -> tuple[list[tuple[str, QListWidgetItem]], tuple | None]:
+        if self._view_mode != self._MODE_THUMB or self._list_widget.count() <= 0:
+            self._thumb_visible_items = []
+            return [], None
+        viewport = self._list_widget.viewport()
+        rect = viewport.rect()
+        if rect.width() <= 0 or rect.height() <= 0:
+            self._thumb_visible_items = []
+            return [], None
+
+        margin = 8
+        sample_points = [
+            QPoint(rect.left() + margin, rect.top() + margin),
+            QPoint(rect.center().x(), rect.top() + margin),
+            QPoint(max(rect.left() + margin, rect.right() - margin), rect.top() + margin),
+            QPoint(rect.left() + margin, max(rect.top() + margin, rect.bottom() - margin)),
+            QPoint(rect.center().x(), max(rect.top() + margin, rect.bottom() - margin)),
+            QPoint(max(rect.left() + margin, rect.right() - margin), max(rect.top() + margin, rect.bottom() - margin)),
+        ]
+        rows: list[int] = []
+        for pt in sample_points:
+            idx = self._list_widget.indexAt(pt)
+            if idx.isValid():
+                rows.append(idx.row())
+        if not rows:
+            self._thumb_visible_items = []
+            return [], None
+
+        grid = self._list_widget.gridSize()
+        grid_w = max(1, grid.width())
+        grid_h = max(1, grid.height())
+        cols = max(1, rect.width() // grid_w)
+        overscan = max(0, overscan_rows) * cols
+        start = max(0, min(rows) - overscan)
+        end = min(self._list_widget.count() - 1, max(rows) + overscan)
+
+        entries: list[tuple[str, QListWidgetItem]] = []
+        for i in range(start, end + 1):
+            item = self._list_widget.item(i)
+            if item is None or item.isHidden():
+                continue
+            path = item.data(_UserRole)
+            if not path:
+                continue
+            entries.append((os.path.normpath(path), item))
+
+        signature = (self._thumb_size, start, end, len(entries), self._list_widget.count(), grid_w, grid_h)
+        self._thumb_visible_items = entries
+        return entries, signature
+
+    def _collect_missing_visible_thumbnail_paths(
+        self,
+        entries: list[tuple[str, QListWidgetItem]] | None = None,
+    ) -> list[str]:
+        requested_paths: list[str] = []
+        seen: set[str] = set()
+        for norm, item in (entries if entries is not None else self._thumb_visible_items):
+            if norm in seen or item is None or item.isHidden():
+                continue
+            seen.add(norm)
+            pixmap = item.data(_ThumbPixmapRole)
+            thumb_size = item.data(_ThumbSizeRole)
+            try:
+                thumb_size_ok = int(thumb_size or 0) == int(self._thumb_size)
+            except Exception:
+                thumb_size_ok = False
+            if isinstance(pixmap, QPixmap) and not pixmap.isNull() and thumb_size_ok:
+                continue
+            requested_paths.append(norm)
+        return requested_paths
+
+    def _schedule_visible_thumbnail_update(self, *_args) -> None:
+        if self._view_mode != self._MODE_THUMB:
+            return
+        self._ensure_thumb_viewport_timer()
+        if self._thumb_viewport_timer is not None:
+            self._thumb_viewport_timer.start(40)
+
+    def _update_visible_thumbnail_range(self) -> None:
+        if self._view_mode != self._MODE_THUMB:
+            return
+        entries, signature = self._build_visible_thumbnail_data_source()
+        if not entries or signature is None:
+            return
+
+        missing_paths = self._collect_missing_visible_thumbnail_paths(entries)
+        same_signature = signature == self._thumb_visible_signature
+        self._thumb_visible_signature = signature
+        if same_signature:
+            if not missing_paths:
+                return
+            if self._thumbnail_loader is not None and self._thumbnail_loader.isRunning():
+                return
+        else:
+            _log.info(
+                "[_update_visible_thumbnail_range] visible rows=%s-%s items=%s missing=%s size=%s",
+                signature[1],
+                signature[2],
+                len(entries),
+                len(missing_paths),
+                self._thumb_size,
+            )
+
+        if not missing_paths:
+            return
+        self._start_thumbnail_loader(missing_paths)
+
     def _set_view_mode(self, mode: int) -> None:
         self._view_mode = mode
         self._btn_list.setChecked(mode == self._MODE_LIST)
         self._btn_thumb.setChecked(mode == self._MODE_THUMB)
         self._stack.setCurrentIndex(0 if mode == self._MODE_LIST else 1)
         self._update_size_controls()
+        self._invalidate_visible_thumbnail_signature()
         if mode == self._MODE_THUMB:
             self._update_thumb_display()
-            self._start_thumbnail_loader()
+            self._schedule_visible_thumbnail_update()
         else:
             self._stop_thumbnail_loader()
 
@@ -2194,42 +2412,66 @@ class FileListPanel(QWidget):
         self._size_label.setText(f"{size}px")
         if self._thumb_size != size:
             self._thumb_size = size
+            self._invalidate_visible_thumbnail_signature()
             if self._view_mode == self._MODE_THUMB:
                 for i in range(self._list_widget.count()):
                     it = self._list_widget.item(i)
                     if it:
                         it.setIcon(QIcon())
+                        it.setData(_ThumbPixmapRole, None)
+                        it.setData(_ThumbSizeRole, 0)
                 self._update_thumb_display()
-                self._start_thumbnail_loader()
+                self._schedule_visible_thumbnail_update()
 
     def _update_thumb_display(self) -> None:
         s = self._thumb_size
         self._list_widget.setIconSize(QSize(s, s))
-        # 网格设为正方形，使每个缩略图格子为正方形，预览图已在加载时缩放到 s×s 内
-        cell = s + 28
-        self._list_widget.setGridSize(QSize(cell, cell))
-        self._list_widget.setSpacing(4)
+        cell_w = s + 32
+        cell_h = s + 46
+        self._list_widget.setGridSize(QSize(cell_w, cell_h))
+        self._list_widget.setSpacing(8)
+        for i in range(self._list_widget.count()):
+            it = self._list_widget.item(i)
+            if it is not None:
+                it.setSizeHint(QSize(cell_w, cell_h))
+        self._list_widget.doItemsLayout()
 
-    # ── 加载器管理 ──────────────────────────────────────────────────────────────
-    def _start_thumbnail_loader(self) -> None:
+    def _start_thumbnail_loader(self, paths: list[str] | None = None) -> None:
         _log.info("[_start_thumbnail_loader] START")
         if self._view_mode != self._MODE_THUMB:
             _log.info("[_start_thumbnail_loader] skip: not in thumb mode")
             return
-        self._stop_thumbnail_loader()
-        paths = [
-            self._list_widget.item(i).data(_UserRole)
-            for i in range(self._list_widget.count())
-            if self._list_widget.item(i) and not self._list_widget.item(i).isHidden()
-        ]
-        paths = [p for p in paths if p]
-        if not paths:
-            _log.info("[_start_thumbnail_loader] no visible paths, return")
+        if paths is None:
+            if not self._thumb_visible_items:
+                self._build_visible_thumbnail_data_source()
+            paths = [path for path, _item in self._thumb_visible_items]
+        requested_paths: list[str] = []
+        seen: set[str] = set()
+        for path in paths or []:
+            norm = os.path.normpath(path)
+            if norm in seen:
+                continue
+            seen.add(norm)
+            item = self._item_map.get(norm)
+            if item is None or item.isHidden():
+                continue
+            pixmap = item.data(_ThumbPixmapRole)
+            thumb_size = item.data(_ThumbSizeRole)
+            try:
+                thumb_size_ok = int(thumb_size or 0) == int(self._thumb_size)
+            except Exception:
+                thumb_size_ok = False
+            if isinstance(pixmap, QPixmap) and not pixmap.isNull() and thumb_size_ok:
+                continue
+            requested_paths.append(norm)
+        if not requested_paths:
+            _log.info("[_start_thumbnail_loader] no visible paths need loading")
             return
-        _log.info("[_start_thumbnail_loader] loading %s thumbnails", len(paths))
+        self._stop_thumbnail_loader()
+        _log.info("[_start_thumbnail_loader] loading visible thumbnails=%s", len(requested_paths))
         preview_base_dir = self._report_root_dir or self._current_dir
         loader = ThumbnailLoader(
-            paths,
+            requested_paths,
             self._thumb_size,
             report_cache=self._report_cache,
             current_dir=preview_base_dir,
@@ -2409,6 +2651,8 @@ class FileListPanel(QWidget):
         if self._view_mode == self._MODE_THUMB:
             paint_t0 = _time.perf_counter()
             self._list_widget.viewport().update()
+            self._invalidate_visible_thumbnail_signature()
+            self._schedule_visible_thumbnail_update()
             _log.info("[STAT][_on_metadata_ready] list viewport updated elapsed=%.3fs", _time.perf_counter() - paint_t0)
 
         if self._meta_apply_needs_filter:
@@ -2495,12 +2739,18 @@ class FileListPanel(QWidget):
         item = self._item_map.get(norm)
         if item is None:
             return
-        item.setIcon(QIcon(QPixmap.fromImage(qimg)))
+        pixmap = QPixmap.fromImage(qimg)
+        item.setIcon(QIcon())
+        item.setData(_ThumbPixmapRole, pixmap)
+        item.setData(_ThumbSizeRole, int(self._thumb_size))
         meta = self._meta_cache.get(norm, {})
         if meta:
             item.setData(_MetaColorRole,  meta.get("color", ""))
             item.setData(_MetaRatingRole, meta.get("rating", 0))
             item.setData(_MetaPickRole,   meta.get("pick", 0))
+        rect = self._list_widget.visualItemRect(item)
+        if rect.isValid():
+            self._list_widget.viewport().update(rect)
 
     def _on_metadata_progress(self, current: int, total: int) -> None:
         """主线程槽：由 progress_updated 信号触发，安全更新进度条。"""
