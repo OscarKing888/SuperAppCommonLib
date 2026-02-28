@@ -346,9 +346,18 @@ def _reveal_in_file_manager(path: str) -> None:
             os.path.isfile(path) if path else False,
         )
         if sys.platform == "darwin":
-            subprocess.Popen(["open", "-R", path])
+            norm_path = os.path.normpath(os.path.abspath(path))
+            args = ["open", "-R", norm_path]
+            _log.info("[_reveal_in_file_manager] darwin_args=%r", args)
+            subprocess.Popen(args)
         elif os.name == "nt":
-            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+            norm_path = os.path.normpath(os.path.abspath(path))
+            if os.path.isfile(norm_path):
+                args = ["explorer.exe", f"/select,{norm_path}"]
+            else:
+                args = ["explorer.exe", norm_path]
+            _log.info("[_reveal_in_file_manager] windows_args=%r", args)
+            subprocess.Popen(args)
         else:
             parent = os.path.dirname(path) if os.path.isfile(path) else path
             subprocess.Popen(["xdg-open", parent])
@@ -1641,7 +1650,7 @@ class FileListPanel(QWidget):
             _log.info("[_resolve_source_path_for_action] source=%r resolved=actual_cache=%r", path, actual_path)
             return actual_path
         if norm_path and os.path.isfile(norm_path):
-            _log.info("[_resolve_source_path_for_action] source=%r resolved=self", path, norm_path)
+            _log.info("[_resolve_source_path_for_action] source=%r resolved=self=%r", path, norm_path)
             return norm_path
 
         row = self._get_report_row_for_path(norm_path)
@@ -2283,8 +2292,9 @@ class FileListPanel(QWidget):
             return
         mime = QMimeData()
         mime.setUrls([QUrl.fromLocalFile(p) for p in expanded_paths])
+        mime.setText("\n".join(expanded_paths))
         QApplication.clipboard().setMimeData(mime)
-        _log.info("[_copy_paths_to_clipboard] copied=%s", expanded_paths)
+        _log.info("[_copy_paths_to_clipboard] platform=%r copied=%s", sys.platform, expanded_paths)
 
     def _on_tree_context_menu(self, pos) -> None:
         item = self._tree_widget.itemAt(pos)
@@ -2304,7 +2314,7 @@ class FileListPanel(QWidget):
         act_copy = menu.addAction("复制")
         act_copy.triggered.connect(lambda: self._copy_paths_to_clipboard(paths))
         menu.addSeparator()
-        label = "在 Finder 中显示" if sys.platform == "darwin" else "在资源管理器中显示"
+        label = "在Finder中显示" if sys.platform == "darwin" else "在资源管理器中显示"
         reveal_path = self._resolve_reveal_path(item.data(0, _UserRole) if item else (paths[0] if paths else None))
         if reveal_path:
             _log.info("[_on_tree_context_menu] reveal_path=%r paths=%s", reveal_path, len(paths))
@@ -2331,7 +2341,7 @@ class FileListPanel(QWidget):
         act_copy = menu.addAction("复制")
         act_copy.triggered.connect(lambda: self._copy_paths_to_clipboard(paths))
         menu.addSeparator()
-        label = "在 Finder 中显示" if sys.platform == "darwin" else "在资源管理器中显示"
+        label = "在Finder中显示" if sys.platform == "darwin" else "在资源管理器中显示"
         reveal_path = self._resolve_reveal_path(item.data(_UserRole) if item else (paths[0] if paths else None))
         if reveal_path:
             _log.info("[_on_list_context_menu] reveal_path=%r paths=%s", reveal_path, len(paths))
@@ -2582,7 +2592,7 @@ class DirectoryBrowserWidget(QWidget):
         if not path:
             return
         menu = QMenu(self)
-        label = "在 Finder 中显示" if sys.platform == "darwin" else "在资源管理器中显示"
+        label = "在Finder中显示" if sys.platform == "darwin" else "在资源管理器中显示"
         act = menu.addAction(label)
         act.triggered.connect(lambda: _reveal_in_file_manager(path))
         _exec_menu(menu, self._tree.viewport().mapToGlobal(pos))
