@@ -44,7 +44,7 @@ class AppInfoBar(QWidget):
         self,
         parent=None,
         *,
-        title: str = "Super EXIF",
+        title: str = "Super Viewer",
         subtitle: str = "查看与编辑EXIF",
         icon_path: str | None = None,
         on_about_clicked: callable | None = None,

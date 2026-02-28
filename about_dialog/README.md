@@ -11,6 +11,6 @@
 ```python
 from app_common.about_dialog import show_about_dialog, load_about_info
 
-info = load_about_info(override_path="/path/to/EXIF.cfg")  # 可选覆盖
+info = load_about_info(override_path="/path/to/about.cfg")  # 可选覆盖
 show_about_dialog(parent, info, logo_path="...", banner_path="...")
 ```

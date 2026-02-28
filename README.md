@@ -22,7 +22,7 @@
 from app_common import show_about_dialog, load_about_info, AppInfoBar
 
 # 加载关于信息（默认读 about_dialog/about.cfg，可选 override_path 覆盖）
-info = load_about_info(override_path="/path/to/EXIF.cfg")
+info = load_about_info(override_path="/path/to/super_viewer.cfg")
 show_about_dialog(parent, info, logo_path="...", banner_path="...")
 
 bar = AppInfoBar(parent, title="MyApp", subtitle="...", icon_path="...", on_about_clicked=lambda: ...)
