@@ -13,6 +13,7 @@ file_browser._browser
 """
 from __future__ import annotations
 
+import html
 import io as _io
 import os
 import subprocess
@@ -232,6 +233,21 @@ def _path_key(path: str) -> str:
     return os.path.normcase(os.path.normpath(os.path.abspath(path)))
 
 
+def _get_cached_actual_path(path: str) -> str | None:
+    if not path:
+        return None
+    actual = _ACTUAL_PATH_CACHE.get(_path_key(path))
+    if actual:
+        return os.path.normpath(actual)
+    return None
+
+
+def _set_cached_actual_path(source_path: str, actual_path: str) -> None:
+    if not source_path or not actual_path:
+        return
+    _ACTUAL_PATH_CACHE[_path_key(source_path)] = os.path.normpath(actual_path)
+
+
 def _is_same_or_child_path(parent: str, child: str) -> bool:
     """Whether child is parent itself or under parent."""
     try:
@@ -322,6 +338,13 @@ def _reveal_in_file_manager(path: str) -> None:
     - Linux  : xdg-open 打开父目录
     """
     try:
+        _log.info(
+            "[_reveal_in_file_manager] platform=%r path=%r exists=%s isfile=%s",
+            sys.platform,
+            path,
+            os.path.exists(path) if path else False,
+            os.path.isfile(path) if path else False,
+        )
         if sys.platform == "darwin":
             subprocess.Popen(["open", "-R", path])
         elif os.name == "nt":
@@ -329,8 +352,8 @@ def _reveal_in_file_manager(path: str) -> None:
         else:
             parent = os.path.dirname(path) if os.path.isfile(path) else path
             subprocess.Popen(["xdg-open", parent])
-    except Exception:
-        pass
+    except Exception as e:
+        _log.warning("[_reveal_in_file_manager] failed path=%r: %s", path, e)
 
 
 def _exec_menu(menu: "QMenu", global_pos) -> None:
@@ -686,6 +709,80 @@ def _env_int(name: str, default: int = 0) -> int:
 _DEBUG_FILE_LIST_LIMIT = max(0, _env_int("SUPEREXIF_DEBUG_FILE_LIST_LIMIT", 0))
 _DEBUG_FILE_LIST_MATCH = (os.environ.get("SUPEREXIF_DEBUG_FILE_LIST_MATCH", "") or "").strip().lower()
 
+_ACTUAL_PATH_CACHE: dict[str, str] = {}
+
+
+
+def _score_path_lookup_candidate(source_path: str, candidate_path: str, root_dir: str) -> tuple[int, int, int]:
+    try:
+        source_rel = os.path.relpath(source_path, root_dir)
+    except Exception:
+        source_rel = source_path
+    try:
+        cand_rel = os.path.relpath(candidate_path, root_dir)
+    except Exception:
+        cand_rel = candidate_path
+    source_parts = [p.lower() for p in Path(os.path.dirname(source_rel)).parts if p not in ("", ".")]
+    cand_parts = [p.lower() for p in Path(os.path.dirname(cand_rel)).parts if p not in ("", ".")]
+    common_suffix = 0
+    while common_suffix < min(len(source_parts), len(cand_parts)):
+        if source_parts[-1 - common_suffix] != cand_parts[-1 - common_suffix]:
+            break
+        common_suffix += 1
+    same_parent = 1 if source_parts and cand_parts and source_parts[-1] == cand_parts[-1] else 0
+    return (common_suffix, same_parent, -len(cand_parts))
+
+
+class PathLookupWorker(QThread):
+    resolved = pyqtSignal(str, object)  # (source_path, actual_path_or_none)
+
+    def __init__(self, source_path: str, root_dir: str, parent=None) -> None:
+        super().__init__(parent)
+        self._source_path = os.path.normpath(source_path) if source_path else ""
+        self._root_dir = os.path.normpath(root_dir) if root_dir else ""
+
+    def run(self) -> None:
+        source_path = self._source_path
+        root_dir = self._root_dir
+        actual_path = None
+        _log.info("[PathLookupWorker.run] START source=%r root=%r", source_path, root_dir)
+        if source_path and os.path.isfile(source_path):
+            actual_path = source_path
+        elif root_dir and os.path.isdir(root_dir) and source_path:
+            target_name = Path(source_path).name.lower()
+            best_score = None
+            best_path = None
+            scanned_dirs = 0
+            candidates = 0
+            try:
+                for walk_root, dirs, names in os.walk(root_dir, topdown=True):
+                    if self.isInterruptionRequested():
+                        _log.info("[PathLookupWorker.run] interrupted source=%r", source_path)
+                        return
+                    dirs[:] = [d for d in dirs if not d.startswith(".")]
+                    scanned_dirs += 1
+                    for name in names:
+                        if name.lower() != target_name:
+                            continue
+                        candidate = os.path.normpath(os.path.join(walk_root, name))
+                        score = _score_path_lookup_candidate(source_path, candidate, root_dir)
+                        candidates += 1
+                        if best_score is None or score > best_score:
+                            best_score = score
+                            best_path = candidate
+                actual_path = best_path
+                _log.info(
+                    "[PathLookupWorker.run] END source=%r root=%r scanned_dirs=%s candidates=%s actual=%r",
+                    source_path,
+                    root_dir,
+                    scanned_dirs,
+                    candidates,
+                    actual_path,
+                )
+            except Exception as e:
+                _log.warning("[PathLookupWorker.run] failed source=%r root=%r: %s", source_path, root_dir, e)
+        self.resolved.emit(source_path, actual_path)
+
 
 class MetadataLoader(QThread):
     """
@@ -999,6 +1096,10 @@ class FileListPanel(QWidget):
         self._tree_item_map: dict = {}   # norm_path → SortableTreeItem (列表)
         self._meta_cache:    dict = {}   # norm_path → metadata dict
         self._report_cache:  dict = {}   # stem → report row (当前目录/子树筛出的 report 子集)
+        self._report_row_by_path: dict = {}
+        self._path_lookup_pending: set[str] = set()
+        self._path_lookup_workers: list[PathLookupWorker] = []
+        self._selected_display_path: str = ""
         self._pending_loaders: list = []
         self._meta_apply_timer: QTimer | None = None
         self._meta_apply_items: list = []
@@ -1260,6 +1361,8 @@ class FileListPanel(QWidget):
         self._stop_directory_scan_worker()
         self._meta_cache.clear()
         self._report_cache = {}
+        self._report_row_by_path = {}
+        self._selected_display_path = ""
         self._all_files = []
         _log.info("[load_directory] _rebuild_views (empty)")
         self._rebuild_views()
@@ -1337,6 +1440,15 @@ class FileListPanel(QWidget):
             )
             files = limited_files
         self._report_cache = report_cache
+        self._report_row_by_path = {}
+        for p in files:
+            norm_p = os.path.normpath(p) if p else ""
+            if not norm_p:
+                continue
+            row = report_cache.get(Path(norm_p).stem)
+            if isinstance(row, dict):
+                self._report_row_by_path[norm_p] = row
+        _log.info("[_on_directory_scan_finished] report row path map entries=%s", len(self._report_row_by_path))
         self._all_files = files
         _log.info("[_on_directory_scan_finished] 已列出 %s 个文件，重建列表/缩略图视图", len(files))
         _log.info("[_on_directory_scan_finished] _rebuild_views START")
@@ -1358,29 +1470,128 @@ class FileListPanel(QWidget):
         """返回当前目录的 report 缓存：stem（不含扩展名）→ report 行 dict。无缓存时返回空 dict。"""
         return self._report_cache
 
+    def _get_actual_path_for_display(self, path: str) -> str | None:
+        actual = _get_cached_actual_path(path)
+        if actual and os.path.isfile(actual):
+            return actual
+        return None
+
+    def _build_path_tooltip(self, path: str) -> str:
+        norm_path = os.path.normpath(path) if path else ""
+        if not norm_path:
+            return ""
+        actual_path = self._get_actual_path_for_display(norm_path)
+        if actual_path and _path_key(actual_path) != _path_key(norm_path):
+            return (
+                "<html><body>"
+                f"<div><span style='color:#c0392b'>{html.escape(norm_path)}</span></div>"
+                f"<div><span style='color:#2980b9'>{html.escape(actual_path)}</span></div>"
+                "</body></html>"
+            )
+        if os.path.isfile(norm_path):
+            return (
+                "<html><body>"
+                f"<div><span style='color:#2980b9'>{html.escape(norm_path)}</span></div>"
+                "</body></html>"
+            )
+        return (
+            "<html><body>"
+            f"<div><span style='color:#c0392b'>{html.escape(norm_path)} (选中查找实际路径...)</span></div>"
+            "</body></html>"
+        )
+
+    def _update_item_tooltips_for_path(self, path: str) -> None:
+        norm_path = os.path.normpath(path) if path else ""
+        if not norm_path:
+            return
+        tooltip = self._build_path_tooltip(norm_path)
+        ti = self._tree_item_map.get(norm_path)
+        if ti is not None:
+            ti.setToolTip(0, tooltip)
+        li = self._item_map.get(norm_path)
+        if li is not None:
+            li.setToolTip(tooltip)
+
+    def _request_actual_path_lookup(self, path: str) -> None:
+        norm_path = os.path.normpath(path) if path else ""
+        if not norm_path or os.path.isfile(norm_path):
+            return
+        cached = self._get_actual_path_for_display(norm_path)
+        if cached:
+            self._update_item_tooltips_for_path(norm_path)
+            return
+        root_dir = self._report_root_dir or self._current_dir
+        if not root_dir or not os.path.isdir(root_dir):
+            return
+        cache_key = _path_key(norm_path)
+        if cache_key in self._path_lookup_pending:
+            return
+        worker = PathLookupWorker(norm_path, root_dir, self)
+        worker.resolved.connect(self._on_actual_path_lookup_resolved)
+        self._path_lookup_pending.add(cache_key)
+        self._path_lookup_workers.append(worker)
+        _log.info("[_request_actual_path_lookup] queued source=%r root=%r", norm_path, root_dir)
+        worker.start()
+
+    def _on_actual_path_lookup_resolved(self, source_path: str, actual_path) -> None:
+        norm_source = os.path.normpath(source_path) if source_path else ""
+        cache_key = _path_key(norm_source) if norm_source else ""
+        if cache_key:
+            self._path_lookup_pending.discard(cache_key)
+        worker = self.sender()
+        if isinstance(worker, PathLookupWorker):
+            try:
+                worker.resolved.disconnect(self._on_actual_path_lookup_resolved)
+            except Exception:
+                pass
+            self._path_lookup_workers = [w for w in self._path_lookup_workers if w is not worker]
+        resolved_path = os.path.normpath(actual_path) if actual_path else None
+        if norm_source and resolved_path and os.path.isfile(resolved_path):
+            _set_cached_actual_path(norm_source, resolved_path)
+            _log.info("[_on_actual_path_lookup_resolved] source=%r actual=%r cached=True", norm_source, resolved_path)
+        else:
+            _log.info("[_on_actual_path_lookup_resolved] source=%r actual=%r cached=False", norm_source, actual_path)
+        if norm_source:
+            self._update_item_tooltips_for_path(norm_source)
+            if self._selected_display_path and _path_key(self._selected_display_path) == _path_key(norm_source):
+                resolved = self._resolve_source_path_for_action(norm_source)
+                if resolved and os.path.isfile(resolved):
+                    _log.info("[_on_actual_path_lookup_resolved] re-emit selected source=%r resolved=%r", norm_source, resolved)
+                    self.file_selected.emit(resolved)
+
     def resolve_preview_path(self, path: str) -> str:
         """Resolve display preview path for a source file, preferring report temp_jpeg_path."""
         norm_path = os.path.normpath(path) if path else ""
         if not norm_path:
             return path
+        actual_path = self._get_actual_path_for_display(norm_path)
         preview_base_dir = self._report_root_dir or self._current_dir
         report_cache = self._report_full_cache or self._report_cache or {}
         preview_path = get_preview_path_for_file(norm_path, preview_base_dir, report_cache)
         _log.info(
-            "[resolve_preview_path] source=%r preview=%r preview_base_dir=%r report_entries=%s",
+            "[resolve_preview_path] source=%r preview=%r actual=%r preview_base_dir=%r report_entries=%s",
             norm_path,
             preview_path,
+            actual_path,
             preview_base_dir,
             len(report_cache),
         )
-        return preview_path or norm_path
+        return preview_path or actual_path or norm_path
 
     def _get_report_row_for_path(self, path: str) -> dict | None:
+        norm_path = os.path.normpath(path) if path else ""
+        if norm_path:
+            row = self._report_row_by_path.get(norm_path)
+            if isinstance(row, dict):
+                _log.info("[_get_report_row_for_path] source=%r matched=path_map", path)
+                return row
         stem = Path(path).stem if path else ""
         if not stem:
             return None
         cache = self._report_full_cache or self._report_cache or {}
         row = cache.get(stem)
+        if isinstance(row, dict):
+            _log.info("[_get_report_row_for_path] source=%r matched=stem_cache stem=%r", path, stem)
         return row if isinstance(row, dict) else None
 
     def _resolve_report_current_abs_path(self, path: str) -> str | None:
@@ -1400,42 +1611,78 @@ class FileListPanel(QWidget):
     def _resolve_sidecar_path(self, path: str) -> str | None:
         cp_abs = self._resolve_report_current_abs_path(path)
         if cp_abs and cp_abs.lower().endswith(".xmp") and os.path.isfile(cp_abs):
+            _log.info("[_resolve_sidecar_path] source=%r sidecar(report_current)=%r", path, cp_abs)
             return cp_abs
+        actual_source = self._get_actual_path_for_display(path)
+        if actual_source:
+            try:
+                xmp_path = find_xmp_sidecar(actual_source)
+            except Exception:
+                xmp_path = None
+            if xmp_path and os.path.isfile(xmp_path):
+                resolved = os.path.normpath(os.path.abspath(xmp_path))
+                _log.info("[_resolve_sidecar_path] source=%r sidecar(actual_sibling)=%r", path, resolved)
+                return resolved
         try:
             xmp_path = find_xmp_sidecar(path)
         except Exception:
             xmp_path = None
         if xmp_path and os.path.isfile(xmp_path):
-            return os.path.normpath(os.path.abspath(xmp_path))
+            resolved = os.path.normpath(os.path.abspath(xmp_path))
+            _log.info("[_resolve_sidecar_path] source=%r sidecar(sibling)=%r", path, resolved)
+            return resolved
+        _log.info("[_resolve_sidecar_path] source=%r sidecar=None", path)
         return None
 
     def _resolve_source_path_for_action(self, path: str) -> str:
         norm_path = os.path.normpath(path) if path else ""
+        actual_path = self._get_actual_path_for_display(norm_path)
+        if actual_path:
+            _log.info("[_resolve_source_path_for_action] source=%r resolved=actual_cache=%r", path, actual_path)
+            return actual_path
         if norm_path and os.path.isfile(norm_path):
+            _log.info("[_resolve_source_path_for_action] source=%r resolved=self", path, norm_path)
             return norm_path
 
         row = self._get_report_row_for_path(norm_path)
         cp_abs = self._resolve_report_current_abs_path(norm_path)
         if row and cp_abs:
             if os.path.isfile(cp_abs) and Path(cp_abs).suffix.lower() in IMAGE_EXTENSIONS:
+                _log.info("[_resolve_source_path_for_action] source=%r resolved=current_path=%r", path, cp_abs)
                 return cp_abs
             op = str(row.get("original_path") or "").strip()
             ext_orig = Path(op).suffix.lower() if op else ""
             if ext_orig:
                 sibling_source = str(Path(cp_abs).with_suffix(ext_orig))
                 if os.path.isfile(sibling_source):
-                    return os.path.normpath(sibling_source)
+                    resolved = os.path.normpath(sibling_source)
+                    _log.info("[_resolve_source_path_for_action] source=%r resolved=sibling_source=%r", path, resolved)
+                    return resolved
 
+        _log.info("[_resolve_source_path_for_action] source=%r unresolved return_original=%r", path, norm_path)
         return norm_path
 
     def _resolve_reveal_path(self, path: str) -> str:
         source_path = self._resolve_source_path_for_action(path)
-        if source_path and os.path.exists(source_path):
-            return source_path
         xmp_path = self._resolve_sidecar_path(path)
-        if xmp_path and os.path.exists(xmp_path):
-            return xmp_path
-        return source_path or path
+        source_exists = bool(source_path and os.path.exists(source_path))
+        xmp_exists = bool(xmp_path and os.path.exists(xmp_path))
+        if source_exists:
+            final_path = source_path
+        elif xmp_exists:
+            final_path = xmp_path
+        else:
+            final_path = source_path or path
+        _log.info(
+            "[_resolve_reveal_path] source=%r source_path=%r source_exists=%s xmp_path=%r xmp_exists=%s final=%r",
+            path,
+            source_path,
+            source_exists,
+            xmp_path,
+            xmp_exists,
+            final_path,
+        )
+        return final_path
 
     def _rebuild_views(self) -> None:
         """从文件列表重建列表视图和缩略图视图。"""
@@ -1461,7 +1708,7 @@ class FileListPanel(QWidget):
             ti = SortableTreeItem([name, "", "", "", "", "", ""])
             ti.setData(0, _UserRole, path)
             ti.setData(0, _SortRole, name.lower())
-            ti.setToolTip(0, path)
+            ti.setToolTip(0, self._build_path_tooltip(path))
             if meta:
                 self._apply_meta_to_tree_item(ti, meta)
             self._tree_widget.addTopLevelItem(ti)
@@ -1470,7 +1717,7 @@ class FileListPanel(QWidget):
             # 缩略图节点
             li = QListWidgetItem(name)
             li.setData(_UserRole, path)
-            li.setToolTip(path)
+            li.setToolTip(self._build_path_tooltip(path))
             if meta:
                 li.setData(_MetaColorRole,  meta.get("color", ""))
                 li.setData(_MetaRatingRole, meta.get("rating", 0))
@@ -1969,7 +2216,10 @@ class FileListPanel(QWidget):
     def _on_tree_item_clicked(self, item, column) -> None:
         path = item.data(0, _UserRole)
         if path:
+            self._selected_display_path = os.path.normpath(path)
             resolved_path = self._resolve_source_path_for_action(path)
+            if not resolved_path or not os.path.isfile(resolved_path):
+                self._request_actual_path_lookup(path)
             _log.info(
                 "[_on_tree_item_clicked] source=%r resolved=%r exists=%s",
                 path,
@@ -1981,7 +2231,10 @@ class FileListPanel(QWidget):
     def _on_list_item_clicked(self, item) -> None:
         path = item.data(_UserRole)
         if path:
+            self._selected_display_path = os.path.normpath(path)
             resolved_path = self._resolve_source_path_for_action(path)
+            if not resolved_path or not os.path.isfile(resolved_path):
+                self._request_actual_path_lookup(path)
             _log.info(
                 "[_on_list_item_clicked] source=%r resolved=%r exists=%s",
                 path,
@@ -1999,28 +2252,39 @@ class FileListPanel(QWidget):
             if not p:
                 continue
             abs_path = self._resolve_source_path_for_action(p)
-            if not abs_path or not os.path.isfile(abs_path):
-                continue
-            abs_path = os.path.abspath(abs_path)
-            norm_key = os.path.normcase(os.path.normpath(abs_path))
-            if norm_key not in seen:
-                expanded_paths.append(abs_path)
-                seen.add(norm_key)
+            source_exists = bool(abs_path and os.path.isfile(abs_path))
+            if source_exists:
+                abs_path = os.path.abspath(abs_path)
+                norm_key = os.path.normcase(os.path.normpath(abs_path))
+                if norm_key not in seen:
+                    expanded_paths.append(abs_path)
+                    seen.add(norm_key)
 
             # 同步带上 sidecar（如 IMG_0001.CR3 -> IMG_0001.xmp）
             xmp_path = self._resolve_sidecar_path(p)
-            if xmp_path and os.path.isfile(xmp_path):
+            xmp_exists = bool(xmp_path and os.path.isfile(xmp_path))
+            if xmp_exists:
                 abs_xmp = os.path.abspath(xmp_path)
                 xmp_key = os.path.normcase(os.path.normpath(abs_xmp))
                 if xmp_key not in seen:
                     expanded_paths.append(abs_xmp)
                     seen.add(xmp_key)
+            _log.info(
+                "[_copy_paths_to_clipboard] source=%r resolved_source=%r source_exists=%s xmp_path=%r xmp_exists=%s",
+                p,
+                abs_path,
+                source_exists,
+                xmp_path,
+                xmp_exists,
+            )
 
         if not expanded_paths:
+            _log.info("[_copy_paths_to_clipboard] nothing_to_copy input=%s", len(paths))
             return
         mime = QMimeData()
         mime.setUrls([QUrl.fromLocalFile(p) for p in expanded_paths])
         QApplication.clipboard().setMimeData(mime)
+        _log.info("[_copy_paths_to_clipboard] copied=%s", expanded_paths)
 
     def _on_tree_context_menu(self, pos) -> None:
         item = self._tree_widget.itemAt(pos)
@@ -2043,6 +2307,7 @@ class FileListPanel(QWidget):
         label = "在 Finder 中显示" if sys.platform == "darwin" else "在资源管理器中显示"
         reveal_path = self._resolve_reveal_path(item.data(0, _UserRole) if item else (paths[0] if paths else None))
         if reveal_path:
+            _log.info("[_on_tree_context_menu] reveal_path=%r paths=%s", reveal_path, len(paths))
             act_reveal = menu.addAction(label)
             act_reveal.triggered.connect(lambda: _reveal_in_file_manager(reveal_path))
         _exec_menu(menu, self._tree_widget.viewport().mapToGlobal(pos))
@@ -2069,6 +2334,7 @@ class FileListPanel(QWidget):
         label = "在 Finder 中显示" if sys.platform == "darwin" else "在资源管理器中显示"
         reveal_path = self._resolve_reveal_path(item.data(_UserRole) if item else (paths[0] if paths else None))
         if reveal_path:
+            _log.info("[_on_list_context_menu] reveal_path=%r paths=%s", reveal_path, len(paths))
             act_reveal = menu.addAction(label)
             act_reveal.triggered.connect(lambda: _reveal_in_file_manager(reveal_path))
         _exec_menu(menu, self._list_widget.viewport().mapToGlobal(pos))
