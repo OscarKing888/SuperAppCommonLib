@@ -1625,6 +1625,28 @@ class FileListPanel(QWidget):
             "</body></html>"
         )
 
+    def _has_path_mismatch(self, path: str) -> bool:
+        norm_path = os.path.normpath(path) if path else ""
+        if not norm_path:
+            return False
+        actual_path = self._get_actual_path_for_display(norm_path)
+        if actual_path and _path_key(actual_path) != _path_key(norm_path):
+            return True
+        return not os.path.isfile(norm_path)
+
+    def _apply_path_status_to_items(self, path: str) -> None:
+        norm_path = os.path.normpath(path) if path else ""
+        if not norm_path:
+            return
+        mismatch = self._has_path_mismatch(norm_path)
+        brush = QBrush(QColor("#c0392b")) if mismatch else QBrush()
+        ti = self._tree_item_map.get(norm_path)
+        if ti is not None:
+            ti.setForeground(0, brush)
+        li = self._item_map.get(norm_path)
+        if li is not None:
+            li.setForeground(brush)
+
     def _update_item_tooltips_for_path(self, path: str) -> None:
         norm_path = os.path.normpath(path) if path else ""
         if not norm_path:
@@ -1636,6 +1658,10 @@ class FileListPanel(QWidget):
         li = self._item_map.get(norm_path)
         if li is not None:
             li.setToolTip(tooltip)
+        self._apply_path_status_to_items(norm_path)
+
+    def has_path_mismatch(self, path: str) -> bool:
+        return self._has_path_mismatch(path)
 
     def _request_actual_path_lookup(self, path: str) -> None:
         norm_path = os.path.normpath(path) if path else ""
@@ -1675,6 +1701,7 @@ class FileListPanel(QWidget):
             _set_cached_actual_path(norm_source, resolved_path)
             row = self._report_row_by_path.get(norm_source)
             if isinstance(row, dict):
+                self._sync_report_current_path_from_actual(norm_source, resolved_path, row)
                 self._report_row_by_path[resolved_path] = row
             _log.info("[_on_actual_path_lookup_resolved] source=%r actual=%r cached=True", norm_source, resolved_path)
         else:
@@ -1686,6 +1713,81 @@ class FileListPanel(QWidget):
                 if resolved and os.path.isfile(resolved):
                     _log.info("[_on_actual_path_lookup_resolved] re-emit selected source=%r resolved=%r", norm_source, resolved)
                     self.file_selected.emit(resolved)
+
+    def _sync_report_current_path_from_actual(self, source_path: str, actual_path: str, row: dict | None) -> None:
+        if not isinstance(row, dict):
+            return
+        root_dir = self._report_root_dir or self._current_dir
+        if not root_dir or not os.path.isdir(root_dir):
+            _log.info("[_sync_report_current_path_from_actual] skip source=%r actual=%r reason=no_root", source_path, actual_path)
+            return
+        if not _is_same_or_child_path(root_dir, actual_path):
+            _log.info(
+                "[_sync_report_current_path_from_actual] skip source=%r actual=%r root=%r reason=outside_root",
+                source_path,
+                actual_path,
+                root_dir,
+            )
+            return
+        filename = str(row.get("filename") or Path(source_path).stem or "").strip()
+        if not filename:
+            _log.info("[_sync_report_current_path_from_actual] skip source=%r actual=%r reason=no_filename", source_path, actual_path)
+            return
+        try:
+            rel_current_path = os.path.normpath(os.path.relpath(actual_path, root_dir))
+        except Exception as e:
+            _log.warning(
+                "[_sync_report_current_path_from_actual] skip source=%r actual=%r root=%r relpath_failed=%s",
+                source_path,
+                actual_path,
+                root_dir,
+                e,
+            )
+            return
+        current_path_old = str(row.get("current_path") or "").strip()
+        if current_path_old and os.path.normcase(os.path.normpath(current_path_old)) == os.path.normcase(rel_current_path):
+            _log.info(
+                "[_sync_report_current_path_from_actual] skip source=%r filename=%r current_path already=%r",
+                source_path,
+                filename,
+                rel_current_path,
+            )
+            return
+        db = ReportDB.open_if_exists(root_dir)
+        if db is None:
+            _log.info(
+                "[_sync_report_current_path_from_actual] skip source=%r filename=%r root=%r reason=no_report_db",
+                source_path,
+                filename,
+                root_dir,
+            )
+            return
+        updated = False
+        try:
+            updated = db.update_photo(filename, {"current_path": rel_current_path})
+        finally:
+            db.close()
+        if not updated:
+            _log.info(
+                "[_sync_report_current_path_from_actual] update_failed source=%r filename=%r current_path=%r",
+                source_path,
+                filename,
+                rel_current_path,
+            )
+            return
+        row["current_path"] = rel_current_path
+        if self._report_full_cache and filename in self._report_full_cache:
+            self._report_full_cache[filename]["current_path"] = rel_current_path
+        if filename in self._report_cache:
+            self._report_cache[filename]["current_path"] = rel_current_path
+        _log.info(
+            "[_sync_report_current_path_from_actual] updated source=%r actual=%r filename=%r old_current_path=%r new_current_path=%r",
+            source_path,
+            actual_path,
+            filename,
+            current_path_old,
+            rel_current_path,
+        )
 
     def resolve_preview_path(self, path: str) -> str:
         """Resolve display preview path for a source file, preferring report temp_jpeg_path."""
@@ -1841,6 +1943,7 @@ class FileListPanel(QWidget):
                 self._apply_meta_to_tree_item(ti, meta)
             self._tree_widget.addTopLevelItem(ti)
             self._tree_item_map[norm] = ti
+            self._apply_path_status_to_items(norm)
 
             # 缩略图节点
             li = QListWidgetItem(name)
@@ -1851,6 +1954,7 @@ class FileListPanel(QWidget):
                 li.setData(_MetaRatingRole, meta.get("rating", 0))
                 li.setData(_MetaPickRole,   meta.get("pick", 0))
             self._item_map[norm] = li
+            self._apply_path_status_to_items(norm)
             self._list_widget.addItem(li)
             added += 1
 
