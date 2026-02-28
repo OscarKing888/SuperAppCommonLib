@@ -282,6 +282,39 @@ def _resolve_report_full_path(row: dict, report_root: str, fallback_dir: str) ->
     return full_path
 
 
+def _get_report_current_path_raw(row: dict) -> str:
+    if not isinstance(row, dict):
+        return ""
+    raw = row.get("_current_path_report_raw")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    cp = row.get("current_path")
+    return str(cp).strip() if cp is not None else ""
+
+
+def _normalize_report_row_paths(row: dict) -> dict:
+    if not isinstance(row, dict):
+        return row
+    out = dict(row)
+    cp_text = str(out.get("current_path") or "").strip()
+    op_text = str(out.get("original_path") or "").strip()
+    out["_current_path_report_raw"] = cp_text
+    if cp_text.lower().endswith(".xmp") and op_text:
+        ext_orig = Path(op_text).suffix
+        if ext_orig:
+            normalized = str(Path(cp_text).with_suffix(ext_orig))
+            if normalized != cp_text:
+                out["current_path"] = normalized
+                _log.info(
+                    "[_normalize_report_row_paths] filename=%r current_path=%r normalized=%r original_path=%r",
+                    out.get("filename"),
+                    cp_text,
+                    normalized,
+                    op_text,
+                )
+    return out
+
+
 def _norm_rel_path_for_match(path_text: str) -> str:
     """Normalize relative path text for prefix matching."""
     s = str(path_text or "").strip()
@@ -632,7 +665,7 @@ class DirectoryScanWorker(QThread):
                     full_report_cache = {}
                     try:
                         for row in db.get_all_photos():
-                            r = dict(row)
+                            r = _normalize_report_row_paths(dict(row))
                             stem = r.get("filename")
                             if stem is not None:
                                 full_report_cache[stem] = r
@@ -670,6 +703,46 @@ class DirectoryScanWorker(QThread):
                 "[DirectoryScanWorker.run] 使用 DB current_path 拼出完整路径构建文件列表 files=%s（跳过文件系统扫描）",
                 len(files),
             )
+            try:
+                actual_files = _collect_image_files_impl(self._path, self._recursive)
+                full_cache = full_report_cache or report_cache or {}
+                existing = {_path_key(p) for p in files if p}
+                file_index_by_stem = {Path(p).stem: i for i, p in enumerate(files) if p}
+                supplemented = 0
+                replaced = 0
+                for actual_path in actual_files:
+                    stem = Path(actual_path).stem
+                    row = full_cache.get(stem)
+                    if not isinstance(row, dict):
+                        continue
+                    actual_norm = os.path.normpath(actual_path)
+                    actual_key = _path_key(actual_norm)
+                    if actual_key in existing:
+                        continue
+                    existing_idx = file_index_by_stem.get(stem)
+                    if existing_idx is not None:
+                        old_path = files[existing_idx]
+                        if old_path and not os.path.isfile(old_path):
+                            old_key = _path_key(old_path)
+                            files[existing_idx] = actual_norm
+                            existing.discard(old_key)
+                            existing.add(actual_key)
+                            replaced += 1
+                        continue
+                    files.append(actual_norm)
+                    existing.add(actual_key)
+                    file_index_by_stem[stem] = len(files) - 1
+                    supplemented += 1
+                    report_cache[stem] = row
+                _log.info(
+                    "[DirectoryScanWorker.run] supplement actual files matched_by_stem=%s replaced_missing=%s total_files=%s selected_report_cache=%s",
+                    supplemented,
+                    replaced,
+                    len(files),
+                    len(report_cache),
+                )
+            except Exception as e:
+                _log.warning("[DirectoryScanWorker.run] supplement actual files failed: %s", e)
         else:
             try:
                 if self._recursive:
@@ -829,7 +902,7 @@ class MetadataLoader(QThread):
         if not isinstance(row, dict):
             return True
 
-        cp = row.get("current_path")
+        cp = _get_report_current_path_raw(row)
         if isinstance(cp, str) and cp.strip().lower().endswith(".xmp"):
             # report 里 current_path 指向 sidecar 的场景，通常依赖文件/XMP补全展示字段
             return True
@@ -938,7 +1011,7 @@ class MetadataLoader(QThread):
                     stem = Path(target_path).stem
                     row = self._report_cache.get(stem)
                     if isinstance(row, dict):
-                        cp_text = str(row.get("current_path") or "").strip()
+                        cp_text = _get_report_current_path_raw(row)
                         if cp_text and self._current_dir:
                             if os.path.isabs(cp_text):
                                 cp_abs = os.path.normpath(cp_text)
@@ -1240,15 +1313,18 @@ class FileListPanel(QWidget):
         hdr = self._tree_widget.header()
         hdr.setSectionResizeMode(0, _ResizeInteractive)
         hdr.setSectionResizeMode(1, _ResizeInteractive)
-        hdr.setSectionResizeMode(2, _ResizeToContents)
-        hdr.setSectionResizeMode(3, _ResizeToContents)
-        hdr.setSectionResizeMode(4, _ResizeToContents)
-        hdr.setSectionResizeMode(5, _ResizeToContents)
-        hdr.setSectionResizeMode(6, _ResizeToContents)
-        fm = self._tree_widget.fontMetrics()
-        text_width = getattr(fm, "horizontalAdvance", None) or getattr(fm, "width")
-        self._tree_widget.setColumnWidth(0, text_width("DSC05250.ARW") + 28)
-        self._tree_widget.setColumnWidth(1, text_width("汉" * 6) + 28)
+        hdr.setSectionResizeMode(2, _ResizeInteractive)
+        hdr.setSectionResizeMode(3, _ResizeInteractive)
+        hdr.setSectionResizeMode(4, _ResizeInteractive)
+        hdr.setSectionResizeMode(5, _ResizeInteractive)
+        hdr.setSectionResizeMode(6, _ResizeInteractive)
+        self._tree_widget.setColumnWidth(0, 190)
+        self._tree_widget.setColumnWidth(1, 150)
+        self._tree_widget.setColumnWidth(2, 86)
+        self._tree_widget.setColumnWidth(3, 72)
+        self._tree_widget.setColumnWidth(4, 96)
+        self._tree_widget.setColumnWidth(5, 96)
+        self._tree_widget.setColumnWidth(6, 108)
         self._tree_widget.setContextMenuPolicy(_CustomContextMenu)
         self._tree_widget.customContextMenuRequested.connect(self._on_tree_context_menu)
         self._stack.addWidget(self._tree_widget)
@@ -1451,11 +1527,12 @@ class FileListPanel(QWidget):
             files = limited_files
         self._report_cache = report_cache
         self._report_row_by_path = {}
+        row_cache_for_path_map = self._report_full_cache or self._report_cache or {}
         for p in files:
             norm_p = os.path.normpath(p) if p else ""
             if not norm_p:
                 continue
-            row = report_cache.get(Path(norm_p).stem)
+            row = row_cache_for_path_map.get(Path(norm_p).stem)
             if isinstance(row, dict):
                 self._report_row_by_path[norm_p] = row
         _log.info("[_on_directory_scan_finished] report row path map entries=%s", len(self._report_row_by_path))
@@ -1776,10 +1853,13 @@ class FileListPanel(QWidget):
             )
             return
         row["current_path"] = rel_current_path
+        row["_current_path_report_raw"] = rel_current_path
         if self._report_full_cache and filename in self._report_full_cache:
             self._report_full_cache[filename]["current_path"] = rel_current_path
+            self._report_full_cache[filename]["_current_path_report_raw"] = rel_current_path
         if filename in self._report_cache:
             self._report_cache[filename]["current_path"] = rel_current_path
+            self._report_cache[filename]["_current_path_report_raw"] = rel_current_path
         _log.info(
             "[_sync_report_current_path_from_actual] updated source=%r actual=%r filename=%r old_current_path=%r new_current_path=%r",
             source_path,
@@ -1839,7 +1919,15 @@ class FileListPanel(QWidget):
         return os.path.normpath(os.path.join(base_dir, cp_text))
 
     def _resolve_sidecar_path(self, path: str) -> str | None:
-        cp_abs = self._resolve_report_current_abs_path(path)
+        row = self._get_report_row_for_path(path)
+        cp_abs = None
+        cp_text_raw = _get_report_current_path_raw(row) if isinstance(row, dict) else ""
+        if cp_text_raw:
+            base_dir = self._report_root_dir or self._current_dir
+            if os.path.isabs(cp_text_raw):
+                cp_abs = os.path.normpath(cp_text_raw)
+            elif base_dir:
+                cp_abs = os.path.normpath(os.path.join(base_dir, cp_text_raw))
         if cp_abs and cp_abs.lower().endswith(".xmp") and os.path.isfile(cp_abs):
             _log.info("[_resolve_sidecar_path] source=%r sidecar(report_current)=%r", path, cp_abs)
             return cp_abs
@@ -2147,7 +2235,13 @@ class FileListPanel(QWidget):
         self._pending_loaders = [l for l in self._pending_loaders if l.isRunning()]
 
     def _start_metadata_loader(self, paths: list) -> None:
-        _log.info("[_start_metadata_loader] 为目录文件列表查询 EXIF paths=%s report_cache=%s", len(paths), len(self._report_cache))
+        report_cache_for_meta = self._report_full_cache or self._report_cache
+        _log.info(
+            "[_start_metadata_loader] ????????? EXIF paths=%s report_cache=%s full_report_cache=%s",
+            len(paths),
+            len(self._report_cache),
+            len(self._report_full_cache or {}),
+        )
         _log.info("[_start_metadata_loader] START paths=%s", len(paths))
         self._stop_metadata_loader()
         total = len(paths)
@@ -2160,7 +2254,7 @@ class FileListPanel(QWidget):
         metadata_base_dir = self._report_root_dir or self._current_dir
         loader = MetadataLoader(
             paths,
-            report_cache=self._report_cache,
+            report_cache=report_cache_for_meta,
             current_dir=metadata_base_dir,
         )
         loader.progress_updated.connect(self._on_metadata_progress)
@@ -2519,6 +2613,35 @@ class FileListPanel(QWidget):
         QApplication.clipboard().setMimeData(mime)
         _log.info("[_copy_paths_to_clipboard] platform=%r copied=%s", sys.platform, expanded_paths)
 
+    def _copy_filenames_to_clipboard(self, paths: list[str]) -> None:
+        """Copy file full paths as plain text, one per line, without sidecars."""
+        copied_paths: list[str] = []
+        seen: set[str] = set()
+
+        for p in paths:
+            if not p:
+                continue
+            resolved_path = self._resolve_source_path_for_action(p)
+            full_path = os.path.abspath(resolved_path or p)
+            key = os.path.normcase(os.path.normpath(full_path))
+            if key in seen:
+                continue
+            seen.add(key)
+            copied_paths.append(full_path)
+            _log.info(
+                "[_copy_filenames_to_clipboard] source=%r resolved=%r full_path=%r",
+                p,
+                resolved_path,
+                full_path,
+            )
+
+        if not copied_paths:
+            _log.info("[_copy_filenames_to_clipboard] nothing_to_copy input=%s", len(paths))
+            return
+
+        QApplication.clipboard().setText("\n".join(copied_paths))
+        _log.info("[_copy_filenames_to_clipboard] platform=%r copied=%s", sys.platform, copied_paths)
+
     def _add_species_menu_actions(self, menu: QMenu, primary_path: str | None, paths: list[str]) -> None:
         source_path = primary_path or (paths[0] if paths else "")
         copy_payload = self._get_species_payload_for_path(source_path) if source_path else None
@@ -2550,6 +2673,8 @@ class FileListPanel(QWidget):
         menu = QMenu(self)
         act_copy = menu.addAction("复制")
         act_copy.triggered.connect(lambda: self._copy_paths_to_clipboard(paths))
+        act_copy_filename = menu.addAction("复制文件名")
+        act_copy_filename.triggered.connect(lambda: self._copy_filenames_to_clipboard(paths))
         self._add_species_menu_actions(menu, item.data(0, _UserRole) if item else (paths[0] if paths else ""), paths)
         menu.addSeparator()
         label = "在Finder中显示" if sys.platform == "darwin" else "在资源管理器中显示"
@@ -2578,6 +2703,8 @@ class FileListPanel(QWidget):
         menu = QMenu(self)
         act_copy = menu.addAction("复制")
         act_copy.triggered.connect(lambda: self._copy_paths_to_clipboard(paths))
+        act_copy_filename = menu.addAction("复制文件名")
+        act_copy_filename.triggered.connect(lambda: self._copy_filenames_to_clipboard(paths))
         self._add_species_menu_actions(menu, item.data(_UserRole) if item else (paths[0] if paths else ""), paths)
         menu.addSeparator()
         label = "在Finder中显示" if sys.platform == "darwin" else "在资源管理器中显示"
