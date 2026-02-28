@@ -60,6 +60,7 @@ from app_common.report_db import (
     get_preview_path_for_file,
     find_report_root,
 )
+from app_common.ui_style.styles import COLORS
 
 _log = get_logger("file_browser")
 
@@ -193,6 +194,13 @@ _COLOR_SORT_ORDER: dict[str, int] = {
     k: i for i, k in enumerate(
         ["Red", "Orange", "Yellow", "Green", "Blue", "Purple", "White", ""]
     )
+}
+
+_FOCUS_STATUS_TEXT_COLORS: dict[str, str] = {
+    "精焦": COLORS["success"],
+    "合焦": COLORS["warning"],
+    "偏移": COLORS["text_primary"],
+    "失焦": COLORS["text_secondary"],
 }
 
 
@@ -2157,6 +2165,11 @@ class FileListPanel(QWidget):
         item.setText(4, city);    item.setData(4, _SortRole, city.lower())
         item.setText(5, state);   item.setData(5, _SortRole, state.lower())
         item.setText(6, country); item.setData(6, _SortRole, country.lower())
+        focus_color = _FOCUS_STATUS_TEXT_COLORS.get(country, "")
+        if focus_color:
+            item.setForeground(6, QBrush(QColor(focus_color)))
+        else:
+            item.setForeground(6, QBrush())
 
     # ── 视图模式切换 ────────────────────────────────────────────────────────────
     def _set_view_mode(self, mode: int) -> None:
