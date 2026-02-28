@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 file_browser._browser
 =====================
@@ -108,6 +108,11 @@ except AttributeError:
     _AlignCenter = Qt.AlignCenter  # type: ignore[attr-defined]
 
 try:
+    _AscendingOrder = Qt.SortOrder.AscendingOrder
+except AttributeError:
+    _AscendingOrder = Qt.AscendingOrder  # type: ignore[attr-defined]
+
+try:
     _UserRole = Qt.ItemDataRole.UserRole
 except AttributeError:
     _UserRole = Qt.UserRole  # type: ignore[attr-defined]
@@ -174,6 +179,15 @@ _MetaPickRole = int(_UserRole) + 3    # Pick/Reject 旗标：1=精选, 0=无, -1
 _MetaFocusRole = int(_UserRole) + 4
 _ThumbPixmapRole = int(_UserRole) + 20
 _ThumbSizeRole = int(_UserRole) + 21
+
+_TREE_COL_SEQ = 0
+_TREE_COL_NAME = 1
+_TREE_COL_TITLE = 2
+_TREE_COL_COLOR = 3
+_TREE_COL_STAR = 4
+_TREE_COL_SHARP = 5
+_TREE_COL_AESTHETIC = 6
+_TREE_COL_FOCUS = 7
 
 # 缩略图尺寸档位（像素）
 _THUMB_SIZE_STEPS = [128, 256, 512, 1024]
@@ -250,16 +264,20 @@ def _qcolor_rgba_css(color_value: str, alpha: int) -> str:
     return f"rgba({q.red()}, {q.green()}, {q.blue()}, {a})"
 
 
-def _focus_filter_button_stylesheet(status: str) -> str:
-    color = _FOCUS_STATUS_TEXT_COLORS.get(status, COLORS["text_secondary"])
+def _filter_badge_stylesheet(
+    color_value: str,
+    *,
+    min_width: int = 42,
+    checked_fg: str = "#f5f5f5",
+) -> str:
+    color = color_value or COLORS["text_secondary"]
     border = _qcolor_rgba_css(color, 180)
     bg = _qcolor_rgba_css(color, 28)
     hover_bg = _qcolor_rgba_css(color, 52)
     checked_bg = _qcolor_rgba_css(color, 108)
-    checked_fg = "#111111" if status in ("??", "??") else "#f5f5f5"
     return (
         "QToolButton {"
-        f"font-size: 10px; padding: 1px 6px; min-width: 42px; "
+        f"font-size: 10px; padding: 1px 6px; min-width: {int(min_width)}px; "
         f"border-radius: 9px; border: 1px solid {border}; "
         f"background: {bg}; color: {color};"
         "}"
@@ -270,6 +288,12 @@ def _focus_filter_button_stylesheet(status: str) -> str:
         f"background: {checked_bg}; border: 1px solid {color}; color: {checked_fg};"
         "}"
     )
+
+
+def _focus_filter_button_stylesheet(status: str) -> str:
+    color = _FOCUS_STATUS_TEXT_COLORS.get(status, COLORS["text_secondary"])
+    checked_fg = "#111111" if status in ("??", "??") else "#f5f5f5"
+    return _filter_badge_stylesheet(color, min_width=42, checked_fg=checked_fg)
 
 
 # 右键菜单策略兼容常量
@@ -1512,6 +1536,8 @@ class FileListPanel(QWidget):
         self._meta_apply_list_hits: int = 0
         self._meta_apply_needs_filter: bool = False
         self._tree_header_fast_mode: bool = False
+        self._tree_last_sort_column: int = _TREE_COL_NAME
+        self._tree_last_sort_order = _AscendingOrder
         self._thumb_memory_cache = ThumbnailMemoryCache()
         self._thumb_loader_workers = _thumbnail_loader_worker_count()
         self._thumb_viewport_timer: QTimer | None = None
@@ -1597,7 +1623,14 @@ class FileListPanel(QWidget):
         self._btn_filter_pick.setText("🏆")
         self._btn_filter_pick.setToolTip("只显示精选（Pick=1）")
         self._btn_filter_pick.setCheckable(True)
-        self._btn_filter_pick.setFixedWidth(30)
+        self._btn_filter_pick.setAutoRaise(False)
+        self._btn_filter_pick.setStyleSheet(
+            _filter_badge_stylesheet(
+                COLORS["star_gold"],
+                min_width=34,
+                checked_fg="#111111",
+            )
+        )
         self._btn_filter_pick.clicked.connect(self._on_pick_filter_toggled)
         filter_bar.addWidget(self._btn_filter_pick)
 
@@ -1608,8 +1641,14 @@ class FileListPanel(QWidget):
             btn.setText("★" * n)
             btn.setToolTip(f"只显示 ≥{n} 星")
             btn.setCheckable(True)
-            btn.setFixedWidth(star_widths[n - 1])
-            btn.setStyleSheet("QToolButton { font-size: 10px; padding: 1px; }")
+            btn.setAutoRaise(False)
+            btn.setStyleSheet(
+                _filter_badge_stylesheet(
+                    COLORS["star_gold"],
+                    min_width=star_widths[n - 1],
+                    checked_fg="#111111",
+                )
+            )
             btn.clicked.connect(
                 lambda checked, rating=n: self._on_rating_filter_changed(rating)
             )
@@ -1636,7 +1675,7 @@ class FileListPanel(QWidget):
 
         # ── 列表模式：多列 QTreeWidget ──
         self._tree_widget = QTreeWidget()
-        self._tree_widget.setColumnCount(7)
+        self._tree_widget.setColumnCount(8)
         
         # @Agents: 这个列名不要修改
         # 城市 = 锐度值（越高越清晰）
@@ -1646,7 +1685,7 @@ class FileListPanel(QWidget):
         # 🟢 绿色标签 = 飞鸟
         # 🔴 红色标签 = 精焦（对焦点在鸟头）
         self._tree_widget.setHeaderLabels([
-            "文件名", "标题", "颜色", "星级", "锐度值", "美学评分", "对焦状态"
+            "#", "文件名", "标题", "颜色", "星级", "锐度值", "美学评分", "对焦状态"
         ])
         self._tree_widget.setSortingEnabled(True)
         self._tree_widget.setRootIsDecorated(False)
@@ -1656,20 +1695,18 @@ class FileListPanel(QWidget):
         self._tree_widget.setStyleSheet("QTreeWidget { font-size: 12px; }")
         self._tree_widget.itemClicked.connect(self._on_tree_item_clicked)
         hdr = self._tree_widget.header()
-        hdr.setSectionResizeMode(0, _ResizeInteractive)
-        hdr.setSectionResizeMode(1, _ResizeInteractive)
-        hdr.setSectionResizeMode(2, _ResizeInteractive)
-        hdr.setSectionResizeMode(3, _ResizeInteractive)
-        hdr.setSectionResizeMode(4, _ResizeInteractive)
-        hdr.setSectionResizeMode(5, _ResizeInteractive)
-        hdr.setSectionResizeMode(6, _ResizeInteractive)
-        self._tree_widget.setColumnWidth(0, 190)
-        self._tree_widget.setColumnWidth(1, 150)
-        self._tree_widget.setColumnWidth(2, 86)
-        self._tree_widget.setColumnWidth(3, 72)
-        self._tree_widget.setColumnWidth(4, 96)
-        self._tree_widget.setColumnWidth(5, 96)
-        self._tree_widget.setColumnWidth(6, 108)
+        hdr.sortIndicatorChanged.connect(self._on_tree_sort_indicator_changed)
+        for col in range(8):
+            hdr.setSectionResizeMode(col, _ResizeInteractive)
+        self._tree_widget.setColumnWidth(_TREE_COL_SEQ, 44)
+        self._tree_widget.setColumnWidth(_TREE_COL_NAME, 190)
+        self._tree_widget.setColumnWidth(_TREE_COL_TITLE, 150)
+        self._tree_widget.setColumnWidth(_TREE_COL_COLOR, 86)
+        self._tree_widget.setColumnWidth(_TREE_COL_STAR, 72)
+        self._tree_widget.setColumnWidth(_TREE_COL_SHARP, 96)
+        self._tree_widget.setColumnWidth(_TREE_COL_AESTHETIC, 96)
+        self._tree_widget.setColumnWidth(_TREE_COL_FOCUS, 108)
+        self._tree_widget.sortByColumn(_TREE_COL_NAME, _AscendingOrder)
         self._tree_widget.setContextMenuPolicy(_CustomContextMenu)
         self._tree_widget.customContextMenuRequested.connect(self._on_tree_context_menu)
         self._stack.addWidget(self._tree_widget)
@@ -2090,7 +2127,7 @@ class FileListPanel(QWidget):
         brush = QBrush(QColor("#c0392b")) if mismatch else QBrush()
         ti = self._tree_item_map.get(norm_path)
         if ti is not None:
-            ti.setForeground(0, brush)
+            ti.setForeground(_TREE_COL_NAME, brush)
         li = self._item_map.get(norm_path)
         if li is not None:
             li.setForeground(brush)
@@ -2102,7 +2139,7 @@ class FileListPanel(QWidget):
         tooltip = self._build_path_tooltip(norm_path)
         ti = self._tree_item_map.get(norm_path)
         if ti is not None:
-            ti.setToolTip(0, tooltip)
+            ti.setToolTip(_TREE_COL_NAME, tooltip)
         li = self._item_map.get(norm_path)
         if li is not None:
             li.setToolTip(tooltip)
@@ -2480,15 +2517,17 @@ class FileListPanel(QWidget):
             ft = self._filter_edit.text().strip().lower()
             _log.info("[_rebuild_views] filter_text=%r adding items", ft or "(none)")
 
-            for path in self._filtered_files:
+            for seq, path in enumerate(self._filtered_files, start=1):
                 name = Path(path).name
                 norm = os.path.normpath(path)
                 meta = self._meta_cache.get(norm, {})
 
-                ti = SortableTreeItem([name, "", "", "", "", "", ""])
+                ti = SortableTreeItem([str(seq), name, "", "", "", "", "", ""])
+                ti.setTextAlignment(_TREE_COL_SEQ, _AlignCenter)
                 ti.setData(0, _UserRole, path)
-                ti.setData(0, _SortRole, name.lower())
-                ti.setToolTip(0, self._build_path_tooltip(path))
+                ti.setData(_TREE_COL_SEQ, _SortRole, 0)
+                ti.setData(_TREE_COL_NAME, _SortRole, name.lower())
+                ti.setToolTip(_TREE_COL_NAME, self._build_path_tooltip(path))
                 if meta:
                     self._apply_meta_to_tree_item(ti, meta)
                 self._tree_widget.addTopLevelItem(ti)
@@ -2506,6 +2545,7 @@ class FileListPanel(QWidget):
             self._tree_widget.setSortingEnabled(True)
             self._tree_widget.setUpdatesEnabled(True)
             self._list_widget.setUpdatesEnabled(True)
+            self._refresh_tree_row_numbers()
 
         _log.info("[_rebuild_views] added %s items", len(self._filtered_files))
         if self._view_mode == self._MODE_THUMB:
@@ -2592,13 +2632,13 @@ class FileListPanel(QWidget):
         state   = meta.get("state", "")
         country = meta.get("country", "")
 
-        item.setText(1, title);  item.setData(1, _SortRole, title.lower())
+        item.setText(_TREE_COL_TITLE, title);  item.setData(_TREE_COL_TITLE, _SortRole, title.lower())
         color_display = (_COLOR_LABEL_COLORS.get(color, ("", ""))[1] or color)
-        item.setText(2, color_display);  item.setData(2, _SortRole, _COLOR_SORT_ORDER.get(color, 99))
+        item.setText(_TREE_COL_COLOR, color_display);  item.setData(_TREE_COL_COLOR, _SortRole, _COLOR_SORT_ORDER.get(color, 99))
         if color in _COLOR_LABEL_COLORS:
             hex_c, _ = _COLOR_LABEL_COLORS[color]
-            item.setBackground(2, QBrush(QColor(hex_c)))
-            item.setForeground(2, QBrush(QColor(
+            item.setBackground(_TREE_COL_COLOR, QBrush(QColor(hex_c)))
+            item.setForeground(_TREE_COL_COLOR, QBrush(QColor(
                 "#333" if color in ("Yellow", "White") else "#fff"
             )))
 
@@ -2613,16 +2653,16 @@ class FileListPanel(QWidget):
         else:
             star_text = "★" * rating if rating > 0 else ""
             sort_val  = rating
-        item.setText(3, star_text); item.setData(3, _SortRole, sort_val)
+        item.setText(_TREE_COL_STAR, star_text); item.setData(_TREE_COL_STAR, _SortRole, sort_val)
 
-        item.setText(4, city);    item.setData(4, _SortRole, city.lower())
-        item.setText(5, state);   item.setData(5, _SortRole, state.lower())
-        item.setText(6, country); item.setData(6, _SortRole, country.lower())
+        item.setText(_TREE_COL_SHARP, city);    item.setData(_TREE_COL_SHARP, _SortRole, city.lower())
+        item.setText(_TREE_COL_AESTHETIC, state);   item.setData(_TREE_COL_AESTHETIC, _SortRole, state.lower())
+        item.setText(_TREE_COL_FOCUS, country); item.setData(_TREE_COL_FOCUS, _SortRole, country.lower())
         focus_color = _FOCUS_STATUS_TEXT_COLORS.get(country, "")
         if focus_color:
-            item.setForeground(6, QBrush(QColor(focus_color)))
+            item.setForeground(_TREE_COL_FOCUS, QBrush(QColor(focus_color)))
         else:
-            item.setForeground(6, QBrush())
+            item.setForeground(_TREE_COL_FOCUS, QBrush())
 
     # ── 视图模式切换 ────────────────────────────────────────────────────────────
     def eventFilter(self, obj, event):
@@ -2659,6 +2699,31 @@ class FileListPanel(QWidget):
         if rect.width() <= 0 or rect.height() <= 0:
             self._thumb_visible_range = None
             return None
+
+        # 当内容总高度未超过视口时，直接将当前列表中的全部项视为可见。
+        # 否则 bottom/edge 采样点会落在空白区，导致第三排及之后的缩略图不进入加载队列。
+        if self._list_widget.verticalScrollBar().maximum() <= 0:
+            entries: list[ThumbViewportEntry] = []
+            for i in range(self._list_widget.count()):
+                item = self._list_widget.item(i)
+                if item is None or item.isHidden():
+                    continue
+                path = item.data(_UserRole)
+                if not path:
+                    continue
+                entries.append(ThumbViewportEntry(os.path.normpath(path), item))
+            grid = self._list_widget.gridSize()
+            visible_range = ThumbViewportRange(
+                thumb_size=self._thumb_size,
+                start_row=0,
+                end_row=max(0, self._list_widget.count() - 1),
+                grid_width=max(1, grid.width()),
+                grid_height=max(1, grid.height()),
+                total_items=self._list_widget.count(),
+                entries=tuple(entries),
+            )
+            self._thumb_visible_range = visible_range
+            return visible_range
 
         margin = 8
         sample_points = [
@@ -2959,20 +3024,46 @@ class FileListPanel(QWidget):
         hdr = self._tree_widget.header()
         try:
             if enabled:
-                for col in (2, 3, 4, 5, 6):
+                for col in (_TREE_COL_TITLE, _TREE_COL_COLOR, _TREE_COL_STAR, _TREE_COL_SHARP, _TREE_COL_AESTHETIC, _TREE_COL_FOCUS):
                     hdr.setSectionResizeMode(col, _ResizeInteractive)
                 self._tree_header_fast_mode = True
             else:
-                hdr.setSectionResizeMode(0, _ResizeInteractive)
-                hdr.setSectionResizeMode(1, _ResizeInteractive)
-                hdr.setSectionResizeMode(2, _ResizeToContents)
-                hdr.setSectionResizeMode(3, _ResizeToContents)
-                hdr.setSectionResizeMode(4, _ResizeToContents)
-                hdr.setSectionResizeMode(5, _ResizeToContents)
-                hdr.setSectionResizeMode(6, _ResizeToContents)
+                hdr.setSectionResizeMode(_TREE_COL_SEQ, _ResizeInteractive)
+                hdr.setSectionResizeMode(_TREE_COL_NAME, _ResizeInteractive)
+                hdr.setSectionResizeMode(_TREE_COL_TITLE, _ResizeToContents)
+                hdr.setSectionResizeMode(_TREE_COL_COLOR, _ResizeToContents)
+                hdr.setSectionResizeMode(_TREE_COL_STAR, _ResizeToContents)
+                hdr.setSectionResizeMode(_TREE_COL_SHARP, _ResizeToContents)
+                hdr.setSectionResizeMode(_TREE_COL_AESTHETIC, _ResizeToContents)
+                hdr.setSectionResizeMode(_TREE_COL_FOCUS, _ResizeToContents)
                 self._tree_header_fast_mode = False
         except Exception:
             pass
+
+    def _refresh_tree_row_numbers(self) -> None:
+        total = self._tree_widget.topLevelItemCount()
+        for idx in range(total):
+            item = self._tree_widget.topLevelItem(idx)
+            if item is None:
+                continue
+            item.setText(_TREE_COL_SEQ, str(idx + 1))
+            item.setTextAlignment(_TREE_COL_SEQ, _AlignCenter)
+            item.setData(_TREE_COL_SEQ, _SortRole, 0)
+
+    def _on_tree_sort_indicator_changed(self, column: int, order) -> None:
+        if column == _TREE_COL_SEQ:
+            hdr = self._tree_widget.header()
+            try:
+                hdr.blockSignals(True)
+                hdr.setSortIndicator(self._tree_last_sort_column, self._tree_last_sort_order)
+            finally:
+                hdr.blockSignals(False)
+            self._tree_widget.sortItems(self._tree_last_sort_column, self._tree_last_sort_order)
+            QTimer.singleShot(0, self._refresh_tree_row_numbers)
+            return
+        self._tree_last_sort_column = column
+        self._tree_last_sort_order = order
+        QTimer.singleShot(0, self._refresh_tree_row_numbers)
 
     def _order_meta_items_by_file_list(self, meta_dict: dict) -> list:
         ordered: list = []
@@ -3020,6 +3111,7 @@ class FileListPanel(QWidget):
         _log.info("[STAT][_on_metadata_ready] enabling tree sorting")
         self._set_tree_header_fast_mode(False)
         self._tree_widget.setSortingEnabled(True)
+        self._refresh_tree_row_numbers()
         _log.info("[STAT][_on_metadata_ready] tree sorting enabled elapsed=%.3fs", _time.perf_counter() - sort_t0)
 
         if self._view_mode == self._MODE_THUMB:
@@ -3069,8 +3161,9 @@ class FileListPanel(QWidget):
                 self._apply_meta_to_tree_item(ti, meta)
                 if _DEBUG_FILE_LIST_LIMIT == 1:
                     _log.info(
-                        "[DEBUG][_apply_meta] row_texts name=%r title=%r color=%r star=%r sharp=%r aesthetic=%r focus=%r",
-                        ti.text(0), ti.text(1), ti.text(2), ti.text(3), ti.text(4), ti.text(5), ti.text(6),
+                        "[DEBUG][_apply_meta] row_texts seq=%r name=%r title=%r color=%r star=%r sharp=%r aesthetic=%r focus=%r",
+                        ti.text(_TREE_COL_SEQ), ti.text(_TREE_COL_NAME), ti.text(_TREE_COL_TITLE), ti.text(_TREE_COL_COLOR),
+                        ti.text(_TREE_COL_STAR), ti.text(_TREE_COL_SHARP), ti.text(_TREE_COL_AESTHETIC), ti.text(_TREE_COL_FOCUS),
                     )
             if self._view_mode == self._MODE_THUMB:
                 li = self._item_map.get(norm_path)
@@ -3596,3 +3689,4 @@ class DirectoryBrowserWidget(QWidget):
         act = menu.addAction(label)
         act.triggered.connect(lambda: _reveal_in_file_manager(path))
         _exec_menu(menu, self._tree.viewport().mapToGlobal(pos))
+
