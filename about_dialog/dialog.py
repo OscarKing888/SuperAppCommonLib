@@ -108,7 +108,7 @@ def show_about_dialog(
     """
     app_name = about_info.get("app_name", "").strip() or "应用"
     d = QDialog(parent)
-    d.setWindowTitle(f"关于 {app_name}")
+    d.setWindowTitle(f"关于 {app_name}")    
     main_layout = QVBoxLayout(d)
     main_layout.setSpacing(20)
     main_layout.setContentsMargins(24, 24, 24, 24)
@@ -179,7 +179,7 @@ def show_about_dialog(
     main_layout.addLayout(btn_row)
 
     # ── 底部 Banner（可选）────────────────────────────────────────────────────
-    min_w, min_h = 480, 320
+    min_w, min_h = 720, 320
     if banner_path:
         banner_pix = QPixmap(banner_path)
         if not banner_pix.isNull():
@@ -195,4 +195,5 @@ def show_about_dialog(
             min_h = min_h + 24 + sh
 
     d.setMinimumSize(min_w, min_h)
+    d.resize(min_w, min_h)
     d.exec()
