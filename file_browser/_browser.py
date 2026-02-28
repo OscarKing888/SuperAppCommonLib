@@ -215,6 +215,7 @@ _FOCUS_STATUS_TEXT_COLORS: dict[str, str] = {
     "偏移": COLORS["text_primary"],
     "失焦": COLORS["text_secondary"],
 }
+_FOCUS_FILTER_OPTIONS: tuple[str, ...] = tuple(_FOCUS_STATUS_TEXT_COLORS.keys())
 
 
 def _format_optional_number(raw: str, fmt: str) -> str:
@@ -239,6 +240,36 @@ def _focus_status_to_display(raw: str) -> str:
     if s in ("精焦", "合焦", "偏移", "失焦"):
         return s
     return s
+
+
+def _qcolor_rgba_css(color_value: str, alpha: int) -> str:
+    q = QColor(color_value)
+    if not q.isValid():
+        q = QColor(COLORS["text_secondary"])
+    a = max(0, min(255, int(alpha)))
+    return f"rgba({q.red()}, {q.green()}, {q.blue()}, {a})"
+
+
+def _focus_filter_button_stylesheet(status: str) -> str:
+    color = _FOCUS_STATUS_TEXT_COLORS.get(status, COLORS["text_secondary"])
+    border = _qcolor_rgba_css(color, 180)
+    bg = _qcolor_rgba_css(color, 28)
+    hover_bg = _qcolor_rgba_css(color, 52)
+    checked_bg = _qcolor_rgba_css(color, 108)
+    checked_fg = "#111111" if status in ("??", "??") else "#f5f5f5"
+    return (
+        "QToolButton {"
+        f"font-size: 10px; padding: 1px 6px; min-width: 42px; "
+        f"border-radius: 9px; border: 1px solid {border}; "
+        f"background: {bg}; color: {color};"
+        "}"
+        "QToolButton:hover {"
+        f"background: {hover_bg};"
+        "}"
+        "QToolButton:checked {"
+        f"background: {checked_bg}; border: 1px solid {color}; color: {checked_fg};"
+        "}"
+    )
 
 
 # 右键菜单策略兼容常量
@@ -1451,6 +1482,7 @@ class FileListPanel(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._all_files: list = []
+        self._filtered_files: list = []
         self._current_dir = ""
         self._report_root_dir: str | None = None  # 当前使用的 report 根目录（含 .superpicky 的目录）
         self._report_full_root_dir: str | None = None
@@ -1488,7 +1520,9 @@ class FileListPanel(QWidget):
         # 过滤状态
         self._filter_pick: bool = False   # 只显示精选(🏆)
         self._filter_min_rating: int = 0  # 最低星级(0=不限)
+        self._filter_focus_status: str = ""
         self._star_btns: list = []
+        self._focus_filter_btns: dict[str, QToolButton] = {}
         self._init_ui()
 
     # ── UI 初始化 ──────────────────────────────────────────────────────────────
@@ -1580,6 +1614,19 @@ class FileListPanel(QWidget):
                 lambda checked, rating=n: self._on_rating_filter_changed(rating)
             )
             self._star_btns.append(btn)
+            filter_bar.addWidget(btn)
+
+        for focus_status in _FOCUS_FILTER_OPTIONS:
+            btn = QToolButton()
+            btn.setText(focus_status)
+            btn.setToolTip(f"只显示{focus_status}文件")
+            btn.setCheckable(True)
+            btn.setAutoRaise(False)
+            btn.setStyleSheet(_focus_filter_button_stylesheet(focus_status))
+            btn.clicked.connect(
+                lambda checked, status=focus_status: self._on_focus_filter_changed(status)
+            )
+            self._focus_filter_btns[focus_status] = btn
             filter_bar.addWidget(btn)
 
         layout.addLayout(filter_bar)
@@ -1718,7 +1765,8 @@ class FileListPanel(QWidget):
         return (
             bool(self._filter_edit.text().strip()) or
             self._filter_pick or
-            self._filter_min_rating > 0
+            self._filter_min_rating > 0 or
+            bool(self._filter_focus_status)
         )
 
     def load_directory(self, path: str, force_reload: bool = False) -> None:
@@ -2350,6 +2398,29 @@ class FileListPanel(QWidget):
             thumb_size_ok = False
         return isinstance(pixmap, QPixmap) and not pixmap.isNull() and thumb_size_ok
 
+    def _compute_filtered_files(self) -> list[str]:
+        ft = self._filter_edit.text().strip().lower()
+        fp = self._filter_pick
+        fr = self._filter_min_rating
+        ff = self._filter_focus_status
+        filtered: list[str] = []
+        for path in self._all_files:
+            norm = os.path.normpath(path)
+            name = Path(path).name
+            meta = self._meta_cache.get(norm, {})
+            pick = meta.get("pick", 0)
+            rating = meta.get("rating", 0)
+            if ft and ft not in name.lower():
+                continue
+            if fp and pick != 1:
+                continue
+            if rating < fr:
+                continue
+            if ff and _focus_status_to_display(meta.get("country", "")) != ff:
+                continue
+            filtered.append(path)
+        return filtered
+
     def _update_clear_thumb_cache_button_tooltip(self) -> None:
         stats = self._thumb_memory_cache.stats()
         mb = stats["bytes"] / (1024.0 * 1024.0)
@@ -2385,49 +2456,58 @@ class FileListPanel(QWidget):
             cleared_items,
         )
 
-    def _rebuild_views(self) -> None:
-        """从文件列表重建列表视图和缩略图视图。"""
-        _log.info("[_rebuild_views] START _all_files=%s", len(self._all_files))
-        self._stop_all_loaders()
-        self._tree_widget.setSortingEnabled(False)
-        self._tree_widget.clear()
-        self._tree_item_map = {}
-        self._list_widget.clear()
-        self._item_map = {}
-        ft = self._filter_edit.text().strip().lower()
-        _log.info("[_rebuild_views] filter_text=%r adding items", ft or "(none)")
+    def _rebuild_views(self, stop_loaders: bool = True) -> None:
+        """??????????????????"""
+        if stop_loaders:
+            self._stop_all_loaders()
+        else:
+            self._stop_thumbnail_loader()
+        self._filtered_files = self._compute_filtered_files()
+        _log.info(
+            "[_rebuild_views] START all_files=%s filtered_files=%s stop_loaders=%s",
+            len(self._all_files),
+            len(self._filtered_files),
+            stop_loaders,
+        )
+        self._tree_widget.setUpdatesEnabled(False)
+        self._list_widget.setUpdatesEnabled(False)
+        try:
+            self._tree_widget.setSortingEnabled(False)
+            self._tree_widget.clear()
+            self._tree_item_map = {}
+            self._list_widget.clear()
+            self._item_map = {}
+            ft = self._filter_edit.text().strip().lower()
+            _log.info("[_rebuild_views] filter_text=%r adding items", ft or "(none)")
 
-        added = 0
-        for path in self._all_files:
-            name = Path(path).name
-            if ft and ft not in name.lower():
-                continue
-            norm = os.path.normpath(path)
-            meta = self._meta_cache.get(norm, {})
+            for path in self._filtered_files:
+                name = Path(path).name
+                norm = os.path.normpath(path)
+                meta = self._meta_cache.get(norm, {})
 
-            # 列表节点
-            ti = SortableTreeItem([name, "", "", "", "", "", ""])
-            ti.setData(0, _UserRole, path)
-            ti.setData(0, _SortRole, name.lower())
-            ti.setToolTip(0, self._build_path_tooltip(path))
-            if meta:
-                self._apply_meta_to_tree_item(ti, meta)
-            self._tree_widget.addTopLevelItem(ti)
-            self._tree_item_map[norm] = ti
-            self._apply_path_status_to_items(norm)
+                ti = SortableTreeItem([name, "", "", "", "", "", ""])
+                ti.setData(0, _UserRole, path)
+                ti.setData(0, _SortRole, name.lower())
+                ti.setToolTip(0, self._build_path_tooltip(path))
+                if meta:
+                    self._apply_meta_to_tree_item(ti, meta)
+                self._tree_widget.addTopLevelItem(ti)
+                self._tree_item_map[norm] = ti
+                self._apply_path_status_to_items(norm)
 
-            # 缩略图节点
-            li = QListWidgetItem(name)
-            li.setData(_UserRole, path)
-            li.setToolTip(self._build_path_tooltip(path))
-            self._reset_thumb_item_state(li, meta)
-            self._item_map[norm] = li
-            self._apply_path_status_to_items(norm)
-            self._list_widget.addItem(li)
-            added += 1
+                li = QListWidgetItem(name)
+                li.setData(_UserRole, path)
+                li.setToolTip(self._build_path_tooltip(path))
+                self._reset_thumb_item_state(li, meta)
+                self._item_map[norm] = li
+                self._apply_path_status_to_items(norm)
+                self._list_widget.addItem(li)
+        finally:
+            self._tree_widget.setSortingEnabled(True)
+            self._tree_widget.setUpdatesEnabled(True)
+            self._list_widget.setUpdatesEnabled(True)
 
-        self._tree_widget.setSortingEnabled(True)
-        _log.info("[_rebuild_views] added %s items", added)
+        _log.info("[_rebuild_views] added %s items", len(self._filtered_files))
         if self._view_mode == self._MODE_THUMB:
             _log.info("[_rebuild_views] thumb mode: update thumb display + schedule visible loader")
             self._invalidate_visible_thumbnail_signature()
@@ -2436,69 +2516,68 @@ class FileListPanel(QWidget):
         _log.info("[_rebuild_views] END")
 
     def _apply_filter(self) -> None:
-        """统一过滤：文件名文字 + 精选旗标 + 最低星级，三者 AND 组合。"""
+        """???????????????????????????????????"""
         ft = self._filter_edit.text().strip().lower()
         fp = self._filter_pick
         fr = self._filter_min_rating
-        _log.info("[_apply_filter] START files=%s pick=%s min_rating=%s", len(self._all_files), fp, fr)
         t0 = _time.perf_counter()
-        total = len(self._all_files)
-        visible = 0
-
-        for idx, path in enumerate(self._all_files, 1):
-            norm = os.path.normpath(path)
-            name = Path(path).name
-            meta = self._meta_cache.get(norm, {})
-            pick   = meta.get("pick", 0)
-            rating = meta.get("rating", 0)
-
-            name_ok   = not ft or ft in name.lower()
-            pick_ok   = not fp or pick == 1
-            rating_ok = rating >= fr
-
-            hidden = not (name_ok and pick_ok and rating_ok)
-            if not hidden:
-                visible += 1
-
-            ti = self._tree_item_map.get(norm)
-            if ti is not None:
-                ti.setHidden(hidden)
-            li = self._item_map.get(norm)
-            if li is not None:
-                li.setHidden(hidden)
-            if idx % 2000 == 0:
-                _log.info(
-                    "[STAT][_apply_filter] progress=%s/%s elapsed=%.3fs",
-                    idx,
-                    total,
-                    _time.perf_counter() - t0,
-                )
+        filtered = self._compute_filtered_files()
+        old_filtered = list(self._filtered_files)
+        self._filtered_files = filtered
+        _log.info(
+            "[_apply_filter] START files=%s filtered=%s pick=%s min_rating=%s text=%r",
+            len(self._all_files),
+            len(filtered),
+            fp,
+            fr,
+            ft or "(none)",
+        )
+        if old_filtered == filtered and len(self._tree_item_map) == len(filtered) and len(self._item_map) == len(filtered):
+            _log.info("[_apply_filter] SKIP unchanged elapsed=%.3fs", _time.perf_counter() - t0)
+            return
+        self._rebuild_views(stop_loaders=False)
         _log.info(
             "[_apply_filter] END visible=%s hidden=%s elapsed=%.3fs",
-            visible,
-            max(0, total - visible),
+            len(filtered),
+            max(0, len(self._all_files) - len(filtered)),
             _time.perf_counter() - t0,
         )
-        if self._view_mode == self._MODE_THUMB:
-            self._invalidate_visible_thumbnail_signature()
-            self._schedule_visible_thumbnail_update()
 
     def _on_pick_filter_toggled(self) -> None:
         """切换精选过滤：只显示 Pick=1 的文件。有任意过滤时递归子目录，无过滤时仅当前目录。"""
         self._filter_pick = self._btn_filter_pick.isChecked()
+        if self._filter_min_rating != 0:
+            self._filter_min_rating = 0
+            for btn in self._star_btns:
+                btn.setChecked(False)
         if self._current_dir and os.path.isdir(self._current_dir):
             self.load_directory(self._current_dir, force_reload=True)
         else:
             self._apply_filter()
 
     def _on_rating_filter_changed(self, n: int) -> None:
-        """切换最低星级过滤：点击已激活的按钮则取消。有任意过滤时递归子目录，无过滤时仅当前目录。"""
+        """???????????????????????????????????????????"""
         if self._filter_min_rating == n:
             self._filter_min_rating = 0
         else:
             self._filter_min_rating = n
+            if self._filter_pick:
+                self._filter_pick = False
+                self._btn_filter_pick.setChecked(False)
         for i, btn in enumerate(self._star_btns):
             btn.setChecked(i + 1 == self._filter_min_rating)
+        if self._current_dir and os.path.isdir(self._current_dir):
+            self.load_directory(self._current_dir, force_reload=True)
+        else:
+            self._apply_filter()
+
+    def _on_focus_filter_changed(self, status: str) -> None:
+        if self._filter_focus_status == status:
+            self._filter_focus_status = ""
+        else:
+            self._filter_focus_status = status
+        for key, btn in self._focus_filter_btns.items():
+            btn.setChecked(key == self._filter_focus_status)
         if self._current_dir and os.path.isdir(self._current_dir):
             self.load_directory(self._current_dir, force_reload=True)
         else:
@@ -2898,7 +2977,8 @@ class FileListPanel(QWidget):
     def _order_meta_items_by_file_list(self, meta_dict: dict) -> list:
         ordered: list = []
         seen: set = set()
-        for p in self._all_files:
+        preferred = self._filtered_files or self._all_files
+        for p in preferred:
             norm = os.path.normpath(p)
             if norm in meta_dict:
                 ordered.append((norm, meta_dict[norm]))
@@ -2919,7 +2999,7 @@ class FileListPanel(QWidget):
         self._meta_apply_list_hits = 0
         self._meta_apply_started_at = _time.perf_counter()
         self._meta_apply_loop_started_at = self._meta_apply_started_at
-        self._meta_apply_needs_filter = bool(self._filter_pick or self._filter_min_rating > 0)
+        self._meta_apply_needs_filter = bool(self._filter_pick or self._filter_min_rating > 0 or self._filter_focus_status)
 
         self._set_tree_header_fast_mode(True)
         self._tree_widget.setSortingEnabled(False)
