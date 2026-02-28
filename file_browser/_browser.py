@@ -1109,6 +1109,7 @@ class FileListPanel(QWidget):
         self._path_lookup_pending: set[str] = set()
         self._path_lookup_workers: list[PathLookupWorker] = []
         self._selected_display_path: str = ""
+        self._copied_species_payload: dict | None = None
         self._pending_loaders: list = []
         self._meta_apply_timer: QTimer | None = None
         self._meta_apply_items: list = []
@@ -1478,6 +1479,99 @@ class FileListPanel(QWidget):
     def get_report_cache(self) -> dict:
         """返回当前目录的 report 缓存：stem（不含扩展名）→ report 行 dict。无缓存时返回空 dict。"""
         return self._report_cache
+
+    def _get_species_payload_for_path(self, path: str) -> dict | None:
+        row = self._get_report_row_for_path(path)
+        if not isinstance(row, dict):
+            return None
+        filename = str(row.get("filename") or Path(path).stem or "").strip()
+        if not filename:
+            return None
+        return {
+            "filename": filename,
+            "source_path": os.path.normpath(path) if path else "",
+            "bird_species_cn": str(row.get("bird_species_cn") or "").strip(),
+            "bird_species_en": str(row.get("bird_species_en") or "").strip(),
+        }
+
+    def _copy_species_from_path(self, path: str) -> None:
+        payload = self._get_species_payload_for_path(path)
+        if not payload:
+            _log.info("[_copy_species_from_path] skip source=%r reason=no_report_row", path)
+            return
+        self._copied_species_payload = payload
+        _log.info(
+            "[_copy_species_from_path] source=%r filename=%r bird_species_cn=%r bird_species_en=%r",
+            path,
+            payload.get("filename"),
+            payload.get("bird_species_cn"),
+            payload.get("bird_species_en"),
+        )
+
+    def _get_paste_species_action_text(self) -> str:
+        payload = self._copied_species_payload or {}
+        label = str(payload.get("bird_species_cn") or payload.get("filename") or "").strip()
+        if label:
+            return f"粘贴鸟种名称（{label}）"
+        return "粘贴鸟种名称"
+
+    def _paste_species_to_paths(self, paths: list[str]) -> None:
+        payload = self._copied_species_payload
+        if not payload:
+            _log.info("[_paste_species_to_paths] skip reason=no_copied_species")
+            return
+        db_dir = self._report_root_dir or self._current_dir
+        db = ReportDB.open_if_exists(db_dir) if db_dir else None
+        if db is None:
+            _log.info("[_paste_species_to_paths] skip db_dir=%r reason=no_report_db", db_dir)
+            return
+
+        cn = str(payload.get("bird_species_cn") or "").strip()
+        en = str(payload.get("bird_species_en") or "").strip()
+        data = {
+            "bird_species_cn": cn,
+            "bird_species_en": en,
+        }
+        updated = 0
+        attempted = 0
+        updated_stems: set[str] = set()
+        try:
+            for path in paths:
+                row = self._get_report_row_for_path(path)
+                filename = str((row or {}).get("filename") or Path(path).stem or "").strip()
+                if not filename or filename in updated_stems:
+                    continue
+                attempted += 1
+                if not db.update_photo(filename, data):
+                    continue
+                updated_stems.add(filename)
+                updated += 1
+                if isinstance(row, dict):
+                    row["bird_species_cn"] = cn
+                    row["bird_species_en"] = en
+                if self._report_full_cache and filename in self._report_full_cache:
+                    self._report_full_cache[filename]["bird_species_cn"] = cn
+                    self._report_full_cache[filename]["bird_species_en"] = en
+                if filename in self._report_cache:
+                    self._report_cache[filename]["bird_species_cn"] = cn
+                    self._report_cache[filename]["bird_species_en"] = en
+                norm_path = os.path.normpath(path) if path else ""
+                if norm_path:
+                    meta = self._meta_cache.setdefault(norm_path, {})
+                    if isinstance(meta, dict):
+                        meta["bird_species_cn"] = cn
+                        meta["bird_species_en"] = en
+        finally:
+            db.close()
+
+        _log.info(
+            "[_paste_species_to_paths] source_filename=%r bird_species_cn=%r bird_species_en=%r attempted=%s updated=%s",
+            payload.get("filename"),
+            cn,
+            en,
+            attempted,
+            updated,
+        )
 
     def _get_actual_path_for_display(self, path: str) -> str | None:
         actual = _get_cached_actual_path(path)
@@ -2296,6 +2390,20 @@ class FileListPanel(QWidget):
         QApplication.clipboard().setMimeData(mime)
         _log.info("[_copy_paths_to_clipboard] platform=%r copied=%s", sys.platform, expanded_paths)
 
+    def _add_species_menu_actions(self, menu: QMenu, primary_path: str | None, paths: list[str]) -> None:
+        source_path = primary_path or (paths[0] if paths else "")
+        copy_payload = self._get_species_payload_for_path(source_path) if source_path else None
+        act_copy_species = menu.addAction("复制鸟种名称")
+        act_copy_species.setEnabled(copy_payload is not None)
+        if copy_payload is not None:
+            act_copy_species.triggered.connect(lambda: self._copy_species_from_path(source_path))
+
+        act_paste_species = menu.addAction(self._get_paste_species_action_text())
+        can_paste = self._copied_species_payload is not None and bool(paths) and bool(self._report_root_dir or self._current_dir)
+        act_paste_species.setEnabled(can_paste)
+        if can_paste:
+            act_paste_species.triggered.connect(lambda: self._paste_species_to_paths(paths))
+
     def _on_tree_context_menu(self, pos) -> None:
         item = self._tree_widget.itemAt(pos)
         if item is not None and not item.isSelected():
@@ -2313,6 +2421,7 @@ class FileListPanel(QWidget):
         menu = QMenu(self)
         act_copy = menu.addAction("复制")
         act_copy.triggered.connect(lambda: self._copy_paths_to_clipboard(paths))
+        self._add_species_menu_actions(menu, item.data(0, _UserRole) if item else (paths[0] if paths else ""), paths)
         menu.addSeparator()
         label = "在Finder中显示" if sys.platform == "darwin" else "在资源管理器中显示"
         reveal_path = self._resolve_reveal_path(item.data(0, _UserRole) if item else (paths[0] if paths else None))
@@ -2340,6 +2449,7 @@ class FileListPanel(QWidget):
         menu = QMenu(self)
         act_copy = menu.addAction("复制")
         act_copy.triggered.connect(lambda: self._copy_paths_to_clipboard(paths))
+        self._add_species_menu_actions(menu, item.data(_UserRole) if item else (paths[0] if paths else ""), paths)
         menu.addSeparator()
         label = "在Finder中显示" if sys.platform == "darwin" else "在资源管理器中显示"
         reveal_path = self._resolve_reveal_path(item.data(_UserRole) if item else (paths[0] if paths else None))
