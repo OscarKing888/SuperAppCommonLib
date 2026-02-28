@@ -704,7 +704,9 @@ class DirectoryScanWorker(QThread):
                 len(files),
             )
             try:
-                actual_files = _collect_image_files_impl(self._path, self._recursive)
+                # In report mode the DB view is subtree-based even without UI filters,
+                # so actual file supplementation must recurse under the selected dir.
+                actual_files = _collect_image_files_impl(self._path, True)
                 full_cache = full_report_cache or report_cache or {}
                 existing = {_path_key(p) for p in files if p}
                 file_index_by_stem = {Path(p).stem: i for i, p in enumerate(files) if p}
