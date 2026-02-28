@@ -1358,6 +1358,85 @@ class FileListPanel(QWidget):
         """返回当前目录的 report 缓存：stem（不含扩展名）→ report 行 dict。无缓存时返回空 dict。"""
         return self._report_cache
 
+    def resolve_preview_path(self, path: str) -> str:
+        """Resolve display preview path for a source file, preferring report temp_jpeg_path."""
+        norm_path = os.path.normpath(path) if path else ""
+        if not norm_path:
+            return path
+        preview_base_dir = self._report_root_dir or self._current_dir
+        report_cache = self._report_full_cache or self._report_cache or {}
+        preview_path = get_preview_path_for_file(norm_path, preview_base_dir, report_cache)
+        _log.info(
+            "[resolve_preview_path] source=%r preview=%r preview_base_dir=%r report_entries=%s",
+            norm_path,
+            preview_path,
+            preview_base_dir,
+            len(report_cache),
+        )
+        return preview_path or norm_path
+
+    def _get_report_row_for_path(self, path: str) -> dict | None:
+        stem = Path(path).stem if path else ""
+        if not stem:
+            return None
+        cache = self._report_full_cache or self._report_cache or {}
+        row = cache.get(stem)
+        return row if isinstance(row, dict) else None
+
+    def _resolve_report_current_abs_path(self, path: str) -> str | None:
+        row = self._get_report_row_for_path(path)
+        if not row:
+            return None
+        cp_text = str(row.get("current_path") or "").strip()
+        if not cp_text:
+            return None
+        base_dir = self._report_root_dir or self._current_dir
+        if os.path.isabs(cp_text):
+            return os.path.normpath(cp_text)
+        if not base_dir:
+            return None
+        return os.path.normpath(os.path.join(base_dir, cp_text))
+
+    def _resolve_sidecar_path(self, path: str) -> str | None:
+        cp_abs = self._resolve_report_current_abs_path(path)
+        if cp_abs and cp_abs.lower().endswith(".xmp") and os.path.isfile(cp_abs):
+            return cp_abs
+        try:
+            xmp_path = find_xmp_sidecar(path)
+        except Exception:
+            xmp_path = None
+        if xmp_path and os.path.isfile(xmp_path):
+            return os.path.normpath(os.path.abspath(xmp_path))
+        return None
+
+    def _resolve_source_path_for_action(self, path: str) -> str:
+        norm_path = os.path.normpath(path) if path else ""
+        if norm_path and os.path.isfile(norm_path):
+            return norm_path
+
+        row = self._get_report_row_for_path(norm_path)
+        cp_abs = self._resolve_report_current_abs_path(norm_path)
+        if row and cp_abs:
+            if os.path.isfile(cp_abs) and Path(cp_abs).suffix.lower() in IMAGE_EXTENSIONS:
+                return cp_abs
+            op = str(row.get("original_path") or "").strip()
+            ext_orig = Path(op).suffix.lower() if op else ""
+            if ext_orig:
+                sibling_source = str(Path(cp_abs).with_suffix(ext_orig))
+                if os.path.isfile(sibling_source):
+                    return os.path.normpath(sibling_source)
+
+        return norm_path
+
+    def _resolve_reveal_path(self, path: str) -> str:
+        source_path = self._resolve_source_path_for_action(path)
+        if source_path and os.path.exists(source_path):
+            return source_path
+        xmp_path = self._resolve_sidecar_path(path)
+        if xmp_path and os.path.exists(xmp_path):
+            return xmp_path
+        return source_path or path
+
     def _rebuild_views(self) -> None:
         """从文件列表重建列表视图和缩略图视图。"""
         _log.info("[_rebuild_views] START _all_files=%s", len(self._all_files))
@@ -1382,6 +1461,7 @@ class FileListPanel(QWidget):
             ti = SortableTreeItem([name, "", "", "", "", "", ""])
             ti.setData(0, _UserRole, path)
             ti.setData(0, _SortRole, name.lower())
+            ti.setToolTip(0, path)
             if meta:
                 self._apply_meta_to_tree_item(ti, meta)
             self._tree_widget.addTopLevelItem(ti)
@@ -1888,15 +1968,27 @@ class FileListPanel(QWidget):
 
     def _on_tree_item_clicked(self, item, column) -> None:
         path = item.data(0, _UserRole)
-        if path and os.path.isfile(path):
-            _log.info("[_on_tree_item_clicked] 选中照片，触发 EXIF 查询 path=%r", path)
-            self.file_selected.emit(path)
+        if path:
+            resolved_path = self._resolve_source_path_for_action(path)
+            _log.info(
+                "[_on_tree_item_clicked] source=%r resolved=%r exists=%s",
+                path,
+                resolved_path,
+                os.path.isfile(resolved_path) if resolved_path else False,
+            )
+            self.file_selected.emit(resolved_path or path)
 
     def _on_list_item_clicked(self, item) -> None:
         path = item.data(_UserRole)
-        if path and os.path.isfile(path):
-            _log.info("[_on_list_item_clicked] 选中照片，触发 EXIF 查询 path=%r", path)
-            self.file_selected.emit(path)
+        if path:
+            resolved_path = self._resolve_source_path_for_action(path)
+            _log.info(
+                "[_on_list_item_clicked] source=%r resolved=%r exists=%s",
+                path,
+                resolved_path,
+                os.path.isfile(resolved_path) if resolved_path else False,
+            )
+            self.file_selected.emit(resolved_path or path)
 
     def _copy_paths_to_clipboard(self, paths: list) -> None:
         """将本地文件路径写入剪贴板；若存在同名 XMP sidecar 也一并复制。"""
@@ -1904,19 +1996,19 @@ class FileListPanel(QWidget):
         seen: set[str] = set()
 
         for p in paths:
-            if not p or not os.path.isfile(p):
+            if not p:
                 continue
-            abs_path = os.path.abspath(p)
+            abs_path = self._resolve_source_path_for_action(p)
+            if not abs_path or not os.path.isfile(abs_path):
+                continue
+            abs_path = os.path.abspath(abs_path)
             norm_key = os.path.normcase(os.path.normpath(abs_path))
             if norm_key not in seen:
                 expanded_paths.append(abs_path)
                 seen.add(norm_key)
 
             # 同步带上 sidecar（如 IMG_0001.CR3 -> IMG_0001.xmp）
-            try:
-                xmp_path = find_xmp_sidecar(abs_path)
-            except Exception:
-                xmp_path = None
+            xmp_path = self._resolve_sidecar_path(p)
             if xmp_path and os.path.isfile(xmp_path):
                 abs_xmp = os.path.abspath(xmp_path)
                 xmp_key = os.path.normcase(os.path.normpath(abs_xmp))
@@ -1949,7 +2041,7 @@ class FileListPanel(QWidget):
         act_copy.triggered.connect(lambda: self._copy_paths_to_clipboard(paths))
         menu.addSeparator()
         label = "在 Finder 中显示" if sys.platform == "darwin" else "在资源管理器中显示"
-        reveal_path = item.data(0, _UserRole) if item else (paths[0] if paths else None)
+        reveal_path = self._resolve_reveal_path(item.data(0, _UserRole) if item else (paths[0] if paths else None))
         if reveal_path:
             act_reveal = menu.addAction(label)
             act_reveal.triggered.connect(lambda: _reveal_in_file_manager(reveal_path))
@@ -1975,7 +2067,7 @@ class FileListPanel(QWidget):
         act_copy.triggered.connect(lambda: self._copy_paths_to_clipboard(paths))
         menu.addSeparator()
         label = "在 Finder 中显示" if sys.platform == "darwin" else "在资源管理器中显示"
-        reveal_path = item.data(_UserRole) if item else (paths[0] if paths else None)
+        reveal_path = self._resolve_reveal_path(item.data(_UserRole) if item else (paths[0] if paths else None))
         if reveal_path:
             act_reveal = menu.addAction(label)
             act_reveal.triggered.connect(lambda: _reveal_in_file_manager(reveal_path))
