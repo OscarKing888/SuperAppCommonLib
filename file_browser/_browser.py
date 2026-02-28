@@ -280,6 +280,40 @@ def _norm_rel_path_for_match(path_text: str) -> str:
     return os.path.normcase(s)
 
 
+def _select_report_scope_files(
+    selected_dir: str,
+    report_root: str,
+    full_report_cache: dict,
+) -> tuple[list, dict]:
+    """Filter full report cache down to the selected directory subtree."""
+    files: list = []
+    selected_report_cache: dict = {}
+    selected_dir = os.path.normpath(selected_dir)
+    report_root = os.path.normpath(report_root)
+    selected_rel = ""
+    if _is_same_or_child_path(report_root, selected_dir):
+        try:
+            selected_rel = os.path.relpath(selected_dir, report_root)
+        except Exception:
+            selected_rel = ""
+    selected_rel_norm = _norm_rel_path_for_match(selected_rel)
+
+    for stem, row in sorted(full_report_cache.items(), key=lambda kv: (kv[0].lower() if kv[0] else "")):
+        cp_text = str(row.get("current_path") or "").strip()
+        if selected_rel_norm and cp_text and not os.path.isabs(cp_text):
+            cp_norm = _norm_rel_path_for_match(cp_text)
+            if cp_norm != selected_rel_norm and not cp_norm.startswith(selected_rel_norm + os.sep):
+                continue
+        full_path = _resolve_report_full_path(row, report_root, selected_dir)
+        if not full_path:
+            continue
+        if not _is_same_or_child_path(selected_dir, full_path):
+            continue
+        files.append(full_path)
+        selected_report_cache[stem] = row
+    return files, selected_report_cache
+
+
 def _reveal_in_file_manager(path: str) -> None:
     """
     在系统文件管理器中定位并高亮显示指定文件或目录。
@@ -527,45 +561,68 @@ class ThumbnailLoader(QThread):
 class DirectoryScanWorker(QThread):
     """在后台执行目录扫描与 report.db 加载，完成后通过信号回传结果。"""
 
-    scan_finished = pyqtSignal(str, object, object)  # (path, files_list, report_cache_dict)
+    scan_finished = pyqtSignal(str, object, object, object)  # (path, files_list, selected_report_cache, full_report_cache_or_none)
 
-    def __init__(self, path: str, recursive: bool, report_root: str | None = None, parent=None) -> None:
+    def __init__(
+        self,
+        path: str,
+        recursive: bool,
+        report_root: str | None = None,
+        report_cache_full: dict | None = None,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self._path = path
         self._recursive = recursive
         self._report_root = report_root
+        self._report_cache_full = report_cache_full
 
     def run(self) -> None:
         _log.info(
-            "[DirectoryScanWorker.run] START path=%r recursive=%s report_root=%r",
+            "[DirectoryScanWorker.run] START path=%r recursive=%s report_root=%r has_cached_full_report=%s",
             self._path,
             self._recursive,
             self._report_root,
+            self._report_cache_full is not None,
         )
         report_cache: dict = {}
+        full_report_cache: dict | None = self._report_cache_full
+        report_source_available = self._report_cache_full is not None
         try:
-            db_dir = self._report_root or self._path
-            db = ReportDB.open_if_exists(db_dir)
-            if db:
-                try:
-                    for row in db.get_all_photos():
-                        r = dict(row)
-                        stem = r.get("filename")
-                        if stem is not None:
-                            report_cache[stem] = r
-                finally:
-                    db.close()
-            _log.info("[DirectoryScanWorker.run] report_cache loaded %s entries", len(report_cache))
+            if self._report_cache_full is not None:
+                report_cache = self._report_cache_full
+                _log.info("[DirectoryScanWorker.run] reuse cached full report_cache %s entries", len(report_cache))
+            else:
+                db_dir = self._report_root or self._path
+                db = ReportDB.open_if_exists(db_dir)
+                if db:
+                    report_source_available = True
+                    full_report_cache = {}
+                    try:
+                        for row in db.get_all_photos():
+                            r = dict(row)
+                            stem = r.get("filename")
+                            if stem is not None:
+                                full_report_cache[stem] = r
+                    finally:
+                        db.close()
+                    report_cache = full_report_cache
+                _log.info("[DirectoryScanWorker.run] report_cache loaded %s entries", len(report_cache))
         except Exception as e:
             _log.warning("[DirectoryScanWorker.run] report load failed: %s", e)
         if self.isInterruptionRequested():
             _log.info("[DirectoryScanWorker.run] interrupted after report")
             return
         files: list = []
-        if report_cache:
+        if report_source_available and self._report_root:
             # 当 report.db 有记录时，用 DB 中 current_path（相对选中目录）拼出完整路径，扩展名用 original_path 的（如 .ARW）
             selected_dir = os.path.normpath(self._path)
-            report_root = os.path.normpath(self._report_root or self._path)
+            report_root = os.path.normpath(self._report_root)
+            files, report_cache = _select_report_scope_files(
+                selected_dir=selected_dir,
+                report_root=report_root,
+                full_report_cache=report_cache,
+            )
             selected_rel = ""
             if _is_same_or_child_path(report_root, selected_dir):
                 try:
@@ -573,21 +630,6 @@ class DirectoryScanWorker(QThread):
                 except Exception:
                     selected_rel = ""
             selected_rel_norm = _norm_rel_path_for_match(selected_rel)
-            selected_report_cache: dict = {}
-            for stem, row in sorted(report_cache.items(), key=lambda kv: (kv[0].lower() if kv[0] else "")):
-                cp_text = str(row.get("current_path") or "").strip()
-                if selected_rel_norm and cp_text and not os.path.isabs(cp_text):
-                    cp_norm = _norm_rel_path_for_match(cp_text)
-                    if cp_norm != selected_rel_norm and not cp_norm.startswith(selected_rel_norm + os.sep):
-                        continue
-                full_path = _resolve_report_full_path(row, report_root, self._path)
-                if not full_path:
-                    continue
-                if not _is_same_or_child_path(selected_dir, full_path):
-                    continue
-                files.append(full_path)
-                selected_report_cache[stem] = row
-            report_cache = selected_report_cache
             _log.info(
                 "[DirectoryScanWorker.run] selected scope files=%s selected_report_cache=%s selected_dir=%r selected_rel=%r report_root=%r",
                 len(files), len(report_cache), selected_dir, selected_rel_norm or ".", report_root,
@@ -618,7 +660,7 @@ class DirectoryScanWorker(QThread):
         _log.info("[DirectoryScanWorker.run] 目录扫描完成：列出 %s 个图像文件，report_cache %s 条，即将通知主线程加载 EXIF", len(files), len(report_cache))
         _log.info("[DirectoryScanWorker.run] scan done files=%s", len(files))
         if not self.isInterruptionRequested():
-            self.scan_finished.emit(self._path, files, report_cache)
+            self.scan_finished.emit(self._path, files, report_cache, full_report_cache)
             _log.info("[DirectoryScanWorker.run] emit scan_finished END")
 
 
@@ -946,6 +988,8 @@ class FileListPanel(QWidget):
         self._all_files: list = []
         self._current_dir = ""
         self._report_root_dir: str | None = None  # 当前使用的 report 根目录（含 .superpicky 的目录）
+        self._report_full_root_dir: str | None = None
+        self._report_full_cache: dict | None = None
         self._view_mode = self._MODE_LIST
         self._thumb_size = 128
         self._thumbnail_loader: ThumbnailLoader | None = None
@@ -954,7 +998,7 @@ class FileListPanel(QWidget):
         self._item_map:      dict = {}   # norm_path → QListWidgetItem  (缩略图)
         self._tree_item_map: dict = {}   # norm_path → SortableTreeItem (列表)
         self._meta_cache:    dict = {}   # norm_path → metadata dict
-        self._report_cache:  dict = {}   # stem → report row (当前目录 .superpicky/report.db 缓存)
+        self._report_cache:  dict = {}   # stem → report row (当前目录/子树筛出的 report 子集)
         self._pending_loaders: list = []
         self._meta_apply_timer: QTimer | None = None
         self._meta_apply_items: list = []
@@ -1179,9 +1223,37 @@ class FileListPanel(QWidget):
             _log.info("[load_directory] SKIP same dir")
             return
         self._current_dir = path
-        # 选择目录后，向上查找最近的 report 根目录；子目录共用同一个 report.db
-        self._report_root_dir = find_report_root(path)
-        _log.info("[load_directory] report_root_dir=%r", self._report_root_dir)
+        # 选择目录后，向上最多查找 4 层最近的 report 根目录；子目录共用同一个 report.db
+        new_report_root_dir = find_report_root(path, max_levels=4)
+        if new_report_root_dir != self._report_root_dir:
+            _log.info(
+                "[load_directory] report_root_dir changed old=%r new=%r",
+                self._report_root_dir,
+                new_report_root_dir,
+            )
+        self._report_root_dir = new_report_root_dir
+        if self._report_root_dir:
+            if self._report_full_root_dir != self._report_root_dir:
+                _log.info(
+                    "[load_directory] reset in-memory full report cache old_root=%r new_root=%r",
+                    self._report_full_root_dir,
+                    self._report_root_dir,
+                )
+                self._report_full_root_dir = self._report_root_dir
+                self._report_full_cache = None
+        elif self._report_full_root_dir is not None or self._report_full_cache is not None:
+            _log.info(
+                "[load_directory] clear in-memory full report cache old_root=%r",
+                self._report_full_root_dir,
+            )
+            self._report_full_root_dir = None
+            self._report_full_cache = None
+        _log.info(
+            "[load_directory] report_root_dir=%r has_cached_full_report=%s cached_entries=%s",
+            self._report_root_dir,
+            self._report_full_cache is not None,
+            len(self._report_full_cache or {}),
+        )
         _log.info("[load_directory] _stop_all_loaders")
         self._stop_all_loaders()
         _log.info("[load_directory] _stop_directory_scan_worker")
@@ -1193,11 +1265,18 @@ class FileListPanel(QWidget):
         self._rebuild_views()
         recursive = self._has_any_filter()
         _log.info(
-            "[load_directory] starting DirectoryScanWorker recursive=%s report_root_dir=%r",
+            "[load_directory] starting DirectoryScanWorker recursive=%s report_root_dir=%r has_cached_full_report=%s",
             recursive,
             self._report_root_dir,
+            self._report_full_cache is not None,
         )
-        self._directory_scan_worker = DirectoryScanWorker(path, recursive, self._report_root_dir, self)
+        self._directory_scan_worker = DirectoryScanWorker(
+            path,
+            recursive,
+            self._report_root_dir,
+            self._report_full_cache if self._report_root_dir and self._report_full_root_dir == self._report_root_dir else None,
+            self,
+        )
         self._directory_scan_worker.scan_finished.connect(self._on_directory_scan_finished)
         self._directory_scan_worker.start()
         _log.info("[load_directory] END worker.started")
@@ -1214,12 +1293,21 @@ class FileListPanel(QWidget):
         self._directory_scan_worker.requestInterruption()
         self._directory_scan_worker = None
 
-    def _on_directory_scan_finished(self, path: str, files: list, report_cache: dict) -> None:
+    def _on_directory_scan_finished(self, path: str, files: list, report_cache: dict, full_report_cache) -> None:
         _log.info("[_on_directory_scan_finished] 收到目录扫描结果 path=%r files=%s report_entries=%s，开始列出文件并查询 EXIF", path, len(files), len(report_cache))
         _log.info("[_on_directory_scan_finished] path=%r _current_dir=%r files=%s report_entries=%s", path, self._current_dir, len(files), len(report_cache))
         if path != self._current_dir:
             _log.info("[_on_directory_scan_finished] IGNORE stale path")
             return
+        if self._report_root_dir:
+            self._report_full_root_dir = self._report_root_dir
+            if full_report_cache is not None:
+                self._report_full_cache = full_report_cache
+            _log.info(
+                "[_on_directory_scan_finished] full report cache root=%r entries=%s",
+                self._report_full_root_dir,
+                len(self._report_full_cache or {}),
+            )
         if _DEBUG_FILE_LIST_LIMIT > 0 and len(files) > _DEBUG_FILE_LIST_LIMIT:
             selected_files = files
             if _DEBUG_FILE_LIST_MATCH:

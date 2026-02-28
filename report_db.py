@@ -96,7 +96,7 @@ COLUMN_NAMES = {col[0] for col in PHOTO_COLUMNS}
 EXIF_ONLY_FROM_REPORT_DB = True
 
 
-def find_report_root(directory: str) -> Optional[str]:
+def find_report_root(directory: str, max_levels: Optional[int] = None) -> Optional[str]:
     """
     从给定目录开始向上查找，返回最近一个包含 .superpicky/report.db 的目录路径。
     若未找到则返回 None。
@@ -106,19 +106,23 @@ def find_report_root(directory: str) -> Optional[str]:
     try:
         cur = os.path.normpath(directory)
         last = None
+        depth = 0
         while cur and cur != last:
+            if max_levels is not None and depth > max_levels:
+                break
             db_path = os.path.join(cur, ".superpicky", ReportDB.DB_FILENAME)
             if os.path.isfile(db_path):
-                _log.info("[find_report_root] 命中 root=%r db_path=%r", cur, db_path)
+                _log.info("[find_report_root] 命中 root=%r db_path=%r depth=%s", cur, db_path, depth)
                 return cur
             last = cur
             parent = os.path.dirname(cur)
             if not parent or parent == cur:
                 break
             cur = parent
+            depth += 1
     except Exception as e:
-        _log.warning("[find_report_root] 失败 directory=%r: %s", directory, e)
-    _log.info("[find_report_root] 未找到 report.db directory=%r", directory)
+        _log.warning("[find_report_root] 失败 directory=%r max_levels=%r: %s", directory, max_levels, e)
+    _log.info("[find_report_root] 未找到 report.db directory=%r max_levels=%r", directory, max_levels)
     return None
 
 
