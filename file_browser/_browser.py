@@ -171,6 +171,7 @@ _SortRole = int(_UserRole) + 10
 _MetaColorRole = int(_UserRole) + 1
 _MetaRatingRole = int(_UserRole) + 2
 _MetaPickRole = int(_UserRole) + 3    # Pick/Reject 旗标：1=精选, 0=无, -1=排除
+_MetaFocusRole = int(_UserRole) + 4
 _ThumbPixmapRole = int(_UserRole) + 20
 _ThumbSizeRole = int(_UserRole) + 21
 
@@ -182,7 +183,7 @@ _JPEG_MIP_EXTENSIONS = frozenset({".jpg", ".jpeg"})
 # Lightroom 颜色标签 → (十六进制色, 列表/缩略图显示文本)
 # 红=眼部对焦，绿=飞版；其余保持常规色名
 _COLOR_LABEL_COLORS: dict[str, tuple[str, str]] = {
-    "Red":    ("#c0392b", "眼部对焦"),
+    "Red":    ("#c0392b", "眼焦"),
     "Yellow": ("#d4ac0d", "黄"),
     "Green":  ("#27ae60", "飞版"),
     "Blue":   ("#2980b9", "蓝"),
@@ -632,6 +633,7 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
         color_label = index.data(_MetaColorRole)
         rating = index.data(_MetaRatingRole)
         pick = index.data(_MetaPickRole)
+        focus_status = str(index.data(_MetaFocusRole) or "").strip()
         pixmap = index.data(_ThumbPixmapRole)
         if not isinstance(pixmap, QPixmap):
             pixmap = None
@@ -646,8 +648,13 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
             painter.setRenderHint(_PainterAntialiasing)
             cell = opt.rect.adjusted(6, 6, -6, -6)
             fm = painter.fontMetrics()
-            text_height = fm.lineSpacing() + 6
-            thumb_rect = QRect(cell.left(), cell.top(), cell.width(), max(24, cell.height() - text_height - 6))
+            name_height = fm.lineSpacing() + 6
+            thumb_rect = QRect(
+                cell.left(),
+                cell.top(),
+                cell.width(),
+                max(24, cell.height() - name_height - 6),
+            )
             draw_rect = QRect(thumb_rect)
 
             painter.setBrush(QBrush(QColor(45, 45, 45)))
@@ -670,15 +677,15 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
 
             has_color = bool(color_label and color_label in _COLOR_LABEL_COLORS)
             if pick == 1:
-                right_badge_text = "??"
+                right_badge_text = "🏆"
                 right_badge_bg = QColor(0, 0, 0, 160)
                 right_badge_fg = QColor(COLORS["star_gold"])
             elif pick == -1:
-                right_badge_text = "??"
+                right_badge_text = "🚫"
                 right_badge_bg = QColor(0, 0, 0, 160)
                 right_badge_fg = QColor("#ffffff")
             elif isinstance(rating, int) and rating > 0:
-                right_badge_text = "?" * min(5, rating)
+                right_badge_text = "★" * min(5, rating)
                 right_badge_bg = QColor(0, 0, 0, 140)
                 right_badge_fg = QColor(COLORS["star_gold"])
             else:
@@ -707,14 +714,32 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
                 except AttributeError:
                     sw = fm2.width(right_badge_text)
                 bw2, bh2 = sw + 10, 16
-                badge2 = QRect(draw_rect.right() - bw2 - 2, draw_rect.bottom() - bh2 - 2, bw2, bh2)
+                badge2 = QRect(draw_rect.right() - bw2 - 2, draw_rect.top() + 2, bw2, bh2)
                 painter.setBrush(QBrush(right_badge_bg))
                 painter.setPen(_NoPen)
                 painter.drawRoundedRect(badge2, 4, 4)
                 painter.setPen(right_badge_fg)
                 painter.drawText(badge2, _AlignCenter, right_badge_text)
 
-            text_rect = QRect(cell.left(), thumb_rect.bottom() + 6, cell.width(), text_height)
+            if focus_status:
+                focus_color = _FOCUS_STATUS_TEXT_COLORS.get(focus_status, COLORS["text_secondary"])
+                focus_font = QFont(opt.font)
+                focus_font.setPixelSize(max(10, opt.font.pixelSize() if opt.font.pixelSize() > 0 else 10))
+                painter.setFont(focus_font)
+                fm3 = painter.fontMetrics()
+                try:
+                    sw3 = fm3.horizontalAdvance(focus_status)
+                except AttributeError:
+                    sw3 = fm3.width(focus_status)
+                bw3, bh3 = sw3 + 10, 16
+                badge3 = QRect(draw_rect.right() - bw3 - 2, draw_rect.bottom() - bh3 - 2, bw3, bh3)
+                painter.setBrush(QBrush(QColor(0, 0, 0, 150)))
+                painter.setPen(_NoPen)
+                painter.drawRoundedRect(badge3, 4, 4)
+                painter.setPen(QColor(focus_color))
+                painter.drawText(badge3, _AlignCenter, focus_status)
+
+            text_rect = QRect(cell.left(), thumb_rect.bottom() + 4, cell.width(), name_height)
             text_color = opt.palette.highlightedText().color() if selected else opt.palette.text().color()
             painter.setPen(text_color)
             painter.setFont(opt.font)
@@ -1521,6 +1546,7 @@ class FileListPanel(QWidget):
         self._btn_clear_thumb_cache.setText("清除图像缓存")
         self._btn_clear_thumb_cache.setFixedWidth(58)
         self._btn_clear_thumb_cache.clicked.connect(self._on_clear_thumb_cache_clicked)
+        self._btn_clear_thumb_cache.setMinimumSize(100, 24)
         filter_bar.addWidget(self._btn_clear_thumb_cache)
 
         self._filter_edit = QLineEdit()
@@ -2304,6 +2330,7 @@ class FileListPanel(QWidget):
         item.setData(_MetaColorRole, meta.get("color", ""))
         item.setData(_MetaRatingRole, meta.get("rating", 0))
         item.setData(_MetaPickRole, meta.get("pick", 0))
+        item.setData(_MetaFocusRole, meta.get("country", ""))
 
     def _clear_thumb_pixmap_for_item(self, item: QListWidgetItem) -> None:
         item.setIcon(QIcon())
