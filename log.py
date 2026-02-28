@@ -48,9 +48,12 @@ class _Logger:
                 self._file.flush()
             except OSError:
                 pass
-        sys.stderr.write(line)
+        err = sys.stderr
+        if err is None or not hasattr(err, "write"):
+            return
         try:
-            sys.stderr.flush()
+            err.write(line)
+            err.flush()
         except OSError:
             pass
 
