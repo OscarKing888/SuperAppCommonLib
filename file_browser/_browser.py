@@ -1480,6 +1480,10 @@ class FileListPanel(QWidget):
         """返回当前目录的 report 缓存：stem（不含扩展名）→ report 行 dict。无缓存时返回空 dict。"""
         return self._report_cache
 
+    def get_report_row_for_path(self, path: str) -> dict | None:
+        row = self._get_report_row_for_path(path)
+        return dict(row) if isinstance(row, dict) else None
+
     def _get_species_payload_for_path(self, path: str) -> dict | None:
         row = self._get_report_row_for_path(path)
         if not isinstance(row, dict):
@@ -1561,8 +1565,15 @@ class FileListPanel(QWidget):
                     if isinstance(meta, dict):
                         meta["bird_species_cn"] = cn
                         meta["bird_species_en"] = en
+                        fallback_title = str((row or {}).get("title") or meta.get("title") or "").strip()
+                        meta["title"] = cn or fallback_title
+                        ti = self._tree_item_map.get(norm_path)
+                        if ti is not None:
+                            self._apply_meta_to_tree_item(ti, meta)
         finally:
             db.close()
+
+        self._tree_widget.viewport().update()
 
         _log.info(
             "[_paste_species_to_paths] source_filename=%r bird_species_cn=%r bird_species_en=%r attempted=%s updated=%s",
@@ -1572,6 +1583,17 @@ class FileListPanel(QWidget):
             attempted,
             updated,
         )
+        if updated > 0 and self._selected_display_path:
+            selected_norm = os.path.normpath(self._selected_display_path)
+            path_keys = {os.path.normcase(os.path.normpath(p)) for p in paths if p}
+            if os.path.normcase(selected_norm) in path_keys:
+                refreshed_path = self._resolve_source_path_for_action(selected_norm)
+                _log.info(
+                    "[_paste_species_to_paths] refresh_selected source=%r refreshed=%r",
+                    selected_norm,
+                    refreshed_path,
+                )
+                self.file_selected.emit(refreshed_path or selected_norm)
 
     def _get_actual_path_for_display(self, path: str) -> str | None:
         actual = _get_cached_actual_path(path)
@@ -1651,6 +1673,9 @@ class FileListPanel(QWidget):
         resolved_path = os.path.normpath(actual_path) if actual_path else None
         if norm_source and resolved_path and os.path.isfile(resolved_path):
             _set_cached_actual_path(norm_source, resolved_path)
+            row = self._report_row_by_path.get(norm_source)
+            if isinstance(row, dict):
+                self._report_row_by_path[resolved_path] = row
             _log.info("[_on_actual_path_lookup_resolved] source=%r actual=%r cached=True", norm_source, resolved_path)
         else:
             _log.info("[_on_actual_path_lookup_resolved] source=%r actual=%r cached=False", norm_source, actual_path)
