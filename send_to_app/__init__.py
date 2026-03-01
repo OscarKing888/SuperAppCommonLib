@@ -38,7 +38,7 @@ __all__ = [
 
 # 兼容旧调用：get_external_apps / open_file_with_app
 def get_external_apps(config_dir=None):
-    """返回配置中的外部应用列表 [{"name": str, "path": str}]。"""
+    """返回配置中的外部应用列表 [{"name": str, "path": str, "app_id": str?}]。"""
     return load_config(config_dir=config_dir).get("apps", [])
 
 

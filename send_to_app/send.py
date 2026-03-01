@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-发送到外部应用：核心逻辑，不依赖 Qt。
-支持一次发送单个或多个文件（全路径），通过命令行参数传给目标应用。
+发送到外部应用：核心逻辑。
+支持一次发送单个或多个文件（全路径）：
+- 若配置了 app_id，则优先按本地 socket 协议热发送给已运行实例；
+- 否则或热发送失败时，回退为命令行启动目标应用。
 跨平台：Windows（QProcess.startDetached）、macOS（open -a）。
 """
 from __future__ import annotations
@@ -23,6 +25,30 @@ if sys.platform == "win32":
     _QProcess = QProcess
 else:
     _QProcess = None
+
+
+def _resolve_socket_app_id(app: dict[str, Any]) -> str:
+    """返回外部应用声明的热接收 app_id；为空表示仅使用启动回退。"""
+    for key in ("app_id", "send_to_app_id"):
+        value = str(app.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _try_send_via_socket(app: dict[str, Any], file_paths: list[str]) -> bool:
+    """若外部应用声明了 app_id，则尝试按项目内 send_to_app 协议热发送。"""
+    app_id = _resolve_socket_app_id(app)
+    if not app_id:
+        return False
+    try:
+        from .receive import send_file_list_to_running_app
+    except Exception:
+        return False
+    try:
+        return send_file_list_to_running_app(app_id, file_paths)
+    except Exception:
+        return False
 
 
 def resolve_app_path(app_path: str) -> str:
@@ -80,6 +106,9 @@ def send_files_to_app(
             fp = os.path.normpath(os.path.join(base_directory, fp))
         resolved.append(fp)
     if not resolved:
+        return
+
+    if _try_send_via_socket(app, resolved):
         return
 
     if sys.platform == "darwin":

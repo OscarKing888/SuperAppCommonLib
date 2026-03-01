@@ -5,12 +5,12 @@
 ## 配置
 
 - **配置文件**：与主程序同目录下的 `extern_app.json`（可由调用方通过 `config_dir` 指定）。
-- **格式**：`{"apps": [{"name": "显示名", "path": "应用路径"}, ...]}`
+- **格式**：`{"apps": [{"name": "显示名", "path": "应用路径", "app_id": "可选热接收ID"}, ...]}`
 
 ## 核心（无 UI）
 
 - **config**：`load_config(config_dir=...)` / `save_config(apps, config_dir=...)`，读写 `extern_app.json`。
-- **send**：`send_files_to_app(file_paths: list[str], app: dict, base_directory="")`，用指定应用打开多个文件（全路径列表）。
+- **send**：`send_files_to_app(file_paths: list[str], app: dict, base_directory="")`，优先按 socket 协议热发送；失败时再启动指定应用并传入文件列表。
 
 ## 设置 UI
 
@@ -26,7 +26,7 @@
 
 ## 协议
 
-- 发送到外部应用：用目标应用的路径启动进程，文件列表作为命令行参数（macOS 上通过 `open -a App 文件1 文件2 ...`）。
+- 发送到外部应用：若配置了 `app_id`，先按 QLocalSocket / UTF-8 JSON 协议 `{"files": [...]}` 热发送给已运行实例；失败时再用目标应用路径启动进程，文件列表作为命令行参数（macOS 上通过 `open -a App 文件1 文件2 ...`）。
 - 发送到本应用：客户端连接 QLocalServer，发送一行 UTF-8 JSON：`{"files": ["path1", "path2", ...]}`。
 
 ## 跨平台说明
@@ -38,5 +38,6 @@
 ## 使用约定
 
 - 发送时文件使用**全路径**；接收到的列表也由调用方转为绝对路径后处理。
+- 若目标应用支持本模块同款单例 IPC，建议在配置中填写 `app_id`（例如 BirdStamp 为 `birdstamp`），这样运行中的实例可以直接接收文件列表。
 - 冷启动时一般通过命令行传入一个文件列表（如 macOS：`SuperEXIF.app file1.jpg`；Windows：`SuperEXIF.exe file1.jpg`）。
 - App 运行时，可接收其它进程通过同一协议发来的文件列表并在回调中处理。

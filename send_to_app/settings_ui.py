@@ -105,8 +105,6 @@ def show_external_apps_settings_dialog(
     group_layout = QVBoxLayout(group)
     list_widget = QListWidget()
     list_widget.setMinimumHeight(120)
-    for a in apps:
-        list_widget.addItem(QListWidgetItem(f"{a.get('name', '')}  |  {a.get('path', '')}"))
     group_layout.addWidget(list_widget)
 
     btn_layout = QHBoxLayout()
@@ -126,7 +124,11 @@ def show_external_apps_settings_dialog(
     def apply_changes():
         list_widget.clear()
         for a in apps:
-            list_widget.addItem(QListWidgetItem(f"{a.get('name', '')}  |  {a.get('path', '')}"))
+            app_id = str(a.get("app_id", "")).strip()
+            suffix = f"  |  app_id={app_id}" if app_id else ""
+            list_widget.addItem(QListWidgetItem(f"{a.get('name', '')}  |  {a.get('path', '')}{suffix}"))
+
+    apply_changes()
 
     def on_add():
         name_edit = QLineEdit()
@@ -134,6 +136,8 @@ def show_external_apps_settings_dialog(
         path_edit = QLineEdit()
         path_edit.setPlaceholderText("应用路径（.app 或可执行文件）")
         path_edit.setReadOnly(True)
+        app_id_edit = QLineEdit()
+        app_id_edit.setPlaceholderText("热接收 app_id（可选，例如 birdstamp）")
         browse_btn = QPushButton("浏览…")
         form = QFormLayout()
         form.addRow("名称:", name_edit)
@@ -141,6 +145,7 @@ def show_external_apps_settings_dialog(
         row.addWidget(path_edit)
         row.addWidget(browse_btn)
         form.addRow("路径:", row)
+        form.addRow("app_id:", app_id_edit)
         sub = QDialog(parent)
         sub.setWindowTitle("添加外部应用")
         sub_layout = QVBoxLayout(sub)
@@ -163,10 +168,14 @@ def show_external_apps_settings_dialog(
         def accept():
             name = name_edit.text().strip()
             path = path_edit.text().strip()
+            app_id = app_id_edit.text().strip()
             if not path:
                 QMessageBox.warning(sub, "提示", "请选择应用路径。")
                 return
-            apps.append({"name": name or os.path.basename(path), "path": path})
+            item = {"name": name or os.path.basename(path), "path": path}
+            if app_id:
+                item["app_id"] = app_id
+            apps.append(item)
             apply_changes()
             sub.accept()
         bb.accepted.connect(accept)
@@ -182,6 +191,7 @@ def show_external_apps_settings_dialog(
         name_edit = QLineEdit(a.get("name", ""))
         path_edit = QLineEdit(a.get("path", ""))
         path_edit.setReadOnly(True)
+        app_id_edit = QLineEdit(a.get("app_id", ""))
         browse_btn = QPushButton("浏览…")
         form = QFormLayout()
         form.addRow("名称:", name_edit)
@@ -189,6 +199,7 @@ def show_external_apps_settings_dialog(
         row.addWidget(path_edit)
         row.addWidget(browse_btn)
         form.addRow("路径:", row)
+        form.addRow("app_id:", app_id_edit)
         sub = QDialog(parent)
         sub.setWindowTitle("编辑外部应用")
         sub_layout = QVBoxLayout(sub)
@@ -211,10 +222,14 @@ def show_external_apps_settings_dialog(
         def accept():
             name = name_edit.text().strip()
             path = path_edit.text().strip()
+            app_id = app_id_edit.text().strip()
             if not path:
                 QMessageBox.warning(sub, "提示", "请选择应用路径。")
                 return
-            apps[i] = {"name": name or os.path.basename(path), "path": path}
+            item = {"name": name or os.path.basename(path), "path": path}
+            if app_id:
+                item["app_id"] = app_id
+            apps[i] = item
             apply_changes()
             sub.accept()
         bb.accepted.connect(accept)

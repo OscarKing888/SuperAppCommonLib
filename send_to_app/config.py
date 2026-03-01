@@ -2,6 +2,7 @@
 """
 send_to_app 配置：从独立的 extern_app.json 读取/写入外部应用列表。
 配置文件与主程序同目录（或由调用方指定 config_dir）。跨平台：Windows / macOS。
+支持可选 app_id，用于按本地 socket 协议热发送到已运行实例。
 """
 from __future__ import annotations
 
@@ -11,6 +12,20 @@ import sys
 from typing import Any
 
 CONFIG_FILENAME = "extern_app.json"
+
+
+def _normalize_app_entry(item: Any) -> dict[str, str] | None:
+    """规范化单个外部应用配置，兼容可选 app_id 字段。"""
+    if not isinstance(item, dict):
+        return None
+    normalized = {
+        "name": str(item.get("name", "")),
+        "path": str(item.get("path", "")),
+    }
+    app_id = str(item.get("app_id", "")).strip()
+    if app_id:
+        normalized["app_id"] = app_id
+    return normalized
 
 
 def _user_config_dir() -> str:
@@ -55,7 +70,7 @@ def load_config(config_path: str | None = None, config_dir: str | None = None) -
     """
     加载外部应用配置。优先使用 config_path（可为文件路径或目录）；
     若为目录或未传，则用 config_dir 或默认目录下的 extern_app.json。
-    返回格式: {"apps": [{"name": str, "path": str}, ...]}
+    返回格式: {"apps": [{"name": str, "path": str, "app_id": str?}, ...]}
     """
     if config_path and os.path.isfile(config_path):
         path = config_path
@@ -76,11 +91,7 @@ def load_config(config_path: str | None = None, config_dir: str | None = None) -
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict) and "apps" in data and isinstance(data["apps"], list):
-            out["apps"] = [
-                {"name": str(item.get("name", "")), "path": str(item.get("path", ""))}
-                for item in data["apps"]
-                if isinstance(item, dict)
-            ]
+            out["apps"] = [entry for item in data["apps"] if (entry := _normalize_app_entry(item)) is not None]
     except Exception:
         pass
     return out
@@ -93,7 +104,7 @@ def save_config(apps: list[dict[str, str]], config_path: str | None = None, conf
     else:
         dir_ = config_dir if config_dir else (config_path if config_path and os.path.isdir(config_path) else None)
         path = get_config_path(dir_)
-    data = {"apps": [{"name": str(a.get("name", "")), "path": str(a.get("path", ""))} for a in apps]}
+    data = {"apps": [entry for app in apps if (entry := _normalize_app_entry(app)) is not None]}
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:

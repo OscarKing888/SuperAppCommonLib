@@ -61,6 +61,7 @@ from app_common.exif_io import (
     run_exiftool_assignments,
 )
 from app_common.log import get_logger
+from app_common.send_to_app import get_external_apps, send_files_to_app
 from app_common.report_db import (
     ReportDB,
     report_row_to_exiftool_style,
@@ -1554,6 +1555,7 @@ class FileListPanel(QWidget):
         self._tree_last_sort_column: int = _TREE_COL_NAME
         self._tree_last_sort_order = _AscendingOrder
         self._copied_species_payload: dict | None = None
+        self._pending_selection_paths: list | None = None  # 接收到的文件列表，目录加载完成后等同多选
         self._thumb_memory_cache = ThumbnailMemoryCache()
         self._thumb_loader_workers = _thumbnail_loader_worker_count()
         self._thumb_viewport_timer: QTimer | None = None
@@ -1977,6 +1979,9 @@ class FileListPanel(QWidget):
         _log.info("[_on_directory_scan_finished] _rebuild_views START")
         self._rebuild_views()
         _log.info("[_on_directory_scan_finished] _rebuild_views END")
+        if self._pending_selection_paths:
+            self._apply_pending_selection()
+            self._pending_selection_paths = None
         if files:
             _log.info("[_on_directory_scan_finished] 为当前目录下列出的 %s 个文件启动 EXIF 查询（report_cache=%s 条，未命中走 exiftool/XMP）", len(files), len(report_cache))
             self._start_metadata_loader(files)
@@ -1996,6 +2001,54 @@ class FileListPanel(QWidget):
     def get_report_row_for_path(self, path: str) -> dict | None:
         row = self._get_report_row_for_path(path)
         return dict(row) if isinstance(row, dict) else None
+
+    def set_pending_selection(self, paths: list) -> None:
+        """设置「待选路径」：下次目录加载完成后将列表中匹配的项多选并视为当前选中（与目录内多选同等）。若当前已打开该目录且列表已加载，则立即应用。"""
+        if not paths:
+            self._pending_selection_paths = None
+            return
+        normalized = [os.path.normpath(os.path.abspath(str(p))) for p in paths if p]
+        if not normalized:
+            self._pending_selection_paths = None
+            return
+        parent = os.path.dirname(normalized[0])
+        if self._current_dir and os.path.normpath(self._current_dir) == os.path.normpath(parent) and self._tree_item_map:
+            self._pending_selection_paths = normalized
+            self._apply_pending_selection()
+            self._pending_selection_paths = None
+            return
+        self._pending_selection_paths = normalized
+
+    def _apply_pending_selection(self) -> None:
+        """在目录加载完成后，将 _pending_selection_paths 中出现在当前列表的路径多选并刷新预览。"""
+        paths = self._pending_selection_paths or []
+        if not paths:
+            return
+        path_set = {os.path.normcase(os.path.normpath(p)) for p in paths if p}
+        if not path_set:
+            return
+        first_matched = None
+        self._tree_widget.clearSelection()
+        for norm, ti in self._tree_item_map.items():
+            if os.path.normcase(norm) in path_set:
+                ti.setSelected(True)
+                if first_matched is None:
+                    first_matched = norm
+        if first_matched is not None:
+            ti_first = self._tree_item_map.get(first_matched)
+            if ti_first is not None:
+                self._tree_widget.setCurrentItem(ti_first)
+        self._list_widget.clearSelection()
+        for norm, li in self._item_map.items():
+            if os.path.normcase(norm) in path_set:
+                li.setSelected(True)
+                if first_matched is None:
+                    first_matched = norm
+        if first_matched is not None:
+            li_first = self._item_map.get(first_matched)
+            if li_first is not None:
+                self._list_widget.setCurrentItem(li_first)
+            self._emit_file_selected_for_path(first_matched)
 
     def _get_species_cn_from_metadata(self, path: str) -> str:
         norm_path = os.path.normpath(path) if path else ""
@@ -3800,6 +3853,18 @@ class FileListPanel(QWidget):
         QApplication.clipboard().setText("\n".join(copied_paths))
         _log.info("[_copy_filenames_to_clipboard] platform=%r copied=%s", sys.platform, copied_paths)
 
+    def _add_send_to_external_app_actions(self, menu: QMenu, paths: list[str]) -> None:
+        """在右键菜单中加入「发送到外部应用」子菜单，使用当前选中的文件列表。"""
+        apps = get_external_apps()
+        if not apps:
+            return
+        sub = menu.addMenu("发送到外部应用")
+        base_dir = self.get_current_dir() or ""
+        for app in apps:
+            name = (app.get("name") or app.get("path") or "未命名").strip()
+            act = sub.addAction(name)
+            act.triggered.connect(lambda checked=False, a=app, p=paths: send_files_to_app(p, a, base_directory=base_dir))
+
     def _add_species_menu_actions(self, menu: QMenu, primary_path: str | None, paths: list[str]) -> None:
         source_path = primary_path or (paths[0] if paths else "")
         copy_payload = self._get_species_payload_for_path(source_path) if source_path else None
@@ -3837,6 +3902,8 @@ class FileListPanel(QWidget):
         menu.addSeparator()
         self._add_species_menu_actions(menu, item.data(0, _UserRole) if item else (paths[0] if paths else ""), paths)
         menu.addSeparator()
+        self._add_send_to_external_app_actions(menu, paths)
+        menu.addSeparator()
         label = "在Finder中显示" if sys.platform == "darwin" else "在资源管理器中显示"
         reveal_path = self._resolve_reveal_path(item.data(0, _UserRole) if item else (paths[0] if paths else None))
         if reveal_path:
@@ -3868,6 +3935,8 @@ class FileListPanel(QWidget):
         self._add_rating_menu_actions(menu, paths)
         menu.addSeparator()
         self._add_species_menu_actions(menu, item.data(_UserRole) if item else (paths[0] if paths else ""), paths)
+        menu.addSeparator()
+        self._add_send_to_external_app_actions(menu, paths)
         menu.addSeparator()
         label = "在Finder中显示" if sys.platform == "darwin" else "在资源管理器中显示"
         reveal_path = self._resolve_reveal_path(item.data(_UserRole) if item else (paths[0] if paths else None))
