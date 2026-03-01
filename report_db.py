@@ -96,9 +96,38 @@ COLUMN_NAMES = {col[0] for col in PHOTO_COLUMNS}
 EXIF_ONLY_FROM_REPORT_DB = True
 
 
+def existing_report_db_paths(directory: str) -> List[str]:
+    """
+    返回给定目录下已存在的 report.db 路径列表（按优先级排序）。
+
+    优先级：
+    1. ``<directory>/.superpicky/report.db``
+    2. ``<directory>/report.db``
+    """
+    if not directory:
+        return []
+    base_dir = os.path.normpath(directory)
+    candidates = [
+        os.path.join(base_dir, ".superpicky", ReportDB.DB_FILENAME),
+        os.path.join(base_dir, ReportDB.DB_FILENAME),
+    ]
+    return [os.path.normpath(path) for path in candidates if os.path.isfile(path)]
+
+
+def resolve_existing_report_db_path(directory: str) -> Optional[str]:
+    """返回给定目录下首个已存在的 report.db 路径。"""
+    paths = existing_report_db_paths(directory)
+    return paths[0] if paths else None
+
+
 def find_report_root(directory: str, max_levels: Optional[int] = None) -> Optional[str]:
     """
-    从给定目录开始向上查找，返回最近一个包含 .superpicky/report.db 的目录路径。
+    从给定目录开始向上查找，返回最近一个包含 report.db 的目录路径。
+
+    兼容以下布局：
+    - ``<directory>/.superpicky/report.db``
+    - ``<directory>/report.db``
+
     若未找到则返回 None。
     """
     if not directory:
@@ -110,8 +139,8 @@ def find_report_root(directory: str, max_levels: Optional[int] = None) -> Option
         while cur and cur != last:
             if max_levels is not None and depth > max_levels:
                 break
-            db_path = os.path.join(cur, ".superpicky", ReportDB.DB_FILENAME)
-            if os.path.isfile(db_path):
+            db_path = resolve_existing_report_db_path(cur)
+            if db_path and os.path.isfile(db_path):
                 _log.info("[find_report_root] 命中 root=%r db_path=%r depth=%s", cur, db_path, depth)
                 return cur
             last = cur
@@ -287,18 +316,27 @@ class ReportDB:
 
     DB_FILENAME = "report.db"
 
-    def __init__(self, directory: str, create_if_missing: bool = True):
+    def __init__(
+        self,
+        directory: str,
+        create_if_missing: bool = True,
+        db_path_override: Optional[str] = None,
+    ):
         """
         初始化数据库连接。
 
         Args:
             directory: 照片目录路径（数据库存储在 .superpicky/ 子目录下）
             create_if_missing: 若 True，确保 .superpicky 存在并创建库；若 False，仅当 report.db 已存在时打开，否则抛出 FileNotFoundError
+            db_path_override: 指定现有数据库文件路径；用于兼容非 ``.superpicky`` 布局的只读打开
         """
         _log.info("[ReportDB.__init__] directory=%r create_if_missing=%s", directory, create_if_missing)
         self.directory = directory
         self._superpicky_dir = os.path.join(directory, ".superpicky")
         self.db_path = os.path.join(self._superpicky_dir, self.DB_FILENAME)
+        if db_path_override:
+            self.db_path = os.path.normpath(db_path_override)
+            self._superpicky_dir = os.path.dirname(self.db_path)
         # 同一连接会被主线程和后台线程复用，需要串行化访问避免事务冲突
         self._lock = threading.RLock()
 
@@ -330,20 +368,43 @@ class ReportDB:
     @classmethod
     def open_if_exists(cls, directory: str) -> Optional["ReportDB"]:
         """
-        仅当 directory/.superpicky/report.db 已存在时打开并返回 ReportDB，否则返回 None。
+        仅当目录中已有 report.db 时打开并返回 ReportDB，否则返回 None。
+
+        兼容以下布局：
+        - ``directory/.superpicky/report.db``
+        - ``directory/report.db``
+
         用于只读加载缓存，不会创建目录或数据库文件。
         """
-        db_path = os.path.join(directory, ".superpicky", cls.DB_FILENAME)
+        db_path = resolve_existing_report_db_path(directory)
         _log.info("[ReportDB.open_if_exists] directory=%r db_path=%r", directory, db_path)
-        if not os.path.isfile(db_path):
+        if not db_path:
             _log.info("[ReportDB.open_if_exists] 文件不存在 返回 None")
             return None
+        return cls.open_db_path_if_exists(db_path)
+
+    @classmethod
+    def open_db_path_if_exists(cls, db_path: str) -> Optional["ReportDB"]:
+        """按明确的数据库文件路径打开已有库，不存在则返回 None。"""
+        if not db_path:
+            _log.info("[ReportDB.open_db_path_if_exists] 空路径 返回 None")
+            return None
+        norm_path = os.path.normpath(db_path)
+        _log.info("[ReportDB.open_db_path_if_exists] db_path=%r", norm_path)
+        if not os.path.isfile(norm_path):
+            _log.info("[ReportDB.open_db_path_if_exists] 文件不存在 返回 None")
+            return None
+        parent_dir = os.path.dirname(norm_path)
+        if os.path.basename(norm_path).lower() == cls.DB_FILENAME and os.path.basename(parent_dir) == ".superpicky":
+            directory = os.path.dirname(parent_dir)
+        else:
+            directory = parent_dir
         try:
-            db = cls(directory, create_if_missing=False)
-            _log.info("[ReportDB.open_if_exists] 打开成功")
+            db = cls(directory, create_if_missing=False, db_path_override=norm_path)
+            _log.info("[ReportDB.open_db_path_if_exists] 打开成功")
             return db
         except Exception as e:
-            _log.warning("[ReportDB.open_if_exists] 打开失败: %s", e)
+            _log.warning("[ReportDB.open_db_path_if_exists] 打开失败: %s", e)
             return None
 
     def _init_schema(self):
