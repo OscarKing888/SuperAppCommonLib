@@ -13,10 +13,35 @@ from typing import Any
 CONFIG_FILENAME = "extern_app.json"
 
 
+def _user_config_dir() -> str:
+    """打包后使用用户可写目录，避免写入 macOS app bundle。"""
+    if sys.platform == "win32":
+        base = (
+            os.environ.get("APPDATA")
+            or os.environ.get("LOCALAPPDATA")
+            or os.path.join(os.path.expanduser("~"), "AppData", "Roaming")
+        )
+        return os.path.join(base, "BirdStamp")
+    if sys.platform == "darwin":
+        return os.path.join(os.path.expanduser("~"), "Library", "Application Support", "BirdStamp")
+    return os.path.join(
+        os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config"),
+        "BirdStamp",
+    )
+
+
+def _legacy_frozen_config_path() -> str | None:
+    """兼容旧版本：曾将 extern_app.json 放在可执行文件旁边。"""
+    if not getattr(sys, "frozen", False):
+        return None
+    legacy = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), CONFIG_FILENAME)
+    return legacy if os.path.isfile(legacy) else None
+
+
 def _default_config_dir() -> str:
-    """与 main 一致：脚本或可执行文件所在目录。"""
+    """开发态使用项目目录，打包态使用用户可写目录。"""
     if getattr(sys, "frozen", False):
-        return os.path.dirname(os.path.abspath(sys.executable))
+        return _user_config_dir()
     return os.path.dirname(os.path.abspath(sys.argv[0] if sys.argv else "."))
 
 
@@ -39,7 +64,14 @@ def load_config(config_path: str | None = None, config_dir: str | None = None) -
         path = get_config_path(dir_)
     out: dict[str, Any] = {"apps": []}
     if not os.path.isfile(path):
-        return out
+        if config_path is None and config_dir is None:
+            legacy = _legacy_frozen_config_path()
+            if legacy and os.path.isfile(legacy):
+                path = legacy
+            else:
+                return out
+        else:
+            return out
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -63,6 +95,7 @@ def save_config(apps: list[dict[str, str]], config_path: str | None = None, conf
         path = get_config_path(dir_)
     data = {"apps": [{"name": str(a.get("name", "")), "path": str(a.get("path", ""))} for a in apps]}
     try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception:

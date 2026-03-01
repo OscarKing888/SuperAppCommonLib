@@ -12,8 +12,11 @@ import os
 import sys
 from typing import Callable
 
+from app_common.log import get_logger
+
 # 协议：客户端发送一行 JSON：{"files": ["path1", "path2", ...]}，UTF-8
 _PROTOCOL_ENCODING = "utf-8"
+_log = get_logger("send_to_app")
 
 
 def get_initial_file_list_from_argv(argv: list[str] | None = None) -> list[str]:
@@ -77,6 +80,27 @@ def _send_via_socket(server_name: str, file_paths: list[str]) -> bool:
     return True
 
 
+def _can_connect_to_server(server_name: str, timeout_ms: int = 300) -> bool:
+    """探测本地服务是否真的在监听，用于区分活跃实例和残留 socket。"""
+    try:
+        from PySide6.QtNetwork import QLocalSocket
+    except ImportError:
+        try:
+            from PyQt6.QtNetwork import QLocalSocket
+        except ImportError:
+            from PyQt5.QtNetwork import QLocalSocket
+    sock = QLocalSocket()
+    try:
+        sock.connectToServer(server_name)
+        ok = bool(sock.waitForConnected(timeout_ms))
+        return ok
+    finally:
+        try:
+            sock.abort()
+        except Exception:
+            pass
+
+
 class SingleInstanceReceiver:
     """
     单例接收端：仅在首进程内启动。
@@ -103,7 +127,36 @@ class SingleInstanceReceiver:
                 from PyQt5.QtCore import QByteArray
         self._server = QLocalServer()
         if not self._server.listen(self._name):
+            error_text = self._server.errorString()
+            if not _can_connect_to_server(self._name):
+                removed = False
+                try:
+                    removed = bool(QLocalServer.removeServer(self._name))
+                except Exception:
+                    removed = False
+                _log.warning(
+                    "receiver listen failed with stale socket; name=%s error=%s removed=%s",
+                    self._name,
+                    error_text,
+                    removed,
+                )
+                if removed and self._server.listen(self._name):
+                    try:
+                        _log.info(
+                            "receiver listen recovered after stale socket cleanup; name=%s full=%s",
+                            self._name,
+                            self._server.fullServerName(),
+                        )
+                    except Exception:
+                        _log.info("receiver listen recovered after stale socket cleanup; name=%s", self._name)
+                    self._server.newConnection.connect(self._on_connection)
+                    return True
+            _log.warning("receiver listen failed; name=%s error=%s", self._name, error_text)
             return False
+        try:
+            _log.info("receiver listening; name=%s full=%s", self._name, self._server.fullServerName())
+        except Exception:
+            _log.info("receiver listening; name=%s", self._name)
         self._server.newConnection.connect(self._on_connection)
         return True
 
@@ -148,6 +201,18 @@ class SingleInstanceReceiver:
         if self._server:
             self._server.close()
             self._server = None
+        try:
+            from PySide6.QtNetwork import QLocalServer
+        except ImportError:
+            try:
+                from PyQt6.QtNetwork import QLocalServer
+            except ImportError:
+                from PyQt5.QtNetwork import QLocalServer
+        try:
+            removed = bool(QLocalServer.removeServer(self._name))
+            _log.info("receiver stopped; name=%s removed=%s", self._name, removed)
+        except Exception:
+            pass
 
 
 def send_file_list_to_running_app(app_id: str, file_paths: list[str]) -> bool:
