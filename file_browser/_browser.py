@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 file_browser._browser
 =====================
@@ -305,9 +305,20 @@ except AttributeError:
 try:
     _EventResize = QEvent.Type.Resize
     _EventShow = QEvent.Type.Show
+    _EventKeyPress = QEvent.Type.KeyPress
 except AttributeError:
     _EventResize = QEvent.Resize  # type: ignore[attr-defined]
     _EventShow = QEvent.Show  # type: ignore[attr-defined]
+    _EventKeyPress = QEvent.KeyPress  # type: ignore[attr-defined]
+
+_KeyUp = getattr(Qt.Key, "Key_Up", None) or getattr(Qt, "Key_Up", None)
+_KeyDown = getattr(Qt.Key, "Key_Down", None) or getattr(Qt, "Key_Down", None)
+_KeyLeft = getattr(Qt.Key, "Key_Left", None) or getattr(Qt, "Key_Left", None)
+_KeyRight = getattr(Qt.Key, "Key_Right", None) or getattr(Qt, "Key_Right", None)
+_ShiftModifier = (
+    getattr(Qt.KeyboardModifier, "ShiftModifier", None)
+    or getattr(Qt, "ShiftModifier", None)
+)
 
 try:
     _StateSelected = QStyle.StateFlag.State_Selected
@@ -1499,11 +1510,14 @@ class FileListPanel(QWidget):
       工具栏滑块可选 128/256/512/1024 px 四档大小。
     """
 
+    # 子类可重载为 False 以不创建过滤栏（filter_bar）
+    create_filter_bar = True
+
     file_selected = pyqtSignal(str)
     _MODE_LIST  = 0
     _MODE_THUMB = 1
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, *, create_filter_bar: bool | None = None) -> None:
         super().__init__(parent)
         self._all_files: list = []
         self._filtered_files: list = []
@@ -1521,10 +1535,6 @@ class FileListPanel(QWidget):
         self._meta_cache:    dict = {}   # norm_path → metadata dict
         self._report_cache:  dict = {}   # stem → report row (当前目录/子树筛出的 report 子集)
         self._report_row_by_path: dict = {}
-        self._path_lookup_pending: set[str] = set()
-        self._path_lookup_workers: list[PathLookupWorker] = []
-        self._selected_display_path: str = ""
-        self._copied_species_payload: dict | None = None
         self._pending_loaders: list = []
         self._meta_apply_timer: QTimer | None = None
         self._meta_apply_items: list = []
@@ -1549,6 +1559,9 @@ class FileListPanel(QWidget):
         self._filter_focus_status: str = ""
         self._star_btns: list = []
         self._focus_filter_btns: dict[str, QToolButton] = {}
+        if create_filter_bar is None:
+            create_filter_bar = getattr(type(self), "create_filter_bar", True)
+        self._create_filter_bar = bool(create_filter_bar)
         self._init_ui()
 
     # ── UI 初始化 ──────────────────────────────────────────────────────────────
@@ -1599,76 +1612,81 @@ class FileListPanel(QWidget):
         layout.addLayout(toolbar)
 
         # ── 过滤栏（文件名 + 精选 + 星级）──
-        filter_bar = QHBoxLayout()
-        filter_bar.setSpacing(3)
+        if self._create_filter_bar:
+            filter_bar = QHBoxLayout()
+            filter_bar.setSpacing(3)
 
-        self._btn_clear_thumb_cache = QToolButton()
-        self._btn_clear_thumb_cache.setText("清除图像缓存")
-        self._btn_clear_thumb_cache.setFixedWidth(58)
-        self._btn_clear_thumb_cache.clicked.connect(self._on_clear_thumb_cache_clicked)
-        self._btn_clear_thumb_cache.setMinimumSize(100, 24)
-        filter_bar.addWidget(self._btn_clear_thumb_cache)
+            self._btn_clear_thumb_cache = QToolButton()
+            self._btn_clear_thumb_cache.setText("清除图像缓存")
+            self._btn_clear_thumb_cache.setFixedWidth(58)
+            self._btn_clear_thumb_cache.clicked.connect(self._on_clear_thumb_cache_clicked)
+            self._btn_clear_thumb_cache.setMinimumSize(100, 24)
+            filter_bar.addWidget(self._btn_clear_thumb_cache)
 
-        self._filter_edit = QLineEdit()
-        self._filter_edit.setPlaceholderText("过滤文件名…")
-        self._filter_edit.setClearButtonEnabled(True)
-        self._filter_edit.setStyleSheet(
-            "QLineEdit { padding: 2px 4px; font-size: 12px; }"
-        )
-        self._filter_edit.textChanged.connect(lambda _: self._apply_filter())
-        filter_bar.addWidget(self._filter_edit, stretch=1)
-
-        # 精选按钮
-        self._btn_filter_pick = QToolButton()
-        self._btn_filter_pick.setText("🏆")
-        self._btn_filter_pick.setToolTip("只显示精选（Pick=1）")
-        self._btn_filter_pick.setCheckable(True)
-        self._btn_filter_pick.setAutoRaise(False)
-        self._btn_filter_pick.setStyleSheet(
-            _filter_badge_stylesheet(
-                COLORS["star_gold"],
-                min_width=34,
-                checked_fg="#111111",
+            self._filter_edit = QLineEdit()
+            self._filter_edit.setPlaceholderText("过滤文件名…")
+            self._filter_edit.setClearButtonEnabled(True)
+            self._filter_edit.setStyleSheet(
+                "QLineEdit { padding: 2px 4px; font-size: 12px; }"
             )
-        )
-        self._btn_filter_pick.clicked.connect(self._on_pick_filter_toggled)
-        filter_bar.addWidget(self._btn_filter_pick)
+            self._filter_edit.textChanged.connect(lambda _: self._apply_filter())
+            filter_bar.addWidget(self._filter_edit, stretch=1)
 
-        # 星级按钮（1～5，单选，点击已激活按钮则取消）
-        star_widths = [22, 28, 34, 40, 46]
-        for n in range(1, 6):
-            btn = QToolButton()
-            btn.setText("★" * n)
-            btn.setToolTip(f"只显示 ≥{n} 星")
-            btn.setCheckable(True)
-            btn.setAutoRaise(False)
-            btn.setStyleSheet(
+            # 精选按钮
+            self._btn_filter_pick = QToolButton()
+            self._btn_filter_pick.setText("🏆")
+            self._btn_filter_pick.setToolTip("只显示精选（Pick=1）")
+            self._btn_filter_pick.setCheckable(True)
+            self._btn_filter_pick.setAutoRaise(False)
+            self._btn_filter_pick.setStyleSheet(
                 _filter_badge_stylesheet(
                     COLORS["star_gold"],
-                    min_width=star_widths[n - 1],
+                    min_width=34,
                     checked_fg="#111111",
                 )
             )
-            btn.clicked.connect(
-                lambda checked, rating=n: self._on_rating_filter_changed(rating)
-            )
-            self._star_btns.append(btn)
-            filter_bar.addWidget(btn)
+            self._btn_filter_pick.clicked.connect(self._on_pick_filter_toggled)
+            filter_bar.addWidget(self._btn_filter_pick)
 
-        for focus_status in _FOCUS_FILTER_OPTIONS:
-            btn = QToolButton()
-            btn.setText(focus_status)
-            btn.setToolTip(f"只显示{focus_status}文件")
-            btn.setCheckable(True)
-            btn.setAutoRaise(False)
-            btn.setStyleSheet(_focus_filter_button_stylesheet(focus_status))
-            btn.clicked.connect(
-                lambda checked, status=focus_status: self._on_focus_filter_changed(status)
-            )
-            self._focus_filter_btns[focus_status] = btn
-            filter_bar.addWidget(btn)
+            # 星级按钮（1～5，单选，点击已激活按钮则取消）
+            star_widths = [22, 28, 34, 40, 46]
+            for n in range(1, 6):
+                btn = QToolButton()
+                btn.setText("★" * n)
+                btn.setToolTip(f"只显示 ≥{n} 星")
+                btn.setCheckable(True)
+                btn.setAutoRaise(False)
+                btn.setStyleSheet(
+                    _filter_badge_stylesheet(
+                        COLORS["star_gold"],
+                        min_width=star_widths[n - 1],
+                        checked_fg="#111111",
+                    )
+                )
+                btn.clicked.connect(
+                    lambda checked, rating=n: self._on_rating_filter_changed(rating)
+                )
+                self._star_btns.append(btn)
+                filter_bar.addWidget(btn)
 
-        layout.addLayout(filter_bar)
+            for focus_status in _FOCUS_FILTER_OPTIONS:
+                btn = QToolButton()
+                btn.setText(focus_status)
+                btn.setToolTip(f"只显示{focus_status}文件")
+                btn.setCheckable(True)
+                btn.setAutoRaise(False)
+                btn.setStyleSheet(_focus_filter_button_stylesheet(focus_status))
+                btn.clicked.connect(
+                    lambda checked, status=focus_status: self._on_focus_filter_changed(status)
+                )
+                self._focus_filter_btns[focus_status] = btn
+                filter_bar.addWidget(btn)
+
+            layout.addLayout(filter_bar)
+        else:
+            self._btn_clear_thumb_cache = None
+            self._filter_edit = None
+            self._btn_filter_pick = None
 
         # 视图堆叠
         self._stack = QStackedWidget()
@@ -1694,6 +1712,7 @@ class FileListPanel(QWidget):
         self._tree_widget.setSelectionMode(_ExtendedSelection)  # Shift/Command 多选
         self._tree_widget.setStyleSheet("QTreeWidget { font-size: 12px; }")
         self._tree_widget.itemClicked.connect(self._on_tree_item_clicked)
+        self._tree_widget.currentItemChanged.connect(self._on_tree_current_item_changed)
         hdr = self._tree_widget.header()
         hdr.sortIndicatorChanged.connect(self._on_tree_sort_indicator_changed)
         for col in range(8):
@@ -1746,6 +1765,7 @@ class FileListPanel(QWidget):
         self._list_widget.itemClicked.connect(self._on_list_item_clicked)
         self._list_widget.setContextMenuPolicy(_CustomContextMenu)
         self._list_widget.customContextMenuRequested.connect(self._on_list_context_menu)
+        self._list_widget.installEventFilter(self)
         self._list_widget.viewport().installEventFilter(self)
         self._list_widget.verticalScrollBar().valueChanged.connect(self._schedule_visible_thumbnail_update)
         self._list_widget.horizontalScrollBar().valueChanged.connect(self._schedule_visible_thumbnail_update)
@@ -1799,6 +1819,8 @@ class FileListPanel(QWidget):
 
     def _has_any_filter(self) -> bool:
         """是否有任意过滤条件开启（文本 / 精选 / 星级）。"""
+        if not self._create_filter_bar:
+            return False
         return (
             bool(self._filter_edit.text().strip()) or
             self._filter_pick or
@@ -1969,18 +1991,64 @@ class FileListPanel(QWidget):
         row = self._get_report_row_for_path(path)
         return dict(row) if isinstance(row, dict) else None
 
+    def _get_species_cn_from_metadata(self, path: str) -> str:
+        norm_path = os.path.normpath(path) if path else ""
+        if not norm_path:
+            return ""
+
+        meta = self._meta_cache.get(norm_path, {})
+        if isinstance(meta, dict):
+            cached_title = str(meta.get("bird_species_cn") or meta.get("title") or "").strip()
+            if cached_title:
+                return cached_title
+
+        actual_path = self._get_actual_path_for_display(norm_path) or norm_path
+        if not actual_path or not os.path.isfile(actual_path):
+            return ""
+
+        title = ""
+        try:
+            raw_map = read_batch_metadata([actual_path])
+        except Exception as exc:
+            _log.warning("[_get_species_cn_from_metadata] source=%r read_exif_failed: %s", path, exc)
+            return ""
+
+        actual_norm = os.path.normpath(actual_path)
+        rec = raw_map.get(actual_norm) or raw_map.get(actual_path)
+        if not isinstance(rec, dict):
+            for candidate in raw_map.values():
+                if isinstance(candidate, dict):
+                    rec = candidate
+                    break
+        if isinstance(rec, dict):
+            title = str(
+                rec.get("XMP-dc:Title")
+                or rec.get("XMP-dc:title")
+                or rec.get("IFD0:XPTitle")
+                or rec.get("IPTC:ObjectName")
+                or ""
+            ).strip()
+
+        if title:
+            cached_meta = self._meta_cache.setdefault(norm_path, {})
+            if isinstance(cached_meta, dict):
+                cached_meta["title"] = title
+                cached_meta.setdefault("bird_species_cn", title)
+        return title
+
     def _get_species_payload_for_path(self, path: str) -> dict | None:
         row = self._get_report_row_for_path(path)
-        if not isinstance(row, dict):
-            return None
-        filename = str(row.get("filename") or Path(path).stem or "").strip()
+        filename = str((row or {}).get("filename") or Path(path).stem or "").strip()
         if not filename:
             return None
+        bird_species_cn = str((row or {}).get("bird_species_cn") or "").strip()
+        if not bird_species_cn:
+            bird_species_cn = self._get_species_cn_from_metadata(path)
         return {
             "filename": filename,
             "source_path": os.path.normpath(path) if path else "",
-            "bird_species_cn": str(row.get("bird_species_cn") or "").strip(),
-            "bird_species_en": str(row.get("bird_species_en") or "").strip(),
+            "bird_species_cn": bird_species_cn,
+            "bird_species_en": str((row or {}).get("bird_species_en") or "").strip(),
         }
 
     def _copy_species_from_path(self, path: str) -> None:
@@ -2436,7 +2504,7 @@ class FileListPanel(QWidget):
         return isinstance(pixmap, QPixmap) and not pixmap.isNull() and thumb_size_ok
 
     def _compute_filtered_files(self) -> list[str]:
-        ft = self._filter_edit.text().strip().lower()
+        ft = (self._filter_edit.text().strip().lower()) if self._filter_edit else ""
         fp = self._filter_pick
         fr = self._filter_min_rating
         ff = self._filter_focus_status
@@ -2459,6 +2527,8 @@ class FileListPanel(QWidget):
         return filtered
 
     def _update_clear_thumb_cache_button_tooltip(self) -> None:
+        if not self._create_filter_bar or self._btn_clear_thumb_cache is None:
+            return
         stats = self._thumb_memory_cache.stats()
         mb = stats["bytes"] / (1024.0 * 1024.0)
         tooltip = (
@@ -2494,7 +2564,7 @@ class FileListPanel(QWidget):
         )
 
     def _rebuild_views(self, stop_loaders: bool = True) -> None:
-        """??????????????????"""
+        """根据当前过滤结果重建列表/树视图与缩略图项。"""
         if stop_loaders:
             self._stop_all_loaders()
         else:
@@ -2514,7 +2584,7 @@ class FileListPanel(QWidget):
             self._tree_item_map = {}
             self._list_widget.clear()
             self._item_map = {}
-            ft = self._filter_edit.text().strip().lower()
+            ft = (self._filter_edit.text().strip().lower()) if self._filter_edit else ""
             _log.info("[_rebuild_views] filter_text=%r adding items", ft or "(none)")
 
             for seq, path in enumerate(self._filtered_files, start=1):
@@ -2556,8 +2626,8 @@ class FileListPanel(QWidget):
         _log.info("[_rebuild_views] END")
 
     def _apply_filter(self) -> None:
-        """???????????????????????????????????"""
-        ft = self._filter_edit.text().strip().lower()
+        """根据当前过滤条件（文件名、精选、星级、对焦）重算过滤结果并刷新视图。"""
+        ft = (self._filter_edit.text().strip().lower()) if self._filter_edit else ""
         fp = self._filter_pick
         fr = self._filter_min_rating
         t0 = _time.perf_counter()
@@ -2596,7 +2666,7 @@ class FileListPanel(QWidget):
             self._apply_filter()
 
     def _on_rating_filter_changed(self, n: int) -> None:
-        """???????????????????????????????????????????"""
+        """切换星级过滤：只显示 ≥n 星的文件。有任意过滤时递归子目录，无过滤时仅当前目录。"""
         if self._filter_min_rating == n:
             self._filter_min_rating = 0
         else:
@@ -2673,6 +2743,61 @@ class FileListPanel(QWidget):
             if et in (_EventResize, _EventShow):
                 self._invalidate_visible_thumbnail_signature()
                 self._schedule_visible_thumbnail_update()
+        if (
+            obj is list_widget
+            and event is not None
+            and event.type() == _EventKeyPress
+            and self._view_mode == self._MODE_THUMB
+            and list_widget is not None
+            and list_widget.count() > 0
+        ):
+            key = event.key()
+            if key not in (_KeyUp, _KeyDown, _KeyLeft, _KeyRight):
+                return super().eventFilter(obj, event)
+            viewport = list_widget.viewport()
+            grid = list_widget.gridSize()
+            gw = max(1, grid.width())
+            cols = max(1, viewport.rect().width() // gw)
+            count = list_widget.count()
+            idx = list_widget.currentRow()
+            if idx < 0:
+                idx = 0
+            row, col = idx // cols, idx % cols
+            new_idx = -1
+            if key == _KeyUp and row > 0:
+                new_idx = (row - 1) * cols + col
+            elif key == _KeyDown:
+                new_idx = (row + 1) * cols + col
+                if new_idx >= count:
+                    new_idx = -1
+            elif key == _KeyLeft and idx > 0:
+                new_idx = idx - 1
+            elif key == _KeyRight and idx < count - 1:
+                new_idx = idx + 1
+            if new_idx >= 0 and new_idx < count:
+                shift = _ShiftModifier and (event.modifiers() & _ShiftModifier)
+                if shift:
+                    sm = list_widget.selectionModel()
+                    anchor = sm.anchorIndex().row() if sm and sm.anchorIndex().isValid() else idx
+                    lo, hi = min(anchor, new_idx), max(anchor, new_idx)
+                    list_widget.clearSelection()
+                    for i in range(lo, hi + 1):
+                        it = list_widget.item(i)
+                        if it is not None:
+                            it.setSelected(True)
+                    list_widget.setCurrentRow(new_idx)
+                else:
+                    list_widget.clearSelection()
+                    list_widget.setCurrentRow(new_idx)
+                    item = list_widget.item(new_idx)
+                    if item is not None:
+                        item.setSelected(True)
+                item = list_widget.currentItem()
+                if item is not None:
+                    path = item.data(_UserRole)
+                    if path:
+                        self._emit_file_selected_for_path(path)
+                return True
         return super().eventFilter(obj, event)
 
     def _ensure_thumb_viewport_timer(self) -> None:
@@ -2932,7 +3057,7 @@ class FileListPanel(QWidget):
     def _start_metadata_loader(self, paths: list) -> None:
         report_cache_for_meta = self._report_full_cache or self._report_cache
         _log.info(
-            "[_start_metadata_loader] ????????? EXIF paths=%s report_cache=%s full_report_cache=%s",
+            "[_start_metadata_loader] 启动元数据加载 EXIF paths=%s report_cache=%s full_report_cache=%s",
             len(paths),
             len(self._report_cache),
             len(self._report_full_cache or {}),
@@ -3049,6 +3174,10 @@ class FileListPanel(QWidget):
             item.setText(_TREE_COL_SEQ, str(idx + 1))
             item.setTextAlignment(_TREE_COL_SEQ, _AlignCenter)
             item.setData(_TREE_COL_SEQ, _SortRole, 0)
+
+    def refresh_row_numbers(self) -> None:
+        """公开的列表编号刷新入口，供通用/业务列表在增删行后统一调用。"""
+        self._refresh_tree_row_numbers()
 
     def _on_tree_sort_indicator_changed(self, column: int, order) -> None:
         if column == _TREE_COL_SEQ:
@@ -3266,35 +3395,39 @@ class FileListPanel(QWidget):
         )
         self._start_meta_apply(meta_dict)
 
+    def _emit_file_selected_for_path(self, path: str) -> None:
+        """更新当前显示路径并发出 file_selected，供点击与键盘选择共用。"""
+        if not path:
+            return
+        self._selected_display_path = os.path.normpath(path)
+        resolved_path = self._resolve_source_path_for_action(path)
+        if not resolved_path or not os.path.isfile(resolved_path):
+            self._request_actual_path_lookup(path)
+        _log.info(
+            "[_emit_file_selected_for_path] source=%r resolved=%r exists=%s",
+            path,
+            resolved_path,
+            os.path.isfile(resolved_path) if resolved_path else False,
+        )
+        self.file_selected.emit(resolved_path or path)
+
     def _on_tree_item_clicked(self, item, column) -> None:
         path = item.data(0, _UserRole)
         if path:
-            self._selected_display_path = os.path.normpath(path)
-            resolved_path = self._resolve_source_path_for_action(path)
-            if not resolved_path or not os.path.isfile(resolved_path):
-                self._request_actual_path_lookup(path)
-            _log.info(
-                "[_on_tree_item_clicked] source=%r resolved=%r exists=%s",
-                path,
-                resolved_path,
-                os.path.isfile(resolved_path) if resolved_path else False,
-            )
-            self.file_selected.emit(resolved_path or path)
+            self._emit_file_selected_for_path(path)
+
+    def _on_tree_current_item_changed(self, current, previous) -> None:
+        """列表模式下键盘上下/Shift 改变当前项时触发刷新。"""
+        if current is None:
+            return
+        path = current.data(0, _UserRole)
+        if path:
+            self._emit_file_selected_for_path(path)
 
     def _on_list_item_clicked(self, item) -> None:
         path = item.data(_UserRole)
         if path:
-            self._selected_display_path = os.path.normpath(path)
-            resolved_path = self._resolve_source_path_for_action(path)
-            if not resolved_path or not os.path.isfile(resolved_path):
-                self._request_actual_path_lookup(path)
-            _log.info(
-                "[_on_list_item_clicked] source=%r resolved=%r exists=%s",
-                path,
-                resolved_path,
-                os.path.isfile(resolved_path) if resolved_path else False,
-            )
-            self.file_selected.emit(resolved_path or path)
+            self._emit_file_selected_for_path(path)
 
     def _copy_paths_to_clipboard(self, paths: list) -> None:
         """将本地文件路径写入剪贴板；若存在同名 XMP sidecar 也一并复制。"""
@@ -3503,6 +3636,7 @@ class DirectoryBrowserWidget(QWidget):
         self._tree.itemClicked.connect(self._on_clicked)
         self._tree.setContextMenuPolicy(_CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._on_dir_context_menu)
+        self._tree.installEventFilter(self)
         layout.addWidget(self._tree)
 
         self._populate_roots()
@@ -3677,6 +3811,46 @@ class DirectoryBrowserWidget(QWidget):
         if path and os.path.isdir(path):
             self.directory_selected.emit(path)
 
+    def eventFilter(self, obj, event) -> bool:
+        if obj is not self._tree or event is None or event.type() != _EventKeyPress:
+            return super().eventFilter(obj, event)
+        key = event.key()
+        item = self._tree.currentItem()
+        if item is None:
+            return super().eventFilter(obj, event)
+        path = item.data(0, _UserRole)
+        if not path or not os.path.isdir(path):
+            return super().eventFilter(obj, event)
+        target = None
+        if key == _KeyUp:
+            target = self._tree.itemAbove(item)
+        elif key == _KeyDown:
+            target = self._tree.itemBelow(item)
+        elif key == _KeyLeft:
+            target = item.parent()
+        elif key == _KeyRight:
+            if item.childCount() > 0:
+                self._ensure_children_loaded(item)
+                self._tree.expandItem(item)
+                if item.childCount() > 0:
+                    child = item.child(0)
+                    if child.text(0) != self._PLACEHOLDER:
+                        target = child
+        if target is None:
+            return super().eventFilter(obj, event)
+        target_path = target.data(0, _UserRole)
+        if not target_path or not os.path.isdir(target_path):
+            return super().eventFilter(obj, event)
+        self._tree.setCurrentItem(target)
+        self._tree.clearSelection()
+        target.setSelected(True)
+        try:
+            self._tree.scrollToItem(target)
+        except Exception:
+            pass
+        self.directory_selected.emit(target_path)
+        return True
+
     def _on_dir_context_menu(self, pos) -> None:
         item = self._tree.itemAt(pos)
         if item is None:
@@ -3689,4 +3863,3 @@ class DirectoryBrowserWidget(QWidget):
         act = menu.addAction(label)
         act.triggered.connect(lambda: _reveal_in_file_manager(path))
         _exec_menu(menu, self._tree.viewport().mapToGlobal(pos))
-
