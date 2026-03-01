@@ -24,7 +24,7 @@ _log = get_logger("report_db")
 
 
 # Schema 版本，用于未来升级
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 
 # 所有列定义（有序），用于 CREATE TABLE 和数据验证
 PHOTO_COLUMNS = [
@@ -40,6 +40,7 @@ PHOTO_COLUMNS = [
     ("is_flying",     "INTEGER", 0),          # 0=no, 1=yes
     ("flight_conf",   "REAL", None),
     ("rating",        "INTEGER", 0),          # -1/0/1/2/3
+    ("pick",          "INTEGER", 0),          # -1=reject, 0=none, 1=pick
     ("focus_status",  "TEXT", None),           # BEST/GOOD/BAD/WORST
     ("focus_x",       "REAL", None),
     ("focus_y",       "REAL", None),
@@ -259,6 +260,17 @@ def report_row_to_exiftool_style(row: Dict[str, Any], source_file: str) -> Dict[
                 out["XMP-xmp:Rating"] = max(0, min(5, rv))
         except (TypeError, ValueError):
             pass
+    pick_value = row.get("pick")
+    if pick_value is not None:
+        try:
+            pv = max(-1, min(1, int(float(str(pick_value)))))
+            if pv != 0:
+                out["XMP-xmpDM:pick"] = pv
+                out["XMP-xmpDM:Pick"] = pv
+                out["XMP-xmp:Pick"] = pv
+                out["XMP:Pick"] = pv
+        except (TypeError, ValueError):
+            pass
 
     # 相机与镜头
     _set("IFD0:Model", row.get("camera_model"))
@@ -463,7 +475,7 @@ class ReportDB:
         _log.info("[ReportDB._init_schema] END")
 
     def _upgrade_schema_if_needed(self):
-        """检查并升级数据库 Schema（支持连续升级 v1 -> v2 -> v3 -> v4）"""
+        """检查并升级数据库 Schema（支持连续升级 v1 -> v2 -> v3 -> v4 -> v5）"""
         _log.debug("[ReportDB._upgrade_schema_if_needed] START")
         with self._lock:
             # 获取当前 schema 版本
@@ -554,6 +566,27 @@ class ReportDB:
                     self._update_schema_version("4")
                 current_version = "4"
                 _log.info("[ReportDB._upgrade_schema_if_needed] 已升级到 v4")
+
+            # ----------------------------------------------------------------------
+            #  Upgrade: v4 -> v5 (Pick flag)
+            # ----------------------------------------------------------------------
+            if current_version == "4":
+                _log.info("[ReportDB._upgrade_schema_if_needed] 升级 v4 -> v5")
+                new_columns_v5 = [
+                    ("pick", "INTEGER"),
+                ]
+                with self._conn:
+                    for col_name, col_type in new_columns_v5:
+                        try:
+                            self._conn.execute(
+                                f"ALTER TABLE photos ADD COLUMN {col_name} {col_type}"
+                            )
+                        except sqlite3.OperationalError:
+                            pass
+                    self._conn.execute("UPDATE photos SET pick = 0 WHERE pick IS NULL")
+                    self._update_schema_version("5")
+                current_version = "5"
+                _log.info("[ReportDB._upgrade_schema_if_needed] 已升级到 v5")
         _log.debug("[ReportDB._upgrade_schema_if_needed] END current_version=%s", current_version)
 
     def _update_schema_version(self, version):
@@ -1125,11 +1158,11 @@ class ReportDB:
                 continue
 
             # 整数字段
-            if key in ("rating", "iso", "focal_length_35mm"):
+            if key in ("rating", "pick", "iso", "focal_length_35mm"):
                 try:
                     cleaned[key] = int(float(value))
                 except (ValueError, TypeError):
-                    cleaned[key] = 0 if key == "rating" else None
+                    cleaned[key] = 0 if key in ("rating", "pick") else None
                 continue
 
             # 文本字段直接使用（包括 V2 新增的文本字段）

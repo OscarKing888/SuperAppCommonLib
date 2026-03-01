@@ -54,7 +54,12 @@ except ImportError:
         QKeySequence,
     )
 
-from app_common.exif_io import read_batch_metadata, find_xmp_sidecar, inject_metadata_cache
+from app_common.exif_io import (
+    find_xmp_sidecar,
+    inject_metadata_cache,
+    read_batch_metadata,
+    run_exiftool_assignments,
+)
 from app_common.log import get_logger
 from app_common.report_db import (
     ReportDB,
@@ -1548,6 +1553,7 @@ class FileListPanel(QWidget):
         self._tree_header_fast_mode: bool = False
         self._tree_last_sort_column: int = _TREE_COL_NAME
         self._tree_last_sort_order = _AscendingOrder
+        self._copied_species_payload: dict | None = None
         self._thumb_memory_cache = ThumbnailMemoryCache()
         self._thumb_loader_workers = _thumbnail_loader_worker_count()
         self._thumb_viewport_timer: QTimer | None = None
@@ -2066,14 +2072,14 @@ class FileListPanel(QWidget):
         )
 
     def _get_paste_species_action_text(self) -> str:
-        payload = self._copied_species_payload or {}
+        payload = getattr(self, "_copied_species_payload", None) or {}
         label = str(payload.get("bird_species_cn") or payload.get("filename") or "").strip()
         if label:
             return f"粘贴鸟种名称（{label}）"
         return "粘贴鸟种名称"
 
     def _paste_species_to_paths(self, paths: list[str]) -> None:
-        payload = self._copied_species_payload
+        payload = getattr(self, "_copied_species_payload", None)
         if not payload:
             _log.info("[_paste_species_to_paths] skip reason=no_copied_species")
             return
@@ -2147,6 +2153,298 @@ class FileListPanel(QWidget):
                     refreshed_path,
                 )
                 self.file_selected.emit(refreshed_path or selected_norm)
+
+    def _unique_norm_paths(self, paths: list[str]) -> list[str]:
+        unique: list[str] = []
+        seen: set[str] = set()
+        for path in paths:
+            norm_path = os.path.normpath(path) if path else ""
+            if not norm_path:
+                continue
+            norm_key = os.path.normcase(norm_path)
+            if norm_key in seen:
+                continue
+            seen.add(norm_key)
+            unique.append(norm_path)
+        return unique
+
+    def _rating_state_for_path(self, path: str) -> tuple[int, int]:
+        norm_path = os.path.normpath(path) if path else ""
+        meta = self._meta_cache.get(norm_path, {})
+        if isinstance(meta, dict):
+            try:
+                rating = max(0, min(5, int(float(str(meta.get("rating", 0) or 0)))))
+            except Exception:
+                rating = 0
+            try:
+                pick = max(-1, min(1, int(float(str(meta.get("pick", 0) or 0)))))
+            except Exception:
+                pick = 0
+            return rating, pick
+        row = self._get_report_row_for_path(path)
+        try:
+            rating = max(0, min(5, int(float(str((row or {}).get("rating", 0) or 0)))))
+        except Exception:
+            rating = 0
+        try:
+            pick = max(-1, min(1, int(float(str((row or {}).get("pick", 0) or 0)))))
+        except Exception:
+            pick = 0
+        return rating, pick
+
+    def _pick_target_for_paths(self, paths: list[str]) -> int:
+        unique_paths = self._unique_norm_paths(paths)
+        if not unique_paths:
+            return 1
+        all_picked = True
+        for path in unique_paths:
+            _rating, pick = self._rating_state_for_path(path)
+            if pick != 1:
+                all_picked = False
+                break
+        return 0 if all_picked else 1
+
+    def _resolve_metadata_write_target(self, path: str) -> str:
+        source_path = self._resolve_source_path_for_action(path)
+        if source_path and os.path.isfile(source_path):
+            return source_path
+        sidecar_path = self._resolve_sidecar_path(path)
+        if sidecar_path and os.path.isfile(sidecar_path):
+            return sidecar_path
+        return source_path or sidecar_path or os.path.normpath(path)
+
+    def _build_exif_rating_assignments(
+        self,
+        *,
+        rating: int | None = None,
+        pick: int | None = None,
+    ) -> list[str]:
+        assignments: list[str] = []
+        if rating is not None:
+            rating_value = max(0, min(5, int(rating)))
+            assignments.append(f"-XMP-xmp:Rating={rating_value}")
+        if pick is not None:
+            pick_value = max(-1, min(1, int(pick)))
+            if pick_value == 0:
+                assignments.extend([
+                    "-XMP-xmpDM:pick=",
+                    "-XMP-xmpDM:Pick=",
+                    "-XMP-xmp:Pick=",
+                    "-XMP-xmp:PickLabel=",
+                    "-XMP:Pick=",
+                    "-XMP:PickLabel=",
+                ])
+            else:
+                assignments.extend([
+                    f"-XMP-xmpDM:pick={pick_value}",
+                    f"-XMP-xmpDM:Pick={pick_value}",
+                    f"-XMP-xmp:Pick={pick_value}",
+                    f"-XMP:Pick={pick_value}",
+                ])
+        return assignments
+
+    def _ensure_report_cache_row(self, path: str, filename: str) -> dict:
+        norm_path = os.path.normpath(path) if path else ""
+        row = self._get_report_row_for_path(norm_path)
+        if not isinstance(row, dict):
+            row = {"filename": filename}
+        else:
+            row.setdefault("filename", filename)
+
+        if isinstance(self._report_full_cache, dict):
+            cached = self._report_full_cache.get(filename)
+            if isinstance(cached, dict):
+                row = cached
+            else:
+                self._report_full_cache[filename] = row
+        if isinstance(self._report_cache, dict):
+            cached = self._report_cache.get(filename)
+            if isinstance(cached, dict):
+                row = cached
+            else:
+                self._report_cache[filename] = row
+        if norm_path:
+            self._report_row_by_path[norm_path] = row
+        return row
+
+    def _apply_rating_state_to_meta_cache(
+        self,
+        path: str,
+        *,
+        rating: int | None = None,
+        pick: int | None = None,
+    ) -> None:
+        norm_path = os.path.normpath(path) if path else ""
+        if not norm_path:
+            return
+        meta = self._meta_cache.setdefault(norm_path, {})
+        if not isinstance(meta, dict):
+            meta = {}
+            self._meta_cache[norm_path] = meta
+        if rating is not None:
+            meta["rating"] = max(0, min(5, int(rating)))
+        if pick is not None:
+            meta["pick"] = max(-1, min(1, int(pick)))
+
+    def _refresh_metadata_state_for_paths(self, paths: list[str]) -> None:
+        unique_paths = self._unique_norm_paths(paths)
+        for norm_path in unique_paths:
+            meta = self._meta_cache.get(norm_path, {})
+            if not isinstance(meta, dict):
+                continue
+            tree_item = self._tree_item_map.get(norm_path)
+            if tree_item is not None:
+                self._apply_meta_to_tree_item(tree_item, meta)
+            list_item = self._item_map.get(norm_path)
+            if list_item is not None:
+                self._apply_thumb_meta_to_item(list_item, meta)
+
+        if self._tree_widget.isSortingEnabled():
+            self._tree_widget.sortItems(self._tree_last_sort_column, self._tree_last_sort_order)
+            self._refresh_tree_row_numbers()
+
+        self._tree_widget.viewport().update()
+        if self._view_mode == self._MODE_THUMB:
+            self._list_widget.viewport().update()
+
+        if self._filter_pick or self._filter_min_rating > 0 or self._filter_focus_status:
+            self._apply_filter()
+
+        if self._selected_display_path:
+            selected_norm = os.path.normpath(self._selected_display_path)
+            path_keys = {os.path.normcase(os.path.normpath(p)) for p in unique_paths}
+            if os.path.normcase(selected_norm) in path_keys:
+                refreshed_path = self._resolve_source_path_for_action(selected_norm)
+                self.file_selected.emit(refreshed_path or selected_norm)
+
+    def _apply_rating_state_via_report_db(
+        self,
+        paths: list[str],
+        *,
+        rating: int | None = None,
+        pick: int | None = None,
+    ) -> list[str]:
+        db_dir = self._report_root_dir or self._current_dir
+        db = ReportDB.open_if_exists(db_dir) if db_dir else None
+        if db is None:
+            return []
+
+        updated_paths: list[str] = []
+        try:
+            for path in self._unique_norm_paths(paths):
+                row = self._get_report_row_for_path(path)
+                filename = str((row or {}).get("filename") or Path(path).stem or "").strip()
+                if not filename:
+                    continue
+                data: dict[str, int] = {}
+                if rating is not None:
+                    data["rating"] = max(0, min(5, int(rating)))
+                if pick is not None:
+                    data["pick"] = max(-1, min(1, int(pick)))
+                if not data:
+                    continue
+                try:
+                    db.insert_photo({"filename": filename, **data})
+                except Exception as exc:
+                    _log.warning("[_apply_rating_state_via_report_db] source=%r filename=%r failed: %s", path, filename, exc)
+                    continue
+                cache_row = self._ensure_report_cache_row(path, filename)
+                for key, value in data.items():
+                    cache_row[key] = value
+                self._apply_rating_state_to_meta_cache(path, rating=rating, pick=pick)
+                updated_paths.append(path)
+        finally:
+            db.close()
+        return updated_paths
+
+    def _apply_rating_state_via_exif(
+        self,
+        paths: list[str],
+        *,
+        rating: int | None = None,
+        pick: int | None = None,
+    ) -> list[str]:
+        assignments = self._build_exif_rating_assignments(rating=rating, pick=pick)
+        if not assignments:
+            return []
+        updated_paths: list[str] = []
+        written_targets: set[str] = set()
+        for path in self._unique_norm_paths(paths):
+            target_path = self._resolve_metadata_write_target(path)
+            if not target_path:
+                continue
+            target_key = os.path.normcase(os.path.normpath(target_path))
+            if target_key in written_targets:
+                continue
+            try:
+                run_exiftool_assignments(target_path, assignments)
+            except Exception as exc:
+                _log.warning("[_apply_rating_state_via_exif] source=%r target=%r failed: %s", path, target_path, exc)
+                continue
+            written_targets.add(target_key)
+            self._apply_rating_state_to_meta_cache(path, rating=rating, pick=pick)
+            updated_paths.append(path)
+        return updated_paths
+
+    def _set_rating_state_for_paths(
+        self,
+        paths: list[str],
+        *,
+        rating: int | None = None,
+        pick: int | None = None,
+    ) -> None:
+        unique_paths = self._unique_norm_paths(paths)
+        if not unique_paths:
+            return
+        db_dir = self._report_root_dir or self._current_dir
+        db_exists = False
+        if db_dir:
+            db_probe = ReportDB.open_if_exists(db_dir)
+            db_exists = db_probe is not None
+            if db_probe is not None:
+                db_probe.close()
+        if db_exists:
+            updated_paths = self._apply_rating_state_via_report_db(unique_paths, rating=rating, pick=pick)
+            source_name = "report_db"
+        else:
+            updated_paths = self._apply_rating_state_via_exif(unique_paths, rating=rating, pick=pick)
+            source_name = "exif"
+        if not updated_paths:
+            _log.info(
+                "[_set_rating_state_for_paths] skip source=%s rating=%r pick=%r selected=%s",
+                source_name,
+                rating,
+                pick,
+                len(unique_paths),
+            )
+            return
+        self._refresh_metadata_state_for_paths(updated_paths)
+        _log.info(
+            "[_set_rating_state_for_paths] source=%s rating=%r pick=%r selected=%s updated=%s",
+            source_name,
+            rating,
+            pick,
+            len(unique_paths),
+            len(updated_paths),
+        )
+
+    def _add_rating_menu_actions(self, menu: QMenu, paths: list[str]) -> None:
+        unique_paths = self._unique_norm_paths(paths)
+        if not unique_paths:
+            return
+        rating_menu = menu.addMenu("修改星级")
+        for stars in range(1, 6):
+            action = rating_menu.addAction("★" * stars)
+            action.triggered.connect(
+                lambda checked=False, value=stars: self._set_rating_state_for_paths(unique_paths, rating=value)
+            )
+        rating_menu.addSeparator()
+        pick_target = self._pick_target_for_paths(unique_paths)
+        pick_label = "取消🏆 Pick" if pick_target == 0 else "🏆 Pick"
+        pick_action = rating_menu.addAction(pick_label)
+        pick_action.triggered.connect(
+            lambda checked=False, value=pick_target: self._set_rating_state_for_paths(unique_paths, pick=value)
+        )
 
     def _get_actual_path_for_display(self, path: str) -> str | None:
         actual = _get_cached_actual_path(path)
@@ -3511,7 +3809,7 @@ class FileListPanel(QWidget):
             act_copy_species.triggered.connect(lambda: self._copy_species_from_path(source_path))
 
         act_paste_species = menu.addAction(self._get_paste_species_action_text())
-        can_paste = self._copied_species_payload is not None and bool(paths) and bool(self._report_root_dir or self._current_dir)
+        can_paste = getattr(self, "_copied_species_payload", None) is not None and bool(paths) and bool(self._report_root_dir or self._current_dir)
         act_paste_species.setEnabled(can_paste)
         if can_paste:
             act_paste_species.triggered.connect(lambda: self._paste_species_to_paths(paths))
@@ -3535,6 +3833,8 @@ class FileListPanel(QWidget):
         act_copy.triggered.connect(lambda: self._copy_paths_to_clipboard(paths))
         act_copy_filename = menu.addAction("复制文件名")
         act_copy_filename.triggered.connect(lambda: self._copy_filenames_to_clipboard(paths))
+        self._add_rating_menu_actions(menu, paths)
+        menu.addSeparator()
         self._add_species_menu_actions(menu, item.data(0, _UserRole) if item else (paths[0] if paths else ""), paths)
         menu.addSeparator()
         label = "在Finder中显示" if sys.platform == "darwin" else "在资源管理器中显示"
@@ -3565,6 +3865,8 @@ class FileListPanel(QWidget):
         act_copy.triggered.connect(lambda: self._copy_paths_to_clipboard(paths))
         act_copy_filename = menu.addAction("复制文件名")
         act_copy_filename.triggered.connect(lambda: self._copy_filenames_to_clipboard(paths))
+        self._add_rating_menu_actions(menu, paths)
+        menu.addSeparator()
         self._add_species_menu_actions(menu, item.data(_UserRole) if item else (paths[0] if paths else ""), paths)
         menu.addSeparator()
         label = "在Finder中显示" if sys.platform == "darwin" else "在资源管理器中显示"
