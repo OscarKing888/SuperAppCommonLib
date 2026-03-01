@@ -10,13 +10,264 @@ from __future__ import annotations
 import json
 import os
 import sys
-from typing import Callable
+from collections.abc import Iterable
+from typing import Any, Callable
 
 from app_common.log import get_logger
 
 # 协议：客户端发送一行 JSON：{"files": ["path1", "path2", ...]}，UTF-8
 _PROTOCOL_ENCODING = "utf-8"
 _log = get_logger("send_to_app")
+
+_QT_APIS = ("PyQt6", "PyQt5", "PySide6")
+_FILE_OPEN_DISPATCHER_ATTR = "_send_to_app_file_open_dispatcher"
+_FILE_OPEN_FILTER_ATTR = "_send_to_app_file_open_filter"
+_QT_FILE_OPEN_SUPPORT: dict[str, Any] | None = None
+
+
+def _iter_qt_api_names() -> tuple[str, ...]:
+    """优先复用当前进程里已经加载的 Qt 绑定，避免混用 PyQt/PySide。"""
+    preferred: list[str] = []
+    for api_name in _QT_APIS:
+        if api_name in sys.modules or any(module_name.startswith(f"{api_name}.") for module_name in sys.modules):
+            preferred.append(api_name)
+    for api_name in _QT_APIS:
+        if api_name not in preferred:
+            preferred.append(api_name)
+    return tuple(preferred)
+
+
+def _load_qt_modules(*, need_network: bool = False, need_widgets: bool = False) -> tuple[Any, Any | None, Any | None]:
+    """按当前绑定优先级加载 QtCore / QtNetwork / QtWidgets。"""
+    for api_name in _iter_qt_api_names():
+        try:
+            if api_name == "PyQt6":
+                from PyQt6 import QtCore
+
+                QtNetwork = None
+                QtWidgets = None
+                if need_network:
+                    from PyQt6 import QtNetwork as _QtNetwork
+
+                    QtNetwork = _QtNetwork
+                if need_widgets:
+                    from PyQt6 import QtWidgets as _QtWidgets
+
+                    QtWidgets = _QtWidgets
+            elif api_name == "PyQt5":
+                from PyQt5 import QtCore
+
+                QtNetwork = None
+                QtWidgets = None
+                if need_network:
+                    from PyQt5 import QtNetwork as _QtNetwork
+
+                    QtNetwork = _QtNetwork
+                if need_widgets:
+                    from PyQt5 import QtWidgets as _QtWidgets
+
+                    QtWidgets = _QtWidgets
+            else:
+                from PySide6 import QtCore
+
+                QtNetwork = None
+                QtWidgets = None
+                if need_network:
+                    from PySide6 import QtNetwork as _QtNetwork
+
+                    QtNetwork = _QtNetwork
+                if need_widgets:
+                    from PySide6 import QtWidgets as _QtWidgets
+
+                    QtWidgets = _QtWidgets
+            return QtCore, QtNetwork, QtWidgets
+        except ImportError:
+            continue
+    raise ImportError("Qt bindings are unavailable")
+
+
+def normalize_file_paths(paths: Iterable[str | os.PathLike[str]] | None) -> list[str]:
+    """统一做 expanduser + abspath + normpath + 去重，供 argv/socket/FileOpen 共用。"""
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_path in paths or ():
+        if raw_path is None:
+            continue
+        try:
+            path_text = os.fspath(raw_path)
+        except TypeError:
+            path_text = str(raw_path)
+        path_text = path_text.strip()
+        if not path_text:
+            continue
+        full_path = os.path.abspath(os.path.normpath(os.path.expanduser(path_text)))
+        if full_path in seen:
+            continue
+        seen.add(full_path)
+        normalized.append(full_path)
+    return normalized
+
+
+def _file_open_event_type(q_event: Any) -> Any:
+    event_type_enum = getattr(q_event, "Type", None)
+    if event_type_enum is not None:
+        return getattr(event_type_enum, "FileOpen", None)
+    return getattr(q_event, "FileOpen", None)
+
+
+def _get_qt_file_open_support() -> dict[str, Any]:
+    """懒加载 FileOpen 事件桥接所需的 Qt 类型，避免无 GUI 场景提前导入。"""
+    global _QT_FILE_OPEN_SUPPORT
+    if _QT_FILE_OPEN_SUPPORT is not None:
+        return _QT_FILE_OPEN_SUPPORT
+
+    QtCore, _, QtWidgets = _load_qt_modules(need_widgets=True)
+    if QtWidgets is None:
+        raise ImportError("QtWidgets is unavailable")
+
+    QApplication = QtWidgets.QApplication
+    QObject = QtCore.QObject
+    QEvent = QtCore.QEvent
+    QTimer = QtCore.QTimer
+    file_open_type = _file_open_event_type(QEvent)
+
+    class _FileOpenEventDispatcher(QObject):
+        def __init__(self, parent: Any = None) -> None:
+            super().__init__(parent)
+            self._pending_file_open_paths: list[str] = []
+            self._buffered_batches: list[list[str]] = []
+            self._dispatch_callback: Callable[[list[str]], None] | None = None
+            self._flush_timer = QTimer(self)
+            self._flush_timer.setSingleShot(True)
+            self._flush_timer.timeout.connect(self._flush_pending_paths)
+
+        def set_dispatch_callback(self, on_files_received: Callable[[list[str]], None]) -> None:
+            self._dispatch_callback = on_files_received
+            self.flush()
+
+        def handle_event(self, event: Any) -> bool:
+            if file_open_type is None or event.type() != file_open_type:
+                return False
+
+            path_text = ""
+            try:
+                if hasattr(event, "file"):
+                    path_text = event.file() or ""
+                elif hasattr(event, "url"):
+                    url = event.url()
+                    if url and url.isLocalFile():
+                        path_text = url.toLocalFile() or ""
+            except Exception:
+                path_text = ""
+
+            normalized_paths = normalize_file_paths([path_text])
+            if not normalized_paths:
+                return False
+
+            self._pending_file_open_paths.extend(normalized_paths)
+            if not self._flush_timer.isActive():
+                self._flush_timer.start(0)
+            return True
+
+        def flush(self) -> None:
+            if self._pending_file_open_paths:
+                self._flush_timer.stop()
+                self._flush_pending_paths()
+                return
+            self._flush_buffered_batches()
+
+        def _flush_pending_paths(self) -> None:
+            pending_paths = normalize_file_paths(self._pending_file_open_paths)
+            self._pending_file_open_paths.clear()
+            if not pending_paths:
+                return
+            if self._dispatch_callback is None:
+                self._buffered_batches.append(pending_paths)
+                return
+            self._dispatch(pending_paths)
+
+        def _flush_buffered_batches(self) -> None:
+            if self._dispatch_callback is None or not self._buffered_batches:
+                return
+            merged_paths = normalize_file_paths(
+                path_text
+                for batch_paths in self._buffered_batches
+                for path_text in batch_paths
+            )
+            self._buffered_batches.clear()
+            if merged_paths:
+                self._dispatch(merged_paths)
+
+        def _dispatch(self, paths: list[str]) -> None:
+            if self._dispatch_callback is None or not paths:
+                return
+            try:
+                self._dispatch_callback(paths)
+            except Exception as exc:
+                _log.warning("FileOpen dispatch failed: %s", exc)
+
+    class _FileOpenEventFilter(QObject):
+        def __init__(self, dispatcher: _FileOpenEventDispatcher, parent: Any = None) -> None:
+            super().__init__(parent)
+            self._dispatcher = dispatcher
+
+        def eventFilter(self, watched: Any, event: Any) -> bool:  # type: ignore[override]
+            return bool(self._dispatcher.handle_event(event))
+
+    class FileOpenAwareApplication(QApplication):
+        def __init__(self, argv: list[str]) -> None:
+            super().__init__(argv)
+            setattr(self, _FILE_OPEN_DISPATCHER_ATTR, _FileOpenEventDispatcher(self))
+
+        def event(self, event: Any) -> bool:  # type: ignore[override]
+            dispatcher = getattr(self, _FILE_OPEN_DISPATCHER_ATTR, None)
+            if dispatcher is not None and dispatcher.handle_event(event):
+                return True
+            return super().event(event)
+
+    _QT_FILE_OPEN_SUPPORT = {
+        "QApplication": QApplication,
+        "dispatcher_cls": _FileOpenEventDispatcher,
+        "filter_cls": _FileOpenEventFilter,
+        "app_cls": FileOpenAwareApplication,
+    }
+    return _QT_FILE_OPEN_SUPPORT
+
+
+def _ensure_file_open_dispatcher(app: Any) -> Any:
+    dispatcher = getattr(app, _FILE_OPEN_DISPATCHER_ATTR, None)
+    if dispatcher is not None:
+        return dispatcher
+
+    support = _get_qt_file_open_support()
+    dispatcher = support["dispatcher_cls"](app)
+    event_filter = support["filter_cls"](dispatcher, app)
+    app.installEventFilter(event_filter)
+    setattr(app, _FILE_OPEN_DISPATCHER_ATTR, dispatcher)
+    setattr(app, _FILE_OPEN_FILTER_ATTR, event_filter)
+    _log.info("installed FileOpen event filter on existing QApplication")
+    return dispatcher
+
+
+def ensure_file_open_aware_application(argv: list[str] | None = None) -> Any:
+    """
+    返回支持 macOS QFileOpenEvent 的 QApplication。
+    无实例时创建子类实例；已有实例时退回为安装 eventFilter。
+    """
+    support = _get_qt_file_open_support()
+    QApplication = support["QApplication"]
+    app = QApplication.instance()
+    if app is None:
+        app = support["app_cls"](list(argv or sys.argv))
+        _log.info("created FileOpen-aware QApplication")
+    _ensure_file_open_dispatcher(app)
+    return app
+
+
+def install_file_open_handler(app: Any, on_files_received: Callable[[list[str]], None]) -> None:
+    """为 QApplication 绑定统一文件接收回调，并立刻冲刷启动早期缓存的 FileOpen 事件。"""
+    dispatcher = _ensure_file_open_dispatcher(app)
+    dispatcher.set_dispatch_callback(on_files_received)
 
 
 def get_initial_file_list_from_argv(argv: list[str] | None = None) -> list[str]:
@@ -34,9 +285,8 @@ def get_initial_file_list_from_argv(argv: list[str] | None = None) -> list[str]:
     for a in args:
         if a.startswith("-"):
             break
-        p = os.path.abspath(os.path.expanduser(a.strip()))
-        paths.append(p)
-    return paths
+        paths.append(a)
+    return normalize_file_paths(paths)
 
 
 def _server_name(app_id: str) -> str:
@@ -58,18 +308,15 @@ def _server_name(app_id: str) -> str:
 
 def _send_via_socket(server_name: str, file_paths: list[str]) -> bool:
     """作为客户端连接已有实例，发送 file_paths 后返回。成功返回 True。"""
-    try:
-        from PySide6.QtNetwork import QLocalSocket
-    except ImportError:
-        try:
-            from PyQt6.QtNetwork import QLocalSocket
-        except ImportError:
-            from PyQt5.QtNetwork import QLocalSocket
+    _, QtNetwork, _ = _load_qt_modules(need_network=True)
+    if QtNetwork is None:
+        return False
+    QLocalSocket = QtNetwork.QLocalSocket
     sock = QLocalSocket()
     sock.connectToServer(server_name)
     if not sock.waitForConnected(3000):
         return False
-    payload = json.dumps({"files": [os.path.normpath(p) for p in file_paths]}, ensure_ascii=False)
+    payload = json.dumps({"files": normalize_file_paths(file_paths)}, ensure_ascii=False)
     sock.write(payload.encode(_PROTOCOL_ENCODING))
     sock.flush()
     sock.waitForBytesWritten(2000)
@@ -82,13 +329,10 @@ def _send_via_socket(server_name: str, file_paths: list[str]) -> bool:
 
 def _can_connect_to_server(server_name: str, timeout_ms: int = 300) -> bool:
     """探测本地服务是否真的在监听，用于区分活跃实例和残留 socket。"""
-    try:
-        from PySide6.QtNetwork import QLocalSocket
-    except ImportError:
-        try:
-            from PyQt6.QtNetwork import QLocalSocket
-        except ImportError:
-            from PyQt5.QtNetwork import QLocalSocket
+    _, QtNetwork, _ = _load_qt_modules(need_network=True)
+    if QtNetwork is None:
+        return False
+    QLocalSocket = QtNetwork.QLocalSocket
     sock = QLocalSocket()
     try:
         sock.connectToServer(server_name)
@@ -115,16 +359,11 @@ class SingleInstanceReceiver:
 
     def start(self) -> bool:
         """创建并监听本地 socket。若已被占用则返回 False（表示本进程应为第二实例）。"""
-        try:
-            from PySide6.QtNetwork import QLocalServer
-            from PySide6.QtCore import QByteArray
-        except ImportError:
-            try:
-                from PyQt6.QtNetwork import QLocalServer
-                from PyQt6.QtCore import QByteArray
-            except ImportError:
-                from PyQt5.QtNetwork import QLocalServer
-                from PyQt5.QtCore import QByteArray
+        _, QtNetwork, _ = _load_qt_modules(need_network=True)
+        if QtNetwork is None:
+            _log.warning("receiver start failed: QtNetwork is unavailable")
+            return False
+        QLocalServer = QtNetwork.QLocalServer
         self._server = QLocalServer()
         if not self._server.listen(self._name):
             error_text = self._server.errorString()
@@ -178,7 +417,7 @@ class SingleInstanceReceiver:
                     paths = obj.get("files")
                     if isinstance(paths, list):
                         done.append(1)
-                        self._on_files([os.path.normpath(str(p)) for p in paths])
+                        self._on_files(normalize_file_paths(paths))
             except Exception:
                 pass
             finally:
@@ -201,13 +440,10 @@ class SingleInstanceReceiver:
         if self._server:
             self._server.close()
             self._server = None
-        try:
-            from PySide6.QtNetwork import QLocalServer
-        except ImportError:
-            try:
-                from PyQt6.QtNetwork import QLocalServer
-            except ImportError:
-                from PyQt5.QtNetwork import QLocalServer
+        _, QtNetwork, _ = _load_qt_modules(need_network=True)
+        if QtNetwork is None:
+            return
+        QLocalServer = QtNetwork.QLocalServer
         try:
             removed = bool(QLocalServer.removeServer(self._name))
             _log.info("receiver stopped; name=%s removed=%s", self._name, removed)
@@ -221,6 +457,7 @@ def send_file_list_to_running_app(app_id: str, file_paths: list[str]) -> bool:
     若成功发送则返回 True，调用方应随后退出（由已运行实例处理）；
     若返回 False 表示没有已运行实例，可正常启动新进程。
     """
-    if not file_paths:
+    normalized_paths = normalize_file_paths(file_paths)
+    if not normalized_paths:
         return False
-    return _send_via_socket(_server_name(app_id), file_paths)
+    return _send_via_socket(_server_name(app_id), normalized_paths)

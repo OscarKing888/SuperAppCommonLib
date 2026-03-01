@@ -15,7 +15,10 @@ from .config import (
     save_config,
 )
 from .receive import (
+    ensure_file_open_aware_application,
     get_initial_file_list_from_argv,
+    install_file_open_handler,
+    normalize_file_paths,
     send_file_list_to_running_app,
     SingleInstanceReceiver,
 )
@@ -29,7 +32,10 @@ __all__ = [
     "get_config_path",
     "load_config",
     "save_config",
+    "ensure_file_open_aware_application",
     "get_initial_file_list_from_argv",
+    "install_file_open_handler",
+    "normalize_file_paths",
     "send_file_list_to_running_app",
     "SingleInstanceReceiver",
     "resolve_app_path",

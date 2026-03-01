@@ -20,9 +20,10 @@
 
 冷启动与热接收采用**同一套逻辑**：收到文件列表后，打开首文件所在目录，待目录加载完成后在文件列表中**多选**这些路径，并刷新预览/EXIF 为第一项，效果与用户在目录内多选文件一致。
 
-1. **冷启动**：`get_initial_file_list_from_argv(argv=None)` 从命令行参数解析出文件列表（遇 `-` 开头参数停止）。主程序对该列表调用与热接收相同的「打开目录 + 待选路径」处理。
-2. **热启动**：`SingleInstanceReceiver(app_id, on_files_received)` 在首进程中监听；其它进程通过 `send_file_list_to_running_app(app_id, file_paths)` 发送文件列表。若发送成功，调用方应退出，由已运行实例在回调中处理。
-3. **统一处理**：主程序将「打开首文件所在目录」并调用 `FileListPanel.set_pending_selection(paths)`；目录加载完成后面板会多选列表中匹配的路径并刷新预览，与目录列表选择同等。
+1. **冷启动 argv**：`get_initial_file_list_from_argv(argv=None)` 从命令行参数解析出文件列表（遇 `-` 开头参数停止）。主程序对该列表调用与热接收相同的统一处理入口。
+2. **macOS FileOpen**：`ensure_file_open_aware_application(argv=None)` + `install_file_open_handler(app, on_files_received)` 负责接收 `QFileOpenEvent / QEvent.FileOpen`，并在主窗口创建前先缓存、创建后再冲刷，兼容 `.app` 冷启动、Finder“打开方式”、`open -a App file1 file2`。
+3. **热启动 socket**：`SingleInstanceReceiver(app_id, on_files_received)` 在首进程中监听；其它进程通过 `send_file_list_to_running_app(app_id, file_paths)` 发送文件列表。若发送成功，调用方应退出，由已运行实例在回调中处理。
+4. **统一处理**：主程序将三种入口都汇总到同一个 `on_files_received(paths)` 处理函数；后续目录打开、多选、预览刷新逻辑只保留一套。
 
 ## 协议
 
