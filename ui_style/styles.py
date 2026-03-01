@@ -472,47 +472,6 @@ QTabBar::tab:hover:!selected {{
     color: {COLORS['text_secondary']};
 }}
 
-/* ==================== 下拉框 ==================== */
-QComboBox {{
-    background-color: {COLORS['bg_input']};
-    border: 1px solid {COLORS['border']};
-    border-radius: 8px;
-    padding: 10px 16px;
-    color: {COLORS['text_primary']};
-    font-size: 13px;
-    min-width: 120px;
-}}
-
-QComboBox:hover {{
-    border-color: {COLORS['text_muted']};
-}}
-
-QComboBox:focus {{
-    border-color: {COLORS['accent']};
-}}
-
-QComboBox::drop-down {{
-    border: none;
-    width: 24px;
-}}
-
-QComboBox::down-arrow {{
-    image: none;
-    border-left: 5px solid transparent;
-    border-right: 5px solid transparent;
-    border-top: 6px solid {COLORS['text_tertiary']};
-    margin-right: 8px;
-}}
-
-QComboBox QAbstractItemView {{
-    background-color: {COLORS['bg_elevated']};
-    border: 1px solid {COLORS['border']};
-    border-radius: 8px;
-    padding: 4px;
-    selection-background-color: {COLORS['accent']};
-    selection-color: {COLORS['bg_void']};
-}}
-
 /* ==================== 工具提示 ==================== */
 QToolTip {{
     background-color: {COLORS['bg_card']};
