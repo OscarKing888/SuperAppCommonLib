@@ -289,6 +289,188 @@ def _coerce_camera_type(
     return resolve_focus_camera_type(text)
 
 
+def _parse_positive_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        parsed = int(value)
+        return parsed if parsed > 0 else None
+    match = re.search(r"(\d+)", str(value))
+    if not match:
+        return None
+    try:
+        parsed = int(match.group(1))
+    except Exception:
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _parse_dimension_pair(value: Any) -> tuple[int, int] | None:
+    if value is None:
+        return None
+    numbers = re.findall(r"\d+", str(value))
+    if len(numbers) < 2:
+        return None
+    try:
+        width = int(numbers[0])
+        height = int(numbers[1])
+    except Exception:
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return (width, height)
+
+
+def resolve_focus_calc_image_size(raw: dict[str, Any], fallback: tuple[int, int]) -> tuple[int, int]:
+    """Resolve the metadata coordinate-space size used by focus-point tags."""
+    lookup = normalize_lookup(raw)
+    key_pairs = [
+        ("exif:exifimagewidth", "exif:exifimageheight"),
+        ("exifimagewidth", "exifimageheight"),
+        ("exif:imagewidth", "exif:imageheight"),
+        ("rawimagewidth", "rawimageheight"),
+        ("imagewidth", "imageheight"),
+        ("file:imagewidth", "file:imageheight"),
+    ]
+    for width_key, height_key in key_pairs:
+        width = _parse_positive_int(lookup.get(width_key))
+        height = _parse_positive_int(lookup.get(height_key))
+        if width and height:
+            return (width, height)
+
+    for pair_key in ("composite:imagesize", "imagesize", "exif:image size"):
+        parsed = _parse_dimension_pair(lookup.get(pair_key))
+        if parsed is not None:
+            return parsed
+
+    fallback_width = int(fallback[0]) if fallback and len(fallback) > 0 else 0
+    fallback_height = int(fallback[1]) if fallback and len(fallback) > 1 else 0
+    if fallback_width > 0 and fallback_height > 0:
+        return (fallback_width, fallback_height)
+    return (1, 1)
+
+
+def parse_focus_orientation(value: Any) -> int:
+    """Parse EXIF Orientation from numeric or text metadata into 1..8."""
+    if value is None:
+        return 1
+    if isinstance(value, (int, float)):
+        orientation = int(value)
+        return orientation if 1 <= orientation <= 8 else 1
+
+    text = (_clean_text(value) or "").lower()
+    if not text:
+        return 1
+    orientation_text_map = {
+        "horizontal (normal)": 1,
+        "mirror horizontal": 2,
+        "rotate 180": 3,
+        "mirror vertical": 4,
+        "mirror horizontal and rotate 270 cw": 5,
+        "rotate 90 cw": 6,
+        "mirror horizontal and rotate 90 cw": 7,
+        "rotate 270 cw": 8,
+        "rotate 90 ccw": 8,
+    }
+    if text in orientation_text_map:
+        return orientation_text_map[text]
+
+    match = re.fullmatch(r"\D*([1-8])\D*", text)
+    if match:
+        try:
+            return int(match.group(1))
+        except Exception:
+            return 1
+    return 1
+
+
+def resolve_focus_orientation(raw: dict[str, Any]) -> int:
+    """Resolve EXIF Orientation from metadata for display-coordinate mapping."""
+    lookup = normalize_lookup(raw)
+    for key in ("orientation", "exif:orientation", "ifd0:orientation"):
+        orientation = parse_focus_orientation(lookup.get(key))
+        if orientation != 1 or lookup.get(key) is not None:
+            return orientation
+    return 1
+
+
+def transform_focus_box_by_orientation(
+    focus_box: tuple[float, float, float, float] | None,
+    orientation: int,
+) -> tuple[float, float, float, float] | None:
+    """Map a source-orientation focus box into the display orientation."""
+    if not focus_box:
+        return None
+    try:
+        left, top, right, bottom = [float(value) for value in focus_box]
+    except Exception:
+        return None
+
+    left = clamp01(left)
+    top = clamp01(top)
+    right = clamp01(right)
+    bottom = clamp01(bottom)
+    if right < left:
+        left, right = right, left
+    if bottom < top:
+        top, bottom = bottom, top
+
+    resolved_orientation = int(orientation or 1)
+    if resolved_orientation == 1:
+        return (left, top, right, bottom)
+
+    def _map_point(x: float, y: float) -> tuple[float, float]:
+        if resolved_orientation == 2:
+            return (1.0 - x, y)
+        if resolved_orientation == 3:
+            return (1.0 - x, 1.0 - y)
+        if resolved_orientation == 4:
+            return (x, 1.0 - y)
+        if resolved_orientation == 5:
+            return (y, x)
+        if resolved_orientation == 6:
+            return (1.0 - y, x)
+        if resolved_orientation == 7:
+            return (1.0 - y, 1.0 - x)
+        if resolved_orientation == 8:
+            return (y, 1.0 - x)
+        return (x, y)
+
+    points = [
+        _map_point(left, top),
+        _map_point(right, top),
+        _map_point(left, bottom),
+        _map_point(right, bottom),
+    ]
+    xs = [clamp01(point[0]) for point in points]
+    ys = [clamp01(point[1]) for point in points]
+    mapped_left, mapped_right = min(xs), max(xs)
+    mapped_top, mapped_bottom = min(ys), max(ys)
+    if mapped_right - mapped_left < 1e-6 or mapped_bottom - mapped_top < 1e-6:
+        return None
+    return (mapped_left, mapped_top, mapped_right, mapped_bottom)
+
+
+def extract_focus_box_for_display(
+    raw: dict[str, Any],
+    display_width: int,
+    display_height: int,
+    camera_type: CameraFocusType | str | None = None,
+) -> tuple[float, float, float, float] | None:
+    """
+    Return the focus box in display coordinates.
+
+    Do not replace this helper with a direct ``extract_focus_box(raw, image.width, image.height)``
+    call: many cameras store focus metadata in the original EXIF coordinate space,
+    while the GUI preview uses an Orientation-corrected image.
+    """
+    calc_width, calc_height = resolve_focus_calc_image_size(raw, fallback=(display_width, display_height))
+    source_box = extract_focus_box(raw, calc_width, calc_height, camera_type=camera_type)
+    if source_box is None:
+        return None
+    return transform_focus_box_by_orientation(source_box, resolve_focus_orientation(raw))
+
+
 def _extract_focus_point_sony(raw: dict[str, Any], width: int, height: int) -> tuple[float, float] | None:
     if width <= 0 or height <= 0:
         return None
@@ -441,8 +623,13 @@ __all__ = [
     "DEFAULT_FOCUS_BOX_SHORT_EDGE_RATIO",
     "clamp01",
     "normalize_lookup",
+    "parse_focus_orientation",
+    "resolve_focus_orientation",
     "resolve_focus_camera_type",
     "resolve_focus_camera_type_from_metadata",
+    "resolve_focus_calc_image_size",
     "get_focus_point",
     "extract_focus_box",
+    "transform_focus_box_by_orientation",
+    "extract_focus_box_for_display",
 ]
