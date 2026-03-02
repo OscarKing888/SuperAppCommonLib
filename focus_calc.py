@@ -451,6 +451,40 @@ def transform_focus_box_by_orientation(
     return (mapped_left, mapped_top, mapped_right, mapped_bottom)
 
 
+def transform_focus_point_by_orientation(
+    focus_point: tuple[float, float] | None,
+    orientation: int,
+) -> tuple[float, float] | None:
+    """Map a source-orientation focus point into the display orientation."""
+    if not focus_point:
+        return None
+    try:
+        x, y = [float(value) for value in focus_point]
+    except Exception:
+        return None
+
+    x = clamp01(x)
+    y = clamp01(y)
+    resolved_orientation = int(orientation or 1)
+    if resolved_orientation == 1:
+        return (x, y)
+    if resolved_orientation == 2:
+        return (1.0 - x, y)
+    if resolved_orientation == 3:
+        return (1.0 - x, 1.0 - y)
+    if resolved_orientation == 4:
+        return (x, 1.0 - y)
+    if resolved_orientation == 5:
+        return (y, x)
+    if resolved_orientation == 6:
+        return (1.0 - y, x)
+    if resolved_orientation == 7:
+        return (1.0 - y, 1.0 - x)
+    if resolved_orientation == 8:
+        return (y, 1.0 - x)
+    return (x, y)
+
+
 def extract_focus_box_for_display(
     raw: dict[str, Any],
     display_width: int,
@@ -469,6 +503,20 @@ def extract_focus_box_for_display(
     if source_box is None:
         return None
     return transform_focus_box_by_orientation(source_box, resolve_focus_orientation(raw))
+
+
+def get_focus_point_for_display(
+    raw: dict[str, Any],
+    display_width: int,
+    display_height: int,
+    camera_type: CameraFocusType | str | None = None,
+) -> tuple[float, float] | None:
+    """Return the focus point in display coordinates."""
+    calc_width, calc_height = resolve_focus_calc_image_size(raw, fallback=(display_width, display_height))
+    source_point = get_focus_point(raw, calc_width, calc_height, camera_type=camera_type)
+    if source_point is None:
+        return None
+    return transform_focus_point_by_orientation(source_point, resolve_focus_orientation(raw))
 
 
 def _extract_focus_point_sony(raw: dict[str, Any], width: int, height: int) -> tuple[float, float] | None:
@@ -629,7 +677,9 @@ __all__ = [
     "resolve_focus_camera_type_from_metadata",
     "resolve_focus_calc_image_size",
     "get_focus_point",
+    "get_focus_point_for_display",
     "extract_focus_box",
+    "transform_focus_point_by_orientation",
     "transform_focus_box_by_orientation",
     "extract_focus_box_for_display",
 ]
