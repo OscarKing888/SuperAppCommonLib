@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 file_browser._browser
 =====================
@@ -3862,7 +3862,7 @@ class FileListPanel(QWidget):
             return
         base_dir = self.get_current_dir() or ""
         for app in apps:
-            name = (app.get("name") or app.get("path") or "未命名").strip()
+            name = f"发送到：{(app.get("name") or app.get("path") or "未命名").strip()}"
             act = menu.addAction(name)
             act.triggered.connect(lambda checked=False, a=app, p=paths: send_files_to_app(p, a, base_directory=base_dir))
 
