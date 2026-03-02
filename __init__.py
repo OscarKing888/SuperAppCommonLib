@@ -11,6 +11,7 @@ from app_common.focus_calc import (
     CameraFocusType,
     extract_focus_box,
     get_focus_point,
+    get_focus_point_for_display,
     resolve_focus_camera_type,
     resolve_focus_camera_type_from_metadata,
 )
@@ -20,6 +21,7 @@ __all__ = [
     "resolve_focus_camera_type",
     "resolve_focus_camera_type_from_metadata",
     "get_focus_point",
+    "get_focus_point_for_display",
     "extract_focus_box",
 ]
 
