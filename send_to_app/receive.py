@@ -21,10 +21,16 @@ _log = get_logger("send_to_app")
 
 def get_initial_file_list_from_argv(argv: list[str] | None = None) -> list[str]:
     """
-    从命令行参数中解析出「文件列表」。
-    约定：第一个参数为程序名，其后若为可存在的文件/目录路径则加入列表，
-    遇到以 - 开头的参数视为选项，停止解析（选项可由主程序自行处理）。
-    用于冷启动时「用本应用打开」传入的文件。
+    从命令行参数中解析出「文件列表」，供冷启动时与目录列表多选同等处理。
+
+    约定：
+    - 第一个参数为程序名，其后为非选项参数则视为文件/目录路径，转为绝对路径加入列表。
+    - 遇到以 ``-`` 开头的参数即停止解析（如 macOS 的 -psn_0_xxx 等由系统注入的参数不会进入列表）。
+
+    外部程序「用本应用打开」的常见调用方式均被支持，例如：
+    - macOS: ``open -a /path/to/SuperEXIF.app /path/to/file.jpg`` → argv[1] 为文件路径。
+    - Windows: ``QProcess.startDetached(exe_path, [filepath])`` → argv[1] 为文件路径。
+    多文件时依次传入即可，解析到第一个 ``-`` 前都会加入列表。
 
     Returns:
         绝对路径列表（不存在的路径也会保留，由业务决定是否过滤）。

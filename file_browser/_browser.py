@@ -3854,11 +3854,13 @@ class FileListPanel(QWidget):
         _log.info("[_copy_filenames_to_clipboard] platform=%r copied=%s", sys.platform, copied_paths)
 
     def _add_send_to_external_app_actions(self, menu: QMenu, paths: list[str]) -> None:
-        """在右键菜单中加入「发送到外部应用」子菜单，使用当前选中的文件列表。"""
+        """在右键菜单中加入「发送到外部应用」子菜单，使用当前选中的文件列表。无配置时也显示子菜单并提示去设置中添加。"""
+        sub = menu.addMenu("发送到外部应用")
         apps = get_external_apps()
         if not apps:
+            hint = sub.addAction("请在「文件 → 外部应用设置」中添加应用")
+            hint.setEnabled(False)
             return
-        sub = menu.addMenu("发送到外部应用")
         base_dir = self.get_current_dir() or ""
         for app in apps:
             name = (app.get("name") or app.get("path") or "未命名").strip()
