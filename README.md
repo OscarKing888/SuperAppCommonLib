@@ -1,6 +1,6 @@
 # app_common
-
-通用 UI 子库：关于对话框、App 信息条、about 配置。可整体作为 Sub Git 库使用。
+* 这是一个通用的处理鸟类照片的python模块库
+* 通用 UI 子库：关于对话框、App 信息条、about 配置。可整体作为 Sub Git 库使用。
 
 ## 结构
 
