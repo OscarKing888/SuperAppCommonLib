@@ -8,8 +8,18 @@
   - `about.cfg`：默认“关于”信息（JSON，含 `about` 键）
   - `config.py`：`load_about_info(override_path=None)` 从 about.cfg 加载，可选外部文件覆盖
   - `dialog.py`：`show_about_dialog(parent, about_info, logo_path=..., banner_path=...)`
+- **exif_io**：EXIF 读写工具，自动支持xml sidecar模式
+  - `exiftools_mac`：macOS 下的 exiftools 工具
+  - `exiftools_win`：Windows 下的 exiftools 工具
+- **file_browser**：文件浏览器，可排序，可过滤，有缩略图模式
+- **focus_calc**：超焦距计算
+- **preview_canvas**：图片预览组件
+- **report_db**：`慧眼选鸟`报告数据库，用于存储报告信息
+- **send_to_app**：发送/接收文件到与其他应用
+- **ui_style**：UI 样式
 - **app_info_bar**：图标 + 主副标题 + “关于...” 按钮
   - `widget.py`：`AppInfoBar(parent, title=..., subtitle=..., icon_path=..., on_about_clicked=...)`
+- **png_to_ico**：从 icons/app_icon.png 生成对应 .ico 和（在 macOS 下）.icns。
 
 ## 依赖
 
@@ -28,3 +38,4 @@ show_about_dialog(parent, info, logo_path="...", banner_path="...")
 bar = AppInfoBar(parent, title="MyApp", subtitle="...", icon_path="...", on_about_clicked=lambda: ...)
 layout.addWidget(bar)
 ```
+
