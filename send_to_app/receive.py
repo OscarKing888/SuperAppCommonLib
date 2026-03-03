@@ -279,7 +279,7 @@ def get_initial_file_list_from_argv(argv: list[str] | None = None) -> list[str]:
     - 遇到以 ``-`` 开头的参数即停止解析（如 macOS 的 -psn_0_xxx 等由系统注入的参数不会进入列表）。
 
     外部程序「用本应用打开」的常见调用方式均被支持，例如：
-    - macOS: ``open -a /path/to/SuperEXIF.app /path/to/file.jpg`` → argv[1] 为文件路径。
+    - macOS: ``open -a /path/to/SuperViewer.app /path/to/file.jpg`` → argv[1] 为文件路径。
     - Windows: ``QProcess.startDetached(exe_path, [filepath])`` → argv[1] 为文件路径。
     多文件时依次传入即可，解析到第一个 ``-`` 前都会加入列表。
 
@@ -305,7 +305,7 @@ def _server_name(app_id: str) -> str:
             uid = str(os.getuid())
         except (AttributeError, OSError):
             uid = os.environ.get("USER", os.environ.get("USERNAME", "default"))
-    name = f"superexif_sendto_{safe}_{uid}"
+    name = f"SuperViewer_sendto_{safe}_{uid}"
     if sys.platform == "win32":
         # Windows Named Pipe 名称长度上限 256，且仅允许部分字符
         name = name[:200].replace("\\", "_")

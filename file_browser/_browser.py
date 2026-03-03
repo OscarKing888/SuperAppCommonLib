@@ -1146,8 +1146,8 @@ def _env_int(name: str, default: int = 0) -> int:
         return default
 
 
-_DEBUG_FILE_LIST_LIMIT = max(0, _env_int("SUPEREXIF_DEBUG_FILE_LIST_LIMIT", 0))
-_DEBUG_FILE_LIST_MATCH = (os.environ.get("SUPEREXIF_DEBUG_FILE_LIST_MATCH", "") or "").strip().lower()
+_DEBUG_FILE_LIST_LIMIT = max(0, _env_int("SuperViewer_DEBUG_FILE_LIST_LIMIT", 0))
+_DEBUG_FILE_LIST_MATCH = (os.environ.get("SuperViewer_DEBUG_FILE_LIST_MATCH", "") or "").strip().lower()
 
 _ACTUAL_PATH_CACHE: dict[str, str] = {}
 
@@ -1943,20 +1943,20 @@ class FileListPanel(QWidget):
                     matched_set = set(matched)
                     selected_files = matched + [p for p in files if p not in matched_set]
                     _log.warning(
-                        "[DEBUG] SUPEREXIF_DEBUG_FILE_LIST_MATCH=%r matched=%s (prioritized)",
+                        "[DEBUG] SuperViewer_DEBUG_FILE_LIST_MATCH=%r matched=%s (prioritized)",
                         _DEBUG_FILE_LIST_MATCH,
                         len(matched),
                     )
                 else:
                     _log.warning(
-                        "[DEBUG] SUPEREXIF_DEBUG_FILE_LIST_MATCH=%r no match in current files",
+                        "[DEBUG] SuperViewer_DEBUG_FILE_LIST_MATCH=%r no match in current files",
                         _DEBUG_FILE_LIST_MATCH,
                     )
             limited_files = selected_files[:_DEBUG_FILE_LIST_LIMIT]
             keep_stems = {Path(p).stem for p in limited_files}
             report_cache = {k: v for k, v in report_cache.items() if k in keep_stems}
             _log.warning(
-                "[DEBUG] SUPEREXIF_DEBUG_FILE_LIST_LIMIT=%s active: files %s -> %s, report_entries -> %s",
+                "[DEBUG] SuperViewer_DEBUG_FILE_LIST_LIMIT=%s active: files %s -> %s, report_entries -> %s",
                 _DEBUG_FILE_LIST_LIMIT,
                 len(files),
                 len(limited_files),
@@ -2257,13 +2257,42 @@ class FileListPanel(QWidget):
                 break
         return 0 if all_picked else 1
 
+    def _reject_target_for_paths(self, paths: list[str]) -> int:
+        unique_paths = self._unique_norm_paths(paths)
+        if not unique_paths:
+            return -1
+        all_rejected = True
+        for path in unique_paths:
+            _rating, pick = self._rating_state_for_path(path)
+            if pick != -1:
+                all_rejected = False
+                break
+        return 0 if all_rejected else -1
+
+    def _resolve_rating_write_source(
+        self,
+        path: str,
+        *,
+        report_db_available: bool,
+    ) -> str:
+        if report_db_available:
+            row = self._get_report_row_for_path(path)
+            if isinstance(row, dict):
+                filename = str(row.get("filename") or Path(path).stem or "").strip()
+                if filename:
+                    return "report_db"
+        sidecar_path = self._resolve_sidecar_path(path)
+        if sidecar_path and os.path.isfile(sidecar_path):
+            return "xmp_sidecar"
+        return "source_exif"
+
     def _resolve_metadata_write_target(self, path: str) -> str:
-        source_path = self._resolve_source_path_for_action(path)
-        if source_path and os.path.isfile(source_path):
-            return source_path
         sidecar_path = self._resolve_sidecar_path(path)
         if sidecar_path and os.path.isfile(sidecar_path):
             return sidecar_path
+        source_path = self._resolve_source_path_for_action(path)
+        if source_path and os.path.isfile(source_path):
+            return source_path
         return source_path or sidecar_path or os.path.normpath(path)
 
     def _build_exif_rating_assignments(
@@ -2386,7 +2415,9 @@ class FileListPanel(QWidget):
         try:
             for path in self._unique_norm_paths(paths):
                 row = self._get_report_row_for_path(path)
-                filename = str((row or {}).get("filename") or Path(path).stem or "").strip()
+                if not isinstance(row, dict):
+                    continue
+                filename = str(row.get("filename") or Path(path).stem or "").strip()
                 if not filename:
                     continue
                 data: dict[str, int] = {}
@@ -2421,22 +2452,40 @@ class FileListPanel(QWidget):
         if not assignments:
             return []
         updated_paths: list[str] = []
-        written_targets: set[str] = set()
+        target_groups: dict[str, dict[str, object]] = {}
         for path in self._unique_norm_paths(paths):
             target_path = self._resolve_metadata_write_target(path)
             if not target_path:
                 continue
             target_key = os.path.normcase(os.path.normpath(target_path))
-            if target_key in written_targets:
+            group = target_groups.get(target_key)
+            if not isinstance(group, dict):
+                target_groups[target_key] = {
+                    "target_path": target_path,
+                    "paths": [path],
+                }
+                continue
+            group_paths = group.get("paths")
+            if isinstance(group_paths, list):
+                group_paths.append(path)
+        for group in target_groups.values():
+            target_path = str(group.get("target_path") or "").strip()
+            source_paths = [os.path.normpath(p) for p in group.get("paths", []) if p]
+            if not target_path or not source_paths:
                 continue
             try:
                 run_exiftool_assignments(target_path, assignments)
             except Exception as exc:
-                _log.warning("[_apply_rating_state_via_exif] source=%r target=%r failed: %s", path, target_path, exc)
+                _log.warning(
+                    "[_apply_rating_state_via_exif] source=%r target=%r failed: %s",
+                    source_paths[0],
+                    target_path,
+                    exc,
+                )
                 continue
-            written_targets.add(target_key)
-            self._apply_rating_state_to_meta_cache(path, rating=rating, pick=pick)
-            updated_paths.append(path)
+            for source_path in source_paths:
+                self._apply_rating_state_to_meta_cache(source_path, rating=rating, pick=pick)
+                updated_paths.append(source_path)
         return updated_paths
 
     def _set_rating_state_for_paths(
@@ -2456,16 +2505,32 @@ class FileListPanel(QWidget):
             db_exists = db_probe is not None
             if db_probe is not None:
                 db_probe.close()
-        if db_exists:
-            updated_paths = self._apply_rating_state_via_report_db(unique_paths, rating=rating, pick=pick)
-            source_name = "report_db"
-        else:
-            updated_paths = self._apply_rating_state_via_exif(unique_paths, rating=rating, pick=pick)
-            source_name = "exif"
+        report_paths: list[str] = []
+        file_paths: list[str] = []
+        source_counts = {
+            "report_db": 0,
+            "xmp_sidecar": 0,
+            "source_exif": 0,
+        }
+        for path in unique_paths:
+            source_name = self._resolve_rating_write_source(path, report_db_available=db_exists)
+            source_counts[source_name] = source_counts.get(source_name, 0) + 1
+            if source_name == "report_db":
+                report_paths.append(path)
+            else:
+                file_paths.append(path)
+        updated_paths: list[str] = []
+        if report_paths:
+            updated_paths.extend(self._apply_rating_state_via_report_db(report_paths, rating=rating, pick=pick))
+        if file_paths:
+            updated_paths.extend(self._apply_rating_state_via_exif(file_paths, rating=rating, pick=pick))
+        source_summary = ", ".join(
+            f"{name}={count}" for name, count in source_counts.items() if count > 0
+        ) or "none"
         if not updated_paths:
             _log.info(
-                "[_set_rating_state_for_paths] skip source=%s rating=%r pick=%r selected=%s",
-                source_name,
+                "[_set_rating_state_for_paths] skip sources=%s rating=%r pick=%r selected=%s",
+                source_summary,
                 rating,
                 pick,
                 len(unique_paths),
@@ -2473,8 +2538,8 @@ class FileListPanel(QWidget):
             return
         self._refresh_metadata_state_for_paths(updated_paths)
         _log.info(
-            "[_set_rating_state_for_paths] source=%s rating=%r pick=%r selected=%s updated=%s",
-            source_name,
+            "[_set_rating_state_for_paths] sources=%s rating=%r pick=%r selected=%s updated=%s",
+            source_summary,
             rating,
             pick,
             len(unique_paths),
@@ -2486,6 +2551,11 @@ class FileListPanel(QWidget):
         if not unique_paths:
             return
         rating_menu = menu.addMenu("修改星级")
+        clear_rating_action = rating_menu.addAction("取消星级")
+        clear_rating_action.triggered.connect(
+            lambda checked=False: self._set_rating_state_for_paths(unique_paths, rating=0)
+        )
+        rating_menu.addSeparator()
         for stars in range(1, 6):
             action = rating_menu.addAction("★" * stars)
             action.triggered.connect(
@@ -2497,6 +2567,12 @@ class FileListPanel(QWidget):
         pick_action = rating_menu.addAction(pick_label)
         pick_action.triggered.connect(
             lambda checked=False, value=pick_target: self._set_rating_state_for_paths(unique_paths, pick=value)
+        )
+        reject_target = self._reject_target_for_paths(unique_paths)
+        reject_label = "取消🚫 排除" if reject_target == 0 else "🚫 标记为排除"
+        reject_action = rating_menu.addAction(reject_label)
+        reject_action.triggered.connect(
+            lambda checked=False, value=reject_target: self._set_rating_state_for_paths(unique_paths, pick=value)
         )
 
     def _get_actual_path_for_display(self, path: str) -> str | None:

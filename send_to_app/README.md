@@ -40,5 +40,5 @@
 
 - 发送时文件使用**全路径**；接收到的列表也由调用方转为绝对路径后处理。
 - 若目标应用支持本模块同款单例 IPC，建议在配置中填写 `app_id`（例如 BirdStamp 为 `birdstamp`），这样运行中的实例可以直接接收文件列表。
-- 冷启动时一般通过命令行传入一个文件列表（如 macOS：`SuperEXIF.app file1.jpg`；Windows：`SuperEXIF.exe file1.jpg`）。
+- 冷启动时一般通过命令行传入一个文件列表（如 macOS：`SuperViewer.app file1.jpg`；Windows：`SuperViewer.exe file1.jpg`）。
 - App 运行时，可接收其它进程通过同一协议发来的文件列表并在回调中处理。
