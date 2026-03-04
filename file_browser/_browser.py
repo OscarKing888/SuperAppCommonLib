@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 file_browser._browser
 =====================
@@ -2964,6 +2964,15 @@ class FileListPanel(QWidget):
                 self._list_widget.addItem(li)
         finally:
             self._tree_widget.setSortingEnabled(True)
+            # 重建后显式按当前记录的排序列排序，避免列头状态未同步时按序号列（全 0）产生不稳定顺序
+            if self._tree_widget.topLevelItemCount() > 0:
+                hdr = self._tree_widget.header()
+                try:
+                    hdr.blockSignals(True)
+                    hdr.setSortIndicator(self._tree_last_sort_column, self._tree_last_sort_order)
+                finally:
+                    hdr.blockSignals(False)
+                self._tree_widget.sortItems(self._tree_last_sort_column, self._tree_last_sort_order)
             self._tree_widget.setUpdatesEnabled(True)
             self._list_widget.setUpdatesEnabled(True)
             self._refresh_tree_row_numbers()
@@ -3315,6 +3324,17 @@ class FileListPanel(QWidget):
             self._schedule_visible_thumbnail_update()
         else:
             self._stop_thumbnail_loader()
+            # 切换到列表视图时显式恢复排序状态，避免因隐藏时列头状态丢失导致按序号列
+            # （所有项 _SortRole 均为 0）排序产生不稳定顺序、列表项跳变
+            if self._tree_widget.isSortingEnabled() and self._tree_widget.topLevelItemCount() > 0:
+                hdr = self._tree_widget.header()
+                try:
+                    hdr.blockSignals(True)
+                    hdr.setSortIndicator(self._tree_last_sort_column, self._tree_last_sort_order)
+                finally:
+                    hdr.blockSignals(False)
+                self._tree_widget.sortItems(self._tree_last_sort_column, self._tree_last_sort_order)
+                self._refresh_tree_row_numbers()
 
     def _update_size_controls(self) -> None:
         enabled = self._view_mode == self._MODE_THUMB
