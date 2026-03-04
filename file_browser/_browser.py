@@ -1542,6 +1542,8 @@ class FileListPanel(QWidget):
         self._report_cache:  dict = {}   # stem → report row (当前目录/子树筛出的 report 子集)
         self._report_row_by_path: dict = {}
         self._pending_loaders: list = []
+        self._path_lookup_pending: set[str] = set()
+        self._path_lookup_workers: list[PathLookupWorker] = []
         self._meta_apply_timer: QTimer | None = None
         self._meta_apply_items: list = []
         self._meta_apply_index: int = 0
@@ -3526,6 +3528,19 @@ class FileListPanel(QWidget):
             self._metadata_loader = None
         self._meta_progress.hide()
 
+    def _stop_actual_path_lookup_workers(self) -> None:
+        if not self._path_lookup_workers and not self._path_lookup_pending:
+            return
+        workers = self._path_lookup_workers
+        self._path_lookup_workers = []
+        self._path_lookup_pending.clear()
+        for worker in workers:
+            try:
+                worker.resolved.disconnect(self._on_actual_path_lookup_resolved)
+            except Exception:
+                pass
+            worker.requestInterruption()
+
     def _detach_loader(self, loader, signal, slot) -> None:
         loader.stop()
         try:
@@ -3547,6 +3562,7 @@ class FileListPanel(QWidget):
         self._stop_pending_meta_apply()
         self._stop_thumbnail_loader()
         self._stop_metadata_loader()
+        self._stop_actual_path_lookup_workers()
 
     def _ensure_meta_apply_timer(self) -> None:
         if self._meta_apply_timer is not None:
