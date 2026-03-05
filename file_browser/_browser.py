@@ -519,24 +519,6 @@ def _select_report_scope_files(
     return files, selected_report_cache
 
 
-def _reveal_in_file_manager(path: str) -> None:
-    """
-    在系统文件管理器中定位并高亮显示指定文件或目录。
-    - macOS  : open -R <path>（在 Finder 中显示）
-    - Windows: explorer /select,<path>（在资源管理器中选中）
-    - Linux  : xdg-open 打开父目录
-    """
-    ok = reveal_in_file_manager(path)
-    _log.info(
-        "[_reveal_in_file_manager] platform=%r path=%r exists=%s isfile=%s ok=%s",
-        sys.platform,
-        path,
-        os.path.exists(path) if path else False,
-        os.path.isfile(path) if path else False,
-        ok,
-    )
-
-
 def _exec_menu(menu: "QMenu", global_pos) -> None:
     """兼容 PyQt5/6 的 QMenu.exec() 调用。"""
     try:
@@ -4089,7 +4071,7 @@ class FileListPanel(QWidget):
         act_preview.setEnabled(bool(preview_path))
         if preview_path:
             _log.info("[_add_browse_preview_menu_action] source=%r preview=%r", source_path, preview_path)
-            act_preview.triggered.connect(lambda checked=False, p=preview_path: _reveal_in_file_manager(p))
+            act_preview.triggered.connect(lambda checked=False, p=preview_path: reveal_in_file_manager(p))
 
     def _on_tree_context_menu(self, pos) -> None:
         item = self._tree_widget.itemAt(pos)
@@ -4122,7 +4104,7 @@ class FileListPanel(QWidget):
         if reveal_path:
             _log.info("[_on_tree_context_menu] reveal_path=%r paths=%s", reveal_path, len(paths))
             act_reveal = menu.addAction(label)
-            act_reveal.triggered.connect(lambda: _reveal_in_file_manager(reveal_path))
+            act_reveal.triggered.connect(lambda: reveal_in_file_manager(reveal_path))
         self._add_browse_preview_menu_action(menu, primary_path)
         _exec_menu(menu, self._tree_widget.viewport().mapToGlobal(pos))
 
@@ -4158,7 +4140,7 @@ class FileListPanel(QWidget):
         if reveal_path:
             _log.info("[_on_list_context_menu] reveal_path=%r paths=%s", reveal_path, len(paths))
             act_reveal = menu.addAction(label)
-            act_reveal.triggered.connect(lambda: _reveal_in_file_manager(reveal_path))
+            act_reveal.triggered.connect(lambda: reveal_in_file_manager(reveal_path))
         self._add_browse_preview_menu_action(menu, primary_path)
         _exec_menu(menu, self._list_widget.viewport().mapToGlobal(pos))
 
@@ -4448,5 +4430,5 @@ class DirectoryBrowserWidget(QWidget):
         menu = QMenu(self)
         label = "在Finder中显示" if sys.platform == "darwin" else "在资源管理器中显示"
         act = menu.addAction(label)
-        act.triggered.connect(lambda: _reveal_in_file_manager(path))
+        act.triggered.connect(lambda: reveal_in_file_manager(path))
         _exec_menu(menu, self._tree.viewport().mapToGlobal(pos))
