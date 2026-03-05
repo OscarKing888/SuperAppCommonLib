@@ -199,6 +199,7 @@ _TREE_COL_FOCUS = 7
 _THUMB_SIZE_STEPS = [128, 256, 512, 1024]
 _THUMB_CACHE_BASE_SIZE = max(_THUMB_SIZE_STEPS)
 _JPEG_MIP_EXTENSIONS = frozenset({".jpg", ".jpeg"})
+_STAR_SILVER_COLOR = "#c0c0c0"
 
 # Lightroom 颜色标签 → (十六进制色, 列表/缩略图显示文本)
 # 红=眼部对焦，绿=飞版；其余保持常规色名
@@ -726,7 +727,7 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
             elif isinstance(rating, int) and rating > 0:
                 right_badge_text = "★" * min(5, rating)
                 right_badge_bg = QColor(0, 0, 0, 140)
-                right_badge_fg = QColor(COLORS["star_gold"])
+                right_badge_fg = QColor(_STAR_SILVER_COLOR)
             else:
                 right_badge_text = ""
 
@@ -1633,7 +1634,7 @@ class FileListPanel(QWidget):
                 btn.setAutoRaise(False)
                 btn.setStyleSheet(
                     _filter_badge_stylesheet(
-                        COLORS["star_gold"],
+                        _STAR_SILVER_COLOR,
                         min_width=star_widths[n - 1],
                         checked_fg="#111111",
                     )
