@@ -2,6 +2,7 @@
 跨平台文件/目录隐藏工具
 """
 import os
+import subprocess
 import sys
 
 
@@ -95,3 +96,37 @@ def unhide_path(path):
     
     # macOS/Linux: 无需操作
     return True
+
+
+def reveal_in_file_manager(path):
+    """
+    在系统文件管理器中定位并显示目标路径。
+
+    - macOS: `open -R <path>`（Finder 中选中）
+    - Windows: `explorer /select,<path>`（资源管理器中选中）
+    - Linux: `xdg-open <dir>`（打开所在目录）
+
+    Args:
+        path: 要显示的文件或目录路径
+
+    Returns:
+        bool: 是否成功启动系统文件管理器命令
+    """
+    if not path:
+        return False
+    try:
+        norm_path = os.path.normpath(os.path.abspath(path))
+        if sys.platform == "darwin":
+            args = ["open", "-R", norm_path]
+        elif os.name == "nt":
+            if os.path.isfile(norm_path):
+                args = ["explorer.exe", f"/select,{norm_path}"]
+            else:
+                args = ["explorer.exe", norm_path]
+        else:
+            target = os.path.dirname(norm_path) if os.path.isfile(norm_path) else norm_path
+            args = ["xdg-open", target]
+        subprocess.Popen(args)
+        return True
+    except Exception:
+        return False

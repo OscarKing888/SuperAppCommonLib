@@ -18,7 +18,6 @@ from dataclasses import dataclass
 import html
 import io as _io
 import os
-import subprocess
 import sys
 import threading
 import time as _time
@@ -32,7 +31,7 @@ try:
         QMenu, QProgressBar, QToolButton, QHeaderView, QAbstractItemView,
         QTreeWidget, QTreeWidgetItem, QStyleOptionViewItem, QStyle,
         QStyledItemDelegate, QStackedWidget, QSlider,
-        QApplication,
+        QApplication, QToolTip,
     )
     from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal, QRect, QTimer, QUrl, QMimeData, QPoint, QEvent
     from PyQt6.QtGui import (
@@ -46,7 +45,7 @@ except ImportError:
         QMenu, QProgressBar, QToolButton, QHeaderView, QAbstractItemView,
         QTreeWidget, QTreeWidgetItem, QStyleOptionViewItem, QStyle,
         QStyledItemDelegate, QStackedWidget, QSlider,
-        QApplication, QShortcut,
+        QApplication, QShortcut, QToolTip,
     )
     from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal, QRect, QTimer, QUrl, QMimeData, QPoint, QEvent
     from PyQt5.QtGui import (
@@ -61,6 +60,7 @@ from app_common.exif_io import (
     run_exiftool_assignments,
 )
 from app_common.log import get_logger
+from app_common.file_utils import reveal_in_file_manager
 from app_common.send_to_app import get_external_apps, send_files_to_app
 from app_common.report_db import (
     ReportDB,
@@ -312,10 +312,12 @@ try:
     _EventResize = QEvent.Type.Resize
     _EventShow = QEvent.Type.Show
     _EventKeyPress = QEvent.Type.KeyPress
+    _EventToolTip = QEvent.Type.ToolTip
 except AttributeError:
     _EventResize = QEvent.Resize  # type: ignore[attr-defined]
     _EventShow = QEvent.Show  # type: ignore[attr-defined]
     _EventKeyPress = QEvent.KeyPress  # type: ignore[attr-defined]
+    _EventToolTip = QEvent.ToolTip  # type: ignore[attr-defined]
 
 _KeyUp = getattr(Qt.Key, "Key_Up", None) or getattr(Qt, "Key_Up", None)
 _KeyDown = getattr(Qt.Key, "Key_Down", None) or getattr(Qt, "Key_Down", None)
@@ -524,32 +526,15 @@ def _reveal_in_file_manager(path: str) -> None:
     - Windows: explorer /select,<path>（在资源管理器中选中）
     - Linux  : xdg-open 打开父目录
     """
-    try:
-        _log.info(
-            "[_reveal_in_file_manager] platform=%r path=%r exists=%s isfile=%s",
-            sys.platform,
-            path,
-            os.path.exists(path) if path else False,
-            os.path.isfile(path) if path else False,
-        )
-        if sys.platform == "darwin":
-            norm_path = os.path.normpath(os.path.abspath(path))
-            args = ["open", "-R", norm_path]
-            _log.info("[_reveal_in_file_manager] darwin_args=%r", args)
-            subprocess.Popen(args)
-        elif os.name == "nt":
-            norm_path = os.path.normpath(os.path.abspath(path))
-            if os.path.isfile(norm_path):
-                args = ["explorer.exe", f"/select,{norm_path}"]
-            else:
-                args = ["explorer.exe", norm_path]
-            _log.info("[_reveal_in_file_manager] windows_args=%r", args)
-            subprocess.Popen(args)
-        else:
-            parent = os.path.dirname(path) if os.path.isfile(path) else path
-            subprocess.Popen(["xdg-open", parent])
-    except Exception as e:
-        _log.warning("[_reveal_in_file_manager] failed path=%r: %s", path, e)
+    ok = reveal_in_file_manager(path)
+    _log.info(
+        "[_reveal_in_file_manager] platform=%r path=%r exists=%s isfile=%s ok=%s",
+        sys.platform,
+        path,
+        os.path.exists(path) if path else False,
+        os.path.isfile(path) if path else False,
+        ok,
+    )
 
 
 def _exec_menu(menu: "QMenu", global_pos) -> None:
@@ -911,13 +896,13 @@ class ThumbnailLoader(QThread):
     def _load_single(self, path: str) -> tuple[str, QImage | None]:
         if self._stop_flag or self.isInterruptionRequested():
             return path, None
-        path_to_load = get_preview_path_for_file(path, self._current_dir, self._report_cache)
+        path_to_load = os.path.normpath(path)
         cache = self._thumb_cache
         if cache is not None:
             cached = cache.get(path_to_load, self._size)
             if cached is not None and not cached.isNull():
                 return path, cached
-        load_size = self._size if Path(path_to_load).suffix.lower() in _JPEG_MIP_EXTENSIONS else _THUMB_CACHE_BASE_SIZE
+        load_size = self._size
         qimg = _load_thumbnail_image(path_to_load, load_size)
         if qimg is None or qimg.isNull():
             return path, None
@@ -928,8 +913,6 @@ class ThumbnailLoader(QThread):
             cached = cache.get(path_to_load, self._size)
             if cached is not None and not cached.isNull():
                 return path, cached
-        if load_size != self._size:
-            qimg = _scale_qimage_for_thumb(qimg, self._size)
         return path, qimg
 
     def run(self) -> None:
@@ -1738,6 +1721,8 @@ class FileListPanel(QWidget):
         self._tree_widget.sortByColumn(_TREE_COL_NAME, _AscendingOrder)
         self._tree_widget.setContextMenuPolicy(_CustomContextMenu)
         self._tree_widget.customContextMenuRequested.connect(self._on_tree_context_menu)
+        self._tree_widget.installEventFilter(self)
+        self._tree_widget.viewport().installEventFilter(self)
         self._stack.addWidget(self._tree_widget)
 
         # ── 缩略图模式：QListWidget ──
@@ -2607,6 +2592,76 @@ class FileListPanel(QWidget):
             "</body></html>"
         )
 
+    def _resolve_preview_path_for_tooltip(self, path: str) -> str:
+        norm_path = os.path.normpath(path) if path else ""
+        if not norm_path:
+            return ""
+        preview_base_dir = self._report_root_dir or self._current_dir
+        report_cache = self._report_full_cache or self._report_cache or {}
+        if preview_base_dir:
+            preview_target = get_preview_path_for_file(norm_path, preview_base_dir, report_cache)
+            if preview_target and os.path.isfile(preview_target):
+                return preview_target
+        actual_path = self._get_actual_path_for_display(norm_path)
+        return actual_path or norm_path
+
+    def _resolve_existing_preview_image_path(self, path: str) -> str:
+        norm_path = os.path.normpath(path) if path else ""
+        if not norm_path:
+            return ""
+        preview_base_dir = self._report_root_dir or self._current_dir
+        if not preview_base_dir:
+            return ""
+        report_cache = self._report_full_cache or self._report_cache or {}
+        preview_target = get_preview_path_for_file(norm_path, preview_base_dir, report_cache)
+        if preview_target and os.path.isfile(preview_target):
+            return preview_target
+        return ""
+
+    def _build_list_path_tooltip(self, path: str) -> str:
+        base_tooltip = self._build_path_tooltip(path)
+        norm_path = os.path.normpath(path) if path else ""
+        if not base_tooltip or not norm_path:
+            return base_tooltip
+        preview_path = self._resolve_preview_path_for_tooltip(norm_path)
+        if not preview_path:
+            return base_tooltip
+        preview_line = (
+            "<div><span style='color:#7f8c8d'>Preview:</span> "
+            f"<span style='color:#16a085'>{html.escape(preview_path)}</span></div>"
+        )
+        end_tag = "</body></html>"
+        if base_tooltip.endswith(end_tag):
+            return base_tooltip[:-len(end_tag)] + preview_line + end_tag
+        return "<html><body>" + base_tooltip + preview_line + "</body></html>"
+
+    def _set_tree_item_tooltip_all_columns(self, item: QTreeWidgetItem, tooltip: str) -> None:
+        if item is None:
+            return
+        col_count = 0
+        try:
+            col_count = int(self._tree_widget.columnCount())
+        except Exception:
+            col_count = 0
+        if col_count <= 0:
+            col_count = 1
+        for col in range(col_count):
+            item.setToolTip(col, tooltip)
+
+    def _find_thumb_item_for_tooltip(self, pos: QPoint) -> QListWidgetItem | None:
+        item = self._list_widget.itemAt(pos)
+        if item is not None:
+            return item
+        visible_range = self._thumb_visible_range or self._build_visible_thumbnail_data_source(overscan_rows=0)
+        for entry in (visible_range.entries if visible_range is not None else ()):
+            it = entry.item
+            if it is None or it.isHidden():
+                continue
+            rect = self._list_widget.visualItemRect(it)
+            if rect.isValid() and rect.contains(pos):
+                return it
+        return None
+
     def _has_path_mismatch(self, path: str) -> bool:
         norm_path = os.path.normpath(path) if path else ""
         if not norm_path:
@@ -2633,13 +2688,14 @@ class FileListPanel(QWidget):
         norm_path = os.path.normpath(path) if path else ""
         if not norm_path:
             return
-        tooltip = self._build_path_tooltip(norm_path)
+        tree_tooltip = self._build_list_path_tooltip(norm_path)
+        list_tooltip = self._build_list_path_tooltip(norm_path)
         ti = self._tree_item_map.get(norm_path)
         if ti is not None:
-            ti.setToolTip(_TREE_COL_NAME, tooltip)
+            self._set_tree_item_tooltip_all_columns(ti, tree_tooltip)
         li = self._item_map.get(norm_path)
         if li is not None:
-            li.setToolTip(tooltip)
+            li.setToolTip(list_tooltip)
         self._apply_path_status_to_items(norm_path)
 
     def has_path_mismatch(self, path: str) -> bool:
@@ -2775,18 +2831,20 @@ class FileListPanel(QWidget):
         )
 
     def resolve_preview_path(self, path: str) -> str:
-        """Resolve display preview path for a source file, preferring report temp_jpeg_path."""
+        """Resolve display preview path, preferring an existing cached preview file."""
         norm_path = os.path.normpath(path) if path else ""
         if not norm_path:
             return path
         actual_path = self._get_actual_path_for_display(norm_path)
         preview_base_dir = self._report_root_dir or self._current_dir
         report_cache = self._report_full_cache or self._report_cache or {}
-        preview_path = get_preview_path_for_file(norm_path, preview_base_dir, report_cache)
+        preview_target = get_preview_path_for_file(norm_path, preview_base_dir, report_cache)
+        preview_path = preview_target if (preview_target and os.path.isfile(preview_target)) else ""
         _log.info(
-            "[resolve_preview_path] source=%r preview=%r actual=%r preview_base_dir=%r report_entries=%s",
+            "[resolve_preview_path] source=%r preview=%r preview_target=%r actual=%r preview_base_dir=%r report_entries=%s",
             norm_path,
             preview_path,
+            preview_target,
             actual_path,
             preview_base_dir,
             len(report_cache),
@@ -3026,7 +3084,7 @@ class FileListPanel(QWidget):
                 ti.setData(0, _UserRole, path)
                 ti.setData(_TREE_COL_SEQ, _SortRole, 0)
                 ti.setData(_TREE_COL_NAME, _SortRole, name.lower())
-                ti.setToolTip(_TREE_COL_NAME, self._build_path_tooltip(path))
+                self._set_tree_item_tooltip_all_columns(ti, self._build_list_path_tooltip(path))
                 if meta:
                     self._apply_meta_to_tree_item(ti, meta)
                 self._tree_widget.addTopLevelItem(ti)
@@ -3035,7 +3093,7 @@ class FileListPanel(QWidget):
 
                 li = QListWidgetItem(name)
                 li.setData(_UserRole, path)
-                li.setToolTip(self._build_path_tooltip(path))
+                li.setToolTip(self._build_list_path_tooltip(path))
                 self._reset_thumb_item_state(li, meta)
                 self._item_map[norm] = li
                 self._apply_path_status_to_items(norm)
@@ -3174,9 +3232,42 @@ class FileListPanel(QWidget):
 
     # ── 视图模式切换 ────────────────────────────────────────────────────────────
     def eventFilter(self, obj, event):
+        tree_widget = getattr(self, "_tree_widget", None)
+        tree_viewport = tree_widget.viewport() if tree_widget is not None else None
         list_widget = getattr(self, "_list_widget", None)
-        viewport = list_widget.viewport() if list_widget is not None else None
-        if obj is viewport and event is not None:
+        list_viewport = list_widget.viewport() if list_widget is not None else None
+        if event is not None and event.type() == _EventToolTip:
+            if obj is tree_viewport and tree_widget is not None:
+                item = tree_widget.itemAt(event.pos())
+                if item is not None:
+                    path = item.data(0, _UserRole)
+                    if path:
+                        tooltip = self._build_list_path_tooltip(path)
+                        if tooltip:
+                            QToolTip.showText(event.globalPos(), tooltip, tree_viewport)
+                            return True
+                QToolTip.hideText()
+                try:
+                    event.ignore()
+                except Exception:
+                    pass
+                return True
+            if obj is list_viewport and list_widget is not None:
+                item = self._find_thumb_item_for_tooltip(event.pos())
+                if item is not None:
+                    path = item.data(_UserRole)
+                    if path:
+                        tooltip = self._build_list_path_tooltip(path)
+                        if tooltip:
+                            QToolTip.showText(event.globalPos(), tooltip, list_viewport)
+                            return True
+                QToolTip.hideText()
+                try:
+                    event.ignore()
+                except Exception:
+                    pass
+                return True
+        if obj is list_viewport and event is not None:
             et = event.type()
             if et in (_EventResize, _EventShow):
                 self._invalidate_visible_thumbnail_signature()
@@ -3992,6 +4083,14 @@ class FileListPanel(QWidget):
         if can_paste:
             act_paste_species.triggered.connect(lambda: self._paste_species_to_paths(paths))
 
+    def _add_browse_preview_menu_action(self, menu: QMenu, source_path: str | None) -> None:
+        preview_path = self._resolve_existing_preview_image_path(source_path or "")
+        act_preview = menu.addAction("浏览预览图像")
+        act_preview.setEnabled(bool(preview_path))
+        if preview_path:
+            _log.info("[_add_browse_preview_menu_action] source=%r preview=%r", source_path, preview_path)
+            act_preview.triggered.connect(lambda checked=False, p=preview_path: _reveal_in_file_manager(p))
+
     def _on_tree_context_menu(self, pos) -> None:
         item = self._tree_widget.itemAt(pos)
         if item is not None and not item.isSelected():
@@ -4018,11 +4117,13 @@ class FileListPanel(QWidget):
         self._add_send_to_external_app_actions(menu, paths)
         menu.addSeparator()
         label = "在Finder中显示" if sys.platform == "darwin" else "在资源管理器中显示"
-        reveal_path = self._resolve_reveal_path(item.data(0, _UserRole) if item else (paths[0] if paths else None))
+        primary_path = item.data(0, _UserRole) if item else (paths[0] if paths else None)
+        reveal_path = self._resolve_reveal_path(primary_path)
         if reveal_path:
             _log.info("[_on_tree_context_menu] reveal_path=%r paths=%s", reveal_path, len(paths))
             act_reveal = menu.addAction(label)
             act_reveal.triggered.connect(lambda: _reveal_in_file_manager(reveal_path))
+        self._add_browse_preview_menu_action(menu, primary_path)
         _exec_menu(menu, self._tree_widget.viewport().mapToGlobal(pos))
 
 
@@ -4052,11 +4153,13 @@ class FileListPanel(QWidget):
         self._add_send_to_external_app_actions(menu, paths)
         menu.addSeparator()
         label = "在Finder中显示" if sys.platform == "darwin" else "在资源管理器中显示"
-        reveal_path = self._resolve_reveal_path(item.data(_UserRole) if item else (paths[0] if paths else None))
+        primary_path = item.data(_UserRole) if item else (paths[0] if paths else None)
+        reveal_path = self._resolve_reveal_path(primary_path)
         if reveal_path:
             _log.info("[_on_list_context_menu] reveal_path=%r paths=%s", reveal_path, len(paths))
             act_reveal = menu.addAction(label)
             act_reveal.triggered.connect(lambda: _reveal_in_file_manager(reveal_path))
+        self._add_browse_preview_menu_action(menu, primary_path)
         _exec_menu(menu, self._list_widget.viewport().mapToGlobal(pos))
 
 

@@ -158,28 +158,44 @@ def find_report_root(directory: str, max_levels: Optional[int] = None) -> Option
 
 def get_preview_path_for_file(path: str, current_dir: str, report_cache: Dict[str, Any]) -> str:
     """
-    若 report 中有该文件（按文件名 stem 匹配）且存在 temp_jpeg_path（相对 current_dir，如 .superpicky\\cache\\temp_preview\\xxx.jpg），
-    则返回拼出的完整路径用于预览/缩略图，避免重复解码；否则返回原 path。
-    current_dir 为选中目录（含 .superpicky 的父目录），用于解析相对路径的 temp_jpeg_path。
+    Return the preview cache target path for a source file.
+
+    Rules:
+    1) If ``<root>/.superpicky`` exists, use
+       ``<root>/.superpicky/cache/temp_preview/<stem>.jpg``.
+    2) Otherwise create ``<root>/temp_preview`` and use
+       ``<root>/temp_preview/<stem>.jpg``.
+
+    This function intentionally does not check whether the preview file exists.
+    ``report_cache`` is kept for call-site compatibility.
     """
-    _log.debug("[get_preview_path_for_file] path=%r current_dir=%r cache_keys=%s", path, current_dir, len(report_cache) if isinstance(report_cache, dict) else 0)
-    if not path or not report_cache or not current_dir:
-        _log.debug("[get_preview_path_for_file] 跳过 path=%r", path)
+    _log.debug(
+        "[get_preview_path_for_file] path=%r current_dir=%r cache_keys=%s",
+        path,
+        current_dir,
+        len(report_cache) if isinstance(report_cache, dict) else 0,
+    )
+    if not path or not current_dir:
+        _log.debug("[get_preview_path_for_file] skip path=%r", path)
         return path
+
+    root_dir = os.path.normpath(current_dir)
+    superpicky_dir = os.path.join(root_dir, ".superpicky")
+    if os.path.isdir(superpicky_dir):
+        preview_dir = os.path.join(superpicky_dir, "cache", "temp_preview")
+    else:
+        preview_dir = os.path.join(root_dir, "temp_preview")
+
+    try:
+        os.makedirs(preview_dir, exist_ok=True)
+    except Exception as e:
+        _log.warning("[get_preview_path_for_file] mkdir failed dir=%r: %s", preview_dir, e)
+
     stem = os.path.splitext(os.path.basename(path))[0]
-    row = report_cache.get(stem) if isinstance(report_cache, dict) else None
-    if not row or not isinstance(row, dict):
-        return path
-    temp_path = row.get("temp_jpeg_path")
-    if not temp_path or not str(temp_path).strip():
-        return path
-    temp_path = str(temp_path).strip()
-    resolved = os.path.normpath(os.path.join(current_dir, temp_path)) if not os.path.isabs(temp_path) else os.path.normpath(temp_path)
-    if os.path.isfile(resolved):
-        _log.debug("[get_preview_path_for_file] 使用 temp_jpeg_path path=%r resolved=%r", path, resolved)
-        return resolved
-    _log.debug("[get_preview_path_for_file] temp 文件不存在 使用原 path=%r", path)
-    return path
+    preview_name = f"{stem}.jpg"
+    resolved = os.path.normpath(os.path.join(preview_dir, preview_name))
+    _log.debug("[get_preview_path_for_file] source=%r preview_target=%r", path, resolved)
+    return resolved
 
 
 def report_row_to_exiftool_style(row: Dict[str, Any], source_file: str) -> Dict[str, Any]:
