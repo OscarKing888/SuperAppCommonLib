@@ -3273,13 +3273,6 @@ class FileListPanel(QWidget):
             filter_bar = QHBoxLayout()
             filter_bar.setSpacing(3)
 
-            self._btn_clear_thumb_cache = QToolButton()
-            self._btn_clear_thumb_cache.setText("清除图像缓存")
-            self._btn_clear_thumb_cache.setFixedWidth(58)
-            self._btn_clear_thumb_cache.clicked.connect(self._on_clear_thumb_cache_clicked)
-            self._btn_clear_thumb_cache.setMinimumSize(100, 24)
-            filter_bar.addWidget(self._btn_clear_thumb_cache)
-
             self._filter_edit = QLineEdit()
             self._filter_edit.setPlaceholderText("过滤文件名…")
             self._filter_edit.setClearButtonEnabled(True)
@@ -3341,7 +3334,6 @@ class FileListPanel(QWidget):
 
             layout.addLayout(filter_bar)
         else:
-            self._btn_clear_thumb_cache = None
             self._filter_edit = None
             self._btn_filter_pick = None
 
@@ -3472,7 +3464,6 @@ class FileListPanel(QWidget):
 
         self._stack.setCurrentIndex(0)
         self._update_size_controls()
-        self._update_clear_thumb_cache_button_tooltip()
 
         # Cmd+C / Ctrl+C 复制选中文件到剪贴板
         _copy_key = getattr(QKeySequence.StandardKey, "Copy", None) or getattr(QKeySequence, "Copy", QKeySequence("Ctrl+C"))
@@ -4903,7 +4894,8 @@ class FileListPanel(QWidget):
             filtered.append(path)
         return filtered
 
-    def _update_clear_thumb_cache_button_tooltip(self) -> None:
+    def _unused_removed_clear_thumb_cache_button_tooltip(self) -> None:
+        return
         if not self._create_filter_bar or self._btn_clear_thumb_cache is None:
             return
         stats = self._thumb_memory_cache.stats()
@@ -4918,7 +4910,8 @@ class FileListPanel(QWidget):
         )
         self._btn_clear_thumb_cache.setToolTip(tooltip)
 
-    def _on_clear_thumb_cache_clicked(self) -> None:
+    def _unused_removed_clear_thumb_cache_clicked(self) -> None:
+        return
         self._stop_thumbnail_loader()
         stats = self._thumb_memory_cache.clear()
         cleared_items = self._thumb_list_model.clear_all_pixmaps()
@@ -6468,7 +6461,6 @@ class FileListPanel(QWidget):
         self._thumb_profile_set_max("ready_wait_max_s", ready_wait_max_s)
         self._thumb_profile_add("flush_total_s", flush_elapsed_s)
         self._thumb_profile_set_max("flush_max_s", flush_elapsed_s)
-        self._update_clear_thumb_cache_button_tooltip()
         if update_rect.isValid():
             self._list_widget.viewport().update(update_rect)
         if (
