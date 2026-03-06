@@ -747,12 +747,18 @@ def _is_same_or_child_path(parent: str, child: str) -> bool:
 
 
 def _resolve_report_full_path(row: dict, report_root: str, fallback_dir: str) -> str | None:
-    """Resolve full file path from report row current_path/original_path."""
+    """Resolve full file path from report row current_path/original_path.
+
+    report.db may have been created on Windows, so current_path / original_path
+    can use backslashes as separators.  Normalise them to the OS-native separator
+    before any path operation so that os.path.join / os.path.normpath work
+    correctly on macOS/Linux.
+    """
     cp = row.get("current_path")
     if not cp or not str(cp).strip():
         return None
 
-    cp_text = str(cp).strip()
+    cp_text = str(cp).strip().replace("\\", os.sep)
     if os.path.isabs(cp_text):
         full_path = os.path.normpath(cp_text)
     else:
@@ -761,7 +767,7 @@ def _resolve_report_full_path(row: dict, report_root: str, fallback_dir: str) ->
 
     op = row.get("original_path")
     if op and str(op).strip():
-        ext_orig = Path(str(op).strip()).suffix
+        ext_orig = Path(str(op).strip().replace("\\", os.sep)).suffix
         if ext_orig:
             full_path = str(Path(full_path).with_suffix(ext_orig))
     return full_path
@@ -781,8 +787,8 @@ def _normalize_report_row_paths(row: dict) -> dict:
     if not isinstance(row, dict):
         return row
     out = dict(row)
-    cp_text = str(out.get("current_path") or "").strip()
-    op_text = str(out.get("original_path") or "").strip()
+    cp_text = str(out.get("current_path") or "").strip().replace("\\", os.sep)
+    op_text = str(out.get("original_path") or "").strip().replace("\\", os.sep)
     out["_current_path_report_raw"] = cp_text
     if cp_text.lower().endswith(".xmp") and op_text:
         ext_orig = Path(op_text).suffix
@@ -4473,6 +4479,10 @@ class FileListPanel(QWidget):
         return None
 
     def _build_path_tooltip(self, path: str) -> str:
+        # Normalise Windows-style backslashes before any path operation so that
+        # report.db paths built on Windows display and resolve correctly on macOS.
+        if path and sys.platform != "win32":
+            path = path.replace("\\", "/")
         norm_path = os.path.normpath(path) if path else ""
         if not norm_path:
             return ""

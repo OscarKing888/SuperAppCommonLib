@@ -102,7 +102,8 @@ def move_to_trash(path):
     """
     将文件或目录移动到系统垃圾桶（回收站），可恢复。
 
-    使用 Send2Trash，跨平台（macOS / Windows / Linux）。
+    优先使用 Send2Trash；若未安装则在 macOS 回退到 osascript / Finder，
+    在 Windows 回退到 SHFileOperation。
 
     Args:
         path: 要删除的文件或目录路径
@@ -116,13 +117,82 @@ def move_to_trash(path):
         import send2trash
         send2trash.send2trash(path)
         return True
+    except ImportError:
+        pass  # fall through to OS-native fallback
     except Exception:
         return False
+
+    # ── OS-native fallback (no send2trash) ───────────────────────────────────
+    try:
+        if sys.platform == "darwin":
+            escaped = path.replace("\\", "\\\\").replace('"', '\\"')
+            result = subprocess.run(
+                ["osascript", "-e",
+                 f'tell application "Finder" to delete POSIX file "{escaped}"'],
+                capture_output=True,
+            )
+            return result.returncode == 0
+        elif sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+
+            class _SHFILEOPSTRUCTW(ctypes.Structure):
+                _fields_ = [
+                    ("hwnd",                  wintypes.HWND),
+                    ("wFunc",                 wintypes.UINT),
+                    ("pFrom",                 wintypes.LPCWSTR),
+                    ("pTo",                   wintypes.LPCWSTR),
+                    ("fFlags",                wintypes.WORD),
+                    ("fAnyOperationsAborted", wintypes.BOOL),
+                    ("hNameMappings",         ctypes.c_void_p),
+                    ("lpszProgressTitle",     wintypes.LPCWSTR),
+                ]
+
+            op = _SHFILEOPSTRUCTW()
+            op.wFunc  = 3            # FO_DELETE
+            op.pFrom  = path + "\0\0"
+            op.fFlags = 0x0040 | 0x0010 | 0x0004  # ALLOWUNDO | NOCONFIRMATION | SILENT
+            return ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op)) == 0
+    except Exception:
+        pass
+    return False
+
+
+# OS-generated metadata files that should not prevent a directory from being
+# considered "empty".  Comparison is case-insensitive.
+_IGNORABLE_NAMES = frozenset({
+    ".ds_store",           # macOS Finder metadata
+    ".localized",          # macOS localization marker
+    ".apdisk",             # macOS AFP disk flag
+    "thumbs.db",           # Windows thumbnail cache
+    "desktop.ini",         # Windows folder configuration
+    ".bridgecache",        # Adobe Bridge
+    ".bridgecachesettings",
+})
+
+
+def _dir_is_effectively_empty(dir_path: str) -> bool:
+    """Return True if *dir_path* contains only ignorable OS/app metadata files.
+
+    Directories that appear empty to the user but contain .DS_Store, Thumbs.db,
+    etc. are treated as empty so they can be trashed.
+    """
+    try:
+        entries = os.listdir(dir_path)
+    except FileNotFoundError:
+        return False  # already gone
+    except Exception:
+        return False
+    return all(e.lower() in _IGNORABLE_NAMES for e in entries)
 
 
 def move_empty_dirs_to_trash(root_path, include_root=False):
     """
     Move empty directories under ``root_path`` to the system trash.
+
+    A directory is considered "empty" if it contains no files or subdirectories
+    other than OS-generated metadata (e.g. .DS_Store on macOS, Thumbs.db on
+    Windows).
 
     Returns:
         tuple[list[str], list[str]]: (moved_paths, failed_paths)
@@ -155,13 +225,7 @@ def move_empty_dirs_to_trash(root_path, include_root=False):
             continue
         if os.path.islink(current_abs):
             continue
-        try:
-            if os.listdir(current_abs):
-                continue
-        except FileNotFoundError:
-            continue
-        except Exception:
-            failed.append(current_abs)
+        if not _dir_is_effectively_empty(current_abs):
             continue
         if move_to_trash(current_abs):
             moved.append(current_abs)
