@@ -228,7 +228,7 @@ def iter_thumbnail_rgb_progressive(
             yield result
         return
 
-    # ── Obtain the JPEG bytes to stream ─────────────────────────────────────
+    # ── Obtain the JPEG stream source ───────────────────────────────────────
     jpeg_bytes: bytes | None = None
     if ext in _RAW_EXTENSIONS:
         jpeg_bytes = _get_raw_thumbnail_bytes(path)
@@ -237,12 +237,6 @@ def iter_thumbnail_rgb_progressive(
             result = load_thumbnail_rgb(path, size)
             if result:
                 yield result
-            return
-    else:  # JPEG
-        try:
-            with open(path, "rb") as f:
-                jpeg_bytes = f.read()
-        except Exception:
             return
 
     # ── Progressive feed loop ────────────────────────────────────────────────
@@ -255,18 +249,39 @@ def iter_thumbnail_rgb_progressive(
         return
 
     parser = ImageFile.Parser()
-    total = len(jpeg_bytes)
-    offset = 0
     last_emit_t = 0.0
     has_intermediate = False  # True once we have emitted at least one partial frame
 
     try:
-        while offset < total:
-            if stop_fn is not None and stop_fn():
+        if jpeg_bytes is not None:
+            chunk_iter = (
+                jpeg_bytes[offset: offset + _PROGRESSIVE_CHUNK]
+                for offset in range(0, len(jpeg_bytes), _PROGRESSIVE_CHUNK)
+            )
+        else:
+            try:
+                fh = open(path, "rb")
+            except Exception:
                 return
 
-            chunk = jpeg_bytes[offset: offset + _PROGRESSIVE_CHUNK]
-            offset += _PROGRESSIVE_CHUNK  # safe: slice past-end is empty
+            def _file_chunks():
+                try:
+                    while True:
+                        chunk = fh.read(_PROGRESSIVE_CHUNK)
+                        if not chunk:
+                            break
+                        yield chunk
+                finally:
+                    try:
+                        fh.close()
+                    except Exception:
+                        pass
+
+            chunk_iter = _file_chunks()
+
+        for chunk in chunk_iter:
+            if stop_fn is not None and stop_fn():
+                return
 
             try:
                 parser.feed(chunk)

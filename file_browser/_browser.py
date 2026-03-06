@@ -29,13 +29,13 @@ from pathlib import Path
 try:
     from PyQt6.QtWidgets import (
         QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-        QListWidget, QListWidgetItem, QListView,
+        QListWidget, QListWidgetItem, QListView, QTreeView,
         QMenu, QProgressBar, QToolButton, QHeaderView, QAbstractItemView,
         QTreeWidget, QTreeWidgetItem, QStyleOptionViewItem, QStyle,
-        QStyledItemDelegate, QStackedWidget, QSlider,
+        QStyledItemDelegate, QStackedWidget, QSlider, QMessageBox,
         QApplication, QToolTip,
     )
-    from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal, QRect, QTimer, QUrl, QMimeData, QPoint, QEvent
+    from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal, QRect, QTimer, QUrl, QMimeData, QPoint, QEvent, QAbstractListModel, QAbstractTableModel, QModelIndex, QItemSelectionModel, QSortFilterProxyModel
     from PyQt6.QtGui import (
         QPixmap, QImage, QFont, QColor, QIcon, QPainter, QBrush,
         QKeySequence, QShortcut,
@@ -43,13 +43,13 @@ try:
 except ImportError:
     from PyQt5.QtWidgets import (
         QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-        QListWidget, QListWidgetItem, QListView,
+        QListWidget, QListWidgetItem, QListView, QTreeView,
         QMenu, QProgressBar, QToolButton, QHeaderView, QAbstractItemView,
         QTreeWidget, QTreeWidgetItem, QStyleOptionViewItem, QStyle,
-        QStyledItemDelegate, QStackedWidget, QSlider,
+        QStyledItemDelegate, QStackedWidget, QSlider, QMessageBox,
         QApplication, QShortcut, QToolTip,
     )
-    from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal, QRect, QTimer, QUrl, QMimeData, QPoint, QEvent
+    from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal, QRect, QTimer, QUrl, QMimeData, QPoint, QEvent, QAbstractListModel, QAbstractTableModel, QModelIndex, QItemSelectionModel, QSortFilterProxyModel
     from PyQt5.QtGui import (
         QPixmap, QImage, QFont, QColor, QIcon, QPainter, QBrush,
         QKeySequence,
@@ -62,7 +62,7 @@ from app_common.exif_io import (
     run_exiftool_assignments,
 )
 from app_common.log import get_logger
-from app_common.file_utils import reveal_in_file_manager, move_to_trash
+from app_common.file_utils import reveal_in_file_manager, move_to_trash, move_empty_dirs_to_trash
 from app_common.send_to_app import get_external_apps, send_files_to_app
 from app_common.report_db import (
     ReportDB,
@@ -126,6 +126,19 @@ try:
 except AttributeError:
     _UserRole = Qt.UserRole  # type: ignore[attr-defined]
 
+try:
+    _DisplayRole = Qt.ItemDataRole.DisplayRole
+    _ToolTipRole = Qt.ItemDataRole.ToolTipRole
+    _ForegroundRole = Qt.ItemDataRole.ForegroundRole
+    _BackgroundRole = Qt.ItemDataRole.BackgroundRole
+    _TextAlignmentRole = Qt.ItemDataRole.TextAlignmentRole
+except AttributeError:
+    _DisplayRole = Qt.DisplayRole  # type: ignore[attr-defined]
+    _ToolTipRole = Qt.ToolTipRole  # type: ignore[attr-defined]
+    _ForegroundRole = Qt.ForegroundRole  # type: ignore[attr-defined]
+    _BackgroundRole = Qt.BackgroundRole  # type: ignore[attr-defined]
+    _TextAlignmentRole = Qt.TextAlignmentRole  # type: ignore[attr-defined]
+
 _orient = getattr(Qt, "Orientation", None)
 _Horizontal = getattr(_orient, "Horizontal", None) if _orient else None
 if _Horizontal is None:
@@ -147,9 +160,32 @@ except AttributeError:
     _ExtendedSelection = QAbstractItemView.ExtendedSelection  # type: ignore[attr-defined]
 
 try:
+    _SelectRows = QAbstractItemView.SelectionBehavior.SelectRows
+except AttributeError:
+    _SelectRows = QAbstractItemView.SelectRows  # type: ignore[attr-defined]
+
+try:
+    _ItemIsEnabled = Qt.ItemFlag.ItemIsEnabled
+    _ItemIsSelectable = Qt.ItemFlag.ItemIsSelectable
+    _NoItemFlags = Qt.ItemFlag.NoItemFlags
+except AttributeError:
+    _ItemIsEnabled = Qt.ItemIsEnabled  # type: ignore[attr-defined]
+    _ItemIsSelectable = Qt.ItemIsSelectable  # type: ignore[attr-defined]
+    _NoItemFlags = Qt.NoItemFlags  # type: ignore[attr-defined]
+
+try:
     _ScrollPerPixel = QAbstractItemView.ScrollMode.ScrollPerPixel
 except AttributeError:
     _ScrollPerPixel = QAbstractItemView.ScrollPerPixel  # type: ignore[attr-defined]
+
+try:
+    _SelectCurrent = QItemSelectionModel.SelectionFlag.SelectCurrent
+    _ClearAndSelect = QItemSelectionModel.SelectionFlag.ClearAndSelect
+    _Select = QItemSelectionModel.SelectionFlag.Select
+except AttributeError:
+    _SelectCurrent = QItemSelectionModel.SelectCurrent  # type: ignore[attr-defined]
+    _ClearAndSelect = QItemSelectionModel.ClearAndSelect  # type: ignore[attr-defined]
+    _Select = QItemSelectionModel.Select  # type: ignore[attr-defined]
 
 try:
     _QImageRGB888 = QImage.Format.Format_RGB888
@@ -198,6 +234,7 @@ _TREE_COL_STAR = 4
 _TREE_COL_SHARP = 5
 _TREE_COL_AESTHETIC = 6
 _TREE_COL_FOCUS = 7
+_FILE_TABLE_HEADERS = ["#", "文件名", "标题", "颜色", "星级", "锐度值", "美学评分", "对焦状态"]
 
 # 缩略图尺寸档位（像素）
 _THUMB_SIZE_STEPS = [128, 256, 512, 1024]
@@ -383,6 +420,28 @@ def _thumb_disk_cache_path(path: str, mtime: float, size: int) -> str:
     return os.path.join(cache_dir, name)
 
 
+def _preview_cache_target_for_file(path: str, current_dir: str | None) -> str:
+    if not path or not current_dir:
+        return ""
+    root_dir = os.path.normpath(current_dir)
+    superpicky_dir = os.path.join(root_dir, ".superpicky")
+    if os.path.isdir(superpicky_dir):
+        preview_dir = os.path.join(superpicky_dir, "cache", "temp_preview")
+    else:
+        preview_dir = os.path.join(root_dir, "temp_preview")
+    stem = os.path.splitext(os.path.basename(path))[0]
+    if not stem:
+        return ""
+    return os.path.normpath(os.path.join(preview_dir, f"{stem}.jpg"))
+
+
+def _existing_preview_cache_path_for_file(path: str, current_dir: str | None) -> str:
+    preview_path = _preview_cache_target_for_file(path, current_dir)
+    if preview_path and os.path.isfile(preview_path):
+        return preview_path
+    return ""
+
+
 def _read_thumb_from_disk_cache(path: str, mtime: float, size: int) -> "QImage | None":
     """Load thumbnail from disk cache if present and valid; returns QImage or None."""
     cache_path = _thumb_disk_cache_path(path, mtime, size)
@@ -441,6 +500,19 @@ def _get_thumb_disk_writer() -> _futures.ThreadPoolExecutor:
         return _THUMB_DISK_WRITER
 
 
+def _shutdown_thumb_disk_writer(wait: bool = True) -> None:
+    global _THUMB_DISK_WRITER
+    with _THUMB_DISK_WRITER_LOCK:
+        executor = _THUMB_DISK_WRITER
+        _THUMB_DISK_WRITER = None
+    if executor is None:
+        return
+    try:
+        executor.shutdown(wait=wait, cancel_futures=False)
+    except Exception:
+        pass
+
+
 def _qimage_num_bytes(image: QImage | None) -> int:
     if image is None or image.isNull():
         return 0
@@ -465,8 +537,26 @@ def _scale_qimage_for_thumb(image: QImage, size: int) -> QImage:
 
 
 def _thumbnail_loader_worker_count() -> int:
-    cpu_count = os.cpu_count() or 8
-    return min(16, max(4, cpu_count * 2))
+    try:
+        override = int(str(os.environ.get("SuperViewer_THUMB_WORKERS", "")).strip() or "0")
+    except Exception:
+        override = 0
+    if override > 0:
+        return min(16, max(1, override))
+    cpu_count = max(1, os.cpu_count() or 8)
+    # Default for modern SSD-backed workflows: use roughly half the cores,
+    # capped to keep the desktop responsive on very high-core machines.
+    return min(12, max(4, cpu_count // 2))
+
+
+def _thumbnail_loader_batch_size(worker_count: int) -> int:
+    try:
+        override = int(str(os.environ.get("SuperViewer_THUMB_BATCH_SIZE", "")).strip() or "0")
+    except Exception:
+        override = 0
+    if override > 0:
+        return min(max(1, override), max(1, worker_count))
+    return min(max(1, worker_count), max(4, (worker_count * 2 + 2) // 3))
 
 
 def _get_cached_actual_path(path: str) -> str | None:
@@ -678,12 +768,577 @@ class SortableTreeItem(QTreeWidgetItem):
         return (self.text(col) or "") < (other.text(col) or "")
 
 
+@dataclass
+class FileTableEntry:
+    path: str
+    name: str
+    tooltip: str = ""
+    mismatch: bool = False
+    title: str = ""
+    color: str = ""
+    color_display: str = ""
+    rating: int = 0
+    pick: int = 0
+    city: str = ""
+    state: str = ""
+    country: str = ""
+
+
+class FileTableModel(QAbstractTableModel):
+    """Flat file-list model for the list view."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._entries: list[FileTableEntry] = []
+        self._row_by_path: dict[str, int] = {}
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        if parent.isValid():
+            return 0
+        return len(self._entries)
+
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        if parent.isValid():
+            return 0
+        return len(_FILE_TABLE_HEADERS)
+
+    def headerData(self, section: int, orientation, role: int = int(_DisplayRole)):
+        if role != _DisplayRole:
+            return None
+        try:
+            horizontal = Qt.Orientation.Horizontal
+        except AttributeError:
+            horizontal = Qt.Horizontal  # type: ignore[attr-defined]
+        if orientation == horizontal and 0 <= section < len(_FILE_TABLE_HEADERS):
+            return _FILE_TABLE_HEADERS[section]
+        return None
+
+    def flags(self, index: QModelIndex):
+        if not index.isValid():
+            return _NoItemFlags
+        return _ItemIsEnabled | _ItemIsSelectable
+
+    def _apply_meta_to_entry(self, entry: FileTableEntry, meta: dict | None) -> None:
+        meta = meta or {}
+        entry.title = str(meta.get("title", "") or "")
+        entry.color = str(meta.get("color", "") or "")
+        entry.color_display = _COLOR_LABEL_COLORS.get(entry.color, ("", ""))[1] or entry.color
+        try:
+            entry.rating = int(meta.get("rating", 0) or 0)
+        except Exception:
+            entry.rating = 0
+        try:
+            entry.pick = int(meta.get("pick", 0) or 0)
+        except Exception:
+            entry.pick = 0
+        entry.city = str(meta.get("city", "") or "")
+        entry.state = str(meta.get("state", "") or "")
+        entry.country = str(meta.get("country", "") or "")
+
+    def _build_entry(
+        self,
+        path: str,
+        *,
+        meta_cache: dict,
+        tooltip_fn,
+        mismatch_fn,
+    ) -> FileTableEntry:
+        norm = os.path.normpath(path)
+        entry = FileTableEntry(
+            path=path,
+            name=Path(path).name,
+            tooltip=tooltip_fn(path),
+            mismatch=bool(mismatch_fn(path)),
+        )
+        self._apply_meta_to_entry(entry, meta_cache.get(norm, {}) if isinstance(meta_cache, dict) else {})
+        return entry
+
+    def _sort_value(self, entry: FileTableEntry, column: int):
+        if column == _TREE_COL_SEQ:
+            return 0
+        if column == _TREE_COL_NAME:
+            return entry.name.lower()
+        if column == _TREE_COL_TITLE:
+            return entry.title.lower()
+        if column == _TREE_COL_COLOR:
+            return _COLOR_SORT_ORDER.get(entry.color, 99)
+        if column == _TREE_COL_STAR:
+            if entry.pick == 1:
+                return 10
+            if entry.pick == -1:
+                return -1
+            return entry.rating
+        if column == _TREE_COL_SHARP:
+            return entry.city.lower()
+        if column == _TREE_COL_AESTHETIC:
+            return entry.state.lower()
+        if column == _TREE_COL_FOCUS:
+            return entry.country.lower()
+        return ""
+
+    def _display_value(self, entry: FileTableEntry, row: int, column: int) -> str:
+        if column == _TREE_COL_SEQ:
+            return str(row + 1)
+        if column == _TREE_COL_NAME:
+            return entry.name
+        if column == _TREE_COL_TITLE:
+            return entry.title
+        if column == _TREE_COL_COLOR:
+            return entry.color_display
+        if column == _TREE_COL_STAR:
+            if entry.pick == 1:
+                return "🏳"
+            if entry.pick == -1:
+                return "🚫"
+            return "★" * max(0, entry.rating)
+        if column == _TREE_COL_SHARP:
+            return entry.city
+        if column == _TREE_COL_AESTHETIC:
+            return entry.state
+        if column == _TREE_COL_FOCUS:
+            return entry.country
+        return ""
+
+    def data(self, index: QModelIndex, role: int = int(_DisplayRole)):
+        if not index.isValid():
+            return None
+        row = index.row()
+        column = index.column()
+        if row < 0 or row >= len(self._entries):
+            return None
+        entry = self._entries[row]
+        if role == _DisplayRole:
+            return self._display_value(entry, row, column)
+        if role == _UserRole:
+            return entry.path
+        if role == _ToolTipRole:
+            return entry.tooltip
+        if role == _SortRole:
+            return self._sort_value(entry, column)
+        if role == _TextAlignmentRole and column == _TREE_COL_SEQ:
+            return int(_AlignCenter)
+        if role == _ForegroundRole:
+            if column == _TREE_COL_NAME and entry.mismatch:
+                return QBrush(QColor("#c0392b"))
+            if column == _TREE_COL_COLOR and entry.color in _COLOR_LABEL_COLORS:
+                return QBrush(QColor("#333" if entry.color in ("Yellow", "White") else "#fff"))
+            if column == _TREE_COL_FOCUS:
+                focus_color = _FOCUS_STATUS_TEXT_COLORS.get(entry.country, "")
+                if focus_color:
+                    return QBrush(QColor(focus_color))
+            return QBrush()
+        if role == _BackgroundRole and column == _TREE_COL_COLOR and entry.color in _COLOR_LABEL_COLORS:
+            hex_c, _label = _COLOR_LABEL_COLORS[entry.color]
+            return QBrush(QColor(hex_c))
+        return None
+
+    def clear(self) -> None:
+        self.beginResetModel()
+        self._entries = []
+        self._row_by_path = {}
+        self.endResetModel()
+
+    def rebuild(
+        self,
+        paths: list[str],
+        *,
+        meta_cache: dict,
+        tooltip_fn,
+        mismatch_fn,
+    ) -> None:
+        entries = [
+            self._build_entry(
+                path,
+                meta_cache=meta_cache,
+                tooltip_fn=tooltip_fn,
+                mismatch_fn=mismatch_fn,
+            )
+            for path in paths
+        ]
+        row_by_path = {os.path.normpath(entry.path): row for row, entry in enumerate(entries)}
+        self.beginResetModel()
+        self._entries = entries
+        self._row_by_path = row_by_path
+        self.endResetModel()
+
+    def row_for_path(self, path: str) -> int | None:
+        norm = os.path.normpath(path) if path else ""
+        row = self._row_by_path.get(norm)
+        if row is None or row < 0 or row >= len(self._entries):
+            return None
+        return row
+
+    def index_for_path(self, path: str, column: int = 0) -> QModelIndex:
+        row = self.row_for_path(path)
+        if row is None:
+            return QModelIndex()
+        col = max(0, min(self.columnCount() - 1, int(column)))
+        return self.index(row, col)
+
+    def path_for_row(self, row: int) -> str | None:
+        if row < 0 or row >= len(self._entries):
+            return None
+        return self._entries[row].path
+
+    def path_for_index(self, index: QModelIndex) -> str | None:
+        if not index.isValid():
+            return None
+        return self.path_for_row(index.row())
+
+    def all_paths(self) -> list[str]:
+        return [entry.path for entry in self._entries]
+
+    def set_meta_for_path(self, path: str, meta: dict | None) -> bool:
+        row = self.row_for_path(path)
+        if row is None:
+            return False
+        entry = self._entries[row]
+        self._apply_meta_to_entry(entry, meta)
+        left = self.index(row, _TREE_COL_TITLE)
+        right = self.index(row, _TREE_COL_FOCUS)
+        self.dataChanged.emit(left, right, [_DisplayRole, _SortRole, _ForegroundRole, _BackgroundRole])
+        return True
+
+    def set_tooltip_for_path(self, path: str, tooltip: str) -> bool:
+        row = self.row_for_path(path)
+        if row is None:
+            return False
+        self._entries[row].tooltip = tooltip
+        left = self.index(row, 0)
+        right = self.index(row, self.columnCount() - 1)
+        self.dataChanged.emit(left, right, [_ToolTipRole])
+        return True
+
+    def set_path_mismatch_for_path(self, path: str, mismatch: bool) -> bool:
+        row = self.row_for_path(path)
+        if row is None:
+            return False
+        self._entries[row].mismatch = bool(mismatch)
+        idx = self.index(row, _TREE_COL_NAME)
+        self.dataChanged.emit(idx, idx, [_ForegroundRole])
+        return True
+
+
+class FileTableSortProxyModel(QSortFilterProxyModel):
+    """Sort proxy with robust comparison and display-only row numbering."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setSortRole(_SortRole)
+        try:
+            self.setDynamicSortFilter(False)
+        except Exception:
+            pass
+
+    def data(self, index: QModelIndex, role: int = int(_DisplayRole)):
+        if role == _DisplayRole and index.isValid() and index.column() == _TREE_COL_SEQ:
+            return str(index.row() + 1)
+        return super().data(index, role)
+
+    def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:
+        source = self.sourceModel()
+        lv = source.data(left, _SortRole) if source is not None else None
+        rv = source.data(right, _SortRole) if source is not None else None
+        if lv is not None and rv is not None:
+            try:
+                return lv < rv
+            except TypeError:
+                return str(lv) < str(rv)
+        return super().lessThan(left, right)
+
+
+class FileTableView(QTreeView):
+    """Compatibility wrapper while list mode migrates from QTreeWidget APIs."""
+
+    def setHeaderLabels(self, labels) -> None:
+        try:
+            self._header_labels = list(labels)
+        except Exception:
+            self._header_labels = []
+
+
 # ── 缩略图 delegate（颜色标签 + 星级徽章）─────────────────────────────────────
 
 @dataclass(frozen=True)
 class ThumbViewportEntry:
     path: str
-    item: QListWidgetItem
+    row: int
+
+
+@dataclass
+class ThumbnailListEntry:
+    path: str
+    name: str
+    tooltip: str = ""
+    mismatch: bool = False
+    color: str = ""
+    rating: int = 0
+    pick: int = 0
+    focus_status: str = ""
+    species_cn: str = ""
+    pixmap: QPixmap | None = None
+    thumb_size: int = 0
+
+
+class ThumbnailListModel(QAbstractListModel):
+    """Thumbnail view model backed by explicit entry data instead of widget items."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._entries: list[ThumbnailListEntry] = []
+        self._row_by_path: dict[str, int] = {}
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        if parent.isValid():
+            return 0
+        return len(self._entries)
+
+    def flags(self, index: QModelIndex):
+        if not index.isValid():
+            return _NoItemFlags
+        return _ItemIsEnabled | _ItemIsSelectable
+
+    def data(self, index: QModelIndex, role: int = int(_DisplayRole)):
+        if not index.isValid():
+            return None
+        row = index.row()
+        if row < 0 or row >= len(self._entries):
+            return None
+        entry = self._entries[row]
+        if role == _DisplayRole:
+            return entry.name
+        if role == _UserRole:
+            return entry.path
+        if role == _ToolTipRole:
+            return entry.tooltip
+        if role == _ForegroundRole:
+            return QBrush(QColor("#c0392b")) if entry.mismatch else QBrush()
+        if role == _MetaColorRole:
+            return entry.color
+        if role == _MetaRatingRole:
+            return entry.rating
+        if role == _MetaPickRole:
+            return entry.pick
+        if role == _MetaFocusRole:
+            return entry.focus_status
+        if role == _MetaSpeciesCnRole:
+            return entry.species_cn
+        if role == _ThumbPixmapRole:
+            return entry.pixmap
+        if role == _ThumbSizeRole:
+            return entry.thumb_size
+        return None
+
+    def _build_entry(
+        self,
+        path: str,
+        *,
+        meta_cache: dict,
+        tooltip_fn,
+        mismatch_fn,
+    ) -> ThumbnailListEntry:
+        norm = os.path.normpath(path)
+        meta = meta_cache.get(norm, {}) if isinstance(meta_cache, dict) else {}
+        try:
+            rating = int(meta.get("rating", 0) or 0)
+        except Exception:
+            rating = 0
+        try:
+            pick = int(meta.get("pick", 0) or 0)
+        except Exception:
+            pick = 0
+        return ThumbnailListEntry(
+            path=path,
+            name=Path(path).name,
+            tooltip=tooltip_fn(path),
+            mismatch=bool(mismatch_fn(path)),
+            color=str(meta.get("color", "")),
+            rating=rating,
+            pick=pick,
+            focus_status=str(meta.get("country", "")),
+            species_cn=str(meta.get("bird_species_cn", "")),
+        )
+
+    def clear(self) -> None:
+        self.beginResetModel()
+        self._entries = []
+        self._row_by_path = {}
+        self.endResetModel()
+
+    def append_paths(
+        self,
+        paths: list[str],
+        *,
+        meta_cache: dict,
+        tooltip_fn,
+        mismatch_fn,
+    ) -> int:
+        if not paths:
+            return 0
+        start_row = len(self._entries)
+        new_entries = [
+            self._build_entry(
+                path,
+                meta_cache=meta_cache,
+                tooltip_fn=tooltip_fn,
+                mismatch_fn=mismatch_fn,
+            )
+            for path in paths
+        ]
+        self.beginInsertRows(QModelIndex(), start_row, start_row + len(new_entries) - 1)
+        self._entries.extend(new_entries)
+        for offset, entry in enumerate(new_entries):
+            self._row_by_path[os.path.normpath(entry.path)] = start_row + offset
+        self.endInsertRows()
+        return len(new_entries)
+
+    def rebuild(
+        self,
+        paths: list[str],
+        *,
+        meta_cache: dict,
+        tooltip_fn,
+        mismatch_fn,
+    ) -> None:
+        entries = [
+            self._build_entry(
+                path,
+                meta_cache=meta_cache,
+                tooltip_fn=tooltip_fn,
+                mismatch_fn=mismatch_fn,
+            )
+            for path in paths
+        ]
+        row_by_path = {os.path.normpath(entry.path): row for row, entry in enumerate(entries)}
+        self.beginResetModel()
+        self._entries = entries
+        self._row_by_path = row_by_path
+        self.endResetModel()
+
+    def row_for_path(self, path: str) -> int | None:
+        norm = os.path.normpath(path) if path else ""
+        row = self._row_by_path.get(norm)
+        if row is None:
+            return None
+        if row < 0 or row >= len(self._entries):
+            return None
+        return row
+
+    def index_for_path(self, path: str) -> QModelIndex:
+        row = self.row_for_path(path)
+        if row is None:
+            return QModelIndex()
+        return self.index(row, 0)
+
+    def path_for_row(self, row: int) -> str | None:
+        if row < 0 or row >= len(self._entries):
+            return None
+        return self._entries[row].path
+
+    def path_for_index(self, index: QModelIndex) -> str | None:
+        if not index.isValid():
+            return None
+        return self.path_for_row(index.row())
+
+    def all_paths(self) -> list[str]:
+        return [entry.path for entry in self._entries]
+
+    def has_current_pixmap(self, path: str, thumb_size: int) -> bool:
+        row = self.row_for_path(path)
+        if row is None:
+            return False
+        entry = self._entries[row]
+        pixmap = entry.pixmap
+        return isinstance(pixmap, QPixmap) and not pixmap.isNull() and int(entry.thumb_size or 0) == int(thumb_size)
+
+    def set_meta_for_path(self, path: str, meta: dict | None) -> bool:
+        row = self.row_for_path(path)
+        if row is None:
+            return False
+        entry = self._entries[row]
+        meta = meta or {}
+        entry.color = str(meta.get("color", ""))
+        try:
+            entry.rating = int(meta.get("rating", 0) or 0)
+        except Exception:
+            entry.rating = 0
+        try:
+            entry.pick = int(meta.get("pick", 0) or 0)
+        except Exception:
+            entry.pick = 0
+        entry.focus_status = str(meta.get("country", ""))
+        entry.species_cn = str(meta.get("bird_species_cn", ""))
+        idx = self.index(row, 0)
+        self.dataChanged.emit(
+            idx,
+            idx,
+            [_MetaColorRole, _MetaRatingRole, _MetaPickRole, _MetaFocusRole, _MetaSpeciesCnRole],
+        )
+        return True
+
+    def set_pixmap_for_path(self, path: str, pixmap: QPixmap | None, thumb_size: int) -> int | None:
+        row = self.row_for_path(path)
+        if row is None:
+            return None
+        entry = self._entries[row]
+        entry.pixmap = pixmap if isinstance(pixmap, QPixmap) and not pixmap.isNull() else None
+        entry.thumb_size = int(thumb_size if entry.pixmap is not None else 0)
+        idx = self.index(row, 0)
+        self.dataChanged.emit(idx, idx, [_ThumbPixmapRole, _ThumbSizeRole])
+        return row
+
+    def clear_pixmap_for_path(self, path: str) -> int | None:
+        row = self.row_for_path(path)
+        if row is None:
+            return None
+        self.clear_pixmap_for_row(row)
+        return row
+
+    def clear_pixmap_for_row(self, row: int) -> bool:
+        if row < 0 or row >= len(self._entries):
+            return False
+        entry = self._entries[row]
+        if entry.pixmap is None and int(entry.thumb_size or 0) == 0:
+            return False
+        entry.pixmap = None
+        entry.thumb_size = 0
+        idx = self.index(row, 0)
+        self.dataChanged.emit(idx, idx, [_ThumbPixmapRole, _ThumbSizeRole])
+        return True
+
+    def clear_all_pixmaps(self) -> int:
+        changed = 0
+        for row, entry in enumerate(self._entries):
+            if entry.pixmap is None and int(entry.thumb_size or 0) == 0:
+                continue
+            entry.pixmap = None
+            entry.thumb_size = 0
+            changed += 1
+        if changed and self._entries:
+            self.dataChanged.emit(
+                self.index(0, 0),
+                self.index(len(self._entries) - 1, 0),
+                [_ThumbPixmapRole, _ThumbSizeRole],
+            )
+        return changed
+
+    def set_tooltip_for_path(self, path: str, tooltip: str) -> bool:
+        row = self.row_for_path(path)
+        if row is None:
+            return False
+        self._entries[row].tooltip = tooltip
+        idx = self.index(row, 0)
+        self.dataChanged.emit(idx, idx, [_ToolTipRole])
+        return True
+
+    def set_path_mismatch(self, path: str, mismatch: bool) -> bool:
+        row = self.row_for_path(path)
+        if row is None:
+            return False
+        self._entries[row].mismatch = bool(mismatch)
+        idx = self.index(row, 0)
+        self.dataChanged.emit(idx, idx, [_ForegroundRole])
+        return True
 
 
 @dataclass(frozen=True)
@@ -889,6 +1544,8 @@ def _compute_thumb_cache_max_bytes() -> int:
 
 
 _THUMB_CACHE_MAX_BYTES_DEFAULT = _compute_thumb_cache_max_bytes()
+_THUMB_MODEL_APPEND_BATCH_SIZE = 160
+_THUMB_MODEL_APPEND_BUDGET_S = 0.008
 
 
 class ThumbnailMemoryCache:
@@ -1041,7 +1698,7 @@ class ThumbnailLoader(QThread):
     within one batch cycle (≤ max_workers completions).
     """
 
-    thumbnail_ready = pyqtSignal(str, object)  # (path, QImage)
+    thumbnail_ready = pyqtSignal(int, str, object)  # (request_token, path, QImage)
 
     PRIORITY_VISIBLE  = 0  # noqa: E221
     PRIORITY_PREFETCH = 1
@@ -1049,6 +1706,7 @@ class ThumbnailLoader(QThread):
     def __init__(
         self,
         size: int,
+        request_token: int,
         report_cache: dict | None = None,
         current_dir: str | None = None,
         thumb_cache: ThumbnailMemoryCache | None = None,
@@ -1056,21 +1714,182 @@ class ThumbnailLoader(QThread):
     ) -> None:
         super().__init__(parent)
         self._size = int(size)
+        self._request_token = int(request_token)
         self._report_cache = report_cache or {}
         self._current_dir = current_dir or ""
         self._thumb_cache = thumb_cache
         self._stop_flag = False
         self._executor: _futures.ThreadPoolExecutor | None = None
         self._max_workers = _thumbnail_loader_worker_count()
+        self._batch_size = _thumbnail_loader_batch_size(self._max_workers)
 
         # Priority queue: items are (priority, seq, path)
         self._task_queue: _queue.PriorityQueue = _queue.PriorityQueue()
         self._queued:  set[str] = set()   # paths currently sitting in the queue
         self._loaded:  set[str] = set()   # paths already submitted to executor
+        self._desired_paths: set[str] = set()
         self._seq = 0                      # monotonic counter for stable FIFO within same priority
         self._queue_lock = threading.Lock()
+        self._profile_lock = threading.Lock()
+        self._profile_enabled = _THUMB_PROFILE_ENABLED
+        self._profile_started_at = _time.perf_counter()
+        self._profile_enqueued_visible = 0
+        self._profile_enqueued_prefetch = 0
+        self._profile_promoted = 0
+        self._profile_batches = 0
+        self._profile_submitted = 0
+        self._profile_completed = 0
+        self._profile_memory_hits = 0
+        self._profile_disk_hits = 0
+        self._profile_progressive_paths = 0
+        self._profile_single_shot_paths = 0
+        self._profile_frames_emitted = 0
+        self._profile_decode_total_s = 0.0
+        self._profile_decode_max_s = 0.0
+        self._profile_decode_max_path = ""
 
     # ── Public API (thread-safe) ─────────────────────────────────────────────
+
+    def _profile_record_decode(
+        self,
+        path: str,
+        *,
+        elapsed_s: float,
+        frames_emitted: int,
+        memory_hit: bool = False,
+        disk_hit: bool = False,
+        progressive: bool = False,
+        single_shot: bool = False,
+    ) -> None:
+        if not self._profile_enabled:
+            return
+        with self._profile_lock:
+            self._profile_completed += 1
+            self._profile_frames_emitted += max(0, int(frames_emitted))
+            self._profile_decode_total_s += max(0.0, float(elapsed_s))
+            if elapsed_s > self._profile_decode_max_s:
+                self._profile_decode_max_s = float(elapsed_s)
+                self._profile_decode_max_path = path
+            if memory_hit:
+                self._profile_memory_hits += 1
+            if disk_hit:
+                self._profile_disk_hits += 1
+            if progressive:
+                self._profile_progressive_paths += 1
+            if single_shot:
+                self._profile_single_shot_paths += 1
+
+    def profile_snapshot(self) -> dict[str, object]:
+        with self._queue_lock:
+            queue_size = int(self._task_queue.qsize())
+            queued_count = len(self._queued)
+            loaded_count = len(self._loaded)
+        with self._profile_lock:
+            return {
+                "started_at": self._profile_started_at,
+                "queue_size": queue_size,
+                "queued_count": queued_count,
+                "loaded_count": loaded_count,
+                "enqueued_visible": self._profile_enqueued_visible,
+                "enqueued_prefetch": self._profile_enqueued_prefetch,
+                "promoted": self._profile_promoted,
+                "batches": self._profile_batches,
+                "submitted": self._profile_submitted,
+                "completed": self._profile_completed,
+                "memory_hits": self._profile_memory_hits,
+                "disk_hits": self._profile_disk_hits,
+                "progressive_paths": self._profile_progressive_paths,
+                "single_shot_paths": self._profile_single_shot_paths,
+                "frames_emitted": self._profile_frames_emitted,
+                "decode_total_s": self._profile_decode_total_s,
+                "decode_max_s": self._profile_decode_max_s,
+                "decode_max_path": self._profile_decode_max_path,
+            }
+
+    @staticmethod
+    def _normalize_unique_paths(paths: list[str] | None) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+        for path in paths or []:
+            if not path:
+                continue
+            norm = os.path.normpath(path)
+            if norm in seen:
+                continue
+            seen.add(norm)
+            result.append(norm)
+        return result
+
+    def set_desired_paths(
+        self,
+        visible_paths: list[str] | None = None,
+        prefetch_paths: list[str] | None = None,
+    ) -> None:
+        desired = set(self._normalize_unique_paths(visible_paths))
+        desired.update(self._normalize_unique_paths(prefetch_paths))
+        with self._queue_lock:
+            self._desired_paths = desired
+
+    def replace_pending(
+        self,
+        visible_paths: list[str] | None = None,
+        prefetch_paths: list[str] | None = None,
+    ) -> int:
+        visible_norms = self._normalize_unique_paths(visible_paths)
+        visible_set = set(visible_norms)
+        prefetch_norms = [
+            norm
+            for norm in self._normalize_unique_paths(prefetch_paths)
+            if norm not in visible_set
+        ]
+        desired = set(visible_norms)
+        desired.update(prefetch_norms)
+
+        replaced = 0
+        with self._queue_lock:
+            self._task_queue = _queue.PriorityQueue()
+            self._queued.clear()
+            self._desired_paths = desired
+            for norm in visible_norms:
+                if norm in self._loaded:
+                    continue
+                self._seq += 1
+                self._task_queue.put_nowait((self.PRIORITY_VISIBLE, self._seq, norm))
+                self._queued.add(norm)
+                replaced += 1
+            for norm in prefetch_norms:
+                if norm in self._loaded or norm in self._queued:
+                    continue
+                self._seq += 1
+                self._task_queue.put_nowait((self.PRIORITY_PREFETCH, self._seq, norm))
+                self._queued.add(norm)
+                replaced += 1
+        return replaced
+
+    def wants_path(self, path: str) -> bool:
+        norm = os.path.normpath(path)
+        with self._queue_lock:
+            return norm in self._desired_paths
+
+    def _resolve_load_target_path(self, path: str) -> str:
+        norm_path = os.path.normpath(path)
+        stem = Path(norm_path).stem
+        if stem and isinstance(self._report_cache, dict):
+            row = self._report_cache.get(stem)
+            if isinstance(row, dict):
+                temp_jpeg_path = str(row.get("temp_jpeg_path") or "").strip()
+                if temp_jpeg_path:
+                    candidate = (
+                        os.path.normpath(temp_jpeg_path)
+                        if os.path.isabs(temp_jpeg_path)
+                        else os.path.normpath(os.path.join(self._current_dir, temp_jpeg_path))
+                        if self._current_dir
+                        else ""
+                    )
+                    if candidate and os.path.isfile(candidate):
+                        return candidate
+        preview_path = _existing_preview_cache_path_for_file(norm_path, self._current_dir)
+        return preview_path or norm_path
 
     def enqueue(self, paths: list[str], priority: int = PRIORITY_VISIBLE) -> int:
         """Add *paths* to the priority queue at *priority*.
@@ -1087,7 +1906,14 @@ class ThumbnailLoader(QThread):
                 self._seq += 1
                 self._task_queue.put_nowait((priority, self._seq, norm))
                 self._queued.add(norm)
+                self._desired_paths.add(norm)
                 added += 1
+        if self._profile_enabled and added > 0:
+            with self._profile_lock:
+                if int(priority) == int(self.PRIORITY_VISIBLE):
+                    self._profile_enqueued_visible += added
+                else:
+                    self._profile_enqueued_prefetch += added
         return added
 
     def promote(self, paths: list[str]) -> int:
@@ -1105,17 +1931,23 @@ class ThumbnailLoader(QThread):
                 norm = os.path.normpath(path)
                 if norm in self._loaded:
                     continue
+                self._desired_paths.add(norm)
                 self._seq += 1
                 self._task_queue.put_nowait((self.PRIORITY_VISIBLE, self._seq, norm))
                 self._queued.add(norm)  # idempotent; may already be present
                 promoted += 1
+        if self._profile_enabled and promoted > 0:
+            with self._profile_lock:
+                self._profile_promoted += promoted
         return promoted
 
     def stop(self) -> None:
         self._stop_flag = True
         self.requestInterruption()
+        with self._queue_lock:
+            self._desired_paths.clear()
 
-    def _load_single(self, path: str, emit_fn) -> None:
+    def _load_single(self, path: str, emit_fn, *, allow_progressive: bool) -> None:
         """Decode one image progressively, calling emit_fn(path, QImage) for every
         available frame — coarse frames first, final high-quality frame last.
 
@@ -1133,47 +1965,82 @@ class ThumbnailLoader(QThread):
         Non-JPEG / non-RAW falls back to a single-shot load.
         """
         path_to_load = os.path.normpath(path)
+        load_started_at = _time.perf_counter()
+        emitted_frames = 0
 
         def stopped() -> bool:
             return self._stop_flag or self.isInterruptionRequested()
 
         def safe_emit(qimg: QImage) -> None:
-            if not stopped() and not qimg.isNull():
-                emit_fn(path_to_load, qimg)
+            nonlocal emitted_frames
+            if not stopped() and not qimg.isNull() and self.wants_path(path_to_load):
+                emitted_frames += 1
+                emit_fn(self._request_token, path_to_load, qimg)
 
         if stopped():
             return
 
         cache = self._thumb_cache
         load_size = self._size
+        load_target_path = self._resolve_load_target_path(path_to_load)
 
         # ── 1. Memory cache ──────────────────────────────────────────────────
         if cache is not None:
             cached = cache.get(path_to_load, load_size)
             if cached is not None and not cached.isNull():
                 safe_emit(cached)
+                self._profile_record_decode(
+                    path_to_load,
+                    elapsed_s=_time.perf_counter() - load_started_at,
+                    frames_emitted=emitted_frames,
+                    memory_hit=True,
+                )
                 return
 
-        ext = Path(path_to_load).suffix.lower()
+        ext = Path(load_target_path).suffix.lower()
 
         # ── 2. JPEG / RAW: disk cache then progressive pipeline ──────────────
         if ext in thumb_stream._JPEG_EXTENSIONS or ext in thumb_stream._RAW_EXTENSIONS:
             try:
-                mtime = os.path.getmtime(path_to_load)
+                mtime = os.path.getmtime(load_target_path)
             except Exception:
                 mtime = 0.0
 
-            disk_img = _read_thumb_from_disk_cache(path_to_load, mtime, load_size)
+            disk_img = _read_thumb_from_disk_cache(load_target_path, mtime, load_size)
             if disk_img is not None and not disk_img.isNull():
                 if cache is not None:
                     cache.put(path_to_load, load_size, disk_img)
                 safe_emit(disk_img)
+                self._profile_record_decode(
+                    path_to_load,
+                    elapsed_s=_time.perf_counter() - load_started_at,
+                    frames_emitted=emitted_frames,
+                    disk_hit=True,
+                )
                 return
 
-            # Progressive decode — emit each frame as it arrives
+            # Progressive decode – emit each frame as it arrives
+            if not allow_progressive:
+                qimg = _load_thumbnail_image(load_target_path, load_size)
+                if qimg is None or qimg.isNull() or stopped():
+                    return
+                if cache is not None:
+                    cache.put(path_to_load, load_size, qimg)
+                    cached = cache.get(path_to_load, load_size)
+                    if cached is not None and not cached.isNull():
+                        qimg = cached
+                safe_emit(qimg)
+                self._profile_record_decode(
+                    path_to_load,
+                    elapsed_s=_time.perf_counter() - load_started_at,
+                    frames_emitted=emitted_frames,
+                    single_shot=True,
+                )
+                return
+
             final_qimg: QImage | None = None
             for rgb_result in thumb_stream.iter_thumbnail_rgb_progressive(
-                path_to_load, load_size, stopped
+                load_target_path, load_size, stopped
             ):
                 if stopped():
                     return
@@ -1182,16 +2049,21 @@ class ThumbnailLoader(QThread):
                 safe_emit(qimg)
                 final_qimg = qimg
 
-            # Persist the final (highest-quality) frame
             if final_qimg is not None and not final_qimg.isNull():
                 if cache is not None:
                     cache.put(path_to_load, load_size, final_qimg)
-                cache_path = _thumb_disk_cache_path(path_to_load, mtime, load_size)
+                cache_path = _thumb_disk_cache_path(load_target_path, mtime, load_size)
                 _schedule_thumb_disk_cache_write(cache_path, final_qimg)
+                self._profile_record_decode(
+                    path_to_load,
+                    elapsed_s=_time.perf_counter() - load_started_at,
+                    frames_emitted=emitted_frames,
+                    progressive=True,
+                )
 
         # ── 3. Other formats: single-shot load (handles disk cache internally) ─
         else:
-            qimg = _load_thumbnail_image(path_to_load, load_size)
+            qimg = _load_thumbnail_image(load_target_path, load_size)
             if qimg is None or qimg.isNull() or stopped():
                 return
             if cache is not None:
@@ -1200,15 +2072,32 @@ class ThumbnailLoader(QThread):
                 if cached is not None and not cached.isNull():
                     qimg = cached
             safe_emit(qimg)
+            self._profile_record_decode(
+                path_to_load,
+                elapsed_s=_time.perf_counter() - load_started_at,
+                frames_emitted=emitted_frames,
+                single_shot=True,
+            )
 
     def run(self) -> None:
         if self._task_queue.empty():
             return
-        _log.debug(
-            "[ThumbnailLoader.run] START size=%s workers=%s",
-            self._size,
-            self._max_workers,
-        )
+        if self._profile_enabled:
+            _log.info(
+                "[THUMB_PROFILE][loader.start] token=%s size=%s workers=%s batch=%s initial_queue=%s",
+                self._request_token,
+                self._size,
+                self._max_workers,
+                self._batch_size,
+                int(self._task_queue.qsize()),
+            )
+        else:
+            _log.debug(
+                "[ThumbnailLoader.run] START size=%s workers=%s batch=%s",
+                self._size,
+                self._max_workers,
+                self._batch_size,
+            )
         executor = _futures.ThreadPoolExecutor(
             max_workers=self._max_workers,
             thread_name_prefix="thumb",
@@ -1223,18 +2112,20 @@ class ThumbnailLoader(QThread):
                 # ── Drain priority queue into one batch ──────────────────────
                 # We submit max_workers items at a time so that new high-priority
                 # items injected via promote() can jump ahead after each batch.
-                batch: list[str] = []
+                batch: list[tuple[int, str]] = []
                 while len(batch) < self._max_workers:
-                    try:
-                        _, _, path = self._task_queue.get_nowait()
-                    except _queue.Empty:
-                        break
                     with self._queue_lock:
+                        if len(batch) >= self._batch_size:
+                            break
+                        try:
+                            priority, _, path = self._task_queue.get_nowait()
+                        except _queue.Empty:
+                            break
                         self._queued.discard(path)
                         if path in self._loaded:
                             continue  # duplicate from promote(); skip
                         self._loaded.add(path)
-                    batch.append(path)
+                    batch.append((priority, path))
 
                 if not batch:
                     # Queue is empty; wait briefly for newly injected items.
@@ -1242,15 +2133,26 @@ class ThumbnailLoader(QThread):
                     if self._task_queue.empty():
                         break
                     continue
+                if self._profile_enabled:
+                    with self._profile_lock:
+                        self._profile_batches += 1
 
                 # ── Submit batch to thread-pool workers ──────────────────────
                 future_map: dict[_futures.Future, str] = {}
-                for path in batch:
+                for priority, path in batch:
                     if self._stop_flag or self.isInterruptionRequested():
                         break
                     try:
-                        f = executor.submit(self._load_single, path, emit_fn)
+                        f = executor.submit(
+                            self._load_single,
+                            path,
+                            emit_fn,
+                            allow_progressive=(priority == self.PRIORITY_VISIBLE),
+                        )
                         future_map[f] = path
+                        if self._profile_enabled:
+                            with self._profile_lock:
+                                self._profile_submitted += 1
                     except RuntimeError as e:
                         _log.info("[ThumbnailLoader.run] submit stopped path=%r: %s", path, e)
                         break
@@ -1271,8 +2173,32 @@ class ThumbnailLoader(QThread):
                         )
 
         finally:
+            if self._profile_enabled:
+                snap = self.profile_snapshot()
+                elapsed_s = max(0.001, _time.perf_counter() - self._profile_started_at)
+                avg_decode_ms = 1000.0 * float(snap.get("decode_total_s", 0.0)) / max(1, int(snap.get("completed", 0)))
+                _log.info(
+                    "[THUMB_PROFILE][loader.end] token=%s elapsed=%.2fs visible=%s prefetch=%s promoted=%s batches=%s submitted=%s completed=%s queue=%s mem_hit=%s disk_hit=%s progressive=%s single=%s frames=%s avg_decode=%.1fms max_decode=%.1fms max_path=%r",
+                    self._request_token,
+                    elapsed_s,
+                    snap.get("enqueued_visible", 0),
+                    snap.get("enqueued_prefetch", 0),
+                    snap.get("promoted", 0),
+                    snap.get("batches", 0),
+                    snap.get("submitted", 0),
+                    snap.get("completed", 0),
+                    snap.get("queue_size", 0),
+                    snap.get("memory_hits", 0),
+                    snap.get("disk_hits", 0),
+                    snap.get("progressive_paths", 0),
+                    snap.get("single_shot_paths", 0),
+                    snap.get("frames_emitted", 0),
+                    avg_decode_ms,
+                    1000.0 * float(snap.get("decode_max_s", 0.0)),
+                    snap.get("decode_max_path", ""),
+                )
             try:
-                executor.shutdown(wait=False, cancel_futures=True)
+                executor.shutdown(wait=True, cancel_futures=True)
             except Exception:
                 pass
             self._executor = None
@@ -1446,8 +2372,18 @@ def _env_int(name: str, default: int = 0) -> int:
         return default
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    v = os.environ.get(name, "")
+    if v is None or str(v).strip() == "":
+        return default
+    return str(v).strip().lower() not in ("0", "false", "no", "off")
+
+
 _DEBUG_FILE_LIST_LIMIT = max(0, _env_int("SuperViewer_DEBUG_FILE_LIST_LIMIT", 0))
 _DEBUG_FILE_LIST_MATCH = (os.environ.get("SuperViewer_DEBUG_FILE_LIST_MATCH", "") or "").strip().lower()
+_THUMB_PROFILE_ENABLED = _env_flag("SuperViewer_THUMB_PROFILE", True)
+_THUMB_PROFILE_VERBOSE = _env_flag("SuperViewer_THUMB_PROFILE_VERBOSE", False)
+_THUMB_PROFILE_REPORT_INTERVAL_S = max(0.25, _env_int("SuperViewer_THUMB_PROFILE_INTERVAL_MS", 1500) / 1000.0)
 
 _ACTUAL_PATH_CACHE: dict[str, str] = {}
 
@@ -1839,8 +2775,10 @@ class FileListPanel(QWidget):
         self._thumbnail_loader: ThumbnailLoader | None = None
         self._metadata_loader:  MetadataLoader  | None = None
         self._directory_scan_worker: DirectoryScanWorker | None = None
-        self._item_map:      dict = {}   # norm_path → QListWidgetItem  (缩略图)
-        self._tree_item_map: dict = {}   # norm_path → SortableTreeItem (列表)
+        self._file_table_model = FileTableModel(self)
+        self._file_table_proxy = FileTableSortProxyModel(self)
+        self._file_table_proxy.setSourceModel(self._file_table_model)
+        self._thumb_list_model = ThumbnailListModel(self)
         self._meta_cache:    dict = {}   # norm_path → metadata dict
         self._report_cache:  dict = {}   # stem → report row (当前目录/子树筛出的 report 子集)
         self._report_row_by_path: dict = {}
@@ -1859,6 +2797,7 @@ class FileListPanel(QWidget):
         self._tree_header_fast_mode: bool = False
         self._tree_last_sort_column: int = _TREE_COL_NAME
         self._tree_last_sort_order = _AscendingOrder
+        self._tree_view_dirty: bool = False
         self._copied_species_payload: dict | None = None
         self._pending_selection_paths: list | None = None  # 接收到的文件列表，目录加载完成后等同多选
         self._thumb_memory_cache = ThumbnailMemoryCache()
@@ -1866,8 +2805,48 @@ class FileListPanel(QWidget):
         self._thumb_viewport_timer: QTimer | None = None
         self._thumb_visible_signature: tuple | None = None
         self._thumb_visible_range: ThumbViewportRange | None = None
-        self._thumb_pending_batch: list[tuple[str, "QImage"]] = []
+        self._thumb_model_dirty: bool = False
+        self._thumb_model_populate_timer: QTimer | None = None
+        self._thumb_model_pending_paths: list[str] = []
+        self._thumb_model_pending_index: int = 0
+        self._thumb_model_populate_started_at: float = 0.0
+        self._thumb_request_token: int = 0
+        self._thumb_pending_batch: dict[str, "QImage"] = {}
         self._thumb_apply_timer: QTimer | None = None
+        self._thumb_profile_enabled: bool = _THUMB_PROFILE_ENABLED
+        self._thumb_profile_last_report_at: float = 0.0
+        self._thumb_profile_window_started_at: float = _time.perf_counter()
+        self._thumb_profile_ready_received_at: dict[str, float] = {}
+        self._background_shutdown_started: bool = False
+        self._thumb_profile_stats: dict[str, float] = {
+            "schedule_calls": 0.0,
+            "viewport_updates": 0.0,
+            "visible_items_total": 0.0,
+            "missing_visible_total": 0.0,
+            "prefetch_total": 0.0,
+            "cache_fill_total": 0.0,
+            "evicted_total": 0.0,
+            "loader_starts": 0.0,
+            "loader_reprioritize": 0.0,
+            "ready_signals": 0.0,
+            "stale_ready": 0.0,
+            "pending_peak": 0.0,
+            "flush_calls": 0.0,
+            "flush_pending_total": 0.0,
+            "flush_applied": 0.0,
+            "flush_skipped_offscreen": 0.0,
+            "flush_skipped_invalid": 0.0,
+            "ready_wait_total_s": 0.0,
+            "ready_wait_count": 0.0,
+            "ready_wait_max_s": 0.0,
+            "flush_total_s": 0.0,
+            "flush_max_s": 0.0,
+            "last_visible_start": -1.0,
+            "last_visible_end": -1.0,
+            "last_visible_count": 0.0,
+            "last_missing_count": 0.0,
+            "last_prefetch_count": 0.0,
+        }
         # 过滤状态
         self._filter_pick: bool = False   # 只显示精选(🏆)
         self._filter_min_rating: int = 0  # 最低星级(0=不限)
@@ -1878,6 +2857,12 @@ class FileListPanel(QWidget):
             create_filter_bar = getattr(type(self), "create_filter_bar", True)
         self._create_filter_bar = bool(create_filter_bar)
         self._init_ui()
+        app = QApplication.instance()
+        if app is not None:
+            try:
+                app.aboutToQuit.connect(self._shutdown_background_work)
+            except Exception:
+                pass
 
     # ── UI 初始化 ──────────────────────────────────────────────────────────────
     def _init_ui(self) -> None:
@@ -2007,8 +2992,8 @@ class FileListPanel(QWidget):
         self._stack = QStackedWidget()
 
         # ── 列表模式：多列 QTreeWidget ──
-        self._tree_widget = QTreeWidget()
-        self._tree_widget.setColumnCount(8)
+        self._tree_widget = FileTableView()
+        self._tree_widget.setModel(self._file_table_proxy)
         
         # @Agents: 这个列名不要修改
         # 城市 = 锐度值（越高越清晰）
@@ -2025,11 +3010,14 @@ class FileListPanel(QWidget):
         self._tree_widget.setUniformRowHeights(True)
         self._tree_widget.setAlternatingRowColors(True)
         self._tree_widget.setSelectionMode(_ExtendedSelection)  # Shift/Command 多选
-        self._tree_widget.setStyleSheet("QTreeWidget { font-size: 12px; }")
-        self._tree_widget.itemClicked.connect(self._on_tree_item_clicked)
-        self._tree_widget.currentItemChanged.connect(self._on_tree_current_item_changed)
+        self._tree_widget.setItemsExpandable(False)
+        self._tree_widget.setSelectionBehavior(_SelectRows)
+        self._tree_widget.setAllColumnsShowFocus(True)
+        self._tree_widget.setStyleSheet("QTreeView { font-size: 12px; }")
+        self._tree_widget.clicked.connect(self._on_tree_item_clicked)
         hdr = self._tree_widget.header()
         hdr.sortIndicatorChanged.connect(self._on_tree_sort_indicator_changed)
+        self._tree_widget.selectionModel().currentChanged.connect(self._on_tree_current_item_changed)
         for col in range(8):
             hdr.setSectionResizeMode(col, _ResizeInteractive)
         self._tree_widget.setColumnWidth(_TREE_COL_SEQ, 44)
@@ -2048,8 +3036,9 @@ class FileListPanel(QWidget):
         self._stack.addWidget(self._tree_widget)
 
         # ── 缩略图模式：QListWidget ──
-        self._list_widget = QListWidget()
+        self._list_widget = QListView()
         self._list_widget.setViewMode(_ViewModeIcon)
+        self._list_widget.setModel(self._thumb_list_model)
         self._list_widget.setItemDelegate(ThumbnailItemDelegate(self._list_widget))
         self._list_widget.setSelectionMode(_ExtendedSelection)  # Shift/Command 多选
         self._list_widget.setResizeMode(
@@ -2078,8 +3067,8 @@ class FileListPanel(QWidget):
         self._list_widget.setVerticalScrollMode(_ScrollPerPixel)
         self._list_widget.setHorizontalScrollMode(_ScrollPerPixel)
         self._list_widget.setWrapping(True)
-        self._list_widget.setStyleSheet("QListWidget { font-size: 11px; }")
-        self._list_widget.itemClicked.connect(self._on_list_item_clicked)
+        self._list_widget.setStyleSheet("QListView { font-size: 11px; }")
+        self._list_widget.clicked.connect(self._on_list_item_clicked)
         self._list_widget.setContextMenuPolicy(_CustomContextMenu)
         self._list_widget.customContextMenuRequested.connect(self._on_list_context_menu)
         self._list_widget.installEventFilter(self)
@@ -2122,9 +3111,9 @@ class FileListPanel(QWidget):
         """将当前视图（列表/缩略图）中选中的文件路径复制到剪贴板。"""
         w = self._stack.currentWidget()
         if w is self._tree_widget:
-            paths = [it.data(0, _UserRole) for it in self._tree_widget.selectedItems() if it and it.data(0, _UserRole)]
+            paths = self._tree_selected_paths()
         elif w is self._list_widget:
-            paths = [it.data(_UserRole) for it in self._list_widget.selectedItems() if it and it.data(_UserRole)]
+            paths = self._thumb_selected_paths()
         else:
             paths = []
         self._copy_paths_to_clipboard(paths)
@@ -2299,7 +3288,8 @@ class FileListPanel(QWidget):
         _log.info("[_on_directory_scan_finished] _rebuild_views END")
         if self._pending_selection_paths:
             self._apply_pending_selection()
-            self._pending_selection_paths = None
+            if self._view_mode != self._MODE_THUMB or not self._thumb_model_dirty:
+                self._pending_selection_paths = None
         if files:
             _log.info("[_on_directory_scan_finished] 为当前目录下列出的 %s 个文件启动 EXIF 查询（report_cache=%s 条，未命中走 exiftool/XMP）", len(files), len(report_cache))
             self._start_metadata_loader(files)
@@ -2330,10 +3320,15 @@ class FileListPanel(QWidget):
             self._pending_selection_paths = None
             return
         parent = os.path.dirname(normalized[0])
-        if self._current_dir and os.path.normpath(self._current_dir) == os.path.normpath(parent) and self._tree_item_map:
+        if (
+            self._current_dir
+            and os.path.normpath(self._current_dir) == os.path.normpath(parent)
+            and (self._tree_row_count() > 0 or self._thumb_row_count() > 0)
+        ):
             self._pending_selection_paths = normalized
             self._apply_pending_selection()
-            self._pending_selection_paths = None
+            if not self._thumb_model_dirty:
+                self._pending_selection_paths = None
             return
         self._pending_selection_paths = normalized
 
@@ -2347,25 +3342,39 @@ class FileListPanel(QWidget):
             return
         first_matched = None
         self._tree_widget.clearSelection()
-        for norm, ti in self._tree_item_map.items():
-            if os.path.normcase(norm) in path_set:
-                ti.setSelected(True)
+        tree_sm = self._tree_widget.selectionModel()
+        if tree_sm is not None:
+            for path in self._file_table_model.all_paths():
+                norm = os.path.normpath(path)
+                if os.path.normcase(norm) not in path_set:
+                    continue
+                idx = self._tree_index_for_path(norm)
+                if not idx.isValid():
+                    continue
+                tree_sm.select(idx, _Select)
                 if first_matched is None:
                     first_matched = norm
-        if first_matched is not None:
-            ti_first = self._tree_item_map.get(first_matched)
-            if ti_first is not None:
-                self._tree_widget.setCurrentItem(ti_first)
+            if first_matched is not None:
+                idx_first = self._tree_index_for_path(first_matched)
+                if idx_first.isValid():
+                    self._tree_widget.setCurrentIndex(idx_first)
         self._list_widget.clearSelection()
-        for norm, li in self._item_map.items():
-            if os.path.normcase(norm) in path_set:
-                li.setSelected(True)
+        sm = self._list_widget.selectionModel()
+        if sm is not None:
+            for path in self._thumb_list_model.all_paths():
+                norm = os.path.normpath(path)
+                if os.path.normcase(norm) not in path_set:
+                    continue
+                idx = self._thumb_index_for_path(norm)
+                if not idx.isValid():
+                    continue
+                sm.select(idx, _Select)
                 if first_matched is None:
                     first_matched = norm
         if first_matched is not None:
-            li_first = self._item_map.get(first_matched)
-            if li_first is not None:
-                self._list_widget.setCurrentItem(li_first)
+            idx_first = self._thumb_index_for_path(first_matched)
+            if idx_first.isValid():
+                self._list_widget.setCurrentIndex(idx_first)
             self._emit_file_selected_for_path(first_matched)
 
     def _get_species_cn_from_metadata(self, path: str) -> str:
@@ -2497,9 +3506,7 @@ class FileListPanel(QWidget):
                         meta["bird_species_en"] = en
                         fallback_title = str((row or {}).get("title") or meta.get("title") or "").strip()
                         meta["title"] = cn or fallback_title
-                        ti = self._tree_item_map.get(norm_path)
-                        if ti is not None:
-                            self._apply_meta_to_tree_item(ti, meta)
+                        self._file_table_model.set_meta_for_path(norm_path, meta)
         finally:
             db.close()
 
@@ -2692,15 +3699,11 @@ class FileListPanel(QWidget):
             meta = self._meta_cache.get(norm_path, {})
             if not isinstance(meta, dict):
                 continue
-            tree_item = self._tree_item_map.get(norm_path)
-            if tree_item is not None:
-                self._apply_meta_to_tree_item(tree_item, meta)
-            list_item = self._item_map.get(norm_path)
-            if list_item is not None:
-                self._apply_thumb_meta_to_item(list_item, meta)
+            self._file_table_model.set_meta_for_path(norm_path, meta)
+            self._apply_thumb_meta_to_path(norm_path, meta)
 
         if self._tree_widget.isSortingEnabled():
-            self._tree_widget.sortItems(self._tree_last_sort_column, self._tree_last_sort_order)
+            self._tree_widget.sortByColumn(self._tree_last_sort_column, self._tree_last_sort_order)
             self._refresh_tree_row_numbers()
 
         self._tree_widget.viewport().update()
@@ -2966,32 +3969,146 @@ class FileListPanel(QWidget):
             return base_tooltip[:-len(end_tag)] + preview_line + end_tag
         return "<html><body>" + base_tooltip + preview_line + "</body></html>"
 
-    def _set_tree_item_tooltip_all_columns(self, item: QTreeWidgetItem, tooltip: str) -> None:
-        if item is None:
-            return
-        col_count = 0
-        try:
-            col_count = int(self._tree_widget.columnCount())
-        except Exception:
-            col_count = 0
-        if col_count <= 0:
-            col_count = 1
-        for col in range(col_count):
-            item.setToolTip(col, tooltip)
+    def _tree_row_count(self) -> int:
+        return self._file_table_proxy.rowCount()
 
-    def _find_thumb_item_for_tooltip(self, pos: QPoint) -> QListWidgetItem | None:
-        item = self._list_widget.itemAt(pos)
-        if item is not None:
-            return item
+    def _tree_source_row_count(self) -> int:
+        return self._file_table_model.rowCount()
+
+    def _tree_index_for_path(self, path: str, column: int = 0) -> QModelIndex:
+        source_index = self._file_table_model.index_for_path(path, column)
+        if not source_index.isValid():
+            return QModelIndex()
+        return self._file_table_proxy.mapFromSource(source_index)
+
+    def _tree_path_from_index(self, index: QModelIndex) -> str:
+        if not index.isValid():
+            return ""
+        source_index = self._file_table_proxy.mapToSource(index)
+        return self._file_table_model.path_for_index(source_index) or ""
+
+    def _tree_selected_indexes(self) -> list[QModelIndex]:
+        sm = self._tree_widget.selectionModel()
+        if sm is None:
+            return []
+        indexes = [idx for idx in sm.selectedRows(0) if idx.isValid()]
+        indexes.sort(key=lambda idx: idx.row())
+        return indexes
+
+    def _tree_selected_paths(self) -> list[str]:
+        return [self._tree_path_from_index(idx) for idx in self._tree_selected_indexes() if self._tree_path_from_index(idx)]
+
+    def _thumb_row_count(self) -> int:
+        return self._thumb_list_model.rowCount()
+
+    def _thumb_index_for_row(self, row: int) -> QModelIndex:
+        if row < 0 or row >= self._thumb_row_count():
+            return QModelIndex()
+        return self._thumb_list_model.index(row, 0)
+
+    def _thumb_index_for_path(self, path: str) -> QModelIndex:
+        return self._thumb_list_model.index_for_path(path)
+
+    def _thumb_path_from_index(self, index: QModelIndex) -> str:
+        return self._thumb_list_model.path_for_index(index) or ""
+
+    def _thumb_selected_indexes(self) -> list[QModelIndex]:
+        sm = self._list_widget.selectionModel()
+        if sm is None:
+            return []
+        indexes = [idx for idx in sm.selectedIndexes() if idx.isValid()]
+        indexes.sort(key=lambda idx: idx.row())
+        return indexes
+
+    def _thumb_selected_paths(self) -> list[str]:
+        return [self._thumb_path_from_index(idx) for idx in self._thumb_selected_indexes() if self._thumb_path_from_index(idx)]
+
+    def _thumb_profile_add(self, key: str, value: float = 1.0) -> None:
+        if not self._thumb_profile_enabled:
+            return
+        self._thumb_profile_stats[key] = float(self._thumb_profile_stats.get(key, 0.0)) + float(value)
+
+    def _thumb_profile_set_max(self, key: str, value: float) -> None:
+        if not self._thumb_profile_enabled:
+            return
+        self._thumb_profile_stats[key] = max(float(self._thumb_profile_stats.get(key, 0.0)), float(value))
+
+    def _reset_thumb_profile_window(self) -> None:
+        self._thumb_profile_window_started_at = _time.perf_counter()
+        for key in list(self._thumb_profile_stats.keys()):
+            if key.startswith("last_"):
+                continue
+            self._thumb_profile_stats[key] = 0.0
+
+    def _report_thumb_profile(self, reason: str, *, force: bool = False, extra: str = "") -> None:
+        if not self._thumb_profile_enabled:
+            return
+        now = _time.perf_counter()
+        if not force and (now - self._thumb_profile_last_report_at) < _THUMB_PROFILE_REPORT_INTERVAL_S:
+            return
+        stats = self._thumb_profile_stats
+        loader = self._thumbnail_loader
+        snap = loader.profile_snapshot() if loader is not None else {}
+        cache_stats = self._thumb_memory_cache.stats()
+        model_pending = max(0, len(self._thumb_model_pending_paths) - int(self._thumb_model_pending_index))
+        ready_wait_count = max(1.0, float(stats.get("ready_wait_count", 0.0)))
+        flush_calls = max(1.0, float(stats.get("flush_calls", 0.0)))
+        window_s = max(0.001, now - self._thumb_profile_window_started_at)
+        extra_suffix = f" {extra}" if extra else ""
+        _log.info(
+            "[THUMB_PROFILE][ui] reason=%s window=%.2fs schedule=%s viewport=%s rows=%s-%s visible=%s missing=%s prefetch=%s cache_fill=%s evicted=%s loader_start=%s reprio=%s ready=%s stale=%s pending_peak=%s flush=%s pending=%s applied=%s offscreen=%s invalid=%s wait_avg=%.1fms wait_max=%.1fms flush_avg=%.1fms flush_max=%.1fms model_pending=%s loader_queue=%s loader_inflight=%s loader_done=%s mem_hit=%s disk_hit=%s progressive=%s frames=%s cache_mb=%.1f%s",
+            reason,
+            window_s,
+            int(stats.get("schedule_calls", 0.0)),
+            int(stats.get("viewport_updates", 0.0)),
+            int(stats.get("last_visible_start", -1.0)),
+            int(stats.get("last_visible_end", -1.0)),
+            int(stats.get("last_visible_count", 0.0)),
+            int(stats.get("last_missing_count", 0.0)),
+            int(stats.get("last_prefetch_count", 0.0)),
+            int(stats.get("cache_fill_total", 0.0)),
+            int(stats.get("evicted_total", 0.0)),
+            int(stats.get("loader_starts", 0.0)),
+            int(stats.get("loader_reprioritize", 0.0)),
+            int(stats.get("ready_signals", 0.0)),
+            int(stats.get("stale_ready", 0.0)),
+            int(stats.get("pending_peak", 0.0)),
+            int(stats.get("flush_calls", 0.0)),
+            int(stats.get("flush_pending_total", 0.0)),
+            int(stats.get("flush_applied", 0.0)),
+            int(stats.get("flush_skipped_offscreen", 0.0)),
+            int(stats.get("flush_skipped_invalid", 0.0)),
+            1000.0 * float(stats.get("ready_wait_total_s", 0.0)) / ready_wait_count,
+            1000.0 * float(stats.get("ready_wait_max_s", 0.0)),
+            1000.0 * float(stats.get("flush_total_s", 0.0)) / flush_calls,
+            1000.0 * float(stats.get("flush_max_s", 0.0)),
+            model_pending,
+            int(snap.get("queue_size", 0)),
+            max(0, int(snap.get("submitted", 0)) - int(snap.get("completed", 0))),
+            int(snap.get("completed", 0)),
+            int(snap.get("memory_hits", 0)),
+            int(snap.get("disk_hits", 0)),
+            int(snap.get("progressive_paths", 0)),
+            int(snap.get("frames_emitted", 0)),
+            float(cache_stats.get("bytes", 0)) / (1024.0 * 1024.0),
+            extra_suffix,
+        )
+        self._thumb_profile_last_report_at = now
+        self._reset_thumb_profile_window()
+
+    def _find_thumb_index_for_tooltip(self, pos: QPoint) -> QModelIndex:
+        idx = self._list_widget.indexAt(pos)
+        if idx.isValid():
+            return idx
         visible_range = self._thumb_visible_range or self._build_visible_thumbnail_data_source(overscan_rows=0)
         for entry in (visible_range.entries if visible_range is not None else ()):
-            it = entry.item
-            if it is None or it.isHidden():
+            idx = self._thumb_index_for_row(entry.row)
+            if not idx.isValid():
                 continue
-            rect = self._list_widget.visualItemRect(it)
+            rect = self._list_widget.visualRect(idx)
             if rect.isValid() and rect.contains(pos):
-                return it
-        return None
+                return idx
+        return QModelIndex()
 
     def _has_path_mismatch(self, path: str) -> bool:
         norm_path = os.path.normpath(path) if path else ""
@@ -3007,13 +4124,8 @@ class FileListPanel(QWidget):
         if not norm_path:
             return
         mismatch = self._has_path_mismatch(norm_path)
-        brush = QBrush(QColor("#c0392b")) if mismatch else QBrush()
-        ti = self._tree_item_map.get(norm_path)
-        if ti is not None:
-            ti.setForeground(_TREE_COL_NAME, brush)
-        li = self._item_map.get(norm_path)
-        if li is not None:
-            li.setForeground(brush)
+        self._file_table_model.set_path_mismatch_for_path(norm_path, mismatch)
+        self._thumb_list_model.set_path_mismatch(norm_path, mismatch)
 
     def _update_item_tooltips_for_path(self, path: str) -> None:
         norm_path = os.path.normpath(path) if path else ""
@@ -3021,12 +4133,8 @@ class FileListPanel(QWidget):
             return
         tree_tooltip = self._build_list_path_tooltip(norm_path)
         list_tooltip = self._build_list_path_tooltip(norm_path)
-        ti = self._tree_item_map.get(norm_path)
-        if ti is not None:
-            self._set_tree_item_tooltip_all_columns(ti, tree_tooltip)
-        li = self._item_map.get(norm_path)
-        if li is not None:
-            li.setToolTip(list_tooltip)
+        self._file_table_model.set_tooltip_for_path(norm_path, tree_tooltip)
+        self._thumb_list_model.set_tooltip_for_path(norm_path, list_tooltip)
         self._apply_path_status_to_items(norm_path)
 
     def has_path_mismatch(self, path: str) -> bool:
@@ -3296,52 +4404,46 @@ class FileListPanel(QWidget):
         )
         return final_path
 
-    def _apply_thumb_meta_to_item(self, item: QListWidgetItem, meta: dict | None) -> None:
-        meta = meta or {}
-        item.setData(_MetaColorRole, meta.get("color", ""))
-        item.setData(_MetaRatingRole, meta.get("rating", 0))
-        item.setData(_MetaPickRole, meta.get("pick", 0))
-        item.setData(_MetaFocusRole, meta.get("country", ""))
-        item.setData(_MetaSpeciesCnRole, meta.get("bird_species_cn", ""))
+    def _apply_thumb_meta_to_path(self, path: str, meta: dict | None) -> None:
+        self._thumb_list_model.set_meta_for_path(path, meta)
 
-    def _clear_thumb_pixmap_for_item(self, item: QListWidgetItem) -> None:
-        item.setIcon(QIcon())
-        item.setData(_ThumbPixmapRole, None)
-        item.setData(_ThumbSizeRole, 0)
+    def _clear_thumb_pixmap_for_path(self, path: str) -> None:
+        self._thumb_list_model.clear_pixmap_for_path(path)
 
-    def _reset_thumb_item_state(self, item: QListWidgetItem, meta: dict | None = None) -> None:
-        self._clear_thumb_pixmap_for_item(item)
-        self._apply_thumb_meta_to_item(item, meta)
-
-    def _apply_cached_thumbs_to_items(self) -> None:
+    def _apply_cached_thumbs_to_items(
+        self,
+        visible_range: "ThumbViewportRange | None" = None,
+    ) -> int:
         """尽可能直接从内存缩略图缓存填充当前列表项，避免已加载目录间切换时重新排队后台加载。
         Only applies to currently-visible items to avoid creating pixmaps for thousands of
         off-screen items (which would cause unbounded memory growth)."""
-        if not self._item_map:
-            return
+        if self._thumb_row_count() <= 0:
+            return 0
         # Determine which items are (or will soon be) visible so we only materialise
         # QPixmaps for those.  Fall back to all items when the viewport is not yet
         # ready (e.g. immediately after a directory switch before layout settles).
-        visible_range = self._build_visible_thumbnail_data_source()
-        if visible_range is not None and visible_range.entries:
-            visible_norms = {e.path for e in visible_range.entries}
+        range_data = visible_range if visible_range is not None else self._build_visible_thumbnail_data_source()
+        if range_data is not None and range_data.entries:
+            visible_norms = {e.path for e in range_data.entries}
         else:
             visible_norms = None  # layout not ready – apply to all (small directories)
-        for norm, item in list(self._item_map.items()):
+        applied = 0
+        for norm in self._thumb_list_model.all_paths():
             if visible_norms is not None and norm not in visible_norms:
                 continue
-            if item is None or self._thumb_item_has_current_pixmap(item):
+            if self._thumb_list_model.has_current_pixmap(norm, self._thumb_size):
                 continue
             cached = self._thumb_memory_cache.get(norm, self._thumb_size)
             if cached is None or cached.isNull():
                 continue
             pixmap = QPixmap.fromImage(cached)
-            item.setData(_ThumbPixmapRole, pixmap)
-            item.setData(_ThumbSizeRole, int(self._thumb_size))
+            self._thumb_list_model.set_pixmap_for_path(norm, pixmap, self._thumb_size)
             meta = self._meta_cache.get(norm, {})
-            self._apply_thumb_meta_to_item(item, meta)
+            self._apply_thumb_meta_to_path(norm, meta)
+            applied += 1
+        return applied
 
-    def _evict_offscreen_item_pixmaps(self, visible_range: "ThumbViewportRange") -> None:
+    def _evict_offscreen_item_pixmaps(self, visible_range: "ThumbViewportRange") -> int:
         """Release QPixmap objects stored on items that are well outside the current
         viewport.  This is the primary guard against unbounded RAM growth: the
         ThumbnailMemoryCache (QImage, bounded at 512 MB) survives, so re-entering
@@ -3350,30 +4452,21 @@ class FileListPanel(QWidget):
         Keeps a buffer of 4 extra rows on each side of the visible range so that
         smooth scrolling doesn't cause visible flicker.
         """
-        total = self._list_widget.count()
+        total = self._thumb_row_count()
         if total == 0:
-            return
+            return 0
         vp_w = self._list_widget.viewport().rect().width()
         cols = max(1, vp_w // max(1, visible_range.grid_width))
         buffer = cols * 4  # 4 extra rows on each side
         keep_start = max(0, visible_range.start_row - buffer)
         keep_end = min(total - 1, visible_range.end_row + buffer)
+        evicted = 0
         for i in range(total):
             if keep_start <= i <= keep_end:
                 continue
-            item = self._list_widget.item(i)
-            if item is not None and item.data(_ThumbPixmapRole) is not None:
-                item.setData(_ThumbPixmapRole, None)
-                item.setData(_ThumbSizeRole, 0)
-
-    def _thumb_item_has_current_pixmap(self, item: QListWidgetItem) -> bool:
-        pixmap = item.data(_ThumbPixmapRole)
-        thumb_size = item.data(_ThumbSizeRole)
-        try:
-            thumb_size_ok = int(thumb_size or 0) == int(self._thumb_size)
-        except Exception:
-            thumb_size_ok = False
-        return isinstance(pixmap, QPixmap) and not pixmap.isNull() and thumb_size_ok
+            if self._thumb_list_model.clear_pixmap_for_row(i):
+                evicted += 1
+        return evicted
 
     def _compute_filtered_files(self) -> list[str]:
         ft = (self._filter_edit.text().strip().lower()) if self._filter_edit else ""
@@ -3416,13 +4509,7 @@ class FileListPanel(QWidget):
     def _on_clear_thumb_cache_clicked(self) -> None:
         self._stop_thumbnail_loader()
         stats = self._thumb_memory_cache.clear()
-        cleared_items = 0
-        for i in range(self._list_widget.count()):
-            item = self._list_widget.item(i)
-            if item is None:
-                continue
-            self._clear_thumb_pixmap_for_item(item)
-            cleared_items += 1
+        cleared_items = self._thumb_list_model.clear_all_pixmaps()
         self._invalidate_visible_thumbnail_signature()
         if self._view_mode == self._MODE_THUMB:
             self._list_widget.viewport().update()
@@ -3435,12 +4522,144 @@ class FileListPanel(QWidget):
             cleared_items,
         )
 
+    def _clear_tree_view_state(self) -> None:
+        self._file_table_model.clear()
+
+    def _rebuild_tree_items(self) -> None:
+        self._tree_widget.setUpdatesEnabled(False)
+        try:
+            self._tree_widget.setSortingEnabled(False)
+            self._set_tree_header_fast_mode(True)
+            self._clear_tree_view_state()
+            ft = (self._filter_edit.text().strip().lower()) if self._filter_edit else ""
+            _log.info("[_rebuild_tree_items] filter_text=%r adding items", ft or "(none)")
+            self._file_table_model.rebuild(
+                self._filtered_files,
+                meta_cache=self._meta_cache,
+                tooltip_fn=self._build_list_path_tooltip,
+                mismatch_fn=self._has_path_mismatch,
+            )
+        finally:
+            self._tree_widget.setSortingEnabled(True)
+            self._set_tree_header_fast_mode(False)
+            if self._tree_row_count() > 0:
+                hdr = self._tree_widget.header()
+                try:
+                    hdr.blockSignals(True)
+                    hdr.setSortIndicator(self._tree_last_sort_column, self._tree_last_sort_order)
+                finally:
+                    hdr.blockSignals(False)
+                self._tree_widget.sortByColumn(self._tree_last_sort_column, self._tree_last_sort_order)
+            self._tree_widget.setUpdatesEnabled(True)
+            self._refresh_tree_row_numbers()
+        self._tree_view_dirty = False
+
+    def _mark_tree_view_dirty(self) -> None:
+        self._tree_view_dirty = True
+        self._clear_tree_view_state()
+
+    def _ensure_thumb_model_populate_timer(self) -> None:
+        if self._thumb_model_populate_timer is not None:
+            return
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(self._populate_thumb_model_batch)
+        self._thumb_model_populate_timer = timer
+
+    def _pause_thumb_model_population(self) -> None:
+        if self._thumb_model_populate_timer is not None and self._thumb_model_populate_timer.isActive():
+            self._thumb_model_populate_timer.stop()
+
+    def _cancel_thumb_model_population(self) -> None:
+        self._pause_thumb_model_population()
+        self._thumb_model_pending_paths = []
+        self._thumb_model_pending_index = 0
+        self._thumb_model_populate_started_at = 0.0
+
+    def _mark_thumb_model_dirty(self) -> None:
+        self._pause_thumb_model_population()
+        self._thumb_model_dirty = True
+        self._thumb_model_pending_paths = list(self._filtered_files)
+        self._thumb_model_pending_index = 0
+        self._thumb_model_populate_started_at = 0.0
+        self._thumb_list_model.clear()
+        self._invalidate_visible_thumbnail_signature()
+
+    def _start_thumb_model_population(self, *, resume: bool = False) -> None:
+        if not resume:
+            self._thumb_model_pending_paths = list(self._filtered_files)
+            self._thumb_model_pending_index = 0
+            self._thumb_model_populate_started_at = _time.perf_counter()
+            self._thumb_list_model.clear()
+            self._invalidate_visible_thumbnail_signature()
+        elif not self._thumb_model_pending_paths:
+            self._thumb_model_pending_paths = list(self._filtered_files)
+        if not self._thumb_model_pending_paths:
+            self._thumb_model_dirty = False
+            return
+        if self._thumb_model_populate_started_at <= 0:
+            self._thumb_model_populate_started_at = _time.perf_counter()
+        self._thumb_model_dirty = True
+        self._ensure_thumb_model_populate_timer()
+        self._populate_thumb_model_batch()
+
+    def _populate_thumb_model_batch(self) -> None:
+        total = len(self._thumb_model_pending_paths)
+        start = self._thumb_model_pending_index
+        if total <= 0 or start >= total:
+            self._thumb_model_dirty = False
+            self._thumb_model_pending_paths = []
+            self._thumb_model_pending_index = 0
+            return
+        tick_t0 = _time.perf_counter()
+        end = start
+        min_batch = 24
+        max_batch = max(1, _THUMB_MODEL_APPEND_BATCH_SIZE)
+        while end < total:
+            end += 1
+            processed = end - start
+            if processed >= max_batch:
+                break
+            if processed >= min_batch and (_time.perf_counter() - tick_t0) >= _THUMB_MODEL_APPEND_BUDGET_S:
+                break
+        appended = self._thumb_list_model.append_paths(
+            self._thumb_model_pending_paths[start:end],
+            meta_cache=self._meta_cache,
+            tooltip_fn=self._build_list_path_tooltip,
+            mismatch_fn=self._has_path_mismatch,
+        )
+        self._thumb_model_pending_index = end
+        if appended:
+            self._invalidate_visible_thumbnail_signature()
+            if self._pending_selection_paths:
+                self._apply_pending_selection()
+            if self._view_mode == self._MODE_THUMB:
+                self._schedule_visible_thumbnail_update()
+        if end < total:
+            self._thumb_model_dirty = True
+            if self._view_mode == self._MODE_THUMB and self._thumb_model_populate_timer is not None:
+                self._thumb_model_populate_timer.start(0)
+            return
+        self._thumb_model_dirty = False
+        self._thumb_model_pending_paths = []
+        self._thumb_model_pending_index = 0
+        if self._pending_selection_paths:
+            self._apply_pending_selection()
+            self._pending_selection_paths = None
+        _log.info(
+            "[_populate_thumb_model_batch] completed total=%s elapsed=%.3fs",
+            total,
+            _time.perf_counter() - self._thumb_model_populate_started_at if self._thumb_model_populate_started_at > 0 else 0.0,
+        )
+        self._thumb_model_populate_started_at = 0.0
+
     def _rebuild_views(self, stop_loaders: bool = True) -> None:
         """根据当前过滤结果重建列表/树视图与缩略图项。"""
         if stop_loaders:
             self._stop_all_loaders()
         else:
             self._stop_thumbnail_loader()
+        self._cancel_thumb_model_population()
         self._filtered_files = self._compute_filtered_files()
         _log.info(
             "[_rebuild_views] START all_files=%s filtered_files=%s stop_loaders=%s",
@@ -3448,14 +4667,25 @@ class FileListPanel(QWidget):
             len(self._filtered_files),
             stop_loaders,
         )
+        _log.info("[_rebuild_views] added %s items", len(self._filtered_files))
+        if self._view_mode == self._MODE_LIST:
+            self._rebuild_tree_items()
+            self._mark_thumb_model_dirty()
+        else:
+            self._mark_tree_view_dirty()
+            self._update_thumb_display()
+            self._start_thumb_model_population()
+        if self._view_mode == self._MODE_THUMB:
+            _log.info("[_rebuild_views] thumb mode: update thumb display + schedule visible loader")
+            self._schedule_visible_thumbnail_update()
+        _log.info("[_rebuild_views] END")
+        return
         self._tree_widget.setUpdatesEnabled(False)
         self._list_widget.setUpdatesEnabled(False)
         try:
             self._tree_widget.setSortingEnabled(False)
             self._tree_widget.clear()
             self._tree_item_map = {}
-            self._list_widget.clear()
-            self._item_map = {}
             ft = (self._filter_edit.text().strip().lower()) if self._filter_edit else ""
             _log.info("[_rebuild_views] filter_text=%r adding items", ft or "(none)")
 
@@ -3475,14 +4705,12 @@ class FileListPanel(QWidget):
                 self._tree_widget.addTopLevelItem(ti)
                 self._tree_item_map[norm] = ti
                 self._apply_path_status_to_items(norm)
-
-                li = QListWidgetItem(name)
-                li.setData(_UserRole, path)
-                li.setToolTip(self._build_list_path_tooltip(path))
-                self._reset_thumb_item_state(li, meta)
-                self._item_map[norm] = li
-                self._apply_path_status_to_items(norm)
-                self._list_widget.addItem(li)
+            self._thumb_list_model.rebuild(
+                self._filtered_files,
+                meta_cache=self._meta_cache,
+                tooltip_fn=self._build_list_path_tooltip,
+                mismatch_fn=self._has_path_mismatch,
+            )
         finally:
             self._tree_widget.setSortingEnabled(True)
             # 重建后显式按当前记录的排序列排序，避免列头状态未同步时按序号列（全 0）产生不稳定顺序
@@ -3525,7 +4753,9 @@ class FileListPanel(QWidget):
             fr,
             ft or "(none)",
         )
-        if old_filtered == filtered and len(self._tree_item_map) == len(filtered) and len(self._item_map) == len(filtered):
+        tree_ready = self._view_mode != self._MODE_LIST or (not self._tree_view_dirty and self._tree_source_row_count() == len(filtered))
+        thumb_ready = self._view_mode != self._MODE_THUMB or (not self._thumb_model_dirty and self._thumb_row_count() == len(filtered))
+        if old_filtered == filtered and tree_ready and thumb_ready:
             _log.info("[_apply_filter] SKIP unchanged elapsed=%.3fs", _time.perf_counter() - t0)
             return
         self._rebuild_views(stop_loaders=False)
@@ -3625,14 +4855,13 @@ class FileListPanel(QWidget):
         list_viewport = list_widget.viewport() if list_widget is not None else None
         if event is not None and event.type() == _EventToolTip:
             if obj is tree_viewport and tree_widget is not None:
-                item = tree_widget.itemAt(event.pos())
-                if item is not None:
-                    path = item.data(0, _UserRole)
-                    if path:
-                        tooltip = self._build_list_path_tooltip(path)
-                        if tooltip:
-                            QToolTip.showText(event.globalPos(), tooltip, tree_viewport)
-                            return True
+                idx = tree_widget.indexAt(event.pos())
+                path = self._tree_path_from_index(idx) if idx.isValid() else ""
+                if path:
+                    tooltip = self._build_list_path_tooltip(path)
+                    if tooltip:
+                        QToolTip.showText(event.globalPos(), tooltip, tree_viewport)
+                        return True
                 QToolTip.hideText()
                 try:
                     event.ignore()
@@ -3640,14 +4869,13 @@ class FileListPanel(QWidget):
                     pass
                 return True
             if obj is list_viewport and list_widget is not None:
-                item = self._find_thumb_item_for_tooltip(event.pos())
-                if item is not None:
-                    path = item.data(_UserRole)
-                    if path:
-                        tooltip = self._build_list_path_tooltip(path)
-                        if tooltip:
-                            QToolTip.showText(event.globalPos(), tooltip, list_viewport)
-                            return True
+                idx = self._find_thumb_index_for_tooltip(event.pos())
+                path = self._thumb_path_from_index(idx) if idx.isValid() else ""
+                if path:
+                    tooltip = self._build_list_path_tooltip(path)
+                    if tooltip:
+                        QToolTip.showText(event.globalPos(), tooltip, list_viewport)
+                        return True
                 QToolTip.hideText()
                 try:
                     event.ignore()
@@ -3665,7 +4893,7 @@ class FileListPanel(QWidget):
             and event.type() == _EventKeyPress
             and self._view_mode == self._MODE_THUMB
             and list_widget is not None
-            and list_widget.count() > 0
+            and self._thumb_row_count() > 0
         ):
             key = event.key()
             if key not in (_KeyUp, _KeyDown, _KeyLeft, _KeyRight):
@@ -3674,10 +4902,9 @@ class FileListPanel(QWidget):
             grid = list_widget.gridSize()
             gw = max(1, grid.width())
             cols = max(1, viewport.rect().width() // gw)
-            count = list_widget.count()
-            idx = list_widget.currentRow()
-            if idx < 0:
-                idx = 0
+            count = self._thumb_row_count()
+            current_index = list_widget.currentIndex()
+            idx = current_index.row() if current_index.isValid() else 0
             row, col = idx // cols, idx % cols
             new_idx = -1
             if key == _KeyUp and row > 0:
@@ -3692,27 +4919,28 @@ class FileListPanel(QWidget):
                 new_idx = idx + 1
             if new_idx >= 0 and new_idx < count:
                 shift = _ShiftModifier and (event.modifiers() & _ShiftModifier)
+                new_index = self._thumb_index_for_row(new_idx)
+                if not new_index.isValid():
+                    return True
                 if shift:
                     sm = list_widget.selectionModel()
                     anchor = sm.anchorIndex().row() if sm and sm.anchorIndex().isValid() else idx
                     lo, hi = min(anchor, new_idx), max(anchor, new_idx)
                     list_widget.clearSelection()
                     for i in range(lo, hi + 1):
-                        it = list_widget.item(i)
-                        if it is not None:
-                            it.setSelected(True)
-                    list_widget.setCurrentRow(new_idx)
+                        it = self._thumb_index_for_row(i)
+                        if it.isValid() and sm is not None:
+                            sm.select(it, _Select)
+                    list_widget.setCurrentIndex(new_index)
                 else:
                     list_widget.clearSelection()
-                    list_widget.setCurrentRow(new_idx)
-                    item = list_widget.item(new_idx)
-                    if item is not None:
-                        item.setSelected(True)
-                item = list_widget.currentItem()
-                if item is not None:
-                    path = item.data(_UserRole)
-                    if path:
-                        self._emit_file_selected_for_path(path)
+                    list_widget.setCurrentIndex(new_index)
+                    sm = list_widget.selectionModel()
+                    if sm is not None:
+                        sm.select(new_index, _SelectCurrent)
+                path = self._thumb_path_from_index(list_widget.currentIndex())
+                if path:
+                    self._emit_file_selected_for_path(path)
                 return True
         return super().eventFilter(obj, event)
 
@@ -3732,7 +4960,8 @@ class FileListPanel(QWidget):
         self,
         overscan_rows: int = 2,
     ) -> ThumbViewportRange | None:
-        if self._view_mode != self._MODE_THUMB or self._list_widget.count() <= 0:
+        total_items = self._thumb_row_count()
+        if self._view_mode != self._MODE_THUMB or total_items <= 0:
             self._thumb_visible_range = None
             return None
         viewport = self._list_widget.viewport()
@@ -3741,26 +4970,35 @@ class FileListPanel(QWidget):
             self._thumb_visible_range = None
             return None
 
-        # 当内容总高度未超过视口时，直接将当前列表中的全部项视为可见。
-        # 否则 bottom/edge 采样点会落在空白区，导致第三排及之后的缩略图不进入加载队列。
+        # 首次切换到缩略图模式时，Qt 可能尚未完成 layout，此时滚动条最大值仍为 0。
+        # 大目录如果在这个瞬间被误判成“全部可见”，会把整个目录都丢进缩略图队列。
+        # 因此这里按当前 viewport 容量做一次保守估算；只有确实装得下时才视为全部可见。
+        grid = self._list_widget.gridSize()
+        # 首次切到缩略图模式时，Qt layout 可能尚未完成，滚动条最大值仍为 0。
+        # 大目录如果在这一瞬间被误判成“全部可见”，会把整批文件直接丢进缩略图队列。
+        # 这里按当前 viewport 容量做保守估算，只覆盖首屏附近。
+        grid = self._list_widget.gridSize()
+        grid = self._list_widget.gridSize()
+        grid_w = max(1, grid.width())
+        grid_h = max(1, grid.height())
+        cols = max(1, rect.width() // grid_w)
         if self._list_widget.verticalScrollBar().maximum() <= 0:
+            estimated_rows = max(1, (rect.height() + grid_h - 1) // grid_h)
+            estimated_visible = cols * max(1, estimated_rows + max(0, overscan_rows) * 2)
+            end_index = min(total_items - 1, max(0, estimated_visible - 1))
             entries: list[ThumbViewportEntry] = []
-            for i in range(self._list_widget.count()):
-                item = self._list_widget.item(i)
-                if item is None or item.isHidden():
-                    continue
-                path = item.data(_UserRole)
+            for i in range(0, end_index + 1):
+                path = self._thumb_list_model.path_for_row(i)
                 if not path:
                     continue
-                entries.append(ThumbViewportEntry(os.path.normpath(path), item))
-            grid = self._list_widget.gridSize()
+                entries.append(ThumbViewportEntry(os.path.normpath(path), i))
             visible_range = ThumbViewportRange(
                 thumb_size=self._thumb_size,
                 start_row=0,
-                end_row=max(0, self._list_widget.count() - 1),
-                grid_width=max(1, grid.width()),
-                grid_height=max(1, grid.height()),
-                total_items=self._list_widget.count(),
+                end_row=end_index,
+                grid_width=grid_w,
+                grid_height=grid_h,
+                total_items=total_items,
                 entries=tuple(entries),
             )
             self._thumb_visible_range = visible_range
@@ -3784,23 +5022,16 @@ class FileListPanel(QWidget):
             self._thumb_visible_range = None
             return None
 
-        grid = self._list_widget.gridSize()
-        grid_w = max(1, grid.width())
-        grid_h = max(1, grid.height())
-        cols = max(1, rect.width() // grid_w)
         overscan = max(0, overscan_rows) * cols
         start = max(0, min(rows) - overscan)
-        end = min(self._list_widget.count() - 1, max(rows) + overscan)
+        end = min(total_items - 1, max(rows) + overscan)
 
         entries: list[ThumbViewportEntry] = []
         for i in range(start, end + 1):
-            item = self._list_widget.item(i)
-            if item is None or item.isHidden():
-                continue
-            path = item.data(_UserRole)
+            path = self._thumb_list_model.path_for_row(i)
             if not path:
                 continue
-            entries.append(ThumbViewportEntry(os.path.normpath(path), item))
+            entries.append(ThumbViewportEntry(os.path.normpath(path), i))
 
         visible_range = ThumbViewportRange(
             thumb_size=self._thumb_size,
@@ -3808,7 +5039,7 @@ class FileListPanel(QWidget):
             end_row=end,
             grid_width=grid_w,
             grid_height=grid_h,
-            total_items=self._list_widget.count(),
+            total_items=total_items,
             entries=tuple(entries),
         )
         self._thumb_visible_range = visible_range
@@ -3823,11 +5054,10 @@ class FileListPanel(QWidget):
         range_data = visible_range if visible_range is not None else self._thumb_visible_range
         for entry in (range_data.entries if range_data is not None else ()):
             norm = entry.path
-            item = entry.item
-            if norm in seen or item is None or item.isHidden():
+            if norm in seen:
                 continue
             seen.add(norm)
-            if self._thumb_item_has_current_pixmap(item):
+            if self._thumb_list_model.has_current_pixmap(norm, self._thumb_size):
                 continue
             requested_paths.append(norm)
         return requested_paths
@@ -3835,6 +5065,7 @@ class FileListPanel(QWidget):
     def _schedule_visible_thumbnail_update(self, *_args) -> None:
         if self._view_mode != self._MODE_THUMB:
             return
+        self._thumb_profile_add("schedule_calls", 1)
         self._ensure_thumb_viewport_timer()
         if self._thumb_viewport_timer is not None:
             self._thumb_viewport_timer.start(25)
@@ -3850,7 +5081,7 @@ class FileListPanel(QWidget):
         (top-adjacent rows before bottom-adjacent rows, alternating), giving
         the best chance of being ready before the user scrolls to them.
         """
-        total = self._list_widget.count()
+        total = self._thumb_row_count()
         if total == 0:
             return []
         cols = max(1, self._list_widget.viewport().rect().width() // max(1, visible_range.grid_width))
@@ -3867,10 +5098,7 @@ class FileListPanel(QWidget):
         above = list(range(visible_range.start_row - 1, pre_start - 1, -1))
         below = list(range(visible_range.end_row   + 1, pre_end   + 1))
         for row in (r for pair in zip(above, below) for r in pair):
-            item = self._list_widget.item(row)
-            if item is None or item.isHidden():
-                continue
-            path = item.data(_UserRole)
+            path = self._thumb_list_model.path_for_row(row)
             if not path:
                 continue
             norm = os.path.normpath(path)
@@ -3880,10 +5108,7 @@ class FileListPanel(QWidget):
             result.append(norm)
         # tail: whichever sequence was longer
         for row in (above[len(below):] + below[len(above):]):
-            item = self._list_widget.item(row)
-            if item is None or item.isHidden():
-                continue
-            path = item.data(_UserRole)
+            path = self._thumb_list_model.path_for_row(row)
             if not path:
                 continue
             norm = os.path.normpath(path)
@@ -3893,19 +5118,45 @@ class FileListPanel(QWidget):
             result.append(norm)
         return result
 
+    @staticmethod
+    def _limit_prefetch_paths(
+        prefetch_paths: list[str],
+        *,
+        visible_count: int,
+        missing_count: int,
+    ) -> list[str]:
+        if not prefetch_paths:
+            return []
+        if missing_count > 0:
+            limit = max(8, min(24, max(8, visible_count // 2)))
+        else:
+            limit = max(24, min(72, max(visible_count, 24)))
+        return prefetch_paths[:limit]
+
+    def _collect_materialized_thumbnail_paths(
+        self,
+        visible_range: "ThumbViewportRange",
+        extra_rows: int = 2,
+    ) -> set[str]:
+        paths = {entry.path for entry in visible_range.entries}
+        for norm in self._collect_prefetch_paths(visible_range, prefetch_rows=extra_rows):
+            paths.add(norm)
+        return paths
+
     def _update_visible_thumbnail_range(self) -> None:
         if self._view_mode != self._MODE_THUMB:
             return
+        profile_started_at = _time.perf_counter()
         visible_range = self._build_visible_thumbnail_data_source()
         if visible_range is None or not visible_range.entries:
             return
 
-        # Always evict off-screen QPixmaps first.  QPixmaps stored on
-        # QListWidgetItems are never freed by Qt itself, so without explicit
-        # eviction every thumbnail loaded while scrolling stays in RAM forever,
-        # leading to OOM on large directories.  The ThumbnailMemoryCache (QImage,
-        # LRU-bounded) is unaffected and provides fast re-population on scroll-back.
-        self._evict_offscreen_item_pixmaps(visible_range)
+        # Always evict off-screen QPixmaps first.  Without explicit eviction,
+        # materialized pixmaps for scrolled-away rows would accumulate in RAM.
+        # The ThumbnailMemoryCache (QImage, LRU-bounded) is unaffected and
+        # provides fast re-population on scroll-back.
+        evicted_count = self._evict_offscreen_item_pixmaps(visible_range)
+        cached_fill_count = self._apply_cached_thumbs_to_items(visible_range)
 
         missing_visible = self._collect_missing_visible_thumbnail_paths(visible_range)
         same_signature  = visible_range.signature == self._thumb_visible_signature
@@ -3916,8 +5167,27 @@ class FileListPanel(QWidget):
 
         if same_signature:
             if not missing_visible:
+                self._thumb_profile_add("viewport_updates", 1)
+                self._thumb_profile_stats["last_visible_start"] = float(visible_range.start_row)
+                self._thumb_profile_stats["last_visible_end"] = float(visible_range.end_row)
+                self._thumb_profile_stats["last_visible_count"] = float(len(visible_range.entries))
+                self._thumb_profile_stats["last_missing_count"] = 0.0
+                self._thumb_profile_stats["last_prefetch_count"] = 0.0
                 return
             if loader_running:
+                self._thumb_profile_add("viewport_updates", 1)
+                self._thumb_profile_add("visible_items_total", len(visible_range.entries))
+                self._thumb_profile_add("missing_visible_total", len(missing_visible))
+                self._thumb_profile_stats["last_visible_start"] = float(visible_range.start_row)
+                self._thumb_profile_stats["last_visible_end"] = float(visible_range.end_row)
+                self._thumb_profile_stats["last_visible_count"] = float(len(visible_range.entries))
+                self._thumb_profile_stats["last_missing_count"] = float(len(missing_visible))
+                self._thumb_profile_stats["last_prefetch_count"] = 0.0
+                self._report_thumb_profile(
+                    "viewport_wait_loader",
+                    force=len(missing_visible) >= max(12, len(visible_range.entries)),
+                    extra=f"same=1 running=1 update_ms={(_time.perf_counter() - profile_started_at) * 1000.0:.1f}",
+                )
                 # Same viewport, loader still running — it is already handling
                 # the missing items; nothing to do.
                 return
@@ -3936,20 +5206,47 @@ class FileListPanel(QWidget):
             self._thumb_size,
         )
 
-        prefetch_paths = self._collect_prefetch_paths(visible_range)
+        raw_prefetch_paths = self._collect_prefetch_paths(visible_range)
+        prefetch_paths = self._limit_prefetch_paths(
+            raw_prefetch_paths,
+            visible_count=len(visible_range.entries),
+            missing_count=len(missing_visible),
+        )
+        self._thumb_profile_add("viewport_updates", 1)
+        self._thumb_profile_add("visible_items_total", len(visible_range.entries))
+        self._thumb_profile_add("missing_visible_total", len(missing_visible))
+        self._thumb_profile_add("prefetch_total", len(prefetch_paths))
+        self._thumb_profile_add("cache_fill_total", cached_fill_count)
+        self._thumb_profile_add("evicted_total", evicted_count)
+        self._thumb_profile_stats["last_visible_start"] = float(visible_range.start_row)
+        self._thumb_profile_stats["last_visible_end"] = float(visible_range.end_row)
+        self._thumb_profile_stats["last_visible_count"] = float(len(visible_range.entries))
+        self._thumb_profile_stats["last_missing_count"] = float(len(missing_visible))
+        self._thumb_profile_stats["last_prefetch_count"] = float(len(prefetch_paths))
 
         if loader_running:
             # ── Loader already running: reprioritize without stop/restart ────
             # Promote newly-visible items to the front of the queue so they
             # are processed before any pending prefetch.
-            if missing_visible:
-                loader.promote(missing_visible)
-            if prefetch_paths:
-                loader.enqueue(prefetch_paths, priority=ThumbnailLoader.PRIORITY_PREFETCH)
+            self._thumb_profile_add("loader_reprioritize", 1)
+            loader.replace_pending(missing_visible, prefetch_paths)
         else:
             # ── No loader running: start fresh ───────────────────────────────
             if missing_visible or prefetch_paths:
                 self._start_thumbnail_loader(missing_visible, prefetch_paths)
+        update_elapsed_s = _time.perf_counter() - profile_started_at
+        if (
+            len(missing_visible) >= max(12, len(visible_range.entries))
+            or update_elapsed_s >= 0.020
+            or (_THUMB_PROFILE_VERBOSE and (cached_fill_count > 0 or evicted_count > 0))
+        ):
+            self._report_thumb_profile(
+                "viewport",
+                force=True,
+                extra=f"same={int(same_signature)} running={int(loader_running)} update_ms={update_elapsed_s * 1000.0:.1f}",
+            )
+        else:
+            self._report_thumb_profile("viewport")
 
     def _set_view_mode(self, mode: int) -> None:
         self._view_mode = mode
@@ -3960,19 +5257,26 @@ class FileListPanel(QWidget):
         self._invalidate_visible_thumbnail_signature()
         if mode == self._MODE_THUMB:
             self._update_thumb_display()
+            if self._thumb_model_dirty:
+                self._start_thumb_model_population(
+                    resume=bool(self._thumb_model_pending_paths) and self._thumb_model_pending_index > 0
+                )
             self._schedule_visible_thumbnail_update()
         else:
+            self._pause_thumb_model_population()
             self._stop_thumbnail_loader()
+            if self._tree_view_dirty:
+                self._rebuild_tree_items()
             # 切换到列表视图时显式恢复排序状态，避免因隐藏时列头状态丢失导致按序号列
             # （所有项 _SortRole 均为 0）排序产生不稳定顺序、列表项跳变
-            if self._tree_widget.isSortingEnabled() and self._tree_widget.topLevelItemCount() > 0:
+            if self._tree_widget.isSortingEnabled() and self._tree_row_count() > 0:
                 hdr = self._tree_widget.header()
                 try:
                     hdr.blockSignals(True)
                     hdr.setSortIndicator(self._tree_last_sort_column, self._tree_last_sort_order)
                 finally:
                     hdr.blockSignals(False)
-                self._tree_widget.sortItems(self._tree_last_sort_column, self._tree_last_sort_order)
+                self._tree_widget.sortByColumn(self._tree_last_sort_column, self._tree_last_sort_order)
                 self._refresh_tree_row_numbers()
 
     def _update_size_controls(self) -> None:
@@ -3987,10 +5291,7 @@ class FileListPanel(QWidget):
             self._thumb_size = size
             self._invalidate_visible_thumbnail_signature()
             if self._view_mode == self._MODE_THUMB:
-                for i in range(self._list_widget.count()):
-                    it = self._list_widget.item(i)
-                    if it:
-                        self._clear_thumb_pixmap_for_item(it)
+                self._thumb_list_model.clear_all_pixmaps()
                 self._update_thumb_display()
                 self._schedule_visible_thumbnail_update()
 
@@ -4001,10 +5302,6 @@ class FileListPanel(QWidget):
         cell_h = s + 46
         self._list_widget.setGridSize(QSize(cell_w, cell_h))
         self._list_widget.setSpacing(8)
-        for i in range(self._list_widget.count()):
-            it = self._list_widget.item(i)
-            if it is not None:
-                it.setSizeHint(QSize(cell_w, cell_h))
         self._list_widget.doItemsLayout()
 
     def _start_thumbnail_loader(
@@ -4040,10 +5337,9 @@ class FileListPanel(QWidget):
             if norm in seen:
                 continue
             seen.add(norm)
-            item = self._item_map.get(norm)
-            if item is None or item.isHidden():
+            if not self._thumb_index_for_path(norm).isValid():
                 continue
-            if self._thumb_item_has_current_pixmap(item):
+            if self._thumb_list_model.has_current_pixmap(norm, self._thumb_size):
                 continue
             requested_visible.append(norm)
 
@@ -4051,6 +5347,7 @@ class FileListPanel(QWidget):
             _log.debug("[_start_thumbnail_loader] nothing to load")
             return
 
+        self._thumb_profile_add("loader_starts", 1)
         self._stop_thumbnail_loader()
 
         cache_stats = self._thumb_memory_cache.stats()
@@ -4061,10 +5358,23 @@ class FileListPanel(QWidget):
             self._thumb_loader_workers,
             float(cache_stats.get("bytes", 0)) / (1024.0 * 1024.0),
         )
+        if self._thumb_profile_enabled:
+            _log.info(
+                "[THUMB_PROFILE][loader.request] token=%s visible=%s prefetch=%s rows=%s-%s size=%s cache_mb=%.1f",
+                self._thumb_request_token + 1,
+                len(requested_visible),
+                len(prefetch_paths or []),
+                self._thumb_visible_range.start_row if self._thumb_visible_range is not None else -1,
+                self._thumb_visible_range.end_row if self._thumb_visible_range is not None else -1,
+                self._thumb_size,
+                float(cache_stats.get("bytes", 0)) / (1024.0 * 1024.0),
+            )
 
         preview_base_dir = self._report_root_dir or self._current_dir
+        self._thumb_request_token += 1
         loader = ThumbnailLoader(
             self._thumb_size,
+            self._thumb_request_token,
             report_cache=self._report_cache,
             current_dir=preview_base_dir,
             thumb_cache=self._thumb_memory_cache,
@@ -4073,6 +5383,7 @@ class FileListPanel(QWidget):
             loader.enqueue(requested_visible, priority=ThumbnailLoader.PRIORITY_VISIBLE)
         if prefetch_paths:
             loader.enqueue(prefetch_paths, priority=ThumbnailLoader.PRIORITY_PREFETCH)
+        loader.set_desired_paths(requested_visible, prefetch_paths)
 
         loader.thumbnail_ready.connect(self._on_thumbnail_ready)
         loader.finished.connect(self._schedule_visible_thumbnail_update)
@@ -4081,6 +5392,14 @@ class FileListPanel(QWidget):
         _log.debug("[_start_thumbnail_loader] END loader.started")
 
     def _stop_thumbnail_loader(self) -> None:
+        if self._thumb_profile_enabled and self._thumbnail_loader is not None:
+            snap = self._thumbnail_loader.profile_snapshot()
+            self._report_thumb_profile(
+                "loader_stop",
+                force=True,
+                extra=f"queue={int(snap.get('queue_size', 0))} done={int(snap.get('completed', 0))}",
+            )
+        self._thumb_request_token += 1
         if self._thumbnail_loader:
             self._detach_loader(
                 self._thumbnail_loader,
@@ -4088,6 +5407,10 @@ class FileListPanel(QWidget):
                 self._on_thumbnail_ready,
             )
             self._thumbnail_loader = None
+        if self._thumb_apply_timer is not None and self._thumb_apply_timer.isActive():
+            self._thumb_apply_timer.stop()
+        self._thumb_pending_batch.clear()
+        self._thumb_profile_ready_received_at.clear()
         self._pending_loaders = [l for l in self._pending_loaders if l.isRunning()]
 
     def _start_metadata_loader(self, paths: list) -> None:
@@ -4171,6 +5494,52 @@ class FileListPanel(QWidget):
         self._stop_metadata_loader()
         self._stop_actual_path_lookup_workers()
 
+    def _shutdown_background_work(self) -> None:
+        if self._background_shutdown_started:
+            return
+        self._background_shutdown_started = True
+
+        directory_worker = self._directory_scan_worker
+        lookup_workers = list(self._path_lookup_workers)
+        active_threads = [
+            worker
+            for worker in (
+                self._thumbnail_loader,
+                self._metadata_loader,
+                directory_worker,
+            )
+            if worker is not None
+        ]
+        active_threads.extend(lookup_workers)
+        active_threads.extend(self._pending_loaders)
+
+        self._pause_thumb_model_population()
+        self._stop_all_loaders()
+        self._stop_directory_scan_worker()
+
+        wait_threads = []
+        seen: set[int] = set()
+        for worker in active_threads + self._pending_loaders:
+            if worker is None:
+                continue
+            key = id(worker)
+            if key in seen:
+                continue
+            seen.add(key)
+            wait_threads.append(worker)
+
+        for worker in wait_threads:
+            try:
+                if worker.isRunning():
+                    worker.wait(2500)
+            except Exception:
+                pass
+        _shutdown_thumb_disk_writer(wait=True)
+
+    def closeEvent(self, event) -> None:
+        self._shutdown_background_work()
+        super().closeEvent(event)
+
     def _ensure_meta_apply_timer(self) -> None:
         if self._meta_apply_timer is not None:
             return
@@ -4216,14 +5585,7 @@ class FileListPanel(QWidget):
             pass
 
     def _refresh_tree_row_numbers(self) -> None:
-        total = self._tree_widget.topLevelItemCount()
-        for idx in range(total):
-            item = self._tree_widget.topLevelItem(idx)
-            if item is None:
-                continue
-            item.setText(_TREE_COL_SEQ, str(idx + 1))
-            item.setTextAlignment(_TREE_COL_SEQ, _AlignCenter)
-            item.setData(_TREE_COL_SEQ, _SortRole, 0)
+        self._tree_widget.viewport().update()
 
     def refresh_row_numbers(self) -> None:
         """公开的列表编号刷新入口，供通用/业务列表在增删行后统一调用。"""
@@ -4237,7 +5599,7 @@ class FileListPanel(QWidget):
                 hdr.setSortIndicator(self._tree_last_sort_column, self._tree_last_sort_order)
             finally:
                 hdr.blockSignals(False)
-            self._tree_widget.sortItems(self._tree_last_sort_column, self._tree_last_sort_order)
+            self._tree_widget.sortByColumn(self._tree_last_sort_column, self._tree_last_sort_order)
             QTimer.singleShot(0, self._refresh_tree_row_numbers)
             return
         self._tree_last_sort_column = column
@@ -4278,8 +5640,8 @@ class FileListPanel(QWidget):
         self._meta_progress.show()
         _log.info(
             "[STAT][_on_metadata_ready] apply_meta begin tree_items=%s list_items=%s batch=%s",
-            len(self._tree_item_map),
-            len(self._item_map),
+            self._tree_source_row_count(),
+            self._thumb_row_count(),
             _META_APPLY_BATCH_SIZE,
         )
         if self._meta_apply_timer is not None:
@@ -4290,6 +5652,7 @@ class FileListPanel(QWidget):
         _log.info("[STAT][_on_metadata_ready] enabling tree sorting")
         self._set_tree_header_fast_mode(False)
         self._tree_widget.setSortingEnabled(True)
+        self._tree_widget.sortByColumn(self._tree_last_sort_column, self._tree_last_sort_order)
         self._refresh_tree_row_numbers()
         _log.info("[STAT][_on_metadata_ready] tree sorting enabled elapsed=%.3fs", _time.perf_counter() - sort_t0)
 
@@ -4332,23 +5695,14 @@ class FileListPanel(QWidget):
             if (i - start) >= 8 and (_time.perf_counter() - tick_t0) >= budget_s:
                 break
             norm_path, meta = self._meta_apply_items[i]
-            ti = self._tree_item_map.get(norm_path)
-            if ti:
+            if self._file_table_model.set_meta_for_path(norm_path, meta):
                 self._meta_apply_tree_hits += 1
                 if _DEBUG_FILE_LIST_LIMIT == 1:
                     _log.info("[DEBUG][_apply_meta] norm=%r meta=%r", norm_path, meta)
-                self._apply_meta_to_tree_item(ti, meta)
-                if _DEBUG_FILE_LIST_LIMIT == 1:
-                    _log.info(
-                        "[DEBUG][_apply_meta] row_texts seq=%r name=%r title=%r color=%r star=%r sharp=%r aesthetic=%r focus=%r",
-                        ti.text(_TREE_COL_SEQ), ti.text(_TREE_COL_NAME), ti.text(_TREE_COL_TITLE), ti.text(_TREE_COL_COLOR),
-                        ti.text(_TREE_COL_STAR), ti.text(_TREE_COL_SHARP), ti.text(_TREE_COL_AESTHETIC), ti.text(_TREE_COL_FOCUS),
-                    )
             if self._view_mode == self._MODE_THUMB:
-                li = self._item_map.get(norm_path)
-                if li:
+                if self._thumb_index_for_path(norm_path).isValid():
                     self._meta_apply_list_hits += 1
-                    self._apply_thumb_meta_to_item(li, meta)
+                    self._apply_thumb_meta_to_path(norm_path, meta)
             i += 1
 
         end = i
@@ -4376,10 +5730,17 @@ class FileListPanel(QWidget):
             self._finish_meta_apply()
 
     # ── Slots ─────────────────────────────────────────────────────────────────
-    def _on_thumbnail_ready(self, path: str, qimg) -> None:
+    def _on_thumbnail_ready(self, request_token: int, path: str, qimg) -> None:
         if self._view_mode != self._MODE_THUMB:
             return
-        self._thumb_pending_batch.append((path, qimg))
+        if int(request_token) != int(self._thumb_request_token):
+            self._thumb_profile_add("stale_ready", 1)
+            return
+        norm = os.path.normpath(path)
+        self._thumb_profile_add("ready_signals", 1)
+        self._thumb_profile_ready_received_at[norm] = _time.perf_counter()
+        self._thumb_pending_batch[norm] = qimg
+        self._thumb_profile_set_max("pending_peak", float(len(self._thumb_pending_batch)))
         if self._thumb_apply_timer is None:
             self._thumb_apply_timer = QTimer(self)
             self._thumb_apply_timer.setSingleShot(True)
@@ -4393,25 +5754,74 @@ class FileListPanel(QWidget):
     def _flush_thumb_pending_batch(self) -> None:
         if not self._thumb_pending_batch:
             return
+        flush_started_at = _time.perf_counter()
         pending = self._thumb_pending_batch
-        self._thumb_pending_batch = []
+        self._thumb_pending_batch = {}
+        visible_range = self._thumb_visible_range or self._build_visible_thumbnail_data_source()
+        materialize_paths = (
+            self._collect_materialized_thumbnail_paths(visible_range)
+            if visible_range is not None and visible_range.entries
+            else None
+        )
         update_rect = QRect()
-        for path, qimg in pending:
-            norm = os.path.normpath(path)
-            item = self._item_map.get(norm)
-            if item is None:
+        applied_count = 0
+        skipped_invalid = 0
+        skipped_offscreen = 0
+        ready_wait_total_s = 0.0
+        ready_wait_max_s = 0.0
+        for norm, qimg in pending.items():
+            idx = self._thumb_index_for_path(norm)
+            if not idx.isValid():
+                skipped_invalid += 1
+                self._thumb_profile_ready_received_at.pop(norm, None)
+                continue
+            if materialize_paths is not None and norm not in materialize_paths:
+                skipped_offscreen += 1
+                self._thumb_profile_ready_received_at.pop(norm, None)
                 continue
             pixmap = QPixmap.fromImage(qimg)
-            item.setData(_ThumbPixmapRole, pixmap)
-            item.setData(_ThumbSizeRole, int(self._thumb_size))
+            self._thumb_list_model.set_pixmap_for_path(norm, pixmap, self._thumb_size)
             meta = self._meta_cache.get(norm, {})
-            self._apply_thumb_meta_to_item(item, meta)
-            rect = self._list_widget.visualItemRect(item)
+            self._apply_thumb_meta_to_path(norm, meta)
+            applied_count += 1
+            ready_at = self._thumb_profile_ready_received_at.pop(norm, 0.0)
+            if ready_at > 0:
+                wait_s = max(0.0, _time.perf_counter() - ready_at)
+                ready_wait_total_s += wait_s
+                if wait_s > ready_wait_max_s:
+                    ready_wait_max_s = wait_s
+            rect = self._list_widget.visualRect(idx)
             if rect.isValid():
                 update_rect = update_rect.united(rect) if update_rect.isValid() else rect
+        flush_elapsed_s = _time.perf_counter() - flush_started_at
+        self._thumb_profile_add("flush_calls", 1)
+        self._thumb_profile_add("flush_pending_total", len(pending))
+        self._thumb_profile_add("flush_applied", applied_count)
+        self._thumb_profile_add("flush_skipped_offscreen", skipped_offscreen)
+        self._thumb_profile_add("flush_skipped_invalid", skipped_invalid)
+        self._thumb_profile_add("ready_wait_total_s", ready_wait_total_s)
+        self._thumb_profile_add("ready_wait_count", applied_count)
+        self._thumb_profile_set_max("ready_wait_max_s", ready_wait_max_s)
+        self._thumb_profile_add("flush_total_s", flush_elapsed_s)
+        self._thumb_profile_set_max("flush_max_s", flush_elapsed_s)
         self._update_clear_thumb_cache_button_tooltip()
         if update_rect.isValid():
             self._list_widget.viewport().update(update_rect)
+        if (
+            len(pending) >= 24
+            or skipped_offscreen > applied_count
+            or ready_wait_max_s >= 0.250
+            or flush_elapsed_s >= 0.020
+        ):
+            self._report_thumb_profile(
+                "flush",
+                force=True,
+                extra=(
+                    f"pending={len(pending)} applied={applied_count} "
+                    f"offscreen={skipped_offscreen} invalid={skipped_invalid} "
+                    f"flush_ms={flush_elapsed_s * 1000.0:.1f}"
+                ),
+            )
 
     def _on_metadata_progress(self, current: int, total: int) -> None:
         """主线程槽：由 progress_updated 信号触发，安全更新进度条。"""
@@ -4481,21 +5891,21 @@ class FileListPanel(QWidget):
         )
         self.file_selected.emit(resolved_path or path)
 
-    def _on_tree_item_clicked(self, item, column) -> None:
-        path = item.data(0, _UserRole)
+    def _on_tree_item_clicked(self, index) -> None:
+        path = self._tree_path_from_index(index)
         if path:
             self._emit_file_selected_for_path(path)
 
     def _on_tree_current_item_changed(self, current, previous) -> None:
         """列表模式下键盘上下/Shift 改变当前项时触发刷新。"""
-        if current is None:
+        if current is None or not current.isValid():
             return
-        path = current.data(0, _UserRole)
+        path = self._tree_path_from_index(current)
         if path:
             self._emit_file_selected_for_path(path)
 
-    def _on_list_item_clicked(self, item) -> None:
-        path = item.data(_UserRole)
+    def _on_list_item_clicked(self, index) -> None:
+        path = self._thumb_path_from_index(index)
         if path:
             self._emit_file_selected_for_path(path)
 
@@ -4608,15 +6018,16 @@ class FileListPanel(QWidget):
             act_preview.triggered.connect(lambda checked=False, p=preview_path: reveal_in_file_manager(p))
 
     def _on_tree_context_menu(self, pos) -> None:
-        item = self._tree_widget.itemAt(pos)
-        if item is not None and not item.isSelected():
+        index = self._tree_widget.indexAt(pos)
+        if index.isValid() and not self._tree_widget.selectionModel().isSelected(index):
             self._tree_widget.clearSelection()
-            item.setSelected(True)
-            self._tree_widget.setCurrentItem(item)
-        selected = self._tree_widget.selectedItems()
-        paths = [it.data(0, _UserRole) for it in selected if it and it.data(0, _UserRole)]
-        if not paths and item:
-            p = item.data(0, _UserRole)
+            self._tree_widget.setCurrentIndex(index)
+            sm = self._tree_widget.selectionModel()
+            if sm is not None:
+                sm.select(index, _SelectCurrent)
+        paths = self._tree_selected_paths()
+        if not paths and index.isValid():
+            p = self._tree_path_from_index(index)
             if p:
                 paths = [p]
         if not paths:
@@ -4628,12 +6039,12 @@ class FileListPanel(QWidget):
         act_copy_filename.triggered.connect(lambda: self._copy_filenames_to_clipboard(paths))
         self._add_rating_menu_actions(menu, paths)
         menu.addSeparator()
-        self._add_species_menu_actions(menu, item.data(0, _UserRole) if item else (paths[0] if paths else ""), paths)
+        self._add_species_menu_actions(menu, self._tree_path_from_index(index) if index.isValid() else (paths[0] if paths else ""), paths)
         menu.addSeparator()
         self._add_send_to_external_app_actions(menu, paths)
         menu.addSeparator()
         label = "在Finder中显示" if sys.platform == "darwin" else "在资源管理器中显示"
-        primary_path = item.data(0, _UserRole) if item else (paths[0] if paths else None)
+        primary_path = self._tree_path_from_index(index) if index.isValid() else (paths[0] if paths else None)
         reveal_path = self._resolve_reveal_path(primary_path)
         if reveal_path:
             _log.info("[_on_tree_context_menu] reveal_path=%r paths=%s", reveal_path, len(paths))
@@ -4658,15 +6069,15 @@ class FileListPanel(QWidget):
             self.load_directory(self._current_dir, force_reload=True)
 
     def _on_list_context_menu(self, pos) -> None:
-        item = self._list_widget.itemAt(pos)
-        if item is not None and not item.isSelected():
+        index = self._list_widget.indexAt(pos)
+        sm = self._list_widget.selectionModel()
+        if index.isValid() and sm is not None and not sm.isSelected(index):
             self._list_widget.clearSelection()
-            item.setSelected(True)
-            self._list_widget.setCurrentItem(item)
-        selected = self._list_widget.selectedItems()
-        paths = [it.data(_UserRole) for it in selected if it and it.data(_UserRole)]
-        if not paths and item:
-            p = item.data(_UserRole)
+            self._list_widget.setCurrentIndex(index)
+            sm.select(index, _SelectCurrent)
+        paths = self._thumb_selected_paths()
+        if not paths and index.isValid():
+            p = self._thumb_path_from_index(index)
             if p:
                 paths = [p]
         if not paths:
@@ -4678,12 +6089,12 @@ class FileListPanel(QWidget):
         act_copy_filename.triggered.connect(lambda: self._copy_filenames_to_clipboard(paths))
         self._add_rating_menu_actions(menu, paths)
         menu.addSeparator()
-        self._add_species_menu_actions(menu, item.data(_UserRole) if item else (paths[0] if paths else ""), paths)
+        self._add_species_menu_actions(menu, self._thumb_path_from_index(index) if index.isValid() else (paths[0] if paths else ""), paths)
         menu.addSeparator()
         self._add_send_to_external_app_actions(menu, paths)
         menu.addSeparator()
         label = "在Finder中显示" if sys.platform == "darwin" else "在资源管理器中显示"
-        primary_path = item.data(_UserRole) if item else (paths[0] if paths else None)
+        primary_path = self._thumb_path_from_index(index) if index.isValid() else (paths[0] if paths else None)
         reveal_path = self._resolve_reveal_path(primary_path)
         if reveal_path:
             _log.info("[_on_list_context_menu] reveal_path=%r paths=%s", reveal_path, len(paths))
@@ -4931,6 +6342,42 @@ class DirectoryBrowserWidget(QWidget):
         if path and os.path.isdir(path):
             self.directory_selected.emit(path)
 
+    def _refresh_dir_item_children(self, item: QTreeWidgetItem) -> None:
+        path = item.data(0, _UserRole)
+        if not path or not os.path.isdir(path):
+            return
+        was_expanded = item.isExpanded()
+        item.takeChildren()
+        item.addChild(QTreeWidgetItem([self._PLACEHOLDER]))
+        if was_expanded:
+            self._on_expanded(item)
+            self._tree.expandItem(item)
+
+    def _trash_empty_subdirectories(self, path: str, item: QTreeWidgetItem) -> None:
+        moved_paths, failed_paths = move_empty_dirs_to_trash(path, include_root=False)
+        self._refresh_dir_item_children(item)
+
+        trash_name = "废纸篓" if sys.platform == "darwin" else "回收站"
+        if failed_paths:
+            QMessageBox.warning(
+                self,
+                "删除空目录",
+                f"已移入{trash_name} {len(moved_paths)} 个空目录，另有 {len(failed_paths)} 个目录处理失败。",
+            )
+            return
+        if moved_paths:
+            QMessageBox.information(
+                self,
+                "删除空目录",
+                f"已移入{trash_name} {len(moved_paths)} 个空目录。",
+            )
+            return
+        QMessageBox.information(
+            self,
+            "删除空目录",
+            "没有找到可删除的空目录。",
+        )
+
     def eventFilter(self, obj, event) -> bool:
         if obj is not self._tree or event is None or event.type() != _EventKeyPress:
             return super().eventFilter(obj, event)
@@ -4982,4 +6429,9 @@ class DirectoryBrowserWidget(QWidget):
         label = "在Finder中显示" if sys.platform == "darwin" else "在资源管理器中显示"
         act = menu.addAction(label)
         act.triggered.connect(lambda: reveal_in_file_manager(path))
+        menu.addSeparator()
+        act_remove_empty = menu.addAction("删除所有空目录")
+        act_remove_empty.triggered.connect(
+            lambda checked=False, p=path, it=item: self._trash_empty_subdirectories(p, it)
+        )
         _exec_menu(menu, self._tree.viewport().mapToGlobal(pos))

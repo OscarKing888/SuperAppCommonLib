@@ -120,6 +120,56 @@ def move_to_trash(path):
         return False
 
 
+def move_empty_dirs_to_trash(root_path, include_root=False):
+    """
+    Move empty directories under ``root_path`` to the system trash.
+
+    Returns:
+        tuple[list[str], list[str]]: (moved_paths, failed_paths)
+    """
+    if not root_path:
+        return [], []
+    try:
+        root_abs = os.path.normpath(os.path.abspath(root_path))
+    except Exception:
+        return [], []
+    if not os.path.isdir(root_abs):
+        return [], []
+
+    root_key = os.path.normcase(root_abs)
+    candidates = []
+    try:
+        for current_root, _, _ in os.walk(root_abs, topdown=False):
+            candidates.append(current_root)
+    except Exception:
+        return [], []
+
+    moved = []
+    failed = []
+    for current_root in candidates:
+        try:
+            current_abs = os.path.normpath(os.path.abspath(current_root))
+        except Exception:
+            continue
+        if not include_root and os.path.normcase(current_abs) == root_key:
+            continue
+        if os.path.islink(current_abs):
+            continue
+        try:
+            if os.listdir(current_abs):
+                continue
+        except FileNotFoundError:
+            continue
+        except Exception:
+            failed.append(current_abs)
+            continue
+        if move_to_trash(current_abs):
+            moved.append(current_abs)
+        else:
+            failed.append(current_abs)
+    return moved, failed
+
+
 def reveal_in_file_manager(path):
     """
     在系统文件管理器中定位并显示目标路径。
