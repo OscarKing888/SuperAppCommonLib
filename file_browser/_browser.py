@@ -3239,7 +3239,10 @@ class FileListPanel(QWidget):
         self._tree_view_dirty: bool = False
         self._copied_species_payload: dict | None = None
         self._pending_selection_paths: list | None = None  # 接收到的文件列表，目录加载完成后等同多选
+        self._pending_selection_current_path: str = ""
         self._thumb_memory_cache = ThumbnailMemoryCache()
+        self._pending_selection_current_path: str = ""
+        self._selected_display_path: str = ""
         self._thumb_loader_workers = _thumbnail_loader_worker_count()
         self._thumb_viewport_timer: QTimer | None = None
         self._thumb_visible_signature: tuple | None = None
@@ -3476,6 +3479,7 @@ class FileListPanel(QWidget):
         hdr = self._tree_widget.header()
         hdr.sortIndicatorChanged.connect(self._on_tree_sort_indicator_changed)
         self._tree_widget.selectionModel().currentChanged.connect(self._on_tree_current_item_changed)
+        self._tree_widget.selectionModel().selectionChanged.connect(self._on_view_selection_changed)
         for col in range(8):
             hdr.setSectionResizeMode(col, _ResizeInteractive)
         self._tree_widget.setColumnWidth(_TREE_COL_SEQ, 44)
@@ -3527,6 +3531,7 @@ class FileListPanel(QWidget):
         self._list_widget.setWrapping(True)
         self._list_widget.setStyleSheet("QListView { font-size: 11px; }")
         self._list_widget.clicked.connect(self._on_list_item_clicked)
+        self._list_widget.selectionModel().selectionChanged.connect(self._on_view_selection_changed)
         self._list_widget.setContextMenuPolicy(_CustomContextMenu)
         self._list_widget.customContextMenuRequested.connect(self._on_list_context_menu)
         self._list_widget.installEventFilter(self)
@@ -3565,14 +3570,20 @@ class FileListPanel(QWidget):
         )
         self._persistent_thumb_progress.hide()
 
+        self._selection_status_label = QLabel("共 0 张 | 当前未选中")
+        self._selection_status_label.setStyleSheet("color: #aaa; font-size: 12px; padding: 0 4px;")
+        self._selection_status_label.setMinimumWidth(220)
+
         status_bar = QHBoxLayout()
         status_bar.setSpacing(6)
+        status_bar.addWidget(self._selection_status_label, 0)
         status_bar.addWidget(self._meta_progress, 1)
         status_bar.addWidget(self._persistent_thumb_progress, 1)
         layout.addLayout(status_bar)
 
         self._stack.setCurrentIndex(0)
         self._update_size_controls()
+        self._update_selection_status()
 
         # Cmd+C / Ctrl+C 复制选中文件到剪贴板
         _copy_key = getattr(QKeySequence.StandardKey, "Copy", None) or getattr(QKeySequence, "Copy", QKeySequence("Ctrl+C"))
@@ -3593,6 +3604,62 @@ class FileListPanel(QWidget):
         else:
             paths = []
         self._copy_paths_to_clipboard(paths)
+
+    def _on_view_selection_changed(self, *_args) -> None:
+        self._update_selection_status()
+
+    def _active_view_selected_paths(self) -> list[str]:
+        if self._view_mode == self._MODE_THUMB:
+            return self._thumb_selected_paths()
+        return self._tree_selected_paths()
+
+    def _active_view_current_path(self) -> str:
+        if self._view_mode == self._MODE_THUMB:
+            index = self._list_widget.currentIndex()
+            path = self._thumb_path_from_index(index)
+        else:
+            index = self._tree_widget.currentIndex()
+            path = self._tree_path_from_index(index)
+        if path:
+            return os.path.normpath(path)
+        if self._selected_display_path:
+            return os.path.normpath(self._selected_display_path)
+        return ""
+
+    def _update_selection_status(self) -> None:
+        label = getattr(self, "_selection_status_label", None)
+        if label is None:
+            return
+        total = len(self._filtered_files)
+        if self._view_mode == self._MODE_THUMB:
+            selected_count = len(self._thumb_selected_indexes())
+            current_index = self._list_widget.currentIndex()
+            current_row = current_index.row() + 1 if current_index.isValid() else None
+            if current_row is None and self._selected_display_path:
+                fallback_index = self._thumb_index_for_path(self._selected_display_path)
+                if fallback_index.isValid():
+                    current_row = fallback_index.row() + 1
+        else:
+            selected_count = len(self._tree_selected_indexes())
+            current_index = self._tree_widget.currentIndex()
+            current_row = current_index.row() + 1 if current_index.isValid() else None
+            if current_row is None and self._selected_display_path:
+                fallback_index = self._tree_index_for_path(self._selected_display_path)
+                if fallback_index.isValid():
+                    current_row = fallback_index.row() + 1
+        if current_row is None and self._selected_display_path:
+            try:
+                current_row = self._filtered_files.index(os.path.normpath(self._selected_display_path)) + 1
+            except ValueError:
+                current_row = None
+        parts = [f"共 {total} 张"]
+        if selected_count > 1:
+            parts.append(f"已选 {selected_count} 张")
+        if current_row is not None and total > 0:
+            parts.append(f"当前 {current_row}/{total}")
+        else:
+            parts.append("当前未选中")
+        label.setText(" | ".join(parts))
 
     # ── 数据加载 ────────────────────────────────────────────────────────────────
     def _collect_image_files(self, dir_path: str, recursive: bool) -> list:
@@ -3766,6 +3833,7 @@ class FileListPanel(QWidget):
             self._apply_pending_selection()
             if self._view_mode != self._MODE_THUMB or not self._thumb_model_dirty:
                 self._pending_selection_paths = None
+                self._pending_selection_current_path = ""
         if files:
             _log.info("[_on_directory_scan_finished] 为当前目录下列出的 %s 个文件启动 EXIF 查询（report_cache=%s 条，未命中走 exiftool/XMP）", len(files), len(report_cache))
             self._start_metadata_loader(files)
@@ -3787,15 +3855,22 @@ class FileListPanel(QWidget):
         row = self._get_report_row_for_path(path)
         return dict(row) if isinstance(row, dict) else None
 
-    def set_pending_selection(self, paths: list) -> None:
+    def set_pending_selection(self, paths: list, current_path: str | None = None) -> None:
         """设置「待选路径」：下次目录加载完成后将列表中匹配的项多选并视为当前选中（与目录内多选同等）。若当前已打开该目录且列表已加载，则立即应用。"""
         if not paths:
             self._pending_selection_paths = None
+            self._pending_selection_current_path = ""
             return
         normalized = [os.path.normpath(os.path.abspath(str(p))) for p in paths if p]
         if not normalized:
             self._pending_selection_paths = None
+            self._pending_selection_current_path = ""
             return
+        normalized_keys = {os.path.normcase(p) for p in normalized}
+        preferred_current = os.path.normpath(os.path.abspath(str(current_path))) if current_path else normalized[0]
+        if os.path.normcase(preferred_current) not in normalized_keys:
+            preferred_current = normalized[0]
+        self._pending_selection_current_path = preferred_current
         parent = os.path.dirname(normalized[0])
         if (
             self._current_dir
@@ -3806,6 +3881,7 @@ class FileListPanel(QWidget):
             self._apply_pending_selection()
             if not self._thumb_model_dirty:
                 self._pending_selection_paths = None
+                self._pending_selection_current_path = ""
             return
         self._pending_selection_paths = normalized
 
@@ -3813,11 +3889,19 @@ class FileListPanel(QWidget):
         """在目录加载完成后，将 _pending_selection_paths 中出现在当前列表的路径多选并刷新预览。"""
         paths = self._pending_selection_paths or []
         if not paths:
+            self._pending_selection_current_path = ""
             return
         path_set = {os.path.normcase(os.path.normpath(p)) for p in paths if p}
         if not path_set:
+            self._pending_selection_current_path = ""
             return
+        preferred_current_key = (
+            os.path.normcase(os.path.normpath(self._pending_selection_current_path))
+            if self._pending_selection_current_path
+            else ""
+        )
         first_matched = None
+        preferred_current_matched = False
         self._tree_widget.clearSelection()
         tree_sm = self._tree_widget.selectionModel()
         if tree_sm is not None:
@@ -3829,12 +3913,16 @@ class FileListPanel(QWidget):
                 if not idx.isValid():
                     continue
                 tree_sm.select(idx, _Select)
+                if preferred_current_key and os.path.normcase(norm) == preferred_current_key:
+                    preferred_current_matched = True
                 if first_matched is None:
                     first_matched = norm
-            if first_matched is not None:
-                idx_first = self._tree_index_for_path(first_matched)
+            current_target = self._pending_selection_current_path if preferred_current_matched else first_matched
+            if current_target is not None:
+                idx_first = self._tree_index_for_path(current_target)
                 if idx_first.isValid():
                     self._tree_widget.setCurrentIndex(idx_first)
+                    self._tree_widget.scrollTo(idx_first)
         self._list_widget.clearSelection()
         sm = self._list_widget.selectionModel()
         if sm is not None:
@@ -3846,13 +3934,18 @@ class FileListPanel(QWidget):
                 if not idx.isValid():
                     continue
                 sm.select(idx, _Select)
+                if preferred_current_key and os.path.normcase(norm) == preferred_current_key:
+                    preferred_current_matched = True
                 if first_matched is None:
                     first_matched = norm
-        if first_matched is not None:
-            idx_first = self._thumb_index_for_path(first_matched)
+        current_target = self._pending_selection_current_path if preferred_current_matched else first_matched
+        if current_target is not None:
+            idx_first = self._thumb_index_for_path(current_target)
             if idx_first.isValid():
                 self._list_widget.setCurrentIndex(idx_first)
-            self._emit_file_selected_for_path(first_matched)
+                self._list_widget.scrollTo(idx_first)
+            self._emit_file_selected_for_path(current_target)
+        self._update_selection_status()
 
     def _get_species_cn_from_metadata(self, path: str) -> str:
         norm_path = os.path.normpath(path) if path else ""
@@ -5161,6 +5254,7 @@ class FileListPanel(QWidget):
         if self._pending_selection_paths:
             self._apply_pending_selection()
             self._pending_selection_paths = None
+            self._pending_selection_current_path = ""
         _log.info(
             "[_populate_thumb_model_batch] completed total=%s elapsed=%.3fs",
             total,
@@ -5193,6 +5287,7 @@ class FileListPanel(QWidget):
         if self._view_mode == self._MODE_THUMB:
             _log.info("[_rebuild_views] thumb mode: update thumb display + schedule visible loader")
             self._schedule_visible_thumbnail_update()
+        self._update_selection_status()
         _log.info("[_rebuild_views] END")
         return
         self._tree_widget.setUpdatesEnabled(False)
@@ -5791,6 +5886,13 @@ class FileListPanel(QWidget):
             self._report_thumb_profile("viewport")
 
     def _set_view_mode(self, mode: int) -> None:
+        if self._view_mode == mode and self._stack.currentIndex() == (0 if mode == self._MODE_LIST else 1):
+            self._update_selection_status()
+            return
+        selected_paths = self._active_view_selected_paths()
+        current_path = self._active_view_current_path()
+        if not selected_paths and current_path:
+            selected_paths = [current_path]
         self._view_mode = mode
         self._btn_list.setChecked(mode == self._MODE_LIST)
         self._btn_thumb.setChecked(mode == self._MODE_THUMB)
@@ -5820,6 +5922,10 @@ class FileListPanel(QWidget):
                     hdr.blockSignals(False)
                 self._tree_widget.sortByColumn(self._tree_last_sort_column, self._tree_last_sort_order)
                 self._refresh_tree_row_numbers()
+        if selected_paths:
+            self.set_pending_selection(selected_paths, current_path=current_path)
+        else:
+            self._update_selection_status()
 
     def _update_size_controls(self) -> None:
         enabled = self._view_mode == self._MODE_THUMB
@@ -6736,6 +6842,7 @@ class FileListPanel(QWidget):
         if not path:
             return
         self._selected_display_path = os.path.normpath(path)
+        self._update_selection_status()
         resolved_path = self._resolve_source_path_for_action(path)
         if not resolved_path or not os.path.isfile(resolved_path):
             self._request_actual_path_lookup(path)
