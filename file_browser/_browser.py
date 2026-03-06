@@ -4013,18 +4013,27 @@ class FileListPanel(QWidget):
             "bird_species_en": str((row or {}).get("bird_species_en") or "").strip(),
         }
 
+    def _copy_text_to_clipboard(self, text: str) -> None:
+        """通过 Qt 剪贴板复制纯文本，兼容 macOS / Windows。"""
+        QApplication.clipboard().setText(text)
+        _log.info("[_copy_text_to_clipboard] platform=%r text=%r", sys.platform, text)
+
     def _copy_species_from_path(self, path: str) -> None:
         payload = self._get_species_payload_for_path(path)
         if not payload:
             _log.info("[_copy_species_from_path] skip source=%r reason=no_report_row", path)
             return
         self._copied_species_payload = payload
+        species_cn = str(payload.get("bird_species_cn") or "").strip()
+        if species_cn:
+            self._copy_text_to_clipboard(species_cn)
         _log.info(
-            "[_copy_species_from_path] source=%r filename=%r bird_species_cn=%r bird_species_en=%r",
+            "[_copy_species_from_path] source=%r filename=%r bird_species_cn=%r bird_species_en=%r copied_to_clipboard=%s",
             path,
             payload.get("filename"),
             payload.get("bird_species_cn"),
             payload.get("bird_species_en"),
+            bool(species_cn),
         )
 
     def _get_paste_species_action_text(self) -> str:
