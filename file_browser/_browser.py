@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import concurrent.futures as _futures
 from dataclasses import dataclass
+import hashlib
 import html
 import io as _io
 import os
+import queue as _queue
 import sys
 import threading
 import time as _time
@@ -60,7 +62,7 @@ from app_common.exif_io import (
     run_exiftool_assignments,
 )
 from app_common.log import get_logger
-from app_common.file_utils import reveal_in_file_manager
+from app_common.file_utils import reveal_in_file_manager, move_to_trash
 from app_common.send_to_app import get_external_apps, send_files_to_app
 from app_common.report_db import (
     ReportDB,
@@ -70,6 +72,7 @@ from app_common.report_db import (
     find_report_root,
 )
 from app_common.ui_style.styles import COLORS
+from app_common import thumb_stream
 
 _log = get_logger("file_browser")
 
@@ -185,6 +188,7 @@ _MetaPickRole = int(_UserRole) + 3    # Pick/Reject 旗标：1=精选, 0=无, -1
 _MetaFocusRole = int(_UserRole) + 4
 _ThumbPixmapRole = int(_UserRole) + 20
 _ThumbSizeRole = int(_UserRole) + 21
+_MetaSpeciesCnRole = int(_UserRole) + 22
 
 _TREE_COL_SEQ = 0
 _TREE_COL_NAME = 1
@@ -362,6 +366,81 @@ def _thumb_cache_key(path: str) -> str:
     return _path_key(path)
 
 
+def _thumb_disk_cache_dir() -> str:
+    """Return persistent cache directory for thumbnails (cross-platform)."""
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+    else:
+        base = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+    return os.path.join(base, "SuperViewer", "thumb_cache")
+
+
+def _thumb_disk_cache_path(path: str, mtime: float, size: int) -> str:
+    """Full path to cached thumbnail file; path must be absolute/normalized for stable key."""
+    cache_dir = _thumb_disk_cache_dir()
+    raw = f"{_path_key(path)}\0{mtime}\0{size}"
+    name = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24] + ".jpg"
+    return os.path.join(cache_dir, name)
+
+
+def _read_thumb_from_disk_cache(path: str, mtime: float, size: int) -> "QImage | None":
+    """Load thumbnail from disk cache if present and valid; returns QImage or None."""
+    cache_path = _thumb_disk_cache_path(path, mtime, size)
+    if not os.path.isfile(cache_path):
+        return None
+    try:
+        from PIL import Image
+        img = Image.open(cache_path)
+        img.load()
+        w, h = img.size
+        if w > size or h > size:
+            img.thumbnail((size, size), Image.LANCZOS)
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        data = img.tobytes("raw", "RGB")
+        w, h = img.size
+        qimg = QImage(data, w, h, w * 3, _QImageRGB888)
+        return qimg.copy()
+    except Exception:
+        return None
+
+
+def _schedule_thumb_disk_cache_write(cache_path: str, qimg: "QImage") -> None:
+    """Schedule async write of QImage to cache_path (JPEG). Pass a copy if caller keeps using qimg."""
+    img_copy = qimg.copy()
+
+    def write():
+        try:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            if not img_copy.isNull():
+                img_copy.save(cache_path, "JPEG", 85)
+        except Exception:
+            pass
+
+    try:
+        _get_thumb_disk_writer().submit(write)
+    except Exception:
+        pass
+
+
+# Single-thread executor for disk thumbnail writes (lazy init)
+_THUMB_DISK_WRITER_LOCK = threading.Lock()
+_THUMB_DISK_WRITER: _futures.ThreadPoolExecutor | None = None
+
+
+def _rgb_bytes_to_qimage(data: bytes, w: int, h: int) -> QImage:
+    """将 thumb_stream 返回的 RGB 字节转为 QImage（主线程或 worker 线程均可）。"""
+    return QImage(data, w, h, w * 3, _QImageRGB888).copy()
+
+
+def _get_thumb_disk_writer() -> _futures.ThreadPoolExecutor:
+    global _THUMB_DISK_WRITER
+    with _THUMB_DISK_WRITER_LOCK:
+        if _THUMB_DISK_WRITER is None:
+            _THUMB_DISK_WRITER = _futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="thumb_disk")
+        return _THUMB_DISK_WRITER
+
+
 def _qimage_num_bytes(image: QImage | None) -> int:
     if image is None or image.isNull():
         return 0
@@ -387,7 +466,7 @@ def _scale_qimage_for_thumb(image: QImage, size: int) -> QImage:
 
 def _thumbnail_loader_worker_count() -> int:
     cpu_count = os.cpu_count() or 8
-    return max(4, cpu_count - 4)
+    return min(16, max(4, cpu_count * 2))
 
 
 def _get_cached_actual_path(path: str) -> str | None:
@@ -559,48 +638,25 @@ def _get_raw_thumbnail(path: str) -> bytes | None:
 def _load_thumbnail_image(path: str, size: int) -> "QImage | None":
     """
     线程安全的缩略图生成，返回 QImage（不使用 QPixmap）。
-    支持普通图像格式及各家 RAW 嵌入缩略图。
+    先查磁盘缓存；未命中则调用 thumb_stream.load_thumbnail_rgb 解码，再异步写入磁盘缓存。
     """
     try:
-        from PIL import Image, ImageOps
-    except ImportError:
-        return None
-    try:
-        ext = Path(path).suffix.lower()
-        img = None
-        if ext in RAW_EXTENSIONS:
-            thumb_data = _get_raw_thumbnail(path)
-            if thumb_data:
-                try:
-                    img = Image.open(_io.BytesIO(thumb_data))
-                except Exception:
-                    img = None
-        if img is None:
-            try:
-                img = Image.open(path)
-            except Exception:
-                return None
+        mtime = 0.0
         try:
-            img = ImageOps.exif_transpose(img)
+            mtime = os.path.getmtime(path)
         except Exception:
             pass
-        img.thumbnail((size, size), Image.LANCZOS)
-        if img.mode == "P":
-            img = img.convert("RGBA")
-        if img.mode in ("RGBA", "LA"):
-            bg = Image.new("RGB", img.size, (45, 45, 45))
-            try:
-                alpha = img.split()[-1]
-                bg.paste(img.convert("RGB"), mask=alpha)
-            except Exception:
-                bg.paste(img.convert("RGB"))
-            img = bg
-        elif img.mode != "RGB":
-            img = img.convert("RGB")
-        w, h = img.size
-        data = img.tobytes("raw", "RGB")
-        qimg = QImage(data, w, h, w * 3, _QImageRGB888)
-        return qimg.copy()
+        disk_cached = _read_thumb_from_disk_cache(path, mtime, size)
+        if disk_cached is not None and not disk_cached.isNull():
+            return disk_cached
+        result = thumb_stream.load_thumbnail_rgb(path, size)
+        if result is None:
+            return None
+        data, w, h = result
+        out = _rgb_bytes_to_qimage(data, w, h)
+        cache_path = _thumb_disk_cache_path(path, mtime, size)
+        _schedule_thumb_disk_cache_write(cache_path, out)
+        return out
     except Exception:
         return None
 
@@ -674,6 +730,7 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
         rating = index.data(_MetaRatingRole)
         pick = index.data(_MetaPickRole)
         focus_status = str(index.data(_MetaFocusRole) or "").strip()
+        species_cn = str(index.data(_MetaSpeciesCnRole) or "").strip()
         pixmap = index.data(_ThumbPixmapRole)
         if not isinstance(pixmap, QPixmap):
             pixmap = None
@@ -700,6 +757,23 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
             painter.setBrush(QBrush(QColor(45, 45, 45)))
             painter.setPen(QColor(70, 70, 70))
             painter.drawRoundedRect(thumb_rect, 6, 6)
+
+            if species_cn:
+                pad = 4
+                font_species = QFont(opt.font)
+                font_species.setPixelSize(max(9, min(11, thumb_rect.width() // 12)))
+                painter.setFont(font_species)
+                fm_s = painter.fontMetrics()
+                max_w = max(40, thumb_rect.width() - pad * 2)
+                elided_cn = fm_s.elidedText(species_cn, _ElideRight, max_w)
+                tw = min(max_w, fm_s.horizontalAdvance(elided_cn) if hasattr(fm_s, "horizontalAdvance") else fm_s.width(elided_cn)) + 8
+                th = fm_s.lineSpacing() + 4
+                badge_cn = QRect(thumb_rect.left() + pad, thumb_rect.top() + pad, tw, th)
+                painter.setBrush(QBrush(QColor(0, 0, 0, 160)))
+                painter.setPen(_NoPen)
+                painter.drawRoundedRect(badge_cn, 4, 4)
+                painter.setPen(QColor("#ffffff"))
+                painter.drawText(badge_cn.adjusted(4, 0, -4, 0), _AlignCenter, elided_cn)
 
             if pixmap is not None and not pixmap.isNull():
                 pw = max(1, pixmap.width())
@@ -789,14 +863,60 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
             painter.restore()
 
 
-class ThumbnailMemoryCache:
-    """Thread-safe thumbnail cache with JPEG mip levels and max-size fallback for others."""
+def _compute_thumb_cache_max_bytes() -> int:
+    """Budget for the thumbnail QImage memory cache.
 
-    def __init__(self) -> None:
+    Hard cap: 16 GB.  On machines where physical RAM is detectable we also
+    limit to 25 % of total RAM so the app doesn't starve the OS on small
+    machines (e.g. 16 GB system → 4 GB cache; 64 GB system → 16 GB cache).
+    """
+    hard_cap = 48 * 1024 * 1024 * 1024  # 16 GB
+    total_ram = 0
+    try:
+        import psutil  # optional dependency
+        total_ram = psutil.virtual_memory().total
+    except Exception:
+        pass
+    if total_ram <= 0:
+        try:
+            # POSIX fallback (macOS / Linux)
+            total_ram = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        except Exception:
+            pass
+    if total_ram > 0:
+        return min(hard_cap, int(total_ram * 0.25))
+    return hard_cap
+
+
+_THUMB_CACHE_MAX_BYTES_DEFAULT = _compute_thumb_cache_max_bytes()
+
+
+class ThumbnailMemoryCache:
+    """Thread-safe thumbnail cache with JPEG mip levels, max-size fallback for others, and LRU eviction."""
+
+    def __init__(self, max_bytes: int | None = None) -> None:
         self._lock = threading.RLock()
         self._jpeg_mips: dict[tuple[str, int], QImage] = {}
         self._base_images: dict[str, QImage] = {}
         self._bytes: int = 0
+        self._max_bytes = int(max_bytes or _THUMB_CACHE_MAX_BYTES_DEFAULT)
+        self._lru_keys: list[tuple[str, object]] = []  # ("jpeg", (ckey, size)) | ("base", ckey)
+
+    def _lru_key_jpeg(self, cache_key: str, requested_size: int) -> tuple[str, tuple[str, int]]:
+        return ("jpeg", (cache_key, int(requested_size)))
+
+    def _lru_key_base(self, cache_key: str) -> tuple[str, str]:
+        return ("base", cache_key)
+
+    def _evict_until_under_limit(self) -> None:
+        while self._bytes > self._max_bytes and self._lru_keys:
+            key = self._lru_keys.pop(0)
+            if key[0] == "jpeg":
+                img = self._jpeg_mips.pop(key[1], None)
+            else:
+                img = self._base_images.pop(key[1], None)
+            if img is not None and not img.isNull():
+                self._bytes -= _qimage_num_bytes(img)
 
     def _store_image(self, bucket: dict, key, image: QImage) -> None:
         old = bucket.get(key)
@@ -813,8 +933,16 @@ class ThumbnailMemoryCache:
         cache_key = _thumb_cache_key(source_path)
         with self._lock:
             if self._is_jpeg_like(source_path):
+                k = self._lru_key_jpeg(cache_key, requested_size)
+                if k in self._lru_keys:
+                    self._lru_keys.remove(k)
+                    self._lru_keys.append(k)
                 cached = self._jpeg_mips.get((cache_key, int(requested_size)))
                 return cached.copy() if cached is not None else None
+            k = self._lru_key_base(cache_key)
+            if k in self._lru_keys:
+                self._lru_keys.remove(k)
+                self._lru_keys.append(k)
             base = self._base_images.get(cache_key)
         if base is None:
             return None
@@ -826,15 +954,63 @@ class ThumbnailMemoryCache:
         cache_key = _thumb_cache_key(source_path)
         with self._lock:
             if self._is_jpeg_like(source_path):
-                self._store_image(self._jpeg_mips, (cache_key, int(requested_size)), image)
+                jkey = (cache_key, int(requested_size))
+                lru_k = self._lru_key_jpeg(cache_key, requested_size)
+                if lru_k in self._lru_keys:
+                    self._lru_keys.remove(lru_k)
+                self._store_image(self._jpeg_mips, jkey, image)
+                self._lru_keys.append(lru_k)
             else:
+                lru_k = self._lru_key_base(cache_key)
+                if lru_k in self._lru_keys:
+                    self._lru_keys.remove(lru_k)
                 self._store_image(self._base_images, cache_key, image)
+                self._lru_keys.append(lru_k)
+            self._evict_until_under_limit()
+
+    def evict_other_dirs(self, current_dir_norm: str) -> int:
+        """Evict all cached QImage entries whose file path does NOT belong to
+        current_dir_norm (or any of its subdirectories).
+
+        Called on every directory switch to implement folder-level FIFO eviction:
+        the moment the user navigates away from a folder its cached thumbnails
+        are freed, regardless of LRU age.  Within the new/current folder the
+        existing byte-limit LRU eviction continues normally.
+
+        current_dir_norm must be the same normalised absolute path that
+        _thumb_cache_key() / _path_key() would produce for the directory.
+
+        Returns the number of bytes freed.
+        """
+        prefix = current_dir_norm + os.sep  # e.g. "/photos/2024/"
+        freed = 0
+        with self._lock:
+            # Collect stale LRU keys in one pass before mutating the dicts.
+            stale = [
+                lru_k for lru_k in self._lru_keys
+                if not (lru_k[1][0] if lru_k[0] == "jpeg" else lru_k[1]).startswith(prefix)
+            ]
+            for lru_k in stale:
+                if lru_k[0] == "jpeg":
+                    img = self._jpeg_mips.pop(lru_k[1], None)
+                else:
+                    img = self._base_images.pop(lru_k[1], None)
+                try:
+                    self._lru_keys.remove(lru_k)
+                except ValueError:
+                    pass
+                if img is not None and not img.isNull():
+                    nb = _qimage_num_bytes(img)
+                    self._bytes -= nb
+                    freed += nb
+        return freed
 
     def clear(self) -> dict[str, int]:
         with self._lock:
             stats = self.stats()
             self._jpeg_mips.clear()
             self._base_images.clear()
+            self._lru_keys.clear()
             self._bytes = 0
         return stats
 
@@ -845,17 +1021,33 @@ class ThumbnailMemoryCache:
                 "base_images": len(self._base_images),
                 "entries": len(self._jpeg_mips) + len(self._base_images),
                 "bytes": int(self._bytes),
+                "max_bytes": self._max_bytes,
             }
 
 
 class ThumbnailLoader(QThread):
-    """Background thumbnail loader with an internal worker pool."""
+    """Background thumbnail loader with a priority queue and internal worker pool.
 
-    thumbnail_ready = pyqtSignal(str, object)  # (????, QImage)
+    Priority levels:
+      PRIORITY_VISIBLE  (0) – currently visible items; processed first.
+      PRIORITY_PREFETCH (1) – nearby but not yet visible; processed when idle.
+
+    Thread-safety contract
+    ----------------------
+    ``enqueue()`` and ``promote()`` may be called from the main thread at any
+    time, including while ``run()`` is executing.  The internal lock serialises
+    mutations to the queued/loaded sets.  ``run()`` polls the priority queue
+    with a short timeout so newly injected high-priority items are picked up
+    within one batch cycle (≤ max_workers completions).
+    """
+
+    thumbnail_ready = pyqtSignal(str, object)  # (path, QImage)
+
+    PRIORITY_VISIBLE  = 0  # noqa: E221
+    PRIORITY_PREFETCH = 1
 
     def __init__(
         self,
-        paths: list,
         size: int,
         report_cache: dict | None = None,
         current_dir: str | None = None,
@@ -863,7 +1055,6 @@ class ThumbnailLoader(QThread):
         parent=None,
     ) -> None:
         super().__init__(parent)
-        self._paths = list(paths)
         self._size = int(size)
         self._report_cache = report_cache or {}
         self._current_dir = current_dir or ""
@@ -872,38 +1063,149 @@ class ThumbnailLoader(QThread):
         self._executor: _futures.ThreadPoolExecutor | None = None
         self._max_workers = _thumbnail_loader_worker_count()
 
+        # Priority queue: items are (priority, seq, path)
+        self._task_queue: _queue.PriorityQueue = _queue.PriorityQueue()
+        self._queued:  set[str] = set()   # paths currently sitting in the queue
+        self._loaded:  set[str] = set()   # paths already submitted to executor
+        self._seq = 0                      # monotonic counter for stable FIFO within same priority
+        self._queue_lock = threading.Lock()
+
+    # ── Public API (thread-safe) ─────────────────────────────────────────────
+
+    def enqueue(self, paths: list[str], priority: int = PRIORITY_VISIBLE) -> int:
+        """Add *paths* to the priority queue at *priority*.
+
+        Paths that are already loaded or already sitting in the queue are
+        skipped (no duplicates).  Returns the number of newly enqueued paths.
+        """
+        added = 0
+        with self._queue_lock:
+            for path in paths:
+                norm = os.path.normpath(path)
+                if norm in self._loaded or norm in self._queued:
+                    continue
+                self._seq += 1
+                self._task_queue.put_nowait((priority, self._seq, norm))
+                self._queued.add(norm)
+                added += 1
+        return added
+
+    def promote(self, paths: list[str]) -> int:
+        """Re-queue *paths* at ``PRIORITY_VISIBLE`` regardless of current state.
+
+        If a path is already loaded it is skipped.  If it is already in the
+        queue at a lower priority a second entry at priority 0 is inserted;
+        the original lower-priority entry will be discarded when dequeued
+        (detected via the ``_loaded`` set).  Returns the number of entries
+        inserted.
+        """
+        promoted = 0
+        with self._queue_lock:
+            for path in paths:
+                norm = os.path.normpath(path)
+                if norm in self._loaded:
+                    continue
+                self._seq += 1
+                self._task_queue.put_nowait((self.PRIORITY_VISIBLE, self._seq, norm))
+                self._queued.add(norm)  # idempotent; may already be present
+                promoted += 1
+        return promoted
+
     def stop(self) -> None:
         self._stop_flag = True
         self.requestInterruption()
 
-    def _load_single(self, path: str) -> tuple[str, QImage | None]:
-        if self._stop_flag or self.isInterruptionRequested():
-            return path, None
+    def _load_single(self, path: str, emit_fn) -> None:
+        """Decode one image progressively, calling emit_fn(path, QImage) for every
+        available frame — coarse frames first, final high-quality frame last.
+
+        emit_fn is called from the thread-pool worker thread.  Qt cross-thread
+        signal delivery (queued connection) makes this safe: each call posts a
+        QMetaCallEvent to the main thread's event loop instead of invoking the
+        slot directly.
+
+        Progressive pipeline for JPEG / RAW:
+          1. Memory cache hit  → emit once, done (fastest path).
+          2. Disk cache hit    → emit once, populate memory cache, done.
+          3. Progressive feed  → emit BILINEAR intermediate frames as libjpeg
+                                  decodes successive JPEG scans, then emit the
+                                  final LANCZOS frame; cache that final frame.
+        Non-JPEG / non-RAW falls back to a single-shot load.
+        """
         path_to_load = os.path.normpath(path)
+
+        def stopped() -> bool:
+            return self._stop_flag or self.isInterruptionRequested()
+
+        def safe_emit(qimg: QImage) -> None:
+            if not stopped() and not qimg.isNull():
+                emit_fn(path_to_load, qimg)
+
+        if stopped():
+            return
+
         cache = self._thumb_cache
-        if cache is not None:
-            cached = cache.get(path_to_load, self._size)
-            if cached is not None and not cached.isNull():
-                return path, cached
         load_size = self._size
-        qimg = _load_thumbnail_image(path_to_load, load_size)
-        if qimg is None or qimg.isNull():
-            return path, None
-        if self._stop_flag or self.isInterruptionRequested():
-            return path, None
+
+        # ── 1. Memory cache ──────────────────────────────────────────────────
         if cache is not None:
-            cache.put(path_to_load, load_size, qimg)
-            cached = cache.get(path_to_load, self._size)
+            cached = cache.get(path_to_load, load_size)
             if cached is not None and not cached.isNull():
-                return path, cached
-        return path, qimg
+                safe_emit(cached)
+                return
+
+        ext = Path(path_to_load).suffix.lower()
+
+        # ── 2. JPEG / RAW: disk cache then progressive pipeline ──────────────
+        if ext in thumb_stream._JPEG_EXTENSIONS or ext in thumb_stream._RAW_EXTENSIONS:
+            try:
+                mtime = os.path.getmtime(path_to_load)
+            except Exception:
+                mtime = 0.0
+
+            disk_img = _read_thumb_from_disk_cache(path_to_load, mtime, load_size)
+            if disk_img is not None and not disk_img.isNull():
+                if cache is not None:
+                    cache.put(path_to_load, load_size, disk_img)
+                safe_emit(disk_img)
+                return
+
+            # Progressive decode — emit each frame as it arrives
+            final_qimg: QImage | None = None
+            for rgb_result in thumb_stream.iter_thumbnail_rgb_progressive(
+                path_to_load, load_size, stopped
+            ):
+                if stopped():
+                    return
+                data, w, h = rgb_result
+                qimg = _rgb_bytes_to_qimage(data, w, h)
+                safe_emit(qimg)
+                final_qimg = qimg
+
+            # Persist the final (highest-quality) frame
+            if final_qimg is not None and not final_qimg.isNull():
+                if cache is not None:
+                    cache.put(path_to_load, load_size, final_qimg)
+                cache_path = _thumb_disk_cache_path(path_to_load, mtime, load_size)
+                _schedule_thumb_disk_cache_write(cache_path, final_qimg)
+
+        # ── 3. Other formats: single-shot load (handles disk cache internally) ─
+        else:
+            qimg = _load_thumbnail_image(path_to_load, load_size)
+            if qimg is None or qimg.isNull() or stopped():
+                return
+            if cache is not None:
+                cache.put(path_to_load, load_size, qimg)
+                cached = cache.get(path_to_load, load_size)
+                if cached is not None and not cached.isNull():
+                    qimg = cached
+            safe_emit(qimg)
 
     def run(self) -> None:
-        if not self._paths:
+        if self._task_queue.empty():
             return
-        _log.info(
-            "[ThumbnailLoader.run] START paths=%s size=%s workers=%s",
-            len(self._paths),
+        _log.debug(
+            "[ThumbnailLoader.run] START size=%s workers=%s",
             self._size,
             self._max_workers,
         )
@@ -912,37 +1214,69 @@ class ThumbnailLoader(QThread):
             thread_name_prefix="thumb",
         )
         self._executor = executor
+        # emit_fn is called from pool-worker threads; Qt queued-connection
+        # delivery is thread-safe and routes each call to the main event loop.
+        emit_fn = self.thumbnail_ready.emit
+
         try:
-            future_map: dict[_futures.Future, str] = {}
-            for path in self._paths:
-                if self._stop_flag or self.isInterruptionRequested():
-                    break
-                try:
-                    future = executor.submit(self._load_single, path)
-                except RuntimeError as e:
-                    _log.info("[ThumbnailLoader.run] submit stopped path=%r: %s", path, e)
-                    break
-                future_map[future] = path
-            if not future_map:
-                return
-            for future in _futures.as_completed(future_map):
-                if self._stop_flag or self.isInterruptionRequested():
-                    break
-                src_path = future_map[future]
-                try:
-                    out_path, qimg = future.result()
-                except Exception as e:
-                    _log.warning("[ThumbnailLoader.run] failed path=%r: %s", src_path, e)
+            while not self._stop_flag and not self.isInterruptionRequested():
+                # ── Drain priority queue into one batch ──────────────────────
+                # We submit max_workers items at a time so that new high-priority
+                # items injected via promote() can jump ahead after each batch.
+                batch: list[str] = []
+                while len(batch) < self._max_workers:
+                    try:
+                        _, _, path = self._task_queue.get_nowait()
+                    except _queue.Empty:
+                        break
+                    with self._queue_lock:
+                        self._queued.discard(path)
+                        if path in self._loaded:
+                            continue  # duplicate from promote(); skip
+                        self._loaded.add(path)
+                    batch.append(path)
+
+                if not batch:
+                    # Queue is empty; wait briefly for newly injected items.
+                    _time.sleep(0.05)
+                    if self._task_queue.empty():
+                        break
                     continue
-                if qimg is not None and not (self._stop_flag or self.isInterruptionRequested()):
-                    self.thumbnail_ready.emit(out_path, qimg)
+
+                # ── Submit batch to thread-pool workers ──────────────────────
+                future_map: dict[_futures.Future, str] = {}
+                for path in batch:
+                    if self._stop_flag or self.isInterruptionRequested():
+                        break
+                    try:
+                        f = executor.submit(self._load_single, path, emit_fn)
+                        future_map[f] = path
+                    except RuntimeError as e:
+                        _log.info("[ThumbnailLoader.run] submit stopped path=%r: %s", path, e)
+                        break
+
+                # ── Wait for this batch before taking the next ───────────────
+                # Waiting (rather than fire-and-forget) lets the priority queue
+                # be checked again after each batch, so newly-visible items
+                # injected via promote() are processed in the next iteration.
+                for f in _futures.as_completed(future_map):
+                    if self._stop_flag or self.isInterruptionRequested():
+                        break
+                    try:
+                        f.result()
+                    except Exception as e:
+                        _log.warning(
+                            "[ThumbnailLoader.run] failed path=%r: %s",
+                            future_map[f], e,
+                        )
+
         finally:
             try:
                 executor.shutdown(wait=False, cancel_futures=True)
             except Exception:
                 pass
             self._executor = None
-            _log.info("[ThumbnailLoader.run] END")
+            _log.debug("[ThumbnailLoader.run] END")
 
 
 class DirectoryScanWorker(QThread):
@@ -1295,6 +1629,9 @@ class MetadataLoader(QThread):
                     if not needs_fallback:
                         inject_metadata_cache(path, flat)
                     meta = self._parse_rec(flat)
+                    species_cn = str(row.get("bird_species_cn") or "").strip()
+                    if species_cn:
+                        meta["bird_species_cn"] = species_cn
                     result[norm] = meta
                     if needs_fallback:
                         fallback_paths.append(path)
@@ -1529,6 +1866,8 @@ class FileListPanel(QWidget):
         self._thumb_viewport_timer: QTimer | None = None
         self._thumb_visible_signature: tuple | None = None
         self._thumb_visible_range: ThumbViewportRange | None = None
+        self._thumb_pending_batch: list[tuple[str, "QImage"]] = []
+        self._thumb_apply_timer: QTimer | None = None
         # 过滤状态
         self._filter_pick: bool = False   # 只显示精选(🏆)
         self._filter_min_rating: int = 0  # 最低星级(0=不限)
@@ -1853,6 +2192,15 @@ class FileListPanel(QWidget):
         self._stop_all_loaders()
         _log.info("[load_directory] _stop_directory_scan_worker")
         self._stop_directory_scan_worker()
+        # Folder-level FIFO eviction: release QImages cached for any directory
+        # other than the one we are about to enter.  This ensures that browsing
+        # through many large folders cannot accumulate an unbounded number of
+        # cached thumbnails in RAM — only the current folder's images are kept.
+        # Old-folder thumbnails remain on the disk cache and reload quickly if
+        # the user navigates back.
+        _evicted = self._thumb_memory_cache.evict_other_dirs(_path_key(path))
+        if _evicted:
+            _log.info("[load_directory] evicted %.1f MB from other dirs", _evicted / (1024 * 1024))
         self._meta_cache.clear()
         self._report_cache = {}
         self._report_row_by_path = {}
@@ -2954,6 +3302,7 @@ class FileListPanel(QWidget):
         item.setData(_MetaRatingRole, meta.get("rating", 0))
         item.setData(_MetaPickRole, meta.get("pick", 0))
         item.setData(_MetaFocusRole, meta.get("country", ""))
+        item.setData(_MetaSpeciesCnRole, meta.get("bird_species_cn", ""))
 
     def _clear_thumb_pixmap_for_item(self, item: QListWidgetItem) -> None:
         item.setIcon(QIcon())
@@ -2963,6 +3312,59 @@ class FileListPanel(QWidget):
     def _reset_thumb_item_state(self, item: QListWidgetItem, meta: dict | None = None) -> None:
         self._clear_thumb_pixmap_for_item(item)
         self._apply_thumb_meta_to_item(item, meta)
+
+    def _apply_cached_thumbs_to_items(self) -> None:
+        """尽可能直接从内存缩略图缓存填充当前列表项，避免已加载目录间切换时重新排队后台加载。
+        Only applies to currently-visible items to avoid creating pixmaps for thousands of
+        off-screen items (which would cause unbounded memory growth)."""
+        if not self._item_map:
+            return
+        # Determine which items are (or will soon be) visible so we only materialise
+        # QPixmaps for those.  Fall back to all items when the viewport is not yet
+        # ready (e.g. immediately after a directory switch before layout settles).
+        visible_range = self._build_visible_thumbnail_data_source()
+        if visible_range is not None and visible_range.entries:
+            visible_norms = {e.path for e in visible_range.entries}
+        else:
+            visible_norms = None  # layout not ready – apply to all (small directories)
+        for norm, item in list(self._item_map.items()):
+            if visible_norms is not None and norm not in visible_norms:
+                continue
+            if item is None or self._thumb_item_has_current_pixmap(item):
+                continue
+            cached = self._thumb_memory_cache.get(norm, self._thumb_size)
+            if cached is None or cached.isNull():
+                continue
+            pixmap = QPixmap.fromImage(cached)
+            item.setData(_ThumbPixmapRole, pixmap)
+            item.setData(_ThumbSizeRole, int(self._thumb_size))
+            meta = self._meta_cache.get(norm, {})
+            self._apply_thumb_meta_to_item(item, meta)
+
+    def _evict_offscreen_item_pixmaps(self, visible_range: "ThumbViewportRange") -> None:
+        """Release QPixmap objects stored on items that are well outside the current
+        viewport.  This is the primary guard against unbounded RAM growth: the
+        ThumbnailMemoryCache (QImage, bounded at 512 MB) survives, so re-entering
+        the viewport reloads from memory cache without any disk I/O.
+
+        Keeps a buffer of 4 extra rows on each side of the visible range so that
+        smooth scrolling doesn't cause visible flicker.
+        """
+        total = self._list_widget.count()
+        if total == 0:
+            return
+        vp_w = self._list_widget.viewport().rect().width()
+        cols = max(1, vp_w // max(1, visible_range.grid_width))
+        buffer = cols * 4  # 4 extra rows on each side
+        keep_start = max(0, visible_range.start_row - buffer)
+        keep_end = min(total - 1, visible_range.end_row + buffer)
+        for i in range(total):
+            if keep_start <= i <= keep_end:
+                continue
+            item = self._list_widget.item(i)
+            if item is not None and item.data(_ThumbPixmapRole) is not None:
+                item.setData(_ThumbPixmapRole, None)
+                item.setData(_ThumbSizeRole, 0)
 
     def _thumb_item_has_current_pixmap(self, item: QListWidgetItem) -> bool:
         pixmap = item.data(_ThumbPixmapRole)
@@ -3101,6 +3503,8 @@ class FileListPanel(QWidget):
             _log.info("[_rebuild_views] thumb mode: update thumb display + schedule visible loader")
             self._invalidate_visible_thumbnail_signature()
             self._update_thumb_display()
+            # 目录间切换时，优先尝试直接用内存缓存的缩略图填充，已有缓存的不再排队后台加载。
+            self._apply_cached_thumbs_to_items()
             self._schedule_visible_thumbnail_update()
         _log.info("[_rebuild_views] END")
 
@@ -3326,7 +3730,7 @@ class FileListPanel(QWidget):
 
     def _build_visible_thumbnail_data_source(
         self,
-        overscan_rows: int = 1,
+        overscan_rows: int = 2,
     ) -> ThumbViewportRange | None:
         if self._view_mode != self._MODE_THUMB or self._list_widget.count() <= 0:
             self._thumb_visible_range = None
@@ -3433,7 +3837,61 @@ class FileListPanel(QWidget):
             return
         self._ensure_thumb_viewport_timer()
         if self._thumb_viewport_timer is not None:
-            self._thumb_viewport_timer.start(40)
+            self._thumb_viewport_timer.start(25)
+
+    def _collect_prefetch_paths(
+        self,
+        visible_range: "ThumbViewportRange",
+        prefetch_rows: int = 6,
+    ) -> list[str]:
+        """Return paths just outside *visible_range* for background prefetching.
+
+        The result is ordered so items closest to the visible area come first
+        (top-adjacent rows before bottom-adjacent rows, alternating), giving
+        the best chance of being ready before the user scrolls to them.
+        """
+        total = self._list_widget.count()
+        if total == 0:
+            return []
+        cols = max(1, self._list_widget.viewport().rect().width() // max(1, visible_range.grid_width))
+        buffer = cols * prefetch_rows
+        pre_start = max(0, visible_range.start_row - buffer)
+        pre_end   = min(total - 1, visible_range.end_row + buffer)
+
+        visible_set = {e.path for e in visible_range.entries}
+        result: list[str] = []
+        seen: set[str]    = set()
+
+        # Alternate between rows above and below visible area so nearest items
+        # are submitted first regardless of scroll direction.
+        above = list(range(visible_range.start_row - 1, pre_start - 1, -1))
+        below = list(range(visible_range.end_row   + 1, pre_end   + 1))
+        for row in (r for pair in zip(above, below) for r in pair):
+            item = self._list_widget.item(row)
+            if item is None or item.isHidden():
+                continue
+            path = item.data(_UserRole)
+            if not path:
+                continue
+            norm = os.path.normpath(path)
+            if norm in visible_set or norm in seen:
+                continue
+            seen.add(norm)
+            result.append(norm)
+        # tail: whichever sequence was longer
+        for row in (above[len(below):] + below[len(above):]):
+            item = self._list_widget.item(row)
+            if item is None or item.isHidden():
+                continue
+            path = item.data(_UserRole)
+            if not path:
+                continue
+            norm = os.path.normpath(path)
+            if norm in visible_set or norm in seen:
+                continue
+            seen.add(norm)
+            result.append(norm)
+        return result
 
     def _update_visible_thumbnail_range(self) -> None:
         if self._view_mode != self._MODE_THUMB:
@@ -3442,27 +3900,56 @@ class FileListPanel(QWidget):
         if visible_range is None or not visible_range.entries:
             return
 
-        missing_paths = self._collect_missing_visible_thumbnail_paths(visible_range)
-        same_signature = visible_range.signature == self._thumb_visible_signature
-        self._thumb_visible_signature = visible_range.signature
-        if same_signature:
-            if not missing_paths:
-                return
-            if self._thumbnail_loader is not None and self._thumbnail_loader.isRunning():
-                return
-        else:
-            _log.info(
-                "[_update_visible_thumbnail_range] visible rows=%s-%s items=%s missing=%s size=%s",
-                visible_range.start_row,
-                visible_range.end_row,
-                len(visible_range.entries),
-                len(missing_paths),
-                self._thumb_size,
-            )
+        # Always evict off-screen QPixmaps first.  QPixmaps stored on
+        # QListWidgetItems are never freed by Qt itself, so without explicit
+        # eviction every thumbnail loaded while scrolling stays in RAM forever,
+        # leading to OOM on large directories.  The ThumbnailMemoryCache (QImage,
+        # LRU-bounded) is unaffected and provides fast re-population on scroll-back.
+        self._evict_offscreen_item_pixmaps(visible_range)
 
-        if not missing_paths:
-            return
-        self._start_thumbnail_loader(missing_paths)
+        missing_visible = self._collect_missing_visible_thumbnail_paths(visible_range)
+        same_signature  = visible_range.signature == self._thumb_visible_signature
+        self._thumb_visible_signature = visible_range.signature
+
+        loader = self._thumbnail_loader
+        loader_running = loader is not None and loader.isRunning()
+
+        if same_signature:
+            if not missing_visible:
+                return
+            if loader_running:
+                # Same viewport, loader still running — it is already handling
+                # the missing items; nothing to do.
+                return
+
+        if not missing_visible and not loader_running:
+            # All visible items are cached; still worth (re-)enqueueing prefetch
+            # so background loading continues after a fast scroll.
+            pass
+
+        _log.debug(
+            "[_update_visible_thumbnail_range] visible rows=%s-%s items=%s missing=%s size=%s",
+            visible_range.start_row,
+            visible_range.end_row,
+            len(visible_range.entries),
+            len(missing_visible),
+            self._thumb_size,
+        )
+
+        prefetch_paths = self._collect_prefetch_paths(visible_range)
+
+        if loader_running:
+            # ── Loader already running: reprioritize without stop/restart ────
+            # Promote newly-visible items to the front of the queue so they
+            # are processed before any pending prefetch.
+            if missing_visible:
+                loader.promote(missing_visible)
+            if prefetch_paths:
+                loader.enqueue(prefetch_paths, priority=ThumbnailLoader.PRIORITY_PREFETCH)
+        else:
+            # ── No loader running: start fresh ───────────────────────────────
+            if missing_visible or prefetch_paths:
+                self._start_thumbnail_loader(missing_visible, prefetch_paths)
 
     def _set_view_mode(self, mode: int) -> None:
         self._view_mode = mode
@@ -3520,18 +4007,35 @@ class FileListPanel(QWidget):
                 it.setSizeHint(QSize(cell_w, cell_h))
         self._list_widget.doItemsLayout()
 
-    def _start_thumbnail_loader(self, paths: list[str] | None = None) -> None:
-        _log.info("[_start_thumbnail_loader] START")
+    def _start_thumbnail_loader(
+        self,
+        visible_paths: list[str] | None = None,
+        prefetch_paths: list[str] | None = None,
+    ) -> None:
+        """Stop any running loader, create a fresh one, enqueue *visible_paths*
+        at PRIORITY_VISIBLE and *prefetch_paths* at PRIORITY_PREFETCH, then start it.
+
+        If *visible_paths* is None the current visible range is used.
+        If there is nothing to load the call is a no-op.
+        """
+        _log.debug("[_start_thumbnail_loader] START")
         if self._view_mode != self._MODE_THUMB:
-            _log.info("[_start_thumbnail_loader] skip: not in thumb mode")
+            _log.debug("[_start_thumbnail_loader] skip: not in thumb mode")
             return
-        if paths is None:
+
+        # Build visible list if not supplied
+        if visible_paths is None:
             if self._thumb_visible_range is None:
                 self._build_visible_thumbnail_data_source()
-            paths = [entry.path for entry in (self._thumb_visible_range.entries if self._thumb_visible_range else ())]
-        requested_paths: list[str] = []
+            visible_paths = [
+                e.path
+                for e in (self._thumb_visible_range.entries if self._thumb_visible_range else ())
+            ]
+
+        # Filter to items that actually need loading
+        requested_visible: list[str] = []
         seen: set[str] = set()
-        for path in paths or []:
+        for path in visible_paths or []:
             norm = os.path.normpath(path)
             if norm in seen:
                 continue
@@ -3541,31 +4045,40 @@ class FileListPanel(QWidget):
                 continue
             if self._thumb_item_has_current_pixmap(item):
                 continue
-            requested_paths.append(norm)
-        if not requested_paths:
-            _log.info("[_start_thumbnail_loader] no visible paths need loading")
+            requested_visible.append(norm)
+
+        if not requested_visible and not prefetch_paths:
+            _log.debug("[_start_thumbnail_loader] nothing to load")
             return
+
         self._stop_thumbnail_loader()
+
         cache_stats = self._thumb_memory_cache.stats()
-        _log.info(
-            "[_start_thumbnail_loader] loading visible thumbnails=%s workers=%s cache_entries=%s cache_mb=%.1f",
-            len(requested_paths),
+        _log.debug(
+            "[_start_thumbnail_loader] visible=%s prefetch=%s workers=%s cache_mb=%.1f",
+            len(requested_visible),
+            len(prefetch_paths or []),
             self._thumb_loader_workers,
-            cache_stats.get("entries", 0),
             float(cache_stats.get("bytes", 0)) / (1024.0 * 1024.0),
         )
+
         preview_base_dir = self._report_root_dir or self._current_dir
         loader = ThumbnailLoader(
-            requested_paths,
             self._thumb_size,
             report_cache=self._report_cache,
             current_dir=preview_base_dir,
             thumb_cache=self._thumb_memory_cache,
         )
+        if requested_visible:
+            loader.enqueue(requested_visible, priority=ThumbnailLoader.PRIORITY_VISIBLE)
+        if prefetch_paths:
+            loader.enqueue(prefetch_paths, priority=ThumbnailLoader.PRIORITY_PREFETCH)
+
         loader.thumbnail_ready.connect(self._on_thumbnail_ready)
+        loader.finished.connect(self._schedule_visible_thumbnail_update)
         self._thumbnail_loader = loader
         loader.start()
-        _log.info("[_start_thumbnail_loader] END loader.started")
+        _log.debug("[_start_thumbnail_loader] END loader.started")
 
     def _stop_thumbnail_loader(self) -> None:
         if self._thumbnail_loader:
@@ -3866,19 +4379,39 @@ class FileListPanel(QWidget):
     def _on_thumbnail_ready(self, path: str, qimg) -> None:
         if self._view_mode != self._MODE_THUMB:
             return
-        norm = os.path.normpath(path)
-        item = self._item_map.get(norm)
-        if item is None:
+        self._thumb_pending_batch.append((path, qimg))
+        if self._thumb_apply_timer is None:
+            self._thumb_apply_timer = QTimer(self)
+            self._thumb_apply_timer.setSingleShot(True)
+            self._thumb_apply_timer.timeout.connect(self._flush_thumb_pending_batch)
+        # Only start the timer if it is not already counting down.
+        # Restarting on every signal (old behaviour) deferred the entire batch
+        # until 60 ms after the *last* thumbnail arrived, defeating two-phase loading.
+        if not self._thumb_apply_timer.isActive():
+            self._thumb_apply_timer.start(30)
+
+    def _flush_thumb_pending_batch(self) -> None:
+        if not self._thumb_pending_batch:
             return
-        pixmap = QPixmap.fromImage(qimg)
-        item.setData(_ThumbPixmapRole, pixmap)
-        item.setData(_ThumbSizeRole, int(self._thumb_size))
-        meta = self._meta_cache.get(norm, {})
-        self._apply_thumb_meta_to_item(item, meta)
+        pending = self._thumb_pending_batch
+        self._thumb_pending_batch = []
+        update_rect = QRect()
+        for path, qimg in pending:
+            norm = os.path.normpath(path)
+            item = self._item_map.get(norm)
+            if item is None:
+                continue
+            pixmap = QPixmap.fromImage(qimg)
+            item.setData(_ThumbPixmapRole, pixmap)
+            item.setData(_ThumbSizeRole, int(self._thumb_size))
+            meta = self._meta_cache.get(norm, {})
+            self._apply_thumb_meta_to_item(item, meta)
+            rect = self._list_widget.visualItemRect(item)
+            if rect.isValid():
+                update_rect = update_rect.united(rect) if update_rect.isValid() else rect
         self._update_clear_thumb_cache_button_tooltip()
-        rect = self._list_widget.visualItemRect(item)
-        if rect.isValid():
-            self._list_widget.viewport().update(rect)
+        if update_rect.isValid():
+            self._list_widget.viewport().update(update_rect)
 
     def _on_metadata_progress(self, current: int, total: int) -> None:
         """主线程槽：由 progress_updated 信号触发，安全更新进度条。"""
@@ -4107,8 +4640,22 @@ class FileListPanel(QWidget):
             act_reveal = menu.addAction(label)
             act_reveal.triggered.connect(lambda: reveal_in_file_manager(reveal_path))
         self._add_browse_preview_menu_action(menu, primary_path)
+        menu.addSeparator()
+        act_delete = menu.addAction("删除")
+        act_delete.triggered.connect(lambda: self._move_paths_to_trash(paths))
         _exec_menu(menu, self._tree_widget.viewport().mapToGlobal(pos))
 
+    def _move_paths_to_trash(self, paths: list) -> None:
+        """将选中路径移动到垃圾桶并刷新当前目录列表。"""
+        if not paths:
+            return
+        ok_count = 0
+        for p in paths:
+            if p and os.path.exists(p):
+                if move_to_trash(p):
+                    ok_count += 1
+        if ok_count and self._current_dir:
+            self.load_directory(self._current_dir, force_reload=True)
 
     def _on_list_context_menu(self, pos) -> None:
         item = self._list_widget.itemAt(pos)
@@ -4143,6 +4690,9 @@ class FileListPanel(QWidget):
             act_reveal = menu.addAction(label)
             act_reveal.triggered.connect(lambda: reveal_in_file_manager(reveal_path))
         self._add_browse_preview_menu_action(menu, primary_path)
+        menu.addSeparator()
+        act_delete = menu.addAction("删除")
+        act_delete.triggered.connect(lambda: self._move_paths_to_trash(paths))
         _exec_menu(menu, self._list_widget.viewport().mapToGlobal(pos))
 
 

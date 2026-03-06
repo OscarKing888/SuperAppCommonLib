@@ -98,6 +98,28 @@ def unhide_path(path):
     return True
 
 
+def move_to_trash(path):
+    """
+    将文件或目录移动到系统垃圾桶（回收站），可恢复。
+
+    使用 Send2Trash，跨平台（macOS / Windows / Linux）。
+
+    Args:
+        path: 要删除的文件或目录路径
+
+    Returns:
+        bool: 是否成功送入垃圾桶；路径不存在或送 trash 失败为 False
+    """
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        import send2trash
+        send2trash.send2trash(path)
+        return True
+    except Exception:
+        return False
+
+
 def reveal_in_file_manager(path):
     """
     在系统文件管理器中定位并显示目标路径。
