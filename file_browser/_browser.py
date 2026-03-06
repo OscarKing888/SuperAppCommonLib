@@ -32,7 +32,7 @@ try:
         QListWidget, QListWidgetItem, QListView, QTreeView,
         QMenu, QProgressBar, QToolButton, QHeaderView, QAbstractItemView,
         QTreeWidget, QTreeWidgetItem, QStyleOptionViewItem, QStyle,
-        QStyledItemDelegate, QStackedWidget, QSlider, QMessageBox,
+        QStyledItemDelegate, QStackedWidget, QSlider, QMessageBox, QComboBox,
         QApplication, QToolTip,
     )
     from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal, QRect, QTimer, QUrl, QMimeData, QPoint, QEvent, QAbstractListModel, QAbstractTableModel, QModelIndex, QItemSelectionModel, QSortFilterProxyModel
@@ -46,7 +46,7 @@ except ImportError:
         QListWidget, QListWidgetItem, QListView, QTreeView,
         QMenu, QProgressBar, QToolButton, QHeaderView, QAbstractItemView,
         QTreeWidget, QTreeWidgetItem, QStyleOptionViewItem, QStyle,
-        QStyledItemDelegate, QStackedWidget, QSlider, QMessageBox,
+        QStyledItemDelegate, QStackedWidget, QSlider, QMessageBox, QComboBox,
         QApplication, QShortcut, QToolTip,
     )
     from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal, QRect, QTimer, QUrl, QMimeData, QPoint, QEvent, QAbstractListModel, QAbstractTableModel, QModelIndex, QItemSelectionModel, QSortFilterProxyModel
@@ -72,11 +72,16 @@ from app_common.report_db import (
     find_report_root,
 )
 from app_common.superviewer_user_options import (
+    KEY_NAVIGATION_FPS_OPTIONS,
+    apply_runtime_user_options,
+    get_key_navigation_fps,
     get_persistent_thumb_max_size,
     get_persistent_thumb_sizes,
     get_preferred_persistent_thumb_sizes,
     get_persistent_thumb_workers,
+    get_runtime_user_options,
     get_thumbnail_loader_workers,
+    save_user_options,
 )
 from app_common.ui_style.styles import COLORS
 from app_common import thumb_stream
@@ -3250,6 +3255,9 @@ class FileListPanel(QWidget):
         self._deferred_file_selected_timer: QTimer | None = None
         self._deferred_file_selected_path: str = ""
         self._selection_key_nav_auto_repeat: bool = False
+        self._key_navigation_fps: int = get_key_navigation_fps()
+        self._key_navigation_last_step_at: float = 0.0
+        self._combo_key_navigation_fps: QComboBox | None = None
         self._persistent_thumb_cache_worker: PersistentThumbCacheWorker | None = None
         self._persistent_thumb_cache_timer: QTimer | None = None
         self._persistent_thumb_cache_pending_paths: list[str] = []
@@ -3422,10 +3430,21 @@ class FileListPanel(QWidget):
                 self._focus_filter_btns[focus_status] = btn
                 filter_bar.addWidget(btn)
 
+            filter_bar.addSpacing(8)
+            filter_bar.addWidget(QLabel("方向键:"))
+            self._combo_key_navigation_fps = QComboBox()
+            self._combo_key_navigation_fps.setToolTip("按住方向键连续浏览时，按选定 FPS 控制移动速率。")
+            for fps in KEY_NAVIGATION_FPS_OPTIONS:
+                self._combo_key_navigation_fps.addItem(f"{fps} FPS", fps)
+            self._sync_key_navigation_fps_combo()
+            self._combo_key_navigation_fps.currentIndexChanged.connect(self._on_key_navigation_fps_changed)
+            filter_bar.addWidget(self._combo_key_navigation_fps)
+
             layout.addLayout(filter_bar)
         else:
             self._filter_edit = None
             self._btn_filter_pick = None
+            self._combo_key_navigation_fps = None
 
         # 视图堆叠
         self._stack = QStackedWidget()
@@ -5392,6 +5411,8 @@ class FileListPanel(QWidget):
         ):
             key = event.key()
             if key in (_KeyUp, _KeyDown, _KeyLeft, _KeyRight):
+                if not self._accept_key_navigation_step(event):
+                    return True
                 try:
                     self._selection_key_nav_auto_repeat = bool(event.isAutoRepeat())
                 except Exception:
@@ -5408,6 +5429,8 @@ class FileListPanel(QWidget):
             key = event.key()
             if key not in (_KeyUp, _KeyDown, _KeyLeft, _KeyRight):
                 return super().eventFilter(obj, event)
+            if not self._accept_key_navigation_step(event):
+                return True
             viewport = list_widget.viewport()
             grid = list_widget.gridSize()
             gw = max(1, grid.width())
@@ -5803,8 +5826,72 @@ class FileListPanel(QWidget):
         self._size_slider.setEnabled(enabled)
         self._size_label.setEnabled(enabled)
 
+    def _sync_key_navigation_fps_combo(self) -> None:
+        combo = self._combo_key_navigation_fps
+        if combo is None:
+            return
+        index = combo.findData(self._key_navigation_fps)
+        if index < 0:
+            index = combo.findData(24)
+        if index < 0 and combo.count() > 0:
+            index = 0
+        if index < 0:
+            return
+        try:
+            combo.blockSignals(True)
+            combo.setCurrentIndex(index)
+        finally:
+            combo.blockSignals(False)
+
+    def _set_key_navigation_fps(self, fps: int, *, persist: bool) -> None:
+        try:
+            value = int(fps)
+        except Exception:
+            value = 24
+        if value not in KEY_NAVIGATION_FPS_OPTIONS:
+            value = 24
+        self._key_navigation_fps = value
+        self._key_navigation_last_step_at = 0.0
+        self._sync_key_navigation_fps_combo()
+        if not persist:
+            return
+        options = get_runtime_user_options()
+        if int(options.get("key_navigation_fps", 24)) == value:
+            return
+        options["key_navigation_fps"] = value
+        normalized = save_user_options(options)
+        apply_runtime_user_options(normalized)
+
+    def _on_key_navigation_fps_changed(self, index: int) -> None:
+        combo = self._combo_key_navigation_fps
+        if combo is None:
+            return
+        value = combo.itemData(index)
+        if value is None:
+            value = combo.currentData()
+        if value is None:
+            return
+        self._set_key_navigation_fps(value, persist=True)
+
+    def _accept_key_navigation_step(self, event) -> bool:
+        try:
+            auto_repeat = bool(event.isAutoRepeat())
+        except Exception:
+            auto_repeat = False
+        now = _time.perf_counter()
+        if not auto_repeat:
+            self._key_navigation_last_step_at = now
+            return True
+        fps = max(1, int(self._key_navigation_fps))
+        interval_s = 1.0 / float(fps)
+        if self._key_navigation_last_step_at > 0.0 and (now - self._key_navigation_last_step_at) < interval_s:
+            return False
+        self._key_navigation_last_step_at = now
+        return True
+
     def apply_user_options(self) -> None:
         self._thumb_loader_workers = _thumbnail_loader_worker_count()
+        self._set_key_navigation_fps(get_key_navigation_fps(), persist=False)
         self._invalidate_visible_thumbnail_signature()
         self._stop_thumbnail_loader()
         self._stop_persistent_thumb_cache_worker()

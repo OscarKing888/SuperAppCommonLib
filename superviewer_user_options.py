@@ -8,6 +8,7 @@ import threading
 
 USER_OPTIONS_FILENAME = "SuperViewerUser.cfg"
 PERSISTENT_THUMB_SIZE_LEVELS = (128, 256, 512)
+KEY_NAVIGATION_FPS_OPTIONS = (8, 10, 12, 13, 15, 20, 24, 25, 30, 40, 48, 50, 60, 120)
 
 _OPTIONS_LOCK = threading.RLock()
 _DEFAULT_CPU_COUNT = max(1, os.cpu_count() or 1)
@@ -15,6 +16,7 @@ _DEFAULT_OPTIONS = {
     "thumbnail_loader_workers": _DEFAULT_CPU_COUNT,
     "persistent_thumb_workers": _DEFAULT_CPU_COUNT,
     "persistent_thumb_max_size": 128,
+    "key_navigation_fps": 24,
 }
 _RUNTIME_OPTIONS = dict(_DEFAULT_OPTIONS)
 
@@ -56,6 +58,14 @@ def normalize_user_options(data: dict | None) -> dict[str, int]:
     if value not in PERSISTENT_THUMB_SIZE_LEVELS:
         value = normalized["persistent_thumb_max_size"]
     normalized["persistent_thumb_max_size"] = value
+
+    try:
+        value = int(source.get("key_navigation_fps", normalized["key_navigation_fps"]) or 0)
+    except Exception:
+        value = normalized["key_navigation_fps"]
+    if value not in KEY_NAVIGATION_FPS_OPTIONS:
+        value = normalized["key_navigation_fps"]
+    normalized["key_navigation_fps"] = value
     return normalized
 
 
@@ -109,6 +119,11 @@ def get_persistent_thumb_workers() -> int:
 def get_persistent_thumb_max_size() -> int:
     with _OPTIONS_LOCK:
         return int(_RUNTIME_OPTIONS["persistent_thumb_max_size"])
+
+
+def get_key_navigation_fps() -> int:
+    with _OPTIONS_LOCK:
+        return int(_RUNTIME_OPTIONS["key_navigation_fps"])
 
 
 def get_persistent_thumb_sizes(max_size: int | None = None) -> list[int]:
