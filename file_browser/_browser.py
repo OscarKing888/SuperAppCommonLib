@@ -2708,6 +2708,23 @@ class DirectoryScanWorker(QThread):
                 )
             except Exception as e:
                 _log.warning("[DirectoryScanWorker.run] supplement actual files failed: %s", e)
+            # Fallback: if DB-based approach produced no files, scan filesystem directly.
+            # This handles empty/uninitialized report.db or mismatched paths.
+            if not files:
+                _log.warning(
+                    "[DirectoryScanWorker.run] DB-based scan yielded 0 files, falling back to filesystem scan path=%r",
+                    self._path,
+                )
+                try:
+                    for root, dirs, names in os.walk(self._path, topdown=True):
+                        if self.isInterruptionRequested():
+                            return
+                        dirs[:] = [d for d in dirs if not d.startswith(".")]
+                        for name in sorted(names, key=str.lower):
+                            if Path(name).suffix.lower() in IMAGE_EXTENSIONS:
+                                files.append(os.path.join(root, name))
+                except (PermissionError, OSError) as e:
+                    _log.warning("[DirectoryScanWorker.run] fallback scan error: %s", e)
         else:
             try:
                 if self._recursive:
