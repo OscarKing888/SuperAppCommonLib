@@ -143,6 +143,10 @@ class PreviewCanvas(QLabel):
         # Runtime-registered overlay callables
         self._overlay_layers: list[OverlayLayer] = []
 
+        # When True, zoom and pan are preserved across set_source_pixmap calls
+        # (e.g. navigating between list items or receiving an updated preview).
+        self._keep_view_on_switch: bool = False
+
     # ------------------------------------------------------------------
     # Public API – batched overlay state / options (open/closed)
     # ------------------------------------------------------------------
@@ -158,6 +162,24 @@ class PreviewCanvas(QLabel):
         target = options if options is not None else PreviewOverlayOptions()
         if self._apply_overlay_options_data(target):
             self.update()
+
+    # ------------------------------------------------------------------
+    # Public API – keep-view mode
+    # ------------------------------------------------------------------
+
+    def set_keep_view_on_switch(self, enabled: bool) -> None:
+        """Preserve zoom and pan when the source pixmap is replaced.
+
+        When *enabled* is True, every ``set_source_pixmap`` call that supplies
+        a non-null pixmap will keep the current total scale and view-centre
+        instead of resetting to fit-to-window.  Any explicit ``reset_view=True``
+        argument is also suppressed so that callers cannot accidentally break
+        the preserved view.
+
+        Typical use-case: navigating between shots in a continuous-burst series
+        while zoomed-in to compare a specific detail.
+        """
+        self._keep_view_on_switch = bool(enabled)
 
     # ------------------------------------------------------------------
     # Public API – focus box
@@ -243,6 +265,18 @@ class PreviewCanvas(QLabel):
         preserve_scale: bool = False,
     ) -> None:
         """Replace the displayed pixmap, optionally preserving the current view."""
+        # keep_view_on_switch: override caller flags so zoom/pan are never lost.
+        if (
+            self._keep_view_on_switch
+            and pixmap is not None
+            and not pixmap.isNull()
+            and self._source_pixmap is not None
+            and not self._source_pixmap.isNull()
+        ):
+            reset_view    = False
+            preserve_scale = True
+            preserve_view  = True
+
         old_pixmap = self._source_pixmap
         view_ratio = self._view_center_ratio() if preserve_view else None
         old_total_scale = self._fit_scale() * self._zoom
