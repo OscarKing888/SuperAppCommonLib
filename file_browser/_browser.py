@@ -420,6 +420,16 @@ def _thumb_disk_cache_path(path: str, mtime: float, size: int) -> str:
     return os.path.join(cache_dir, name)
 
 
+try:
+    _PERSISTENT_THUMB_CACHE_SIZE = int(
+        str(os.environ.get("SuperViewer_PERSISTENT_THUMB_SIZE", "")).strip() or "128"
+    )
+except Exception:
+    _PERSISTENT_THUMB_CACHE_SIZE = 128
+_PERSISTENT_THUMB_CACHE_SIZE = min(512, max(64, _PERSISTENT_THUMB_CACHE_SIZE))
+_PERSISTENT_THUMB_CACHE_DIRNAME = f"thumb_preview_{_PERSISTENT_THUMB_CACHE_SIZE}"
+
+
 def _preview_cache_target_for_file(path: str, current_dir: str | None) -> str:
     if not path or not current_dir:
         return ""
@@ -440,6 +450,111 @@ def _existing_preview_cache_path_for_file(path: str, current_dir: str | None) ->
     if preview_path and os.path.isfile(preview_path):
         return preview_path
     return ""
+
+
+def _persistent_thumb_cache_dir(current_dir: str | None) -> str:
+    if not current_dir:
+        return ""
+    root_dir = os.path.normpath(current_dir)
+    superpicky_dir = os.path.join(root_dir, ".superpicky")
+    if os.path.isdir(superpicky_dir):
+        return os.path.join(superpicky_dir, "cache", _PERSISTENT_THUMB_CACHE_DIRNAME)
+    return os.path.join(root_dir, _PERSISTENT_THUMB_CACHE_DIRNAME)
+
+
+def _persistent_thumb_cache_path_for_file(path: str, current_dir: str | None) -> str:
+    cache_dir = _persistent_thumb_cache_dir(current_dir)
+    if not cache_dir or not path:
+        return ""
+    digest = hashlib.sha1(_path_key(path).encode("utf-8")).hexdigest()
+    return os.path.join(cache_dir, digest[:2], f"{digest}.jpg")
+
+
+def _thumb_source_stamp(path: str, auxiliary_path: str = "") -> float:
+    stamp = 0.0
+    for candidate in (path, auxiliary_path):
+        if not candidate:
+            continue
+        try:
+            stamp = max(stamp, float(os.path.getmtime(candidate)))
+        except Exception:
+            continue
+    return stamp
+
+
+def _existing_persistent_thumb_cache_path_for_file(
+    path: str,
+    current_dir: str | None,
+    source_stamp: float | None = None,
+) -> str:
+    cache_path = _persistent_thumb_cache_path_for_file(path, current_dir)
+    if not cache_path or not os.path.isfile(cache_path):
+        return ""
+    if source_stamp is None:
+        source_stamp = _thumb_source_stamp(path)
+    if source_stamp and source_stamp > 0:
+        try:
+            cache_stamp = float(os.path.getmtime(cache_path))
+        except Exception:
+            return ""
+        if cache_stamp + 0.5 < source_stamp:
+            return ""
+    return cache_path
+
+
+def _write_persistent_thumb_cache_image(
+    target_path: str,
+    qimg: "QImage",
+    source_stamp: float | None = None,
+) -> bool:
+    if not target_path or qimg is None or qimg.isNull():
+        return False
+    tmp_path = f"{target_path}.tmp-{os.getpid()}-{threading.get_ident()}"
+    try:
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        if not qimg.save(tmp_path, "JPEG", 85):
+            return False
+        os.replace(tmp_path, target_path)
+        if source_stamp and source_stamp > 0:
+            try:
+                os.utime(target_path, (source_stamp, source_stamp))
+            except Exception:
+                pass
+        return True
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        return False
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def _resolve_thumb_source_path(path: str, report_cache: dict | None, current_dir: str | None) -> str:
+    norm_path = os.path.normpath(path)
+    stem = Path(norm_path).stem
+    if stem and isinstance(report_cache, dict):
+        row = report_cache.get(stem)
+        if isinstance(row, dict):
+            temp_jpeg_path = str(row.get("temp_jpeg_path") or "").strip()
+            if temp_jpeg_path:
+                candidate = (
+                    os.path.normpath(temp_jpeg_path)
+                    if os.path.isabs(temp_jpeg_path)
+                    else os.path.normpath(os.path.join(current_dir, temp_jpeg_path))
+                    if current_dir
+                    else ""
+                )
+                if candidate and os.path.isfile(candidate):
+                    return candidate
+    preview_path = _existing_preview_cache_path_for_file(norm_path, current_dir)
+    return preview_path or norm_path
 
 
 def _read_thumb_from_disk_cache(path: str, mtime: float, size: int) -> "QImage | None":
@@ -926,7 +1041,7 @@ class FileTableModel(QAbstractTableModel):
                 focus_color = _FOCUS_STATUS_TEXT_COLORS.get(entry.country, "")
                 if focus_color:
                     return QBrush(QColor(focus_color))
-            return QBrush()
+            return None
         if role == _BackgroundRole and column == _TREE_COL_COLOR and entry.color in _COLOR_LABEL_COLORS:
             hex_c, _label = _COLOR_LABEL_COLORS[entry.color]
             return QBrush(QColor(hex_c))
@@ -1112,7 +1227,7 @@ class ThumbnailListModel(QAbstractListModel):
         if role == _ToolTipRole:
             return entry.tooltip
         if role == _ForegroundRole:
-            return QBrush(QColor("#c0392b")) if entry.mismatch else QBrush()
+            return QBrush(QColor("#c0392b")) if entry.mismatch else None
         if role == _MetaColorRole:
             return entry.color
         if role == _MetaRatingRole:
@@ -1257,23 +1372,37 @@ class ThumbnailListModel(QAbstractListModel):
             return False
         entry = self._entries[row]
         meta = meta or {}
-        entry.color = str(meta.get("color", ""))
+        changed_roles: list[int] = []
+        new_color = str(meta.get("color", ""))
+        if entry.color != new_color:
+            entry.color = new_color
+            changed_roles.append(_MetaColorRole)
         try:
-            entry.rating = int(meta.get("rating", 0) or 0)
+            new_rating = int(meta.get("rating", 0) or 0)
         except Exception:
-            entry.rating = 0
+            new_rating = 0
+        if entry.rating != new_rating:
+            entry.rating = new_rating
+            changed_roles.append(_MetaRatingRole)
         try:
-            entry.pick = int(meta.get("pick", 0) or 0)
+            new_pick = int(meta.get("pick", 0) or 0)
         except Exception:
-            entry.pick = 0
-        entry.focus_status = str(meta.get("country", ""))
-        entry.species_cn = str(meta.get("bird_species_cn", ""))
+            new_pick = 0
+        if entry.pick != new_pick:
+            entry.pick = new_pick
+            changed_roles.append(_MetaPickRole)
+        new_focus_status = str(meta.get("country", ""))
+        if entry.focus_status != new_focus_status:
+            entry.focus_status = new_focus_status
+            changed_roles.append(_MetaFocusRole)
+        new_species_cn = str(meta.get("bird_species_cn", ""))
+        if entry.species_cn != new_species_cn:
+            entry.species_cn = new_species_cn
+            changed_roles.append(_MetaSpeciesCnRole)
+        if not changed_roles:
+            return False
         idx = self.index(row, 0)
-        self.dataChanged.emit(
-            idx,
-            idx,
-            [_MetaColorRole, _MetaRatingRole, _MetaPickRole, _MetaFocusRole, _MetaSpeciesCnRole],
-        )
+        self.dataChanged.emit(idx, idx, changed_roles)
         return True
 
     def set_pixmap_for_path(self, path: str, pixmap: QPixmap | None, thumb_size: int) -> int | None:
@@ -1286,6 +1415,44 @@ class ThumbnailListModel(QAbstractListModel):
         idx = self.index(row, 0)
         self.dataChanged.emit(idx, idx, [_ThumbPixmapRole, _ThumbSizeRole])
         return row
+
+    def set_pixmaps_for_paths(
+        self,
+        updates: list[tuple[str, QPixmap | None, int]],
+    ) -> list[int]:
+        if not updates:
+            return []
+        changed_rows: list[int] = []
+        for path, pixmap, thumb_size in updates:
+            row = self.row_for_path(path)
+            if row is None:
+                continue
+            entry = self._entries[row]
+            entry.pixmap = pixmap if isinstance(pixmap, QPixmap) and not pixmap.isNull() else None
+            entry.thumb_size = int(thumb_size if entry.pixmap is not None else 0)
+            changed_rows.append(row)
+        if not changed_rows:
+            return []
+        changed_rows = sorted(set(changed_rows))
+        range_start = changed_rows[0]
+        range_end = range_start
+        for row in changed_rows[1:]:
+            if row == range_end + 1:
+                range_end = row
+                continue
+            self.dataChanged.emit(
+                self.index(range_start, 0),
+                self.index(range_end, 0),
+                [_ThumbPixmapRole, _ThumbSizeRole],
+            )
+            range_start = row
+            range_end = row
+        self.dataChanged.emit(
+            self.index(range_start, 0),
+            self.index(range_end, 0),
+            [_ThumbPixmapRole, _ThumbSizeRole],
+        )
+        return changed_rows
 
     def clear_pixmap_for_path(self, path: str) -> int | None:
         row = self.row_for_path(path)
@@ -1763,6 +1930,7 @@ class ThumbnailLoader(QThread):
     ) -> None:
         if not self._profile_enabled:
             return
+        _record_thumb_bottleneck_sample("decode_ms", elapsed_s * 1000.0)
         with self._profile_lock:
             self._profile_completed += 1
             self._profile_frames_emitted += max(0, int(frames_emitted))
@@ -1873,23 +2041,17 @@ class ThumbnailLoader(QThread):
 
     def _resolve_load_target_path(self, path: str) -> str:
         norm_path = os.path.normpath(path)
-        stem = Path(norm_path).stem
-        if stem and isinstance(self._report_cache, dict):
-            row = self._report_cache.get(stem)
-            if isinstance(row, dict):
-                temp_jpeg_path = str(row.get("temp_jpeg_path") or "").strip()
-                if temp_jpeg_path:
-                    candidate = (
-                        os.path.normpath(temp_jpeg_path)
-                        if os.path.isabs(temp_jpeg_path)
-                        else os.path.normpath(os.path.join(self._current_dir, temp_jpeg_path))
-                        if self._current_dir
-                        else ""
-                    )
-                    if candidate and os.path.isfile(candidate):
-                        return candidate
-        preview_path = _existing_preview_cache_path_for_file(norm_path, self._current_dir)
-        return preview_path or norm_path
+        source_path = _resolve_thumb_source_path(norm_path, self._report_cache, self._current_dir)
+        if self._size <= _PERSISTENT_THUMB_CACHE_SIZE:
+            source_stamp = _thumb_source_stamp(norm_path, source_path)
+            persistent_path = _existing_persistent_thumb_cache_path_for_file(
+                norm_path,
+                self._current_dir,
+                source_stamp=source_stamp,
+            )
+            if persistent_path:
+                return persistent_path
+        return source_path
 
     def enqueue(self, paths: list[str], priority: int = PRIORITY_VISIBLE) -> int:
         """Add *paths* to the priority queue at *priority*.
@@ -2205,6 +2367,124 @@ class ThumbnailLoader(QThread):
             _log.debug("[ThumbnailLoader.run] END")
 
 
+class PersistentThumbCacheWorker(QThread):
+    """Build restart-persistent small thumbnail JPEGs for the current directory."""
+
+    progress_updated = pyqtSignal(int, int, int, int, int, str)
+    finished_summary = pyqtSignal(int, int, int, int, int)
+
+    def __init__(
+        self,
+        paths: list[str],
+        current_dir: str,
+        *,
+        report_cache: dict | None = None,
+        size: int = _PERSISTENT_THUMB_CACHE_SIZE,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._paths = [os.path.normpath(p) for p in paths if p]
+        self._current_dir = os.path.normpath(current_dir) if current_dir else ""
+        self._report_cache = report_cache or {}
+        self._size = int(size)
+
+    def stop(self) -> None:
+        self.requestInterruption()
+
+    def run(self) -> None:
+        total = len(self._paths)
+        processed = 0
+        generated = 0
+        skipped = 0
+        failed = 0
+        current_path = ""
+        started_at = _time.perf_counter()
+        last_emit_at = 0.0
+
+        def emit_progress(force: bool = False) -> None:
+            nonlocal last_emit_at
+            now = _time.perf_counter()
+            if (
+                not force
+                and processed < total
+                and processed != 1
+                and processed % 8 != 0
+                and (now - last_emit_at) < 0.15
+            ):
+                return
+            last_emit_at = now
+            self.progress_updated.emit(
+                processed,
+                total,
+                generated,
+                skipped,
+                failed,
+                current_path,
+            )
+
+        _log.info(
+            "[PersistentThumbCacheWorker.run] START dir=%r total=%s size=%s",
+            self._current_dir,
+            total,
+            self._size,
+        )
+        try:
+            for source_path in self._paths:
+                if self.isInterruptionRequested():
+                    break
+                current_path = source_path
+                load_target_path = _resolve_thumb_source_path(
+                    source_path,
+                    self._report_cache,
+                    self._current_dir,
+                )
+                source_stamp = _thumb_source_stamp(source_path, load_target_path)
+                existing_path = _existing_persistent_thumb_cache_path_for_file(
+                    source_path,
+                    self._current_dir,
+                    source_stamp=source_stamp,
+                )
+                if existing_path:
+                    skipped += 1
+                    processed += 1
+                    emit_progress()
+                    continue
+
+                qimg = _load_thumbnail_image(load_target_path, self._size)
+                target_path = _persistent_thumb_cache_path_for_file(
+                    source_path,
+                    self._current_dir,
+                )
+                if (
+                    qimg is not None
+                    and not qimg.isNull()
+                    and target_path
+                    and _write_persistent_thumb_cache_image(
+                        target_path,
+                        qimg,
+                        source_stamp=source_stamp,
+                    )
+                ):
+                    generated += 1
+                else:
+                    failed += 1
+                processed += 1
+                emit_progress()
+        finally:
+            emit_progress(force=True)
+            self.finished_summary.emit(processed, total, generated, skipped, failed)
+            _log.info(
+                "[PersistentThumbCacheWorker.run] END dir=%r processed=%s/%s generated=%s skipped=%s failed=%s elapsed=%.2fs",
+                self._current_dir,
+                processed,
+                total,
+                generated,
+                skipped,
+                failed,
+                _time.perf_counter() - started_at,
+            )
+
+
 class DirectoryScanWorker(QThread):
     """在后台执行目录扫描与 report.db 加载，完成后通过信号回传结果。"""
 
@@ -2384,8 +2664,67 @@ _DEBUG_FILE_LIST_MATCH = (os.environ.get("SuperViewer_DEBUG_FILE_LIST_MATCH", ""
 _THUMB_PROFILE_ENABLED = _env_flag("SuperViewer_THUMB_PROFILE", True)
 _THUMB_PROFILE_VERBOSE = _env_flag("SuperViewer_THUMB_PROFILE_VERBOSE", False)
 _THUMB_PROFILE_REPORT_INTERVAL_S = max(0.25, _env_int("SuperViewer_THUMB_PROFILE_INTERVAL_MS", 1500) / 1000.0)
+_THUMB_BOTTLENECK_SAMPLE_LIMIT = max(256, _env_int("SuperViewer_THUMB_BOTTLENECK_SAMPLE_LIMIT", 50000))
+_PERSISTENT_THUMB_CACHE_START_DELAY_MS = max(
+    500,
+    _env_int("SuperViewer_PERSISTENT_THUMB_DELAY_MS", 1800),
+)
 
 _ACTUAL_PATH_CACHE: dict[str, str] = {}
+_THUMB_BOTTLENECK_LOCK = threading.Lock()
+_THUMB_BOTTLENECK_SAMPLES: dict[str, list[float]] = {
+    "decode_ms": [],
+    "flush_ms": [],
+    "ready_wait_ms": [],
+    "viewport_ms": [],
+}
+
+
+def _record_thumb_bottleneck_sample(metric: str, value_ms: float) -> None:
+    if not _THUMB_PROFILE_ENABLED:
+        return
+    try:
+        sample = float(value_ms)
+    except Exception:
+        return
+    if sample <= 0.0:
+        return
+    with _THUMB_BOTTLENECK_LOCK:
+        samples = _THUMB_BOTTLENECK_SAMPLES.setdefault(metric, [])
+        if len(samples) >= _THUMB_BOTTLENECK_SAMPLE_LIMIT:
+            return
+        samples.append(sample)
+
+
+def _log_thumb_bottleneck_summary() -> None:
+    if not _THUMB_PROFILE_ENABLED:
+        return
+    with _THUMB_BOTTLENECK_LOCK:
+        snapshot = {
+            metric: list(samples)
+            for metric, samples in _THUMB_BOTTLENECK_SAMPLES.items()
+            if samples
+        }
+    if not snapshot:
+        return
+    for metric, samples in snapshot.items():
+        ordered = sorted(samples)
+        count = len(ordered)
+        top_count = max(1, (count + 19) // 20)
+        top_slice = ordered[-top_count:]
+        p95 = ordered[max(0, count - top_count)]
+        top_values = ",".join(f"{value:.1f}" for value in top_slice[-min(3, len(top_slice)):])
+        _log.info(
+            "[THUMB_PROFILE][summary] metric=%s samples=%s top5_count=%s avg=%.1fms p95=%.1fms top5_avg=%.1fms max=%.1fms top=%s",
+            metric,
+            count,
+            top_count,
+            sum(ordered) / max(1, count),
+            p95,
+            sum(top_slice) / max(1, len(top_slice)),
+            top_slice[-1],
+            top_values,
+        )
 
 
 
@@ -2813,6 +3152,16 @@ class FileListPanel(QWidget):
         self._thumb_request_token: int = 0
         self._thumb_pending_batch: dict[str, "QImage"] = {}
         self._thumb_apply_timer: QTimer | None = None
+        self._persistent_thumb_cache_worker: PersistentThumbCacheWorker | None = None
+        self._persistent_thumb_cache_timer: QTimer | None = None
+        self._persistent_thumb_cache_pending_paths: list[str] = []
+        self._persistent_thumb_cache_base_dir: str = ""
+        self._persistent_thumb_cache_generated: int = 0
+        self._persistent_thumb_cache_skipped: int = 0
+        self._persistent_thumb_cache_failed: int = 0
+        self._persistent_thumb_cache_total: int = 0
+        self._persistent_thumb_cache_done: int = 0
+        self._persistent_thumb_cache_current_path: str = ""
         self._thumb_profile_enabled: bool = _THUMB_PROFILE_ENABLED
         self._thumb_profile_last_report_at: float = 0.0
         self._thumb_profile_window_started_at: float = _time.perf_counter()
@@ -3092,7 +3441,26 @@ class FileListPanel(QWidget):
             "QProgressBar::chunk { background: #3a7bd5; border-radius: 3px; }"
         )
         self._meta_progress.hide()
-        layout.addWidget(self._meta_progress)
+
+        self._persistent_thumb_progress = QProgressBar()
+        self._persistent_thumb_progress.setMinimum(0)
+        self._persistent_thumb_progress.setMaximum(100)
+        self._persistent_thumb_progress.setValue(0)
+        self._persistent_thumb_progress.setFixedHeight(20)
+        self._persistent_thumb_progress.setMinimumWidth(200)
+        self._persistent_thumb_progress.setTextVisible(True)
+        self._persistent_thumb_progress.setFormat("小缩略图 %v/%m")
+        self._persistent_thumb_progress.setStyleSheet(
+            "QProgressBar { background: #333; border: none; border-radius: 3px; }"
+            "QProgressBar::chunk { background: #16a085; border-radius: 3px; }"
+        )
+        self._persistent_thumb_progress.hide()
+
+        status_bar = QHBoxLayout()
+        status_bar.setSpacing(6)
+        status_bar.addWidget(self._meta_progress, 1)
+        status_bar.addWidget(self._persistent_thumb_progress, 1)
+        layout.addLayout(status_bar)
 
         self._stack.setCurrentIndex(0)
         self._update_size_controls()
@@ -3295,6 +3663,7 @@ class FileListPanel(QWidget):
             self._start_metadata_loader(files)
         else:
             _log.info("[_on_directory_scan_finished] 当前目录无图像文件，跳过 EXIF 查询")
+        self._schedule_persistent_thumb_cache_build(files)
         self._directory_scan_worker = None
         _log.info("[_on_directory_scan_finished] END")
 
@@ -5235,6 +5604,7 @@ class FileListPanel(QWidget):
             if missing_visible or prefetch_paths:
                 self._start_thumbnail_loader(missing_visible, prefetch_paths)
         update_elapsed_s = _time.perf_counter() - profile_started_at
+        _record_thumb_bottleneck_sample("viewport_ms", update_elapsed_s * 1000.0)
         if (
             len(missing_visible) >= max(12, len(visible_range.entries))
             or update_elapsed_s >= 0.020
@@ -5458,6 +5828,165 @@ class FileListPanel(QWidget):
             self._metadata_loader = None
         self._meta_progress.hide()
 
+    def _ensure_persistent_thumb_cache_timer(self) -> None:
+        if self._persistent_thumb_cache_timer is not None:
+            return
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(self._start_persistent_thumb_cache_worker)
+        self._persistent_thumb_cache_timer = timer
+
+    def _hide_persistent_thumb_progress_if_idle(self) -> None:
+        if self._persistent_thumb_cache_worker is not None:
+            return
+        if self._persistent_thumb_cache_total > 0 and self._persistent_thumb_cache_done < self._persistent_thumb_cache_total:
+            return
+        self._persistent_thumb_progress.hide()
+
+    def _update_persistent_thumb_progress_widget(self) -> None:
+        total = max(0, int(self._persistent_thumb_cache_total))
+        if total <= 0:
+            self._persistent_thumb_progress.hide()
+            self._persistent_thumb_progress.setToolTip("")
+            return
+        done = min(max(0, int(self._persistent_thumb_cache_done)), total)
+        self._persistent_thumb_progress.setMaximum(max(1, total))
+        self._persistent_thumb_progress.setValue(done)
+        self._persistent_thumb_progress.setFormat(f"小缩略图 {done}/{total}")
+        cache_dir = _persistent_thumb_cache_dir(self._persistent_thumb_cache_base_dir)
+        current_name = os.path.basename(self._persistent_thumb_cache_current_path) if self._persistent_thumb_cache_current_path else "(waiting)"
+        tooltip = (
+            f"后台持久化小缩略图缓存\n"
+            f"- 目录: {self._persistent_thumb_cache_base_dir or '(none)'}\n"
+            f"- 缓存目录: {cache_dir or '(none)'}\n"
+            f"- 尺寸: {_PERSISTENT_THUMB_CACHE_SIZE}px\n"
+            f"- 进度: {done}/{total}\n"
+            f"- 新生成: {self._persistent_thumb_cache_generated}\n"
+            f"- 已跳过: {self._persistent_thumb_cache_skipped}\n"
+            f"- 失败: {self._persistent_thumb_cache_failed}\n"
+            f"- 当前: {current_name}"
+        )
+        self._persistent_thumb_progress.setToolTip(tooltip)
+        self._persistent_thumb_progress.show()
+
+    def _schedule_persistent_thumb_cache_build(self, paths: list[str] | None) -> None:
+        base_dir = self._report_root_dir or self._current_dir
+        pending_paths = ThumbnailLoader._normalize_unique_paths(paths or [])
+        self._persistent_thumb_cache_pending_paths = pending_paths
+        self._persistent_thumb_cache_base_dir = base_dir or ""
+        self._persistent_thumb_cache_generated = 0
+        self._persistent_thumb_cache_skipped = 0
+        self._persistent_thumb_cache_failed = 0
+        self._persistent_thumb_cache_total = len(pending_paths)
+        self._persistent_thumb_cache_done = 0
+        self._persistent_thumb_cache_current_path = ""
+        if not pending_paths or not self._persistent_thumb_cache_base_dir:
+            self._update_persistent_thumb_progress_widget()
+            return
+        self._update_persistent_thumb_progress_widget()
+        self._ensure_persistent_thumb_cache_timer()
+        self._persistent_thumb_cache_timer.start(_PERSISTENT_THUMB_CACHE_START_DELAY_MS)
+
+    def _start_persistent_thumb_cache_worker(self) -> None:
+        if self._background_shutdown_started:
+            return
+        if self._persistent_thumb_cache_worker is not None:
+            return
+        if not self._persistent_thumb_cache_pending_paths or not self._persistent_thumb_cache_base_dir:
+            self._update_persistent_thumb_progress_widget()
+            return
+        loader = self._thumbnail_loader
+        if loader is not None and loader.isRunning():
+            snap = loader.profile_snapshot()
+            queue_size = int(snap.get("queue_size", 0))
+            inflight = max(
+                0,
+                int(snap.get("submitted", 0)) - int(snap.get("completed", 0)),
+            )
+            if queue_size > 0 or inflight > 0:
+                self._persistent_thumb_cache_current_path = "(waiting for visible thumbs)"
+                self._update_persistent_thumb_progress_widget()
+                self._ensure_persistent_thumb_cache_timer()
+                self._persistent_thumb_cache_timer.start(_PERSISTENT_THUMB_CACHE_START_DELAY_MS)
+                return
+        worker = PersistentThumbCacheWorker(
+            self._persistent_thumb_cache_pending_paths,
+            self._persistent_thumb_cache_base_dir,
+            report_cache=self._report_full_cache or self._report_cache or {},
+            size=_PERSISTENT_THUMB_CACHE_SIZE,
+            parent=self,
+        )
+        worker.progress_updated.connect(self._on_persistent_thumb_cache_progress)
+        worker.finished_summary.connect(self._on_persistent_thumb_cache_finished)
+        self._persistent_thumb_cache_worker = worker
+        worker.start()
+        _log.info(
+            "[_start_persistent_thumb_cache_worker] dir=%r total=%s size=%s",
+            self._persistent_thumb_cache_base_dir,
+            len(self._persistent_thumb_cache_pending_paths),
+            _PERSISTENT_THUMB_CACHE_SIZE,
+        )
+
+    def _stop_persistent_thumb_cache_worker(self) -> None:
+        if self._persistent_thumb_cache_timer is not None and self._persistent_thumb_cache_timer.isActive():
+            self._persistent_thumb_cache_timer.stop()
+        worker = self._persistent_thumb_cache_worker
+        if worker is not None:
+            try:
+                worker.progress_updated.disconnect(self._on_persistent_thumb_cache_progress)
+            except Exception:
+                pass
+            self._detach_loader(
+                worker,
+                worker.finished_summary,
+                self._on_persistent_thumb_cache_finished,
+            )
+            self._persistent_thumb_cache_worker = None
+        self._persistent_thumb_cache_pending_paths = []
+        self._persistent_thumb_cache_base_dir = ""
+        self._persistent_thumb_cache_generated = 0
+        self._persistent_thumb_cache_skipped = 0
+        self._persistent_thumb_cache_failed = 0
+        self._persistent_thumb_cache_total = 0
+        self._persistent_thumb_cache_done = 0
+        self._persistent_thumb_cache_current_path = ""
+        self._update_persistent_thumb_progress_widget()
+
+    def _on_persistent_thumb_cache_progress(
+        self,
+        done: int,
+        total: int,
+        generated: int,
+        skipped: int,
+        failed: int,
+        current_path: str,
+    ) -> None:
+        self._persistent_thumb_cache_done = max(0, int(done))
+        self._persistent_thumb_cache_total = max(0, int(total))
+        self._persistent_thumb_cache_generated = max(0, int(generated))
+        self._persistent_thumb_cache_skipped = max(0, int(skipped))
+        self._persistent_thumb_cache_failed = max(0, int(failed))
+        self._persistent_thumb_cache_current_path = os.path.normpath(current_path) if current_path else ""
+        self._update_persistent_thumb_progress_widget()
+
+    def _on_persistent_thumb_cache_finished(
+        self,
+        done: int,
+        total: int,
+        generated: int,
+        skipped: int,
+        failed: int,
+    ) -> None:
+        self._persistent_thumb_cache_worker = None
+        self._persistent_thumb_cache_done = max(0, int(done))
+        self._persistent_thumb_cache_total = max(0, int(total))
+        self._persistent_thumb_cache_generated = max(0, int(generated))
+        self._persistent_thumb_cache_skipped = max(0, int(skipped))
+        self._persistent_thumb_cache_failed = max(0, int(failed))
+        self._persistent_thumb_cache_pending_paths = []
+        self._update_persistent_thumb_progress_widget()
+        QTimer.singleShot(1500, self._hide_persistent_thumb_progress_if_idle)
+
     def _stop_actual_path_lookup_workers(self) -> None:
         if not self._path_lookup_workers and not self._path_lookup_pending:
             return
@@ -5492,6 +6021,7 @@ class FileListPanel(QWidget):
         self._stop_pending_meta_apply()
         self._stop_thumbnail_loader()
         self._stop_metadata_loader()
+        self._stop_persistent_thumb_cache_worker()
         self._stop_actual_path_lookup_workers()
 
     def _shutdown_background_work(self) -> None:
@@ -5506,6 +6036,7 @@ class FileListPanel(QWidget):
             for worker in (
                 self._thumbnail_loader,
                 self._metadata_loader,
+                self._persistent_thumb_cache_worker,
                 directory_worker,
             )
             if worker is not None
@@ -5534,6 +6065,7 @@ class FileListPanel(QWidget):
                     worker.wait(2500)
             except Exception:
                 pass
+        _log_thumb_bottleneck_summary()
         _shutdown_thumb_disk_writer(wait=True)
 
     def closeEvent(self, event) -> None:
@@ -5769,6 +6301,8 @@ class FileListPanel(QWidget):
         skipped_offscreen = 0
         ready_wait_total_s = 0.0
         ready_wait_max_s = 0.0
+        pixmap_updates: list[tuple[str, QPixmap | None, int]] = []
+        update_rows: list[int] = []
         for norm, qimg in pending.items():
             idx = self._thumb_index_for_path(norm)
             if not idx.isValid():
@@ -5780,20 +6314,26 @@ class FileListPanel(QWidget):
                 self._thumb_profile_ready_received_at.pop(norm, None)
                 continue
             pixmap = QPixmap.fromImage(qimg)
-            self._thumb_list_model.set_pixmap_for_path(norm, pixmap, self._thumb_size)
+            pixmap_updates.append((norm, pixmap, self._thumb_size))
             meta = self._meta_cache.get(norm, {})
             self._apply_thumb_meta_to_path(norm, meta)
             applied_count += 1
+            update_rows.append(idx.row())
             ready_at = self._thumb_profile_ready_received_at.pop(norm, 0.0)
             if ready_at > 0:
                 wait_s = max(0.0, _time.perf_counter() - ready_at)
                 ready_wait_total_s += wait_s
+                _record_thumb_bottleneck_sample("ready_wait_ms", wait_s * 1000.0)
                 if wait_s > ready_wait_max_s:
                     ready_wait_max_s = wait_s
+        changed_rows = self._thumb_list_model.set_pixmaps_for_paths(pixmap_updates)
+        for row in changed_rows or sorted(set(update_rows)):
+            idx = self._thumb_list_model.index(row, 0)
             rect = self._list_widget.visualRect(idx)
             if rect.isValid():
                 update_rect = update_rect.united(rect) if update_rect.isValid() else rect
         flush_elapsed_s = _time.perf_counter() - flush_started_at
+        _record_thumb_bottleneck_sample("flush_ms", flush_elapsed_s * 1000.0)
         self._thumb_profile_add("flush_calls", 1)
         self._thumb_profile_add("flush_pending_total", len(pending))
         self._thumb_profile_add("flush_applied", applied_count)
