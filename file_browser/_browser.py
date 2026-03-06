@@ -71,6 +71,13 @@ from app_common.report_db import (
     get_preview_path_for_file,
     find_report_root,
 )
+from app_common.superviewer_user_options import (
+    get_persistent_thumb_max_size,
+    get_persistent_thumb_sizes,
+    get_preferred_persistent_thumb_sizes,
+    get_persistent_thumb_workers,
+    get_thumbnail_loader_workers,
+)
 from app_common.ui_style.styles import COLORS
 from app_common import thumb_stream
 
@@ -420,14 +427,26 @@ def _thumb_disk_cache_path(path: str, mtime: float, size: int) -> str:
     return os.path.join(cache_dir, name)
 
 
-try:
-    _PERSISTENT_THUMB_CACHE_SIZE = int(
-        str(os.environ.get("SuperViewer_PERSISTENT_THUMB_SIZE", "")).strip() or "128"
-    )
-except Exception:
-    _PERSISTENT_THUMB_CACHE_SIZE = 128
-_PERSISTENT_THUMB_CACHE_SIZE = min(512, max(64, _PERSISTENT_THUMB_CACHE_SIZE))
-_PERSISTENT_THUMB_CACHE_DIRNAME = f"thumb_preview_{_PERSISTENT_THUMB_CACHE_SIZE}"
+def _persistent_thumb_cache_max_size() -> int:
+    override = _env_int("SuperViewer_PERSISTENT_THUMB_SIZE", 0)
+    if override in (128, 256, 512):
+        return override
+    return get_persistent_thumb_max_size()
+
+
+def _persistent_thumb_cache_sizes() -> list[int]:
+    return get_persistent_thumb_sizes(_persistent_thumb_cache_max_size())
+
+
+def _persistent_thumb_cache_worker_count() -> int:
+    override = _env_int("SuperViewer_PERSISTENT_THUMB_WORKERS", 0)
+    if override > 0:
+        return max(1, override)
+    return max(1, get_persistent_thumb_workers())
+
+
+def _persistent_thumb_cache_dirname(size: int) -> str:
+    return f"thumb_preview_{int(size)}"
 
 
 def _preview_cache_target_for_file(path: str, current_dir: str | None) -> str:
@@ -452,18 +471,18 @@ def _existing_preview_cache_path_for_file(path: str, current_dir: str | None) ->
     return ""
 
 
-def _persistent_thumb_cache_dir(current_dir: str | None) -> str:
+def _persistent_thumb_cache_dir(current_dir: str | None, size: int) -> str:
     if not current_dir:
         return ""
     root_dir = os.path.normpath(current_dir)
     superpicky_dir = os.path.join(root_dir, ".superpicky")
     if os.path.isdir(superpicky_dir):
-        return os.path.join(superpicky_dir, "cache", _PERSISTENT_THUMB_CACHE_DIRNAME)
-    return os.path.join(root_dir, _PERSISTENT_THUMB_CACHE_DIRNAME)
+        return os.path.join(superpicky_dir, "cache", _persistent_thumb_cache_dirname(size))
+    return os.path.join(root_dir, _persistent_thumb_cache_dirname(size))
 
 
-def _persistent_thumb_cache_path_for_file(path: str, current_dir: str | None) -> str:
-    cache_dir = _persistent_thumb_cache_dir(current_dir)
+def _persistent_thumb_cache_path_for_file(path: str, current_dir: str | None, size: int) -> str:
+    cache_dir = _persistent_thumb_cache_dir(current_dir, size)
     if not cache_dir or not path:
         return ""
     digest = hashlib.sha1(_path_key(path).encode("utf-8")).hexdigest()
@@ -482,12 +501,13 @@ def _thumb_source_stamp(path: str, auxiliary_path: str = "") -> float:
     return stamp
 
 
-def _existing_persistent_thumb_cache_path_for_file(
+def _existing_persistent_thumb_cache_path_for_exact_size(
     path: str,
     current_dir: str | None,
+    size: int,
     source_stamp: float | None = None,
 ) -> str:
-    cache_path = _persistent_thumb_cache_path_for_file(path, current_dir)
+    cache_path = _persistent_thumb_cache_path_for_file(path, current_dir, size)
     if not cache_path or not os.path.isfile(cache_path):
         return ""
     if source_stamp is None:
@@ -500,6 +520,28 @@ def _existing_persistent_thumb_cache_path_for_file(
         if cache_stamp + 0.5 < source_stamp:
             return ""
     return cache_path
+
+
+def _existing_persistent_thumb_cache_path_for_file(
+    path: str,
+    current_dir: str | None,
+    *,
+    requested_size: int,
+    source_stamp: float | None = None,
+) -> str:
+    for size in get_preferred_persistent_thumb_sizes(
+        requested_size,
+        _persistent_thumb_cache_max_size(),
+    ):
+        cache_path = _existing_persistent_thumb_cache_path_for_exact_size(
+            path,
+            current_dir,
+            size,
+            source_stamp=source_stamp,
+        )
+        if cache_path:
+            return cache_path
+    return ""
 
 
 def _write_persistent_thumb_cache_image(
@@ -657,11 +699,8 @@ def _thumbnail_loader_worker_count() -> int:
     except Exception:
         override = 0
     if override > 0:
-        return min(16, max(1, override))
-    cpu_count = max(1, os.cpu_count() or 8)
-    # Default for modern SSD-backed workflows: use roughly half the cores,
-    # capped to keep the desktop responsive on very high-core machines.
-    return min(12, max(4, cpu_count // 2))
+        return max(1, override)
+    return max(1, get_thumbnail_loader_workers())
 
 
 def _thumbnail_loader_batch_size(worker_count: int) -> int:
@@ -2042,15 +2081,15 @@ class ThumbnailLoader(QThread):
     def _resolve_load_target_path(self, path: str) -> str:
         norm_path = os.path.normpath(path)
         source_path = _resolve_thumb_source_path(norm_path, self._report_cache, self._current_dir)
-        if self._size <= _PERSISTENT_THUMB_CACHE_SIZE:
-            source_stamp = _thumb_source_stamp(norm_path, source_path)
-            persistent_path = _existing_persistent_thumb_cache_path_for_file(
-                norm_path,
-                self._current_dir,
-                source_stamp=source_stamp,
-            )
-            if persistent_path:
-                return persistent_path
+        source_stamp = _thumb_source_stamp(norm_path, source_path)
+        persistent_path = _existing_persistent_thumb_cache_path_for_file(
+            norm_path,
+            self._current_dir,
+            requested_size=self._size,
+            source_stamp=source_stamp,
+        )
+        if persistent_path:
+            return persistent_path
         return source_path
 
     def enqueue(self, paths: list[str], priority: int = PRIORITY_VISIBLE) -> int:
@@ -2379,17 +2418,78 @@ class PersistentThumbCacheWorker(QThread):
         current_dir: str,
         *,
         report_cache: dict | None = None,
-        size: int = _PERSISTENT_THUMB_CACHE_SIZE,
+        sizes: list[int] | tuple[int, ...] | None = None,
+        worker_count: int | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self._paths = [os.path.normpath(p) for p in paths if p]
         self._current_dir = os.path.normpath(current_dir) if current_dir else ""
         self._report_cache = report_cache or {}
-        self._size = int(size)
+        normalized_sizes = sorted(
+            {
+                int(size)
+                for size in (sizes or _persistent_thumb_cache_sizes())
+                if int(size) in (128, 256, 512)
+            }
+        )
+        self._sizes = tuple(normalized_sizes or _persistent_thumb_cache_sizes())
+        self._worker_count = max(1, int(worker_count or _persistent_thumb_cache_worker_count()))
+        self._stop_event = threading.Event()
 
     def stop(self) -> None:
+        self._stop_event.set()
         self.requestInterruption()
+
+    def _process_path(self, source_path: str) -> tuple[str, int, int, int]:
+        if self._stop_event.is_set():
+            return source_path, 0, 0, 1
+        load_target_path = _resolve_thumb_source_path(
+            source_path,
+            self._report_cache,
+            self._current_dir,
+        )
+        source_stamp = _thumb_source_stamp(source_path, load_target_path)
+        missing_sizes = [
+            size
+            for size in self._sizes
+            if not _existing_persistent_thumb_cache_path_for_exact_size(
+                source_path,
+                self._current_dir,
+                size,
+                source_stamp=source_stamp,
+            )
+        ]
+        if not missing_sizes:
+            return source_path, 0, 1, 0
+        if self._stop_event.is_set():
+            return source_path, 0, 0, 1
+        base_image = _load_thumbnail_image(load_target_path, max(missing_sizes))
+        if base_image is None or base_image.isNull():
+            return source_path, 0, 0, 1
+        wrote_any = False
+        for size in missing_sizes:
+            if self._stop_event.is_set():
+                break
+            target_path = _persistent_thumb_cache_path_for_file(
+                source_path,
+                self._current_dir,
+                size,
+            )
+            output_image = base_image if size >= max(missing_sizes) else _scale_qimage_for_thumb(base_image, size)
+            if (
+                target_path
+                and not output_image.isNull()
+                and _write_persistent_thumb_cache_image(
+                    target_path,
+                    output_image,
+                    source_stamp=source_stamp,
+                )
+            ):
+                wrote_any = True
+        if wrote_any:
+            return source_path, 1, 0, 0
+        return source_path, 0, 0, 1
 
     def run(self) -> None:
         total = len(self._paths)
@@ -2423,54 +2523,44 @@ class PersistentThumbCacheWorker(QThread):
             )
 
         _log.info(
-            "[PersistentThumbCacheWorker.run] START dir=%r total=%s size=%s",
+            "[PersistentThumbCacheWorker.run] START dir=%r total=%s sizes=%s workers=%s",
             self._current_dir,
             total,
-            self._size,
+            list(self._sizes),
+            self._worker_count,
         )
+        executor: _futures.ThreadPoolExecutor | None = None
         try:
-            for source_path in self._paths:
-                if self.isInterruptionRequested():
-                    break
-                current_path = source_path
-                load_target_path = _resolve_thumb_source_path(
-                    source_path,
-                    self._report_cache,
-                    self._current_dir,
-                )
-                source_stamp = _thumb_source_stamp(source_path, load_target_path)
-                existing_path = _existing_persistent_thumb_cache_path_for_file(
-                    source_path,
-                    self._current_dir,
-                    source_stamp=source_stamp,
-                )
-                if existing_path:
-                    skipped += 1
-                    processed += 1
-                    emit_progress()
-                    continue
-
-                qimg = _load_thumbnail_image(load_target_path, self._size)
-                target_path = _persistent_thumb_cache_path_for_file(
-                    source_path,
-                    self._current_dir,
-                )
-                if (
-                    qimg is not None
-                    and not qimg.isNull()
-                    and target_path
-                    and _write_persistent_thumb_cache_image(
-                        target_path,
-                        qimg,
-                        source_stamp=source_stamp,
-                    )
-                ):
-                    generated += 1
-                else:
-                    failed += 1
+            executor = _futures.ThreadPoolExecutor(
+                max_workers=self._worker_count,
+                thread_name_prefix="thumb_preview",
+            )
+            futures = {
+                executor.submit(self._process_path, source_path): source_path
+                for source_path in self._paths
+            }
+            for future in _futures.as_completed(futures):
+                current_path = futures.get(future, "") or current_path
+                try:
+                    _, generated_inc, skipped_inc, failed_inc = future.result()
+                except Exception:
+                    generated_inc = 0
+                    skipped_inc = 0
+                    failed_inc = 1
                 processed += 1
+                generated += generated_inc
+                skipped += skipped_inc
+                failed += failed_inc
                 emit_progress()
+                if self.isInterruptionRequested() or self._stop_event.is_set():
+                    break
         finally:
+            self._stop_event.set()
+            if executor is not None:
+                try:
+                    executor.shutdown(wait=True, cancel_futures=True)
+                except Exception:
+                    pass
             emit_progress(force=True)
             self.finished_summary.emit(processed, total, generated, skipped, failed)
             _log.info(
@@ -4652,6 +4742,7 @@ class FileListPanel(QWidget):
             persistent_thumb_path = _existing_persistent_thumb_cache_path_for_file(
                 source_path,
                 preview_base_dir,
+                requested_size=_persistent_thumb_cache_max_size(),
                 source_stamp=source_stamp,
             )
             if persistent_thumb_path:
@@ -5712,6 +5803,20 @@ class FileListPanel(QWidget):
         self._size_slider.setEnabled(enabled)
         self._size_label.setEnabled(enabled)
 
+    def apply_user_options(self) -> None:
+        self._thumb_loader_workers = _thumbnail_loader_worker_count()
+        self._invalidate_visible_thumbnail_signature()
+        self._stop_thumbnail_loader()
+        self._stop_persistent_thumb_cache_worker()
+        if self._view_mode == self._MODE_THUMB:
+            self._thumb_list_model.clear_all_pixmaps()
+            self._update_thumb_display()
+            self._schedule_visible_thumbnail_update()
+        if self._all_files:
+            self._schedule_persistent_thumb_cache_build(self._all_files)
+        else:
+            self._update_persistent_thumb_progress_widget()
+
     def _on_size_slider_changed(self, value: int) -> None:
         size = _THUMB_SIZE_STEPS[max(0, min(len(_THUMB_SIZE_STEPS) - 1, value))]
         self._size_label.setText(f"{size}px")
@@ -5777,6 +5882,7 @@ class FileListPanel(QWidget):
 
         self._thumb_profile_add("loader_starts", 1)
         self._stop_thumbnail_loader()
+        self._thumb_loader_workers = _thumbnail_loader_worker_count()
 
         cache_stats = self._thumb_memory_cache.stats()
         _log.debug(
@@ -5969,13 +6075,18 @@ class FileListPanel(QWidget):
         self._persistent_thumb_progress.setMaximum(max(1, total))
         self._persistent_thumb_progress.setValue(done)
         self._persistent_thumb_progress.setFormat(f"小缩略图 {done}/{total}")
-        cache_dir = _persistent_thumb_cache_dir(self._persistent_thumb_cache_base_dir)
+        sizes = _persistent_thumb_cache_sizes()
+        cache_dirs = [
+            _persistent_thumb_cache_dir(self._persistent_thumb_cache_base_dir, size)
+            for size in sizes
+        ]
         current_name = os.path.basename(self._persistent_thumb_cache_current_path) if self._persistent_thumb_cache_current_path else "(waiting)"
         tooltip = (
             f"后台持久化小缩略图缓存\n"
             f"- 目录: {self._persistent_thumb_cache_base_dir or '(none)'}\n"
-            f"- 缓存目录: {cache_dir or '(none)'}\n"
-            f"- 尺寸: {_PERSISTENT_THUMB_CACHE_SIZE}px\n"
+            f"- 缓存目录: {'; '.join(cache_dirs) if cache_dirs else '(none)'}\n"
+            f"- 尺寸层级: {', '.join(str(size) for size in sizes) or '(none)'}\n"
+            f"- 生成线程: {_persistent_thumb_cache_worker_count()}\n"
             f"- 进度: {done}/{total}\n"
             f"- 新生成: {self._persistent_thumb_cache_generated}\n"
             f"- 已跳过: {self._persistent_thumb_cache_skipped}\n"
@@ -6029,7 +6140,8 @@ class FileListPanel(QWidget):
             self._persistent_thumb_cache_pending_paths,
             self._persistent_thumb_cache_base_dir,
             report_cache=self._report_full_cache or self._report_cache or {},
-            size=_PERSISTENT_THUMB_CACHE_SIZE,
+            sizes=_persistent_thumb_cache_sizes(),
+            worker_count=_persistent_thumb_cache_worker_count(),
             parent=self,
         )
         worker.progress_updated.connect(self._on_persistent_thumb_cache_progress)
@@ -6037,10 +6149,11 @@ class FileListPanel(QWidget):
         self._persistent_thumb_cache_worker = worker
         worker.start()
         _log.info(
-            "[_start_persistent_thumb_cache_worker] dir=%r total=%s size=%s",
+            "[_start_persistent_thumb_cache_worker] dir=%r total=%s sizes=%s workers=%s",
             self._persistent_thumb_cache_base_dir,
             len(self._persistent_thumb_cache_pending_paths),
-            _PERSISTENT_THUMB_CACHE_SIZE,
+            _persistent_thumb_cache_sizes(),
+            _persistent_thumb_cache_worker_count(),
         )
 
     def _stop_persistent_thumb_cache_worker(self) -> None:
