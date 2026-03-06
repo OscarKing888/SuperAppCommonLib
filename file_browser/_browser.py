@@ -454,15 +454,27 @@ def _persistent_thumb_cache_dirname(size: int) -> str:
     return f"thumb_preview_{int(size)}"
 
 
+def _find_superpicky_dir(current_dir: str, max_levels: int = 4) -> str:
+    """Walk up from current_dir (up to max_levels) to find the nearest .superpicky directory.
+    Returns the .superpicky path if found, otherwise returns current_dir/.superpicky (may not exist yet)."""
+    candidate = os.path.normpath(current_dir)
+    for _ in range(max_levels + 1):
+        superpicky = os.path.join(candidate, ".superpicky")
+        if os.path.isdir(superpicky):
+            return superpicky
+        parent = os.path.dirname(candidate)
+        if parent == candidate:
+            break
+        candidate = parent
+    # Not found — default to creating one in the current dir
+    return os.path.join(os.path.normpath(current_dir), ".superpicky")
+
+
 def _preview_cache_target_for_file(path: str, current_dir: str | None) -> str:
     if not path or not current_dir:
         return ""
-    root_dir = os.path.normpath(current_dir)
-    superpicky_dir = os.path.join(root_dir, ".superpicky")
-    if os.path.isdir(superpicky_dir):
-        preview_dir = os.path.join(superpicky_dir, "cache", "temp_preview")
-    else:
-        preview_dir = os.path.join(root_dir, "temp_preview")
+    superpicky_dir = _find_superpicky_dir(current_dir)
+    preview_dir = os.path.join(superpicky_dir, "cache", "temp_preview")
     stem = os.path.splitext(os.path.basename(path))[0]
     if not stem:
         return ""
@@ -479,11 +491,8 @@ def _existing_preview_cache_path_for_file(path: str, current_dir: str | None) ->
 def _persistent_thumb_cache_dir(current_dir: str | None, size: int) -> str:
     if not current_dir:
         return ""
-    root_dir = os.path.normpath(current_dir)
-    superpicky_dir = os.path.join(root_dir, ".superpicky")
-    if os.path.isdir(superpicky_dir):
-        return os.path.join(superpicky_dir, "cache", _persistent_thumb_cache_dirname(size))
-    return os.path.join(root_dir, _persistent_thumb_cache_dirname(size))
+    superpicky_dir = _find_superpicky_dir(current_dir)
+    return os.path.join(superpicky_dir, "cache", _persistent_thumb_cache_dirname(size))
 
 
 def _persistent_thumb_cache_path_for_file(path: str, current_dir: str | None, size: int) -> str:
