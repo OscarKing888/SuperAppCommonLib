@@ -2669,6 +2669,10 @@ _PERSISTENT_THUMB_CACHE_START_DELAY_MS = max(
     500,
     _env_int("SuperViewer_PERSISTENT_THUMB_DELAY_MS", 1800),
 )
+_FAST_PREVIEW_COMMIT_DELAY_MS = max(
+    60,
+    _env_int("SuperViewer_FAST_PREVIEW_COMMIT_DELAY_MS", 140),
+)
 
 _ACTUAL_PATH_CACHE: dict[str, str] = {}
 _THUMB_BOTTLENECK_LOCK = threading.Lock()
@@ -3098,6 +3102,7 @@ class FileListPanel(QWidget):
     create_filter_bar = True
 
     file_selected = pyqtSignal(str)
+    file_fast_preview_requested = pyqtSignal(str)
     _MODE_LIST  = 0
     _MODE_THUMB = 1
 
@@ -3152,6 +3157,9 @@ class FileListPanel(QWidget):
         self._thumb_request_token: int = 0
         self._thumb_pending_batch: dict[str, "QImage"] = {}
         self._thumb_apply_timer: QTimer | None = None
+        self._deferred_file_selected_timer: QTimer | None = None
+        self._deferred_file_selected_path: str = ""
+        self._selection_key_nav_auto_repeat: bool = False
         self._persistent_thumb_cache_worker: PersistentThumbCacheWorker | None = None
         self._persistent_thumb_cache_timer: QTimer | None = None
         self._persistent_thumb_cache_pending_paths: list[str] = []
@@ -4638,7 +4646,7 @@ class FileListPanel(QWidget):
             rel_current_path,
         )
 
-    def resolve_preview_path(self, path: str) -> str:
+    def resolve_preview_path(self, path: str, prefer_fast_preview: bool = False) -> str:
         """Resolve display preview path, preferring an existing cached preview file."""
         norm_path = os.path.normpath(path) if path else ""
         if not norm_path:
@@ -4646,16 +4654,51 @@ class FileListPanel(QWidget):
         actual_path = self._get_actual_path_for_display(norm_path)
         preview_base_dir = self._report_root_dir or self._current_dir
         report_cache = self._report_full_cache or self._report_cache or {}
+        source_path = actual_path or norm_path
+        if prefer_fast_preview:
+            thumb_source = _resolve_thumb_source_path(source_path, report_cache, preview_base_dir)
+            source_stamp = _thumb_source_stamp(source_path, thumb_source)
+            persistent_thumb_path = _existing_persistent_thumb_cache_path_for_file(
+                source_path,
+                preview_base_dir,
+                source_stamp=source_stamp,
+            )
+            if persistent_thumb_path:
+                _log.info(
+                    "[resolve_preview_path] fast source=%r persistent_thumb=%r actual=%r preview_base_dir=%r",
+                    norm_path,
+                    persistent_thumb_path,
+                    actual_path,
+                    preview_base_dir,
+                )
+                return persistent_thumb_path
+            if thumb_source and os.path.isfile(thumb_source):
+                try:
+                    thumb_mtime = float(os.path.getmtime(thumb_source))
+                except Exception:
+                    thumb_mtime = 0.0
+                thumb_disk_path = _thumb_disk_cache_path(thumb_source, thumb_mtime, self._thumb_size)
+                if thumb_disk_path and os.path.isfile(thumb_disk_path):
+                    _log.info(
+                        "[resolve_preview_path] fast source=%r thumb_disk=%r actual=%r preview_base_dir=%r size=%s",
+                        norm_path,
+                        thumb_disk_path,
+                        actual_path,
+                        preview_base_dir,
+                        self._thumb_size,
+                    )
+                    return thumb_disk_path
         preview_target = get_preview_path_for_file(norm_path, preview_base_dir, report_cache)
         preview_path = preview_target if (preview_target and os.path.isfile(preview_target)) else ""
         _log.info(
-            "[resolve_preview_path] source=%r preview=%r preview_target=%r actual=%r preview_base_dir=%r report_entries=%s",
+            "[resolve_preview_path] source=%r preview=%r preview_target=%r actual=%r preview_base_dir=%r report_entries=%s fast=%s",
             norm_path,
             preview_path,
             preview_target,
             actual_path,
             preview_base_dir,
             len(report_cache),
+            int(bool(prefer_fast_preview)),
         )
         return preview_path or actual_path or norm_path
 
@@ -5257,6 +5300,20 @@ class FileListPanel(QWidget):
                 self._invalidate_visible_thumbnail_signature()
                 self._schedule_visible_thumbnail_update()
         if (
+            obj is tree_widget
+            and event is not None
+            and event.type() == _EventKeyPress
+            and self._view_mode == self._MODE_LIST
+            and tree_widget is not None
+        ):
+            key = event.key()
+            if key in (_KeyUp, _KeyDown, _KeyLeft, _KeyRight):
+                try:
+                    self._selection_key_nav_auto_repeat = bool(event.isAutoRepeat())
+                except Exception:
+                    self._selection_key_nav_auto_repeat = False
+                QTimer.singleShot(0, lambda: setattr(self, "_selection_key_nav_auto_repeat", False))
+        if (
             obj is list_widget
             and event is not None
             and event.type() == _EventKeyPress
@@ -5287,6 +5344,10 @@ class FileListPanel(QWidget):
             elif key == _KeyRight and idx < count - 1:
                 new_idx = idx + 1
             if new_idx >= 0 and new_idx < count:
+                try:
+                    fast_preview = bool(event.isAutoRepeat())
+                except Exception:
+                    fast_preview = False
                 shift = _ShiftModifier and (event.modifiers() & _ShiftModifier)
                 new_index = self._thumb_index_for_row(new_idx)
                 if not new_index.isValid():
@@ -5309,7 +5370,11 @@ class FileListPanel(QWidget):
                         sm.select(new_index, _SelectCurrent)
                 path = self._thumb_path_from_index(list_widget.currentIndex())
                 if path:
-                    self._emit_file_selected_for_path(path)
+                    self._handle_selection_preview_request(
+                        path,
+                        fast_preview=fast_preview,
+                        defer_full=fast_preview,
+                    )
                 return True
         return super().eventFilter(obj, event)
 
@@ -5828,6 +5893,64 @@ class FileListPanel(QWidget):
             self._metadata_loader = None
         self._meta_progress.hide()
 
+    def _ensure_deferred_file_selected_timer(self) -> None:
+        if self._deferred_file_selected_timer is not None:
+            return
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(self._commit_deferred_file_selected)
+        self._deferred_file_selected_timer = timer
+
+    def _cancel_deferred_file_selected(self) -> None:
+        if self._deferred_file_selected_timer is not None and self._deferred_file_selected_timer.isActive():
+            self._deferred_file_selected_timer.stop()
+        self._deferred_file_selected_path = ""
+        self._selection_key_nav_auto_repeat = False
+
+    def _schedule_deferred_file_selected(self, path: str) -> None:
+        norm_path = os.path.normpath(path) if path else ""
+        if not norm_path:
+            return
+        self._deferred_file_selected_path = norm_path
+        self._ensure_deferred_file_selected_timer()
+        self._deferred_file_selected_timer.start(_FAST_PREVIEW_COMMIT_DELAY_MS)
+
+    def _commit_deferred_file_selected(self) -> None:
+        path = self._deferred_file_selected_path
+        self._deferred_file_selected_path = ""
+        self._selection_key_nav_auto_repeat = False
+        if path:
+            self._emit_file_selected_for_path(path)
+
+    def _emit_fast_preview_for_path(self, path: str) -> None:
+        if not path:
+            return
+        self._selected_display_path = os.path.normpath(path)
+        resolved_path = self._resolve_source_path_for_action(path)
+        if not resolved_path or not os.path.isfile(resolved_path):
+            self._request_actual_path_lookup(path)
+        self.file_fast_preview_requested.emit(resolved_path or path)
+
+    def _handle_selection_preview_request(
+        self,
+        path: str,
+        *,
+        fast_preview: bool = False,
+        defer_full: bool = False,
+    ) -> None:
+        if not path:
+            return
+        if fast_preview:
+            self._emit_fast_preview_for_path(path)
+            if defer_full:
+                self._schedule_deferred_file_selected(path)
+            else:
+                self._cancel_deferred_file_selected()
+                self._emit_file_selected_for_path(path)
+            return
+        self._cancel_deferred_file_selected()
+        self._emit_file_selected_for_path(path)
+
     def _ensure_persistent_thumb_cache_timer(self) -> None:
         if self._persistent_thumb_cache_timer is not None:
             return
@@ -6018,6 +6141,7 @@ class FileListPanel(QWidget):
             pass
 
     def _stop_all_loaders(self) -> None:
+        self._cancel_deferred_file_selected()
         self._stop_pending_meta_apply()
         self._stop_thumbnail_loader()
         self._stop_metadata_loader()
@@ -6434,7 +6558,7 @@ class FileListPanel(QWidget):
     def _on_tree_item_clicked(self, index) -> None:
         path = self._tree_path_from_index(index)
         if path:
-            self._emit_file_selected_for_path(path)
+            self._handle_selection_preview_request(path)
 
     def _on_tree_current_item_changed(self, current, previous) -> None:
         """列表模式下键盘上下/Shift 改变当前项时触发刷新。"""
@@ -6442,12 +6566,18 @@ class FileListPanel(QWidget):
             return
         path = self._tree_path_from_index(current)
         if path:
-            self._emit_file_selected_for_path(path)
+            fast_preview = bool(self._selection_key_nav_auto_repeat)
+            self._selection_key_nav_auto_repeat = False
+            self._handle_selection_preview_request(
+                path,
+                fast_preview=fast_preview,
+                defer_full=fast_preview,
+            )
 
     def _on_list_item_clicked(self, index) -> None:
         path = self._thumb_path_from_index(index)
         if path:
-            self._emit_file_selected_for_path(path)
+            self._handle_selection_preview_request(path)
 
     def _copy_paths_to_clipboard(self, paths: list) -> None:
         """将本地文件路径写入剪贴板；若存在同名 XMP sidecar 也一并复制。"""
