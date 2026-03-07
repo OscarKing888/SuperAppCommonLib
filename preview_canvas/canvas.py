@@ -640,13 +640,15 @@ class PreviewCanvas(QLabel):
 class PreviewWithStatusBar(QWidget):
     """Composite: a PreviewCanvas (or subclass) plus a status bar below.
 
-    The status bar shows resolution info by default. Subclasses can extend
-    the status content by overriding ``_get_status_segments()`` (open/closed).
+    The status bar shows original/cropped resolution info by default.
+    Subclasses can extend the status content by overriding
+    ``_get_status_segments()`` (open/closed).
 
     Usage::
         w = PreviewWithStatusBar(canvas=EditorPreviewCanvas())
         w.set_source_pixmap(pixmap)
         w.set_original_size(4000, 3000)   # optional, for "原始分辨率"
+        w.set_cropped_size(3000, 1688)    # optional, for "裁切后分辨率"
         w.set_source_mode("原图")          # optional, appended to status
         w.set_focus_box(...)               # forwarded to canvas
     """
@@ -659,9 +661,10 @@ class PreviewWithStatusBar(QWidget):
     ) -> None:
         super().__init__(parent)
         self._canvas: "PreviewCanvas" = canvas if canvas is not None else PreviewCanvas()
-        self._status_label = QLabel("原始分辨率: -")
+        self._status_label = QLabel("原始分辨率: - | 裁切后分辨率: -")
         self._display_pixmap: "QPixmap | None" = None
         self._original_size: "tuple[int, int] | None" = None
+        self._cropped_size: "tuple[int, int] | None" = None
         self._source_mode: str = ""
 
         layout = QVBoxLayout(self)
@@ -700,6 +703,14 @@ class PreviewWithStatusBar(QWidget):
             self._original_size = None
         self._refresh_status_bar()
 
+    def set_cropped_size(self, width: int | None, height: int | None) -> None:
+        """Set the 'cropped' resolution line (e.g. crop output before resize)."""
+        if width is not None and height is not None:
+            self._cropped_size = (int(width), int(height))
+        else:
+            self._cropped_size = None
+        self._refresh_status_bar()
+
     def set_source_mode(self, mode: str) -> None:
         """Set a short mode suffix (e.g. '原图' or '预览图') for the status bar."""
         self._source_mode = str(mode).strip()
@@ -725,7 +736,11 @@ class PreviewWithStatusBar(QWidget):
         elif self._display_pixmap is not None and not self._display_pixmap.isNull():
             orig_str = f"{self._display_pixmap.width()}x{self._display_pixmap.height()}"
 
-        out = [f"原始分辨率: {orig_str}"]
+        cropped_str = "-"
+        if self._cropped_size is not None:
+            cropped_str = f"{self._cropped_size[0]}x{self._cropped_size[1]}"
+
+        out = [f"原始分辨率: {orig_str}", f"裁切后分辨率: {cropped_str}"]
         if self._source_mode:
             out.append(f"({self._source_mode})")
         return out

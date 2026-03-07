@@ -13,7 +13,7 @@ PreviewCanvas
       without subclassing.
 
 PreviewWithStatusBar
-    Composite: canvas + status bar below (原始分辨率 / 当前预览分辨率).
+    Composite: canvas + status bar below (原始分辨率 / 裁切后分辨率).
     Subclass override ``_get_status_segments()`` to extend status content (open/closed).
 
 draw_checker_background
