@@ -101,5 +101,7 @@ def _on_preview_overlay_toggled(self, _checked: bool) -> None:
 - `focus_calc` 是纯计算模块（无 GUI 依赖），适合在 CLI/服务端复用。
 - `PreviewCanvas` 已负责焦点框绘制和缩放/拖拽后的显示变换，外部不要再按屏幕坐标重算焦点框。
 - 只有当“预览图不是原图坐标系”时，才需要在传入 canvas 前做 box 坐标变换。
+- 导出图片如果需要带叠加信息，必须走 `PreviewCanvas.render_source_pixmap_with_overlays()` 或 `save_source_pixmap_with_overlays()`；
+  不要直接保存底层 source pixmap，否则会漏掉“焦点”等 overlays。
 
 1. 如果你希望，我可以再给你一份“另一个 app”的最小可运行 PyQt demo（含 `QCheckBox + PreviewCanvas + focus_calc`）。

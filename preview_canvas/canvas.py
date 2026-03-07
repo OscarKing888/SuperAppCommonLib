@@ -61,7 +61,7 @@ PREVIEW_COMPOSITION_GRID_MODES = (
     "diag_square",
     "crosshair",
 )
-PREVIEW_COMPOSITION_GRID_LINE_WIDTHS = (4, 1, 2, 3, 4, 5, 6)
+PREVIEW_COMPOSITION_GRID_LINE_WIDTHS = (1, 2, 3, 4, 5, 6)
 _PREVIEW_COMPOSITION_GRID_MODE_SET = set(PREVIEW_COMPOSITION_GRID_MODES)
 _PREVIEW_COMPOSITION_GRID_LINE_WIDTH_SET = set(PREVIEW_COMPOSITION_GRID_LINE_WIDTHS)
 _DEFAULT_PREVIEW_COMPOSITION_GRID_MODE = "none"
@@ -628,29 +628,70 @@ class PreviewCanvas(QLabel):
             QRectF(0, 0, self._source_pixmap.width(), self._source_pixmap.height()),
         )
 
-        # ── built-in: composition grid ────────────────────────────────
+        self._paint_overlay_stack(painter, draw_rect, content)
+
+        painter.end()
+
+    def render_source_pixmap_with_overlays(self) -> "QPixmap | None":
+        """
+        Return a copy of the source pixmap with the current overlays drawn on it.
+
+        导出图片时请优先走这个方法，而不是直接保存 ``_source_pixmap``，
+        这样可以保证焦点框/构图线与预览 canvas 使用同一套绘制逻辑。
+        """
+        source = self._source_pixmap
+        if source is None or source.isNull():
+            return None
+        out = source.copy()
+        if out.isNull():
+            return None
+        painter = QPainter(out)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            draw_rect = QRectF(0.0, 0.0, float(out.width()), float(out.height()))
+            self._paint_overlay_stack(painter, draw_rect, out.rect())
+        finally:
+            painter.end()
+        return out
+
+    def save_source_pixmap_with_overlays(
+        self,
+        path: str,
+        fmt: str | None = None,
+        quality: int = -1,
+    ) -> bool:
+        """Save the source pixmap with current overlays. Returns False if unavailable."""
+        rendered = self.render_source_pixmap_with_overlays()
+        if rendered is None or rendered.isNull():
+            return False
+        if fmt is None:
+            return rendered.save(path)
+        return rendered.save(path, fmt, quality)
+
+    # ------------------------------------------------------------------
+    # Built-in overlay painters (private)
+    # ------------------------------------------------------------------
+
+    def _paint_overlay_stack(
+        self,
+        painter: "QPainter",
+        draw_rect: "QRectF",
+        content: "object",
+    ) -> None:
+        # 预览和导出共用这一层，避免“屏幕上有焦点框，导出图却没有”的分叉回归。
         if self._composition_grid_mode != _DEFAULT_PREVIEW_COMPOSITION_GRID_MODE:
             self._paint_composition_grid(painter, draw_rect)
 
-        # ── built-in: focus box ───────────────────────────────────────
         if self._show_focus_box and self._focus_box:
             self._paint_focus_box(painter, draw_rect, content)
 
-        # ── subclass overlays ─────────────────────────────────────────
         self._paint_overlays(painter, draw_rect, content)
 
-        # ── runtime-registered layers ─────────────────────────────────
         for layer_fn in self._overlay_layers:
             try:
                 layer_fn(painter, draw_rect, content)
             except Exception:
                 pass
-
-        painter.end()
-
-    # ------------------------------------------------------------------
-    # Built-in overlay painters (private)
-    # ------------------------------------------------------------------
 
     def _paint_focus_box(self, painter: "QPainter", draw_rect: "QRectF", content: "object") -> None:
         fb = self._focus_box
