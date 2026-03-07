@@ -17,6 +17,7 @@ _DEFAULT_OPTIONS = {
     "persistent_thumb_workers": _DEFAULT_CPU_COUNT,
     "persistent_thumb_max_size": 128,
     "key_navigation_fps": 24,
+    "keep_view_on_switch": 1,
 }
 _RUNTIME_OPTIONS = dict(_DEFAULT_OPTIONS)
 
@@ -66,6 +67,13 @@ def normalize_user_options(data: dict | None) -> dict[str, int]:
     if value not in KEY_NAVIGATION_FPS_OPTIONS:
         value = normalized["key_navigation_fps"]
     normalized["key_navigation_fps"] = value
+
+    try:
+        value = int(source.get("keep_view_on_switch", 1) or 0)
+    except Exception:
+        value = 1
+    normalized["keep_view_on_switch"] = max(0, min(1, value))
+
     return normalized
 
 
@@ -124,6 +132,11 @@ def get_persistent_thumb_max_size() -> int:
 def get_key_navigation_fps() -> int:
     with _OPTIONS_LOCK:
         return int(_RUNTIME_OPTIONS["key_navigation_fps"])
+
+
+def get_keep_view_on_switch() -> bool:
+    with _OPTIONS_LOCK:
+        return bool(_RUNTIME_OPTIONS.get("keep_view_on_switch", 1))
 
 
 def get_persistent_thumb_sizes(max_size: int | None = None) -> list[int]:

@@ -14,6 +14,7 @@ file_browser._browser
 from __future__ import annotations
 
 import concurrent.futures as _futures
+from collections import deque
 from dataclasses import dataclass
 import hashlib
 import html
@@ -61,6 +62,7 @@ from app_common.exif_io import (
     read_batch_metadata,
     run_exiftool_assignments,
 )
+from app_common.exif_io.photo_meta import PhotoMetaDataProxy, PhotoMetaDataReportDB
 from app_common.log import get_logger
 from app_common.file_utils import reveal_in_file_manager, move_to_trash, move_empty_dirs_to_trash
 from app_common.send_to_app import get_external_apps, send_files_to_app
@@ -189,6 +191,11 @@ try:
     _ScrollPerPixel = QAbstractItemView.ScrollMode.ScrollPerPixel
 except AttributeError:
     _ScrollPerPixel = QAbstractItemView.ScrollPerPixel  # type: ignore[attr-defined]
+
+try:
+    _PositionAtCenter = QAbstractItemView.ScrollHint.PositionAtCenter
+except AttributeError:
+    _PositionAtCenter = QAbstractItemView.PositionAtCenter  # type: ignore[attr-defined]
 
 try:
     _SelectCurrent = QItemSelectionModel.SelectionFlag.SelectCurrent
@@ -1061,7 +1068,7 @@ class FileTableModel(QAbstractTableModel):
             return entry.color_display
         if column == _TREE_COL_STAR:
             if entry.pick == 1:
-                return "🏳"
+                return "🏆"
             if entry.pick == -1:
                 return "🚫"
             return "★" * max(0, entry.rating)
@@ -2933,81 +2940,26 @@ class PathLookupWorker(QThread):
 class MetadataLoader(QThread):
     """
     批量读取图像文件的列表列元数据。
-    若提供 report_cache 与 current_dir，则优先从 .superpicky/report.db 缓存取数；
-    未命中再分块调用 read_batch_metadata（exiftool / XMP sidecar）。
+    通过 PhotoMetaDataProxy 做分块查询；每个 chunk 完成后立即把结果回推到主线程。
     """
 
-    all_metadata_ready = pyqtSignal(object)  # dict {norm_path: metadata_dict}
+    metadata_batch_ready = pyqtSignal(object)  # dict {norm_path: metadata_dict}
     progress_updated = pyqtSignal(int, int)  # (current_count, total_count)
 
     def __init__(
         self,
         paths: list,
-        report_cache: dict | None = None,
-        current_dir: str | None = None,
+        meta_proxy: PhotoMetaDataProxy,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self._paths = list(paths)
-        self._report_cache = report_cache or {}
-        self._current_dir = os.path.normpath(current_dir) if current_dir else None
+        self._meta_proxy = meta_proxy
         self._stop_flag = False
 
     def stop(self) -> None:
         self._stop_flag = True
         self.requestInterruption()
-
-    @staticmethod
-    def _report_row_needs_file_fallback(row: dict) -> bool:
-        """
-        某些 report.db 仅保存路径/评分，缺少标题、锐度、对焦等展示字段。
-        这类行需要再走一次 read_batch_metadata（文件 + sidecar）补齐。
-        """
-        if not isinstance(row, dict):
-            return True
-
-        cp = _get_report_current_path_raw(row)
-        if isinstance(cp, str) and cp.strip().lower().endswith(".xmp"):
-            # report 里 current_path 指向 sidecar 的场景，通常依赖文件/XMP补全展示字段
-            return True
-
-        def _has_value(v) -> bool:
-            if v is None:
-                return False
-            if isinstance(v, str):
-                return v.strip() != ""
-            return True
-
-        rich_keys = (
-            "title",
-            "bird_species_cn",
-            "caption",
-            "city",
-            "state_province",
-            "country",
-            "focus_status",
-            "adj_sharpness",
-            "adj_topiq",
-            "head_sharp",
-            "left_eye",
-            "right_eye",
-        )
-        for k in rich_keys:
-            if _has_value(row.get(k)):
-                return False
-
-        # rating>0 / is_flying==1 也视为已有有效展示信息
-        try:
-            if int(float(str(row.get("rating") or 0))) > 0:
-                return False
-        except Exception:
-            pass
-        try:
-            if int(float(str(row.get("is_flying") or 0))) == 1:
-                return False
-        except Exception:
-            pass
-        return True
 
     def run(self) -> None:
         if not self._paths or self._stop_flag:
@@ -3017,131 +2969,34 @@ class MetadataLoader(QThread):
         try:
             paths = self._paths
             total = len(paths)
-            result: dict = {}
-            uncached: list = []
-            fallback_paths: list = []
-            # 先按 path 分流：命中 report 的立即填 result 并注入 writer 缓存，未命中进 uncached
-            for path in paths:
+            chunk_size = max(1, _METADATA_CHUNK_SIZE)
+            processed = 0
+            for i in range(0, total, chunk_size):
                 if self._stop_flag or self.isInterruptionRequested():
-                    _log.info("[MetadataLoader.run] interrupted in report loop")
+                    _log.info("[MetadataLoader.run] interrupted")
                     return
-                norm = os.path.normpath(path)
-                stem = Path(path).stem  # 只按文件名 stem 匹配，不包含路径
-                if stem in self._report_cache:
-                    row = self._report_cache[stem]
-                    flat = report_row_to_exiftool_style(row, path)
-                    needs_fallback = self._report_row_needs_file_fallback(row)
-                    # 仅当不需要文件回退时才注入缓存，避免 read_batch 直接命中“空DB记录”
-                    if not needs_fallback:
-                        inject_metadata_cache(path, flat)
+                chunk = paths[i : i + chunk_size]
+                batch = self._meta_proxy.read_batch(chunk)
+                parsed_batch: dict = {}
+                for norm_path, flat in batch.items():
+                    if self._stop_flag or self.isInterruptionRequested():
+                        return
                     meta = self._parse_rec(flat)
-                    species_cn = str(row.get("bird_species_cn") or "").strip()
+                    species_cn = str(flat.get("bird_species_cn") or "").strip()
                     if species_cn:
                         meta["bird_species_cn"] = species_cn
-                    result[norm] = meta
-                    if needs_fallback:
-                        fallback_paths.append(path)
+                    parsed_batch[norm_path] = meta
                     _log.info(
-                        "[MetadataLoader.run] path=%r 来源=DB stem=%r 解析 title=%r rating=%s pick=%s",
-                        path, stem, meta.get("title", ""), meta.get("rating"), meta.get("pick"),
+                        "[MetadataLoader.run] path=%r title=%r rating=%s pick=%s",
+                        norm_path, meta.get("title", ""), meta.get("rating"), meta.get("pick"),
                     )
-                else:
-                    uncached.append(path)
-            processed = total - len(uncached)
-            _log.info(
-                "[MetadataLoader.run] report done result=%s uncached=%s fallback=%s",
-                len(result), len(uncached), len(fallback_paths)
-            )
-            if processed > 0:
-                self.progress_updated.emit(processed, total)
-            # 命中 DB 但信息稀疏的路径，始终回退读文件/XMP；
-            # 未命中 DB 的路径，仅在 EXIF_ONLY_FROM_REPORT_DB=False 时回退。
-            # 注意：当目标源图不存在且 report.current_path 指向 .xmp 时，
-            # 读取查询路径应改为 sidecar(.xmp)，但结果要映射回目标图片路径。
-            read_query_by_key: dict = {}            # normcase(query_norm) -> query_norm
-            read_targets_by_query_key: dict = {}    # normcase(query_norm) -> set(target_norm)
-            fallback_target_norms: set = set()
-
-            def _plan_read(query_path: str, target_norm: str) -> None:
-                qn = os.path.normpath(query_path)
-                qk = os.path.normcase(qn)
-                read_query_by_key.setdefault(qk, qn)
-                targets = read_targets_by_query_key.setdefault(qk, set())
-                targets.add(target_norm)
-
-            if fallback_paths:
-                for target_path in fallback_paths:
-                    target_norm = os.path.normpath(target_path)
-                    fallback_target_norms.add(target_norm)
-                    query_path = target_path
-
-                    stem = Path(target_path).stem
-                    row = self._report_cache.get(stem)
-                    if isinstance(row, dict):
-                        cp_text = _get_report_current_path_raw(row)
-                        if cp_text and self._current_dir:
-                            if os.path.isabs(cp_text):
-                                cp_abs = os.path.normpath(cp_text)
-                            else:
-                                cp_abs = os.path.normpath(os.path.join(self._current_dir, cp_text))
-                            if (
-                                cp_abs.lower().endswith(".xmp")
-                                and os.path.isfile(cp_abs)
-                            ):
-                                query_path = cp_abs
-                                _log.debug(
-                                    "[MetadataLoader.run] fallback prefer report current_path xmp: target=%r query=%r",
-                                    target_path,
-                                    query_path,
-                                )
-
-                    _plan_read(query_path, target_norm)
-
-            if not EXIF_ONLY_FROM_REPORT_DB and uncached:
-                for p in uncached:
-                    norm = os.path.normpath(p)
-                    _plan_read(p, norm)
-
-            dedup_read = list(read_query_by_key.values())
-            if dedup_read:
-                _log.info(
-                    "[MetadataLoader.run] read_batch planned total=%s fallback=%s uncached=%s exif_only=%s",
-                    len(dedup_read), len(fallback_paths), len(uncached), EXIF_ONLY_FROM_REPORT_DB
-                )
-                chunk_size = max(1, _METADATA_CHUNK_SIZE)
-                for i in range(0, len(dedup_read), chunk_size):
-                    if self._stop_flag or self.isInterruptionRequested():
-                        _log.info("[MetadataLoader.run] interrupted in read_batch loop")
-                        return
-                    chunk = dedup_read[i : i + chunk_size]
-                    _log.debug("[MetadataLoader.run] read_batch chunk %s-%s", i, i + len(chunk))
-                    chunk_raw = read_batch_metadata(chunk)
-                    if self._stop_flag or self.isInterruptionRequested():
-                        return
-                    for norm, rec in chunk_raw.items():
-                        if self._stop_flag or self.isInterruptionRequested():
-                            return
-                        norm_key = os.path.normpath(norm)
-                        query_key = os.path.normcase(norm_key)
-                        target_norms = read_targets_by_query_key.get(query_key)
-                        if not target_norms:
-                            target_norms = {norm_key}
-                        meta = self._parse_rec(rec)
-                        for target_norm in target_norms:
-                            result[target_norm] = meta
-                            src = "read_batch_fallback" if target_norm in fallback_target_norms else "read_batch"
-                            _log.info(
-                                "[MetadataLoader.run] query=%r target=%r 来源=%s 解析 title=%r rating=%s pick=%s",
-                                norm_key, target_norm, src, meta.get("title", ""), meta.get("rating"), meta.get("pick"),
-                            )
-                    processed += len(chunk)
-                    self.progress_updated.emit(min(processed, total), total)
+                if parsed_batch and not (self._stop_flag or self.isInterruptionRequested()):
+                    _log.info("[MetadataLoader.run] emit metadata_batch_ready batch=%s", len(parsed_batch))
+                    self.metadata_batch_ready.emit(parsed_batch)
+                processed += len(chunk)
+                self.progress_updated.emit(min(processed, total), total)
         except Exception as e:
             _log.warning("[MetadataLoader.run] exception: %s", e)
-            result = {}
-        if not (self._stop_flag or self.isInterruptionRequested()):
-            _log.info("[MetadataLoader.run] emit all_metadata_ready result=%s", len(result))
-            self.all_metadata_ready.emit(result)
         _log.info("[MetadataLoader.run] END")
 
     def _parse_rec(self, rec: dict) -> dict:
@@ -3241,6 +3096,7 @@ class FileListPanel(QWidget):
         self._report_root_dir: str | None = None  # 当前使用的 report 根目录（含 .superpicky 的目录）
         self._report_full_root_dir: str | None = None
         self._report_full_cache: dict | None = None
+        self._meta_proxy = PhotoMetaDataProxy(report_db=PhotoMetaDataReportDB())
         self._view_mode = self._MODE_LIST
         self._thumb_size = 128
         self._thumbnail_loader: ThumbnailLoader | None = None
@@ -3260,11 +3116,14 @@ class FileListPanel(QWidget):
         self._meta_apply_items: list = []
         self._meta_apply_index: int = 0
         self._meta_apply_total: int = 0
+        self._meta_apply_expected_total: int = 0
         self._meta_apply_started_at: float = 0.0
         self._meta_apply_loop_started_at: float = 0.0
         self._meta_apply_tree_hits: int = 0
         self._meta_apply_list_hits: int = 0
         self._meta_apply_needs_filter: bool = False
+        self._meta_apply_loader_finished: bool = True
+        self._meta_filter_refresh_timer: QTimer | None = None
         self._tree_header_fast_mode: bool = False
         self._tree_last_sort_column: int = _TREE_COL_NAME
         self._tree_last_sort_order = _AscendingOrder
@@ -3308,6 +3167,11 @@ class FileListPanel(QWidget):
         self._thumb_profile_window_started_at: float = _time.perf_counter()
         self._thumb_profile_ready_received_at: dict[str, float] = {}
         self._background_shutdown_started: bool = False
+        self._selection_scroll_debug_events: deque[str] = deque(maxlen=120)
+        self._selection_scroll_debug_total: int = 0
+        self._selection_scroll_debug_flushed: bool = False
+        self._selection_visibility_restore_path: str = ""
+        self._selection_visibility_restore_budget: int = 0
         self._thumb_profile_stats: dict[str, float] = {
             "schedule_calls": 0.0,
             "viewport_updates": 0.0,
@@ -3492,7 +3356,7 @@ class FileListPanel(QWidget):
         # 城市 = 锐度值（越高越清晰）
         # 省/直辖市/自治区 = 美学评分（越高越好看）
         # 国家/地区 = 对焦状态（精焦/合焦/偏移/失焦）
-        # 🏳️ 白旗 = Pick 精选旗标（双维度都出色）
+        # 🏆 奖杯 = Pick 精选旗标（双维度都出色）
         # 🟢 绿色标签 = 飞鸟
         # 🔴 红色标签 = 精焦（对焦点在鸟头）
         self._tree_widget.setHeaderLabels([
@@ -3658,6 +3522,18 @@ class FileListPanel(QWidget):
             return os.path.normpath(self._selected_display_path)
         return ""
 
+    def _capture_selection_restore_state(self) -> tuple[list[str], str]:
+        """按路径保存当前选中状态，供过滤重建/视图切换后恢复。"""
+        selected_paths = self._active_view_selected_paths()
+        current_path = self._active_view_current_path()
+        if not selected_paths and current_path:
+            selected_paths = [current_path]
+        if not selected_paths and self._selected_display_path:
+            selected_paths = [self._selected_display_path]
+        if not current_path and selected_paths:
+            current_path = selected_paths[0]
+        return self._unique_norm_paths(selected_paths), (os.path.normpath(current_path) if current_path else "")
+
     def _update_selection_status(self) -> None:
         label = getattr(self, "_selection_status_label", None)
         if label is None:
@@ -3730,6 +3606,7 @@ class FileListPanel(QWidget):
                 new_report_root_dir,
             )
         self._report_root_dir = new_report_root_dir
+        self._meta_proxy.report_db.update_report_root(self._report_root_dir)
         if self._report_root_dir:
             if self._report_full_root_dir != self._report_root_dir:
                 _log.info(
@@ -3846,6 +3723,7 @@ class FileListPanel(QWidget):
             )
             files = limited_files
         self._report_cache = report_cache
+        self._meta_proxy.report_db.update_cache(self._report_full_cache or self._report_cache)
         self._report_row_by_path = {}
         row_cache_for_path_map = self._report_full_cache or self._report_cache or {}
         for p in files:
@@ -3903,11 +3781,13 @@ class FileListPanel(QWidget):
         if os.path.normcase(preferred_current) not in normalized_keys:
             preferred_current = normalized[0]
         self._pending_selection_current_path = preferred_current
-        parent = os.path.dirname(normalized[0])
         if (
             self._current_dir
-            and os.path.normpath(self._current_dir) == os.path.normpath(parent)
-            and (self._tree_row_count() > 0 or self._thumb_row_count() > 0)
+            and (
+                self._tree_row_count() > 0
+                or self._thumb_row_count() > 0
+                or self._thumb_model_dirty
+            )
         ):
             self._pending_selection_paths = normalized
             self._apply_pending_selection()
@@ -3954,7 +3834,13 @@ class FileListPanel(QWidget):
                 idx_first = self._tree_index_for_path(current_target)
                 if idx_first.isValid():
                     self._tree_widget.setCurrentIndex(idx_first)
-                    self._tree_widget.scrollTo(idx_first)
+                    self._record_selection_scroll_debug(
+                        "apply_pending.tree",
+                        current_target,
+                        row=idx_first.row(),
+                        view_mode=self._view_mode,
+                    )
+                    self._scroll_path_into_view(current_target, prefer_active=False)
         self._list_widget.clearSelection()
         sm = self._list_widget.selectionModel()
         if sm is not None:
@@ -3975,9 +3861,151 @@ class FileListPanel(QWidget):
             idx_first = self._thumb_index_for_path(current_target)
             if idx_first.isValid():
                 self._list_widget.setCurrentIndex(idx_first)
-                self._list_widget.scrollTo(idx_first)
+                self._record_selection_scroll_debug(
+                    "apply_pending.thumb",
+                    current_target,
+                    row=idx_first.row(),
+                    view_mode=self._view_mode,
+                )
+                self._scroll_path_into_view(current_target, prefer_active=False)
+            QTimer.singleShot(0, lambda p=current_target: self._scroll_path_into_view(p))
+            QTimer.singleShot(30, lambda p=current_target: self._scroll_path_into_view(p))
             self._emit_file_selected_for_path(current_target)
         self._update_selection_status()
+
+    def _record_selection_scroll_debug(self, event: str, path: str = "", **fields) -> None:
+        """缓存选中/滚动诊断信息，退出时统一汇总输出，避免运行中刷屏。"""
+        self._selection_scroll_debug_total += 1
+        line_parts = [f"{self._selection_scroll_debug_total:03d}", event]
+        if path:
+            line_parts.append(f"path={os.path.normpath(path)!r}")
+        for key, value in fields.items():
+            line_parts.append(f"{key}={value!r}")
+        self._selection_scroll_debug_events.append(" ".join(line_parts))
+
+    def _request_selection_visibility_restore(self, path: str, *, budget: int = 3, reason: str = "") -> None:
+        """记录一次短期的“选中项需要保持可见”请求，供后续刷新/排序后补定位。"""
+        norm_path = os.path.normpath(path) if path else ""
+        if not norm_path:
+            return
+        self._selection_visibility_restore_path = norm_path
+        self._selection_visibility_restore_budget = max(self._selection_visibility_restore_budget, max(1, int(budget)))
+        self._record_selection_scroll_debug(
+            "restore.request",
+            norm_path,
+            budget=self._selection_visibility_restore_budget,
+            reason=reason,
+        )
+
+    def _replay_selection_visibility_restore(self, reason: str) -> None:
+        """在后续 tree refresh / sort 完成后，按需再次确保选中项可见。"""
+        norm_path = self._selection_visibility_restore_path
+        if not norm_path or self._selection_visibility_restore_budget <= 0:
+            return
+        self._selection_visibility_restore_budget = max(0, self._selection_visibility_restore_budget - 1)
+        self._record_selection_scroll_debug(
+            "restore.replay",
+            norm_path,
+            budget=self._selection_visibility_restore_budget,
+            reason=reason,
+            view_mode=self._view_mode,
+        )
+        QTimer.singleShot(0, lambda p=norm_path: self._scroll_path_into_view(p))
+        QTimer.singleShot(30, lambda p=norm_path: self._scroll_path_into_view(p))
+        if self._selection_visibility_restore_budget <= 0:
+            self._selection_visibility_restore_path = ""
+
+    def _flush_selection_scroll_debug_summary(self) -> None:
+        if self._selection_scroll_debug_flushed:
+            return
+        self._selection_scroll_debug_flushed = True
+        kept = len(self._selection_scroll_debug_events)
+        if kept <= 0:
+            return
+        dropped = max(0, self._selection_scroll_debug_total - kept)
+        lines = "\n".join(self._selection_scroll_debug_events)
+        _log.info(
+            "[selection_scroll_debug_summary] total=%s kept=%s dropped=%s\n%s",
+            self._selection_scroll_debug_total,
+            kept,
+            dropped,
+            lines,
+        )
+
+    def _scroll_path_into_view(self, path: str, *, prefer_active: bool = True) -> None:
+        """按路径滚动到目标项，必要时补设当前项。"""
+        norm_path = os.path.normpath(path) if path else ""
+        if not norm_path:
+            return
+        target_mode = self._view_mode if prefer_active else None
+
+        def _scroll_tree() -> bool:
+            idx = self._tree_index_for_path(norm_path)
+            if not idx.isValid():
+                self._record_selection_scroll_debug("scroll.tree.miss", norm_path)
+                return False
+            if target_mode in (None, self._MODE_LIST):
+                self._tree_widget.setCurrentIndex(idx)
+            bar = self._tree_widget.verticalScrollBar()
+            before = bar.value() if bar is not None else None
+            rect_before = self._tree_widget.visualRect(idx)
+            self._tree_widget.scrollTo(idx, _PositionAtCenter)
+            rect_after = self._tree_widget.visualRect(idx)
+            after = bar.value() if bar is not None else None
+            self._record_selection_scroll_debug(
+                "scroll.tree",
+                norm_path,
+                row=idx.row(),
+                target_mode=target_mode,
+                scroll_before=before,
+                scroll_after=after,
+                rect_before=(rect_before.x(), rect_before.y(), rect_before.width(), rect_before.height()),
+                rect_after=(rect_after.x(), rect_after.y(), rect_after.width(), rect_after.height()),
+            )
+            return True
+
+        def _scroll_thumb() -> bool:
+            idx = self._thumb_index_for_path(norm_path)
+            if not idx.isValid():
+                self._record_selection_scroll_debug("scroll.thumb.miss", norm_path)
+                return False
+            if target_mode in (None, self._MODE_THUMB):
+                self._list_widget.setCurrentIndex(idx)
+            bar = self._list_widget.verticalScrollBar()
+            before = bar.value() if bar is not None else None
+            rect_before = self._list_widget.visualRect(idx)
+            self._list_widget.scrollTo(idx, _PositionAtCenter)
+            rect_after = self._list_widget.visualRect(idx)
+            after = bar.value() if bar is not None else None
+            self._record_selection_scroll_debug(
+                "scroll.thumb",
+                norm_path,
+                row=idx.row(),
+                target_mode=target_mode,
+                scroll_before=before,
+                scroll_after=after,
+                rect_before=(rect_before.x(), rect_before.y(), rect_before.width(), rect_before.height()),
+                rect_after=(rect_after.x(), rect_after.y(), rect_after.width(), rect_after.height()),
+            )
+            return True
+
+        if target_mode == self._MODE_LIST:
+            _scroll_tree()
+            return
+        if target_mode == self._MODE_THUMB:
+            _scroll_thumb()
+            return
+        tree_ok = _scroll_tree()
+        thumb_ok = _scroll_thumb()
+        if not tree_ok and not thumb_ok:
+            return
+
+    def _scroll_to_selected_display_path(self) -> None:
+        """Scroll the active view so that _selected_display_path is visible."""
+        path = self._selected_display_path
+        if not path:
+            return
+        self._scroll_path_into_view(path)
 
     def _get_species_cn_from_metadata(self, path: str) -> str:
         norm_path = os.path.normpath(path) if path else ""
@@ -4316,6 +4344,7 @@ class FileListPanel(QWidget):
         if self._tree_widget.isSortingEnabled():
             self._tree_widget.sortByColumn(self._tree_last_sort_column, self._tree_last_sort_order)
             self._refresh_tree_row_numbers()
+            self._replay_selection_visibility_restore("refresh_metadata_state.sort")
 
         self._tree_widget.viewport().update()
         if self._view_mode == self._MODE_THUMB:
@@ -4338,39 +4367,30 @@ class FileListPanel(QWidget):
         rating: int | None = None,
         pick: int | None = None,
     ) -> list[str]:
-        db_dir = self._report_root_dir or self._current_dir
-        db = ReportDB.open_if_exists(db_dir) if db_dir else None
-        if db is None:
-            return []
-
         updated_paths: list[str] = []
-        try:
-            for path in self._unique_norm_paths(paths):
-                row = self._get_report_row_for_path(path)
-                if not isinstance(row, dict):
-                    continue
-                filename = str(row.get("filename") or Path(path).stem or "").strip()
-                if not filename:
-                    continue
-                data: dict[str, int] = {}
-                if rating is not None:
-                    data["rating"] = max(0, min(5, int(rating)))
-                if pick is not None:
-                    data["pick"] = max(-1, min(1, int(pick)))
-                if not data:
-                    continue
-                try:
-                    db.insert_photo({"filename": filename, **data})
-                except Exception as exc:
-                    _log.warning("[_apply_rating_state_via_report_db] source=%r filename=%r failed: %s", path, filename, exc)
-                    continue
-                cache_row = self._ensure_report_cache_row(path, filename)
-                for key, value in data.items():
-                    cache_row[key] = value
-                self._apply_rating_state_to_meta_cache(path, rating=rating, pick=pick)
-                updated_paths.append(path)
-        finally:
-            db.close()
+        for path in self._unique_norm_paths(paths):
+            row = self._get_report_row_for_path(path)
+            if not isinstance(row, dict):
+                continue
+            filename = str(row.get("filename") or Path(path).stem or "").strip()
+            if not filename:
+                continue
+            data: dict[str, int] = {}
+            if rating is not None:
+                data["rating"] = max(0, min(5, int(rating)))
+            if pick is not None:
+                data["pick"] = max(-1, min(1, int(pick)))
+            if not data:
+                continue
+            ok = self._meta_proxy.report_db.write(path, data)
+            if not ok:
+                _log.warning("[_apply_rating_state_via_report_db] source=%r filename=%r write failed", path, filename)
+                continue
+            cache_row = self._ensure_report_cache_row(path, filename)
+            for key, value in data.items():
+                cache_row[key] = value
+            self._apply_rating_state_to_meta_cache(path, rating=rating, pick=pick)
+            updated_paths.append(path)
         return updated_paths
 
     def _apply_rating_state_via_exif(
@@ -4406,7 +4426,13 @@ class FileListPanel(QWidget):
             if not target_path or not source_paths:
                 continue
             try:
-                run_exiftool_assignments(target_path, assignments)
+                fields = {}
+                for a in assignments:
+                    if a.startswith("-") and "=" in a:
+                        tag, _, val = a[1:].partition("=")
+                        fields[tag] = val
+                if not self._meta_proxy.exif.write(target_path, fields):
+                    raise RuntimeError("exif write returned False")
             except Exception as exc:
                 _log.warning(
                     "[_apply_rating_state_via_exif] source=%r target=%r failed: %s",
@@ -5397,6 +5423,7 @@ class FileListPanel(QWidget):
         fp = self._filter_pick
         fr = self._filter_min_rating
         t0 = _time.perf_counter()
+        selected_paths, current_path = self._capture_selection_restore_state()
         filtered = self._compute_filtered_files()
         old_filtered = list(self._filtered_files)
         self._filtered_files = filtered
@@ -5414,6 +5441,10 @@ class FileListPanel(QWidget):
             _log.info("[_apply_filter] SKIP unchanged elapsed=%.3fs", _time.perf_counter() - t0)
             return
         self._rebuild_views(stop_loaders=False)
+        if selected_paths:
+            self._request_selection_visibility_restore(current_path or selected_paths[0], reason="apply_filter")
+            # 过滤后行号会变化，必须在新模型里按路径重新定位；缩略图异步补模时由 pending selection 继续完成。
+            self.set_pending_selection(selected_paths, current_path=current_path)
         _log.info(
             "[_apply_filter] END visible=%s hidden=%s elapsed=%.3fs",
             len(filtered),
@@ -5652,11 +5683,11 @@ class FileListPanel(QWidget):
             return None
 
         # 首次切换到缩略图模式时，Qt 可能尚未完成 layout，此时滚动条最大值仍为 0。
-        # 大目录如果在这个瞬间被误判成“全部可见”，会把整个目录都丢进缩略图队列。
+        # 大目录如果在这个瞬间被误判成"全部可见"，会把整个目录都丢进缩略图队列。
         # 因此这里按当前 viewport 容量做一次保守估算；只有确实装得下时才视为全部可见。
         grid = self._list_widget.gridSize()
         # 首次切到缩略图模式时，Qt layout 可能尚未完成，滚动条最大值仍为 0。
-        # 大目录如果在这一瞬间被误判成“全部可见”，会把整批文件直接丢进缩略图队列。
+        # 大目录如果在这一瞬间被误判成"全部可见"，会把整批文件直接丢进缩略图队列。
         # 这里按当前 viewport 容量做保守估算，只覆盖首屏附近。
         grid = self._list_widget.gridSize()
         grid = self._list_widget.gridSize()
@@ -5934,10 +5965,7 @@ class FileListPanel(QWidget):
         if self._view_mode == mode and self._stack.currentIndex() == (0 if mode == self._MODE_LIST else 1):
             self._update_selection_status()
             return
-        selected_paths = self._active_view_selected_paths()
-        current_path = self._active_view_current_path()
-        if not selected_paths and current_path:
-            selected_paths = [current_path]
+        selected_paths, current_path = self._capture_selection_restore_state()
         self._view_mode = mode
         self._btn_list.setChecked(mode == self._MODE_LIST)
         self._btn_thumb.setChecked(mode == self._MODE_THUMB)
@@ -5968,6 +5996,7 @@ class FileListPanel(QWidget):
                 self._tree_widget.sortByColumn(self._tree_last_sort_column, self._tree_last_sort_order)
                 self._refresh_tree_row_numbers()
         if selected_paths:
+            self._request_selection_visibility_restore(current_path or selected_paths[0], reason="set_view_mode")
             self.set_pending_selection(selected_paths, current_path=current_path)
         else:
             self._update_selection_status()
@@ -6186,44 +6215,43 @@ class FileListPanel(QWidget):
         self._pending_loaders = [l for l in self._pending_loaders if l.isRunning()]
 
     def _start_metadata_loader(self, paths: list) -> None:
-        report_cache_for_meta = self._report_full_cache or self._report_cache
         _log.info(
-            "[_start_metadata_loader] 启动元数据加载 EXIF paths=%s report_cache=%s full_report_cache=%s",
+            "[_start_metadata_loader] START paths=%s report_cache=%s full_report_cache=%s",
             len(paths),
             len(self._report_cache),
             len(self._report_full_cache or {}),
         )
-        _log.info("[_start_metadata_loader] START paths=%s", len(paths))
         self._stop_metadata_loader()
         total = len(paths)
         if total <= 0:
             _log.info("[_start_metadata_loader] no paths, return")
             return
-        self._meta_progress.setMaximum(total)
-        self._meta_progress.setValue(0)
-        self._meta_progress.show()
-        metadata_base_dir = self._report_root_dir or self._current_dir
-        loader = MetadataLoader(
-            paths,
-            report_cache=report_cache_for_meta,
-            current_dir=metadata_base_dir,
-        )
+        self._stop_pending_meta_apply()
+        self._begin_meta_apply_session(total)
+        loader = MetadataLoader(paths, meta_proxy=self._meta_proxy)
         loader.progress_updated.connect(self._on_metadata_progress)
-        loader.all_metadata_ready.connect(self._on_metadata_ready)
+        loader.metadata_batch_ready.connect(self._on_metadata_batch_ready)
+        loader.finished.connect(self._on_metadata_loader_finished)
         self._metadata_loader = loader
         loader.start()
-        _log.info("[_start_metadata_loader] MetadataLoader 已启动，EXIF 将来自 DB(report_cache) 或 read_batch(exiftool/XMP)")
+        _log.info("[_start_metadata_loader] MetadataLoader started via PhotoMetaDataProxy")
 
     def _stop_metadata_loader(self) -> None:
         if self._metadata_loader:
             self._detach_loader(
                 self._metadata_loader,
-                self._metadata_loader.all_metadata_ready,
-                self._on_metadata_ready,
+                self._metadata_loader.metadata_batch_ready,
+                self._on_metadata_batch_ready,
             )
             try:
                 self._metadata_loader.progress_updated.disconnect(
                     self._on_metadata_progress
+                )
+            except Exception:
+                pass
+            try:
+                self._metadata_loader.finished.disconnect(
+                    self._on_metadata_loader_finished
                 )
             except Exception:
                 pass
@@ -6533,6 +6561,7 @@ class FileListPanel(QWidget):
                     worker.wait(2500)
             except Exception:
                 pass
+        self._flush_selection_scroll_debug_summary()
         _log_thumb_bottleneck_summary()
         _shutdown_thumb_disk_writer(wait=True)
 
@@ -6548,17 +6577,55 @@ class FileListPanel(QWidget):
         timer.timeout.connect(self._apply_meta_batch_tick)
         self._meta_apply_timer = timer
 
-    def _stop_pending_meta_apply(self) -> None:
-        if self._meta_apply_timer is not None and self._meta_apply_timer.isActive():
-            self._meta_apply_timer.stop()
+    def _ensure_meta_filter_refresh_timer(self) -> None:
+        if self._meta_filter_refresh_timer is not None:
+            return
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(self._flush_meta_filter_refresh)
+        self._meta_filter_refresh_timer = timer
+
+    def _begin_meta_apply_session(self, expected_total: int) -> None:
+        self._ensure_meta_apply_timer()
+        self._ensure_meta_filter_refresh_timer()
         self._meta_apply_items = []
         self._meta_apply_index = 0
         self._meta_apply_total = 0
+        self._meta_apply_expected_total = max(0, int(expected_total or 0))
+        self._meta_apply_started_at = _time.perf_counter()
+        self._meta_apply_loop_started_at = self._meta_apply_started_at
+        self._meta_apply_tree_hits = 0
+        self._meta_apply_list_hits = 0
+        self._meta_apply_needs_filter = bool(self._filter_pick or self._filter_min_rating > 0 or self._filter_focus_status)
+        self._meta_apply_loader_finished = False
+        self._set_tree_header_fast_mode(True)
+        self._tree_widget.setSortingEnabled(False)
+        self._meta_progress.setMaximum(max(1, self._meta_apply_expected_total))
+        self._meta_progress.setValue(0)
+        self._meta_progress.show()
+        _log.info(
+            "[STAT][_meta_apply] begin tree_items=%s list_items=%s expected_total=%s batch=%s",
+            self._tree_source_row_count(),
+            self._thumb_row_count(),
+            self._meta_apply_expected_total,
+            _META_APPLY_BATCH_SIZE,
+        )
+
+    def _stop_pending_meta_apply(self) -> None:
+        if self._meta_apply_timer is not None and self._meta_apply_timer.isActive():
+            self._meta_apply_timer.stop()
+        if self._meta_filter_refresh_timer is not None and self._meta_filter_refresh_timer.isActive():
+            self._meta_filter_refresh_timer.stop()
+        self._meta_apply_items = []
+        self._meta_apply_index = 0
+        self._meta_apply_total = 0
+        self._meta_apply_expected_total = 0
         self._meta_apply_started_at = 0.0
         self._meta_apply_loop_started_at = 0.0
         self._meta_apply_tree_hits = 0
         self._meta_apply_list_hits = 0
         self._meta_apply_needs_filter = False
+        self._meta_apply_loader_finished = True
         self._set_tree_header_fast_mode(False)
 
     def _set_tree_header_fast_mode(self, enabled: bool) -> None:
@@ -6621,67 +6688,96 @@ class FileListPanel(QWidget):
             ordered.append((norm, meta))
         return ordered
 
-    def _start_meta_apply(self, meta_dict: dict) -> None:
-        self._stop_pending_meta_apply()
-        self._ensure_meta_apply_timer()
-        self._meta_apply_items = self._order_meta_items_by_file_list(meta_dict)
-        self._meta_apply_total = len(self._meta_apply_items)
-        self._meta_apply_index = 0
-        self._meta_apply_tree_hits = 0
-        self._meta_apply_list_hits = 0
-        self._meta_apply_started_at = _time.perf_counter()
-        self._meta_apply_loop_started_at = self._meta_apply_started_at
-        self._meta_apply_needs_filter = bool(self._filter_pick or self._filter_min_rating > 0 or self._filter_focus_status)
+    def _schedule_meta_filter_refresh(self) -> None:
+        if not self._meta_apply_needs_filter:
+            return
+        self._ensure_meta_filter_refresh_timer()
+        if self._meta_filter_refresh_timer is None or self._meta_filter_refresh_timer.isActive():
+            return
+        # 过滤重建比较重，这里只做节流刷新，避免每个 chunk 都重建一次全视图。
+        self._meta_filter_refresh_timer.start(120)
 
-        self._set_tree_header_fast_mode(True)
-        self._tree_widget.setSortingEnabled(False)
-        self._meta_progress.setMaximum(max(1, self._meta_apply_total))
-        self._meta_progress.setValue(0)
+    def _flush_meta_filter_refresh(self) -> None:
+        if not self._meta_apply_needs_filter:
+            return
+        _log.info(
+            "[STAT][_meta_apply] incremental filter refresh applied=%s queued=%s expected=%s",
+            self._meta_apply_index,
+            self._meta_apply_total,
+            self._meta_apply_expected_total,
+        )
+        self._apply_filter()
+        if not self._meta_apply_loader_finished or self._meta_apply_index < self._meta_apply_total:
+            self._set_tree_header_fast_mode(True)
+            self._tree_widget.setSortingEnabled(False)
+
+    def _enqueue_meta_apply(self, meta_dict: dict) -> None:
+        if not meta_dict:
+            return
+        ordered_batch = self._order_meta_items_by_file_list(meta_dict)
+        if not ordered_batch:
+            return
+        self._meta_apply_items.extend(ordered_batch)
+        self._meta_apply_total = len(self._meta_apply_items)
+        self._meta_progress.setMaximum(max(1, self._meta_apply_expected_total or self._meta_apply_total))
+        self._meta_progress.setValue(min(self._meta_apply_index, self._meta_progress.maximum()))
         self._meta_progress.show()
         _log.info(
-            "[STAT][_on_metadata_ready] apply_meta begin tree_items=%s list_items=%s batch=%s",
-            self._tree_source_row_count(),
-            self._thumb_row_count(),
-            _META_APPLY_BATCH_SIZE,
+            "[STAT][_meta_apply] enqueue batch=%s queued_total=%s applied=%s expected=%s",
+            len(ordered_batch),
+            self._meta_apply_total,
+            self._meta_apply_index,
+            self._meta_apply_expected_total,
         )
-        if self._meta_apply_timer is not None:
+        self._schedule_meta_filter_refresh()
+        if self._meta_apply_timer is not None and not self._meta_apply_timer.isActive():
             self._meta_apply_timer.start(1)
 
     def _finish_meta_apply(self) -> None:
+        if self._meta_filter_refresh_timer is not None and self._meta_filter_refresh_timer.isActive():
+            self._meta_filter_refresh_timer.stop()
         sort_t0 = _time.perf_counter()
-        _log.info("[STAT][_on_metadata_ready] enabling tree sorting")
+        _log.info("[STAT][_meta_apply] enabling tree sorting")
         self._set_tree_header_fast_mode(False)
         self._tree_widget.setSortingEnabled(True)
         self._tree_widget.sortByColumn(self._tree_last_sort_column, self._tree_last_sort_order)
         self._refresh_tree_row_numbers()
-        _log.info("[STAT][_on_metadata_ready] tree sorting enabled elapsed=%.3fs", _time.perf_counter() - sort_t0)
+        self._replay_selection_visibility_restore("finish_meta_apply.sort")
+        _log.info("[STAT][_meta_apply] tree sorting enabled elapsed=%.3fs", _time.perf_counter() - sort_t0)
 
         if self._view_mode == self._MODE_THUMB:
             paint_t0 = _time.perf_counter()
             self._list_widget.viewport().update()
             self._invalidate_visible_thumbnail_signature()
             self._schedule_visible_thumbnail_update()
-            _log.info("[STAT][_on_metadata_ready] list viewport updated elapsed=%.3fs", _time.perf_counter() - paint_t0)
+            _log.info("[STAT][_meta_apply] list viewport updated elapsed=%.3fs", _time.perf_counter() - paint_t0)
 
         if self._meta_apply_needs_filter:
-            _log.info("[_on_metadata_ready] _apply_filter")
+            _log.info("[_meta_apply] final _apply_filter")
             filter_t0 = _time.perf_counter()
             self._apply_filter()
-            _log.info("[STAT][_on_metadata_ready] _apply_filter elapsed=%.3fs", _time.perf_counter() - filter_t0)
+            _log.info("[STAT][_meta_apply] _apply_filter elapsed=%.3fs", _time.perf_counter() - filter_t0)
 
         self._meta_progress.setValue(self._meta_progress.maximum())
         QTimer.singleShot(400, self._meta_progress.hide)
+        elapsed = (_time.perf_counter() - self._meta_apply_started_at) if self._meta_apply_started_at > 0 else 0.0
         _log.info(
-            "[STAT][_on_metadata_ready] total elapsed=%.3fs",
-            _time.perf_counter() - self._meta_apply_started_at,
+            "[STAT][_meta_apply] total elapsed=%.3fs applied=%s queued_total=%s expected=%s",
+            elapsed,
+            self._meta_apply_index,
+            self._meta_apply_total,
+            self._meta_apply_expected_total,
         )
-        _log.info("[_on_metadata_ready] 目录文件列表 EXIF 已全部就绪 END")
+        _log.info("[_meta_apply] 目录文件列表 EXIF 已全部应用 END")
         self._stop_pending_meta_apply()
 
     def _apply_meta_batch_tick(self) -> None:
         total = self._meta_apply_total
-        if total <= 0:
-            self._finish_meta_apply()
+        if total <= 0 or self._meta_apply_index >= total:
+            if self._meta_apply_timer is not None and self._meta_apply_timer.isActive():
+                self._meta_apply_timer.stop()
+            if self._meta_apply_loader_finished:
+                self._finish_meta_apply()
             return
 
         start = self._meta_apply_index
@@ -6707,27 +6803,30 @@ class FileListPanel(QWidget):
 
         end = i
         self._meta_apply_index = end
-        self._meta_progress.setValue(end)
+        self._meta_progress.setValue(min(end, self._meta_progress.maximum()))
         if end % 1000 == 0 or end >= total:
             _log.info(
-                "[STAT][_on_metadata_ready] apply_meta progress=%s/%s tree_hits=%s list_hits=%s elapsed=%.3fs",
+                "[STAT][_meta_apply] apply_meta progress=%s/%s tree_hits=%s list_hits=%s expected=%s elapsed=%.3fs",
                 end,
                 total,
                 self._meta_apply_tree_hits,
                 self._meta_apply_list_hits,
+                self._meta_apply_expected_total,
                 _time.perf_counter() - self._meta_apply_loop_started_at,
             )
 
         if end >= total:
             _log.info(
-                "[STAT][_on_metadata_ready] apply_meta end tree_hits=%s list_hits=%s elapsed=%.3fs",
+                "[STAT][_meta_apply] apply_meta drained tree_hits=%s list_hits=%s loader_finished=%s elapsed=%.3fs",
                 self._meta_apply_tree_hits,
                 self._meta_apply_list_hits,
+                self._meta_apply_loader_finished,
                 _time.perf_counter() - self._meta_apply_loop_started_at,
             )
             if self._meta_apply_timer is not None:
                 self._meta_apply_timer.stop()
-            self._finish_meta_apply()
+            if self._meta_apply_loader_finished:
+                self._finish_meta_apply()
 
     # ── Slots ─────────────────────────────────────────────────────────────────
     def _on_thumbnail_ready(self, request_token: int, path: str, qimg) -> None:
@@ -6831,15 +6930,23 @@ class FileListPanel(QWidget):
             )
 
     def _on_metadata_progress(self, current: int, total: int) -> None:
-        """主线程槽：由 progress_updated 信号触发，安全更新进度条。"""
+        """主线程槽：由 progress_updated 信号触发，更新 metadata 总量基线。"""
         if total <= 0:
             return
-        self._meta_progress.setMaximum(total)
-        self._meta_progress.setValue(min(current, total))
+        self._meta_apply_expected_total = max(self._meta_apply_expected_total, int(total))
+        self._meta_progress.setMaximum(max(1, self._meta_apply_expected_total))
+        self._meta_progress.setValue(min(self._meta_apply_index, self._meta_progress.maximum()))
+        _log.debug(
+            "[_on_metadata_progress] loaded=%s/%s applied=%s queued=%s",
+            current,
+            total,
+            self._meta_apply_index,
+            self._meta_apply_total,
+        )
 
-    def _on_metadata_ready(self, meta_dict: dict) -> None:
-        _log.info("[_on_metadata_ready] 当前目录 EXIF 查询完成，共 %s 条，更新列表与缩略图", len(meta_dict))
-        _log.info("[_on_metadata_ready] START entries=%s", len(meta_dict))
+    def _on_metadata_batch_ready(self, meta_dict: dict) -> None:
+        _log.info("[_on_metadata_batch_ready] 收到 metadata 批次 %s 条，增量更新列表与缩略图", len(meta_dict))
+        _log.info("[_on_metadata_batch_ready] START entries=%s", len(meta_dict))
         t0 = _time.perf_counter()
         total = len(meta_dict)
         self._meta_cache.update(meta_dict)
@@ -6866,13 +6973,13 @@ class FileListPanel(QWidget):
             except Exception:
                 pass
         _log.info(
-            "[STAT][_on_metadata_ready] meta_cache updated entries=%s cache_size=%s elapsed=%.3fs",
+            "[STAT][_on_metadata_batch_ready] meta_cache updated entries=%s cache_size=%s elapsed=%.3fs",
             total,
             len(self._meta_cache),
             _time.perf_counter() - t0,
         )
         _log.info(
-            "[STAT][_on_metadata_ready] richness title=%s color=%s rating>0=%s city=%s state=%s country=%s",
+            "[STAT][_on_metadata_batch_ready] richness title=%s color=%s rating>0=%s city=%s state=%s country=%s",
             title_cnt,
             color_cnt,
             rating_pos_cnt,
@@ -6880,7 +6987,22 @@ class FileListPanel(QWidget):
             state_cnt,
             country_cnt,
         )
-        self._start_meta_apply(meta_dict)
+        self._enqueue_meta_apply(meta_dict)
+
+    def _on_metadata_loader_finished(self) -> None:
+        loader = self.sender()
+        if loader is not self._metadata_loader:
+            return
+        self._metadata_loader = None
+        self._meta_apply_loader_finished = True
+        _log.info(
+            "[_on_metadata_loader_finished] loader finished applied=%s queued_total=%s expected=%s",
+            self._meta_apply_index,
+            self._meta_apply_total,
+            self._meta_apply_expected_total,
+        )
+        if self._meta_apply_index >= self._meta_apply_total:
+            self._finish_meta_apply()
 
     def _emit_file_selected_for_path(self, path: str) -> None:
         """更新当前显示路径并发出 file_selected，供点击与键盘选择共用。"""
@@ -7005,7 +7127,7 @@ class FileListPanel(QWidget):
             return
         base_dir = self.get_current_dir() or ""
         for app in apps:
-            name = f"发送到：{(app.get("name") or app.get("path") or "未命名").strip()}"
+            name = f"发送到：{(app.get('name') or app.get('path') or '未命名').strip()}"
             act = menu.addAction(name)
             act.triggered.connect(lambda checked=False, a=app, p=paths: send_files_to_app(p, a, base_directory=base_dir))
 
