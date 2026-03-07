@@ -7192,15 +7192,104 @@ class FileListPanel(QWidget):
         act_delete.triggered.connect(lambda: self._move_paths_to_trash(paths))
         _exec_menu(menu, self._tree_widget.viewport().mapToGlobal(pos))
 
+    def _collect_report_filenames_for_paths(self, paths: list[str]) -> list[str]:
+        filenames: list[str] = []
+        seen: set[str] = set()
+        for path in paths or []:
+            norm_path = os.path.normpath(path) if path else ""
+            row = self._get_report_row_for_path(norm_path)
+            filename = str((row or {}).get("filename") or Path(norm_path).stem or "").strip()
+            if not filename or filename in seen:
+                continue
+            seen.add(filename)
+            filenames.append(filename)
+        return filenames
+
+    def _remove_report_cache_entries_for_filenames(self, filenames: list[str]) -> None:
+        filename_set = {str(name or "").strip() for name in filenames if str(name or "").strip()}
+        if not filename_set:
+            return
+        if isinstance(self._report_full_cache, dict):
+            for filename in filename_set:
+                self._report_full_cache.pop(filename, None)
+        if isinstance(self._report_cache, dict):
+            for filename in filename_set:
+                self._report_cache.pop(filename, None)
+        if self._report_row_by_path:
+            self._report_row_by_path = {
+                path: row
+                for path, row in self._report_row_by_path.items()
+                if str((row or {}).get("filename") or Path(path).stem or "").strip() not in filename_set
+            }
+        self._meta_proxy.report_db.update_cache(self._report_full_cache or self._report_cache)
+        _log.info(
+            "[_remove_report_cache_entries_for_filenames] removed=%s full_cache=%s selected_cache=%s path_map=%s",
+            len(filename_set),
+            len(self._report_full_cache or {}),
+            len(self._report_cache or {}),
+            len(self._report_row_by_path or {}),
+        )
+
+    def _delete_report_rows_for_paths(self, paths: list[str]) -> int:
+        filenames = self._collect_report_filenames_for_paths(paths)
+        if not filenames:
+            _log.info("[_delete_report_rows_for_paths] skip reason=no_filenames")
+            return 0
+        db_dir = self._report_root_dir or self._current_dir
+        db = ReportDB.open_if_exists(db_dir) if db_dir else None
+        if db is None:
+            _log.info("[_delete_report_rows_for_paths] skip db_dir=%r reason=no_report_db", db_dir)
+            return 0
+        try:
+            deleted = db.delete_photos_by_filenames(filenames)
+        except Exception as exc:
+            _log.warning(
+                "[_delete_report_rows_for_paths] db_dir=%r filenames=%s delete_failed: %s",
+                db_dir,
+                len(filenames),
+                exc,
+            )
+            return 0
+        finally:
+            db.close()
+        self._remove_report_cache_entries_for_filenames(filenames)
+        _log.info(
+            "[_delete_report_rows_for_paths] db_dir=%r filenames=%s deleted=%s",
+            db_dir,
+            len(filenames),
+            deleted,
+        )
+        return deleted
+
     def _move_paths_to_trash(self, paths: list) -> None:
-        """将选中路径移动到垃圾桶并刷新当前目录列表。"""
+        """将选中路径移动到垃圾桶，并同步删除 report.db 中对应记录。"""
         if not paths:
             return
         ok_count = 0
+        moved_display_paths: list[str] = []
         for p in paths:
-            if p and os.path.exists(p):
-                if move_to_trash(p):
+            norm_path = os.path.normpath(p) if p else ""
+            if not norm_path:
+                continue
+            target_path = self._resolve_source_path_for_action(norm_path)
+            target_path = os.path.normpath(target_path) if target_path else norm_path
+            if target_path and os.path.exists(target_path):
+                if move_to_trash(target_path):
                     ok_count += 1
+                    moved_display_paths.append(norm_path)
+                    _log.info(
+                        "[_move_paths_to_trash] moved source=%r target=%r",
+                        norm_path,
+                        target_path,
+                    )
+            else:
+                _log.info(
+                    "[_move_paths_to_trash] skip source=%r target=%r reason=missing",
+                    norm_path,
+                    target_path,
+                )
+        if moved_display_paths:
+            self._delete_report_rows_for_paths(moved_display_paths)
         if ok_count and self._current_dir:
             self.load_directory(self._current_dir, force_reload=True)
 

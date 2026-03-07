@@ -87,8 +87,15 @@ def _on_preview_overlay_toggled(self, _checked: bool) -> None:
 **机型扩展方式（后续新增相机时）**
 1. 在 `app_common/focus_calc.py:16` 给 `CameraFocusType` 加新枚举
 2. 在 `app_common/focus_calc.py:198` 的 `_CAMERA_MODEL_TO_FOCUS_TYPE` 增加机型映射
-3. 新增该机型的提取函数（point/box）
-4. 注册到 `_FOCUS_POINT_EXTRACTORS` / `_FOCUS_BOX_EXTRACTORS`
+3. 如该机型/文件容器的竖拍判断不能只靠标准 EXIF，新增一个 orientation resolver，并注册到 `_FOCUS_ORIENTATION_RESOLVERS`
+4. 新增该机型的提取函数（point/box）
+5. 注册到 `_FOCUS_POINT_EXTRACTORS` / `_FOCUS_BOX_EXTRACTORS`
+
+**方向检测扩展提醒（给 AI Coding 工具）**
+- 不要把厂商专用横竖判断直接散落到 `main.py` 或 GUI 事件里。
+- 请优先在 `app_common/focus_calc.py` 新增小型 resolver，再注册到 `_FOCUS_ORIENTATION_RESOLVERS`。
+- 保持“标准 EXIF 在前，厂商私有字段 fallback 在后”的顺序，避免改坏现有 JPEG/RAW 行为。
+- 每次扩展至少用该机型一张横图和一张竖图做焦点框回归验证。
 
 **注意点**
 - `focus_calc` 是纯计算模块（无 GUI 依赖），适合在 CLI/服务端复用。

@@ -1066,6 +1066,43 @@ class ReportDB:
         _log.info("[ReportDB.update_ratings_batch] 完成 count=%s", count)
         return count
 
+    def delete_photos_by_filenames(self, filenames: List[str]) -> int:
+        """
+        按 filename 批量删除照片记录。
+
+        Args:
+            filenames: 照片文件名列表（不含扩展名）
+
+        Returns:
+            实际删除的记录数
+        """
+        _log.info("[ReportDB.delete_photos_by_filenames] requested=%s", len(filenames or []))
+        unique_filenames: list[str] = []
+        seen: set[str] = set()
+        for filename in filenames or []:
+            name = str(filename or "").strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            unique_filenames.append(name)
+        if not unique_filenames:
+            _log.info("[ReportDB.delete_photos_by_filenames] 无有效 filename 返回 0")
+            return 0
+
+        placeholders = ", ".join(["?"] * len(unique_filenames))
+        sql = f"DELETE FROM photos WHERE filename IN ({placeholders})"
+
+        with self._lock:
+            cursor = self._conn.execute(sql, unique_filenames)
+            self._safe_commit()
+            deleted = cursor.rowcount if cursor.rowcount is not None and cursor.rowcount >= 0 else 0
+        _log.info(
+            "[ReportDB.delete_photos_by_filenames] 完成 requested=%s deleted=%s",
+            len(unique_filenames),
+            deleted,
+        )
+        return deleted
+
     def clear_cache_paths(self) -> int:
         """清空缓存相关路径字段（临时 JPG、调试裁切、YOLO 调试图）。"""
         _log.info("[ReportDB.clear_cache_paths]")
