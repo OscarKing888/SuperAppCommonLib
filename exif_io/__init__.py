@@ -25,6 +25,13 @@ from app_common.exif_io.writer import (
 )
 from app_common.exif_io.writer import _get_exiftool_tag_target  # 供 main 读路径使用
 from app_common.exif_io.xmp_sidecar import find_xmp_sidecar, read_xmp_sidecar
+from app_common.exif_io.photo_meta import (
+    PhotoMetaData,
+    PhotoMetaDataEXIFEmbeded,
+    PhotoMetaDataXMP,
+    PhotoMetaDataReportDB,
+    PhotoMetaDataProxy,
+)
 
 __all__ = [
     "get_exiftool_executable_path",
@@ -44,4 +51,10 @@ __all__ = [
     "extract_many_with_xmp_priority",
     "extract_pillow_metadata",
     "extract_metadata_with_xmp_priority",
+    # OOD metadata abstraction
+    "PhotoMetaData",
+    "PhotoMetaDataEXIFEmbeded",
+    "PhotoMetaDataXMP",
+    "PhotoMetaDataReportDB",
+    "PhotoMetaDataProxy",
 ]
