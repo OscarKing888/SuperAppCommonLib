@@ -121,6 +121,48 @@ def resolve_existing_report_db_path(directory: str) -> Optional[str]:
     return paths[0] if paths else None
 
 
+def find_superpicky_report_db_paths(directory: str, max_levels: int = 3) -> List[str]:
+    """
+    从给定目录开始向上查找 `.superpicky/report.db`，返回命中的数据库路径列表。
+
+    说明：
+    - depth=0 表示 ``directory`` 自身。
+    - ``max_levels=3`` 表示最多检查当前目录及向上 3 层父目录。
+    - 仅匹配 `.superpicky/report.db`，不包含裸 `report.db`。
+    """
+    if not directory or max_levels < 0:
+        return []
+    try:
+        cur = os.path.normpath(directory)
+        last = None
+        depth = 0
+        found: List[str] = []
+        seen: set[str] = set()
+        while cur and cur != last:
+            if depth > max_levels:
+                break
+            candidate = os.path.normpath(os.path.join(cur, ".superpicky", ReportDB.DB_FILENAME))
+            candidate_key = os.path.normcase(candidate)
+            if candidate_key not in seen and os.path.isfile(candidate):
+                seen.add(candidate_key)
+                found.append(candidate)
+            last = cur
+            parent = os.path.dirname(cur)
+            if not parent or parent == cur:
+                break
+            cur = parent
+            depth += 1
+        return found
+    except Exception as e:
+        _log.warning(
+            "[find_superpicky_report_db_paths] 失败 directory=%r max_levels=%r: %s",
+            directory,
+            max_levels,
+            e,
+        )
+        return []
+
+
 def find_report_root(directory: str, max_levels: Optional[int] = None) -> Optional[str]:
     """
     从给定目录开始向上查找，返回最近一个包含 report.db 的目录路径。
