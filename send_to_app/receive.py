@@ -295,9 +295,32 @@ def get_initial_file_list_from_argv(argv: list[str] | None = None) -> list[str]:
     return normalize_file_paths(paths)
 
 
-def _server_name(app_id: str) -> str:
-    """生成当前用户下唯一的 IPC 名称（QLocalServer：Windows Named Pipe / macOS Unix socket）。"""
-    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in (app_id or ""))
+def _canonicalize_app_id(app_id: str) -> str:
+    """将显示名/配置名归一为稳定 app_id，避免大小写、空格差异导致 IPC 断开。"""
+    raw = str(app_id or "").strip()
+    if not raw:
+        return "default"
+
+    collapsed = "".join(ch.lower() for ch in raw if ch.isalnum())
+    if collapsed:
+        return collapsed
+
+    safe = "".join(ch.lower() if ch.isalnum() or ch in "-_" else "_" for ch in raw)
+    safe = safe.strip("_")
+    return safe or "default"
+
+
+def _legacy_safe_app_id(app_id: str) -> str:
+    """保留旧版本的 app_id 命名方式，便于热发送协议向后兼容。"""
+    raw = str(app_id or "").strip()
+    if not raw:
+        return "default"
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in raw)
+    safe = safe.strip("_")
+    return safe or "default"
+
+
+def _server_name_from_safe_id(safe: str) -> str:
     if sys.platform == "win32":
         uid = os.environ.get("USERNAME", "default").strip() or "default"
     else:
@@ -310,6 +333,24 @@ def _server_name(app_id: str) -> str:
         # Windows Named Pipe 名称长度上限 256，且仅允许部分字符
         name = name[:200].replace("\\", "_")
     return name
+
+
+def _server_names(app_id: str) -> list[str]:
+    """按新旧两种 app_id 规则生成 IPC 名称，优先尝试稳定归一化结果。"""
+    names: list[str] = []
+    seen: set[str] = set()
+    for safe in (_canonicalize_app_id(app_id), _legacy_safe_app_id(app_id)):
+        name = _server_name_from_safe_id(safe)
+        if name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return names or [_server_name_from_safe_id("default")]
+
+
+def _server_name(app_id: str) -> str:
+    """返回首选 IPC 名称，保留给旧调用点与诊断脚本使用。"""
+    return _server_names(app_id)[0]
 
 
 def _send_via_socket(server_name: str, file_paths: list[str]) -> bool:
@@ -360,8 +401,8 @@ class SingleInstanceReceiver:
     def __init__(self, app_id: str, on_files_received: Callable[[list[str]], None]):
         self._app_id = app_id
         self._on_files = on_files_received
-        self._server = None
-        self._name = _server_name(app_id)
+        self._servers: list[Any] = []
+        self._names = _server_names(app_id)
 
     def start(self) -> bool:
         """创建并监听本地 socket。若已被占用则返回 False（表示本进程应为第二实例）。"""
@@ -369,46 +410,64 @@ class SingleInstanceReceiver:
         if QtNetwork is None:
             _log.warning("receiver start failed: QtNetwork is unavailable")
             return False
+
+        for name in self._names:
+            if _can_connect_to_server(name):
+                _log.info("receiver start skipped; active instance already listening on name=%s", name)
+                return False
+
+        started_servers: list[Any] = []
+        for name in self._names:
+            server = self._listen_one_name(QtNetwork, name)
+            if server is not None:
+                started_servers.append(server)
+        if not started_servers:
+            return False
+        self._servers = started_servers
+        return True
+
+    def _listen_one_name(self, QtNetwork: Any, name: str) -> Any | None:
+        """监听单个 IPC 名称；若发现残留 socket 则清理后重试。"""
         QLocalServer = QtNetwork.QLocalServer
-        self._server = QLocalServer()
-        if not self._server.listen(self._name):
-            error_text = self._server.errorString()
-            if not _can_connect_to_server(self._name):
+        server = QLocalServer()
+        if not server.listen(name):
+            error_text = server.errorString()
+            if not _can_connect_to_server(name):
                 removed = False
                 try:
-                    removed = bool(QLocalServer.removeServer(self._name))
+                    removed = bool(QLocalServer.removeServer(name))
                 except Exception:
                     removed = False
                 _log.warning(
                     "receiver listen failed with stale socket; name=%s error=%s removed=%s",
-                    self._name,
+                    name,
                     error_text,
                     removed,
                 )
-                if removed and self._server.listen(self._name):
+                if removed and server.listen(name):
                     try:
                         _log.info(
                             "receiver listen recovered after stale socket cleanup; name=%s full=%s",
-                            self._name,
-                            self._server.fullServerName(),
+                            name,
+                            server.fullServerName(),
                         )
                     except Exception:
-                        _log.info("receiver listen recovered after stale socket cleanup; name=%s", self._name)
-                    self._server.newConnection.connect(self._on_connection)
-                    return True
-            _log.warning("receiver listen failed; name=%s error=%s", self._name, error_text)
-            return False
+                        _log.info("receiver listen recovered after stale socket cleanup; name=%s", name)
+                    server.newConnection.connect(lambda s=server: self._on_connection(s))
+                    return server
+            _log.warning("receiver listen failed; name=%s error=%s", name, error_text)
+            return None
         try:
-            _log.info("receiver listening; name=%s full=%s", self._name, self._server.fullServerName())
+            _log.info("receiver listening; name=%s full=%s", name, server.fullServerName())
         except Exception:
-            _log.info("receiver listening; name=%s", self._name)
-        self._server.newConnection.connect(self._on_connection)
-        return True
+            _log.info("receiver listening; name=%s", name)
+        server.newConnection.connect(lambda s=server: self._on_connection(s))
+        return server
 
-    def _on_connection(self) -> None:
-        if not self._server:
+    def _on_connection(self, server: Any) -> None:
+        if server is None:
             return
-        conn = self._server.nextPendingConnection()
+        conn = server.nextPendingConnection()
         if not conn:
             return
         done = []
@@ -443,18 +502,22 @@ class SingleInstanceReceiver:
             conn.deleteLater()
 
     def stop(self) -> None:
-        if self._server:
-            self._server.close()
-            self._server = None
+        for server in self._servers:
+            try:
+                server.close()
+            except Exception:
+                pass
+        self._servers = []
         _, QtNetwork, _ = _load_qt_modules(need_network=True)
         if QtNetwork is None:
             return
         QLocalServer = QtNetwork.QLocalServer
-        try:
-            removed = bool(QLocalServer.removeServer(self._name))
-            _log.info("receiver stopped; name=%s removed=%s", self._name, removed)
-        except Exception:
-            pass
+        for name in self._names:
+            try:
+                removed = bool(QLocalServer.removeServer(name))
+                _log.info("receiver stopped; name=%s removed=%s", name, removed)
+            except Exception:
+                pass
 
 
 def send_file_list_to_running_app(app_id: str, file_paths: list[str]) -> bool:
@@ -466,4 +529,7 @@ def send_file_list_to_running_app(app_id: str, file_paths: list[str]) -> bool:
     normalized_paths = normalize_file_paths(file_paths)
     if not normalized_paths:
         return False
-    return _send_via_socket(_server_name(app_id), normalized_paths)
+    for server_name in _server_names(app_id):
+        if _send_via_socket(server_name, normalized_paths):
+            return True
+    return False
