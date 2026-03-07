@@ -384,14 +384,95 @@ def parse_focus_orientation(value: Any) -> int:
     return 1
 
 
-def resolve_focus_orientation(raw: dict[str, Any]) -> int:
-    """Resolve EXIF Orientation from metadata for display-coordinate mapping."""
+def _resolve_focus_orientation_from_keys(
+    lookup: dict[str, Any],
+    keys: tuple[str, ...],
+) -> int | None:
+    for key in keys:
+        value = lookup.get(key)
+        orientation = parse_focus_orientation(value)
+        if orientation != 1 or value is not None:
+            return orientation
+    return None
+
+
+_FocusOrientationResolver = Callable[[dict[str, Any], dict[str, Any], CameraFocusType], int | None]
+
+
+def _resolve_standard_focus_orientation(
+    raw: dict[str, Any],
+    lookup: dict[str, Any],
+    camera_type: CameraFocusType,
+) -> int | None:
+    del raw, camera_type
+    return _resolve_focus_orientation_from_keys(
+        lookup,
+        ("orientation", "exif:orientation", "ifd0:orientation"),
+    )
+
+
+def _resolve_sony_focus_orientation(
+    raw: dict[str, Any],
+    lookup: dict[str, Any],
+    camera_type: CameraFocusType,
+) -> int | None:
+    del raw, camera_type
+    # Sony HIF/HEIF 竖拍样本经常没有标准 EXIF Orientation，
+    # 但会把真实显示方向写在 CameraOrientation 里。
+    return _resolve_focus_orientation_from_keys(
+        lookup,
+        ("sony:cameraorientation", "cameraorientation"),
+    )
+
+
+_DEFAULT_FOCUS_ORIENTATION_RESOLVERS: tuple[_FocusOrientationResolver, ...] = (
+    _resolve_standard_focus_orientation,
+)
+_SONY_FOCUS_ORIENTATION_RESOLVERS: tuple[_FocusOrientationResolver, ...] = (
+    _resolve_standard_focus_orientation,
+    _resolve_sony_focus_orientation,
+)
+
+# AI Coding 扩展说明：
+# 1. 新增机型/文件家族的横竖检测时，优先新增一个小 resolver 函数；
+# 2. 再把 resolver 注册到这个表，不要把厂商分支散落到调用方；
+# 3. 请先保留标准 EXIF resolver 在前，再补厂商私有字段 fallback；
+# 4. 扩展前务必用该机型真实横图/竖图样本各验证一次，避免误用别家私有标签语义。
+_FOCUS_ORIENTATION_RESOLVERS: dict[CameraFocusType, tuple[_FocusOrientationResolver, ...]] = {
+    CameraFocusType.UNKNOWN: _DEFAULT_FOCUS_ORIENTATION_RESOLVERS,
+    CameraFocusType.SONY_GENERIC: _SONY_FOCUS_ORIENTATION_RESOLVERS,
+    CameraFocusType.ILCE_A1M2: _SONY_FOCUS_ORIENTATION_RESOLVERS,
+}
+
+
+def resolve_focus_display_orientation(
+    raw: dict[str, Any],
+    camera_type: CameraFocusType | str | None = None,
+) -> int:
+    """
+    Resolve the display orientation used by focus overlay mapping.
+
+    标准 EXIF Orientation 永远优先；仅当它缺失时，才尝试机型/厂商私有字段。
+    这样既能修正 Sony HIF/HEIF 竖拍焦点框错位，也尽量不改变现有 JPEG/RAW 行为。
+    """
     lookup = normalize_lookup(raw)
-    for key in ("orientation", "exif:orientation", "ifd0:orientation"):
-        orientation = parse_focus_orientation(lookup.get(key))
-        if orientation != 1 or lookup.get(key) is not None:
+    resolved_camera_type = _coerce_camera_type(camera_type, raw=raw)
+    resolvers = _FOCUS_ORIENTATION_RESOLVERS.get(resolved_camera_type)
+    if not resolvers:
+        resolvers = _FOCUS_ORIENTATION_RESOLVERS[CameraFocusType.UNKNOWN]
+    for resolver in resolvers:
+        orientation = resolver(raw, lookup, resolved_camera_type)
+        if orientation is not None:
             return orientation
     return 1
+
+
+def resolve_focus_orientation(
+    raw: dict[str, Any],
+    camera_type: CameraFocusType | str | None = None,
+) -> int:
+    """Backward-compatible alias for resolve_focus_display_orientation()."""
+    return resolve_focus_display_orientation(raw, camera_type=camera_type)
 
 
 def transform_focus_box_by_orientation(
@@ -502,7 +583,10 @@ def extract_focus_box_for_display(
     source_box = extract_focus_box(raw, calc_width, calc_height, camera_type=camera_type)
     if source_box is None:
         return None
-    return transform_focus_box_by_orientation(source_box, resolve_focus_orientation(raw))
+    return transform_focus_box_by_orientation(
+        source_box,
+        resolve_focus_display_orientation(raw, camera_type=camera_type),
+    )
 
 
 def get_focus_point_for_display(
@@ -516,7 +600,10 @@ def get_focus_point_for_display(
     source_point = get_focus_point(raw, calc_width, calc_height, camera_type=camera_type)
     if source_point is None:
         return None
-    return transform_focus_point_by_orientation(source_point, resolve_focus_orientation(raw))
+    return transform_focus_point_by_orientation(
+        source_point,
+        resolve_focus_display_orientation(raw, camera_type=camera_type),
+    )
 
 
 def _extract_focus_point_sony(raw: dict[str, Any], width: int, height: int) -> tuple[float, float] | None:
@@ -672,6 +759,7 @@ __all__ = [
     "clamp01",
     "normalize_lookup",
     "parse_focus_orientation",
+    "resolve_focus_display_orientation",
     "resolve_focus_orientation",
     "resolve_focus_camera_type",
     "resolve_focus_camera_type_from_metadata",

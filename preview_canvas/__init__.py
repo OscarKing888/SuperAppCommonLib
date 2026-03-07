@@ -33,17 +33,25 @@ Example::
     canvas.set_focus_box((0.3, 0.4, 0.7, 0.6))
 """
 from app_common.preview_canvas.canvas import (
+    PREVIEW_COMPOSITION_GRID_LINE_WIDTHS,
+    PREVIEW_COMPOSITION_GRID_MODES,
     PreviewCanvas,
     PreviewOverlayOptions,
     PreviewOverlayState,
     PreviewWithStatusBar,
     draw_checker_background,
+    normalize_preview_composition_grid_line_width,
+    normalize_preview_composition_grid_mode,
 )
 
 __all__ = [
+    "PREVIEW_COMPOSITION_GRID_LINE_WIDTHS",
+    "PREVIEW_COMPOSITION_GRID_MODES",
     "PreviewCanvas",
     "PreviewOverlayState",
     "PreviewOverlayOptions",
     "PreviewWithStatusBar",
     "draw_checker_background",
+    "normalize_preview_composition_grid_line_width",
+    "normalize_preview_composition_grid_mode",
 ]

@@ -14,12 +14,14 @@ from app_common.focus_calc import (
     get_focus_point_for_display,
     resolve_focus_camera_type,
     resolve_focus_camera_type_from_metadata,
+    resolve_focus_display_orientation,
 )
 
 __all__ = [
     "CameraFocusType",
     "resolve_focus_camera_type",
     "resolve_focus_camera_type_from_metadata",
+    "resolve_focus_display_orientation",
     "get_focus_point",
     "get_focus_point_for_display",
     "extract_focus_box",
