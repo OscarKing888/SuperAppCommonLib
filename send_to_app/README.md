@@ -4,7 +4,7 @@
 
 ## 配置
 
-- **配置文件**：与主程序同目录下的 `extern_app.json`（可由调用方通过 `config_dir` 指定）。
+- **配置文件**：默认位于用户目录下的 `extern_app.json`（可由调用方通过 `config_dir` 指定）。
 - **格式**：`{"apps": [{"name": "显示名", "path": "应用路径", "app_id": "可选热接收ID"}, ...]}`
 
 ## 核心（无 UI）
@@ -34,7 +34,7 @@
 
 - **Windows**：发送用 `QProcess.startDetached(exe, [file1, file2, ...])`；单例 IPC 使用 Named Pipe（`QLocalServer`）；选择应用时过滤器为 `*.exe`，初始目录为 `ProgramFiles`。
 - **macOS**：发送用 `open -a App 文件1 文件2 ...`，`resolve_app_path` 处理 `.app` 与 Adobe 风格目录；单例 IPC 使用 Unix domain socket；选择应用时过滤器为 `*.app`，初始目录为 `/Applications`。
-- 路径统一使用 `os.path`，不写死 `/` 或 `\\`；配置文件与主程序同目录，两平台通用。
+- 路径统一使用 `os.path`，不写死 `/` 或 `\\`；默认配置写入用户目录，避免写入源码目录或 macOS app bundle。
 
 ## 使用约定
 

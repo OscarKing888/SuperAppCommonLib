@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 send_to_app 配置：从独立的 extern_app.json 读取/写入外部应用列表。
-配置文件与主程序同目录（或由调用方指定 config_dir）。跨平台：Windows / macOS。
+默认写入用户目录（也可由调用方通过 config_dir 指定）。跨平台：Windows / macOS。
 支持可选 app_id，用于按本地 socket 协议热发送到已运行实例。
 """
 from __future__ import annotations
@@ -12,6 +12,8 @@ import sys
 from typing import Any
 
 CONFIG_FILENAME = "extern_app.json"
+APP_CONFIG_DIRNAME = "SuperViewer"
+LEGACY_APP_CONFIG_DIRNAMES = ("BirdStamp",)
 
 
 def _normalize_app_entry(item: Any) -> dict[str, str] | None:
@@ -28,40 +30,55 @@ def _normalize_app_entry(item: Any) -> dict[str, str] | None:
     return normalized
 
 
-def _user_config_dir() -> str:
-    """打包后使用用户可写目录，避免写入 macOS app bundle。"""
+def _build_user_config_dir(app_dir_name: str) -> str:
+    """按应用目录名返回跨平台用户配置目录。"""
     if sys.platform == "win32":
         base = (
             os.environ.get("APPDATA")
             or os.environ.get("LOCALAPPDATA")
             or os.path.join(os.path.expanduser("~"), "AppData", "Roaming")
         )
-        return os.path.join(base, "BirdStamp")
+        return os.path.join(base, app_dir_name)
     if sys.platform == "darwin":
-        return os.path.join(os.path.expanduser("~"), "Library", "Application Support", "BirdStamp")
+        return os.path.join(os.path.expanduser("~"), "Library", "Application Support", app_dir_name)
     return os.path.join(
         os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config"),
-        "BirdStamp",
+        app_dir_name,
     )
 
 
-def _legacy_frozen_config_path() -> str | None:
-    """兼容旧版本：曾将 extern_app.json 放在可执行文件旁边。"""
-    if not getattr(sys, "frozen", False):
-        return None
-    legacy = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), CONFIG_FILENAME)
-    return legacy if os.path.isfile(legacy) else None
+def _user_config_dir() -> str:
+    """返回当前应用默认使用的用户配置目录。"""
+    return _build_user_config_dir(APP_CONFIG_DIRNAME)
 
 
-def _default_config_dir() -> str:
-    """开发态使用项目目录，打包态使用用户可写目录。"""
+def _local_config_dir() -> str:
+    """返回历史版本曾使用的程序目录（源码运行时为脚本目录，打包后为可执行文件目录）。"""
     if getattr(sys, "frozen", False):
-        return _user_config_dir()
+        return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(sys.argv[0] if sys.argv else "."))
 
 
+def _legacy_config_paths() -> list[str]:
+    """兼容旧版本：曾将 extern_app.json 放在程序目录或旧的用户目录名下。"""
+    candidates: list[str] = []
+    for legacy_dir_name in LEGACY_APP_CONFIG_DIRNAMES:
+        legacy_user_path = os.path.join(_build_user_config_dir(legacy_dir_name), CONFIG_FILENAME)
+        if os.path.isfile(legacy_user_path):
+            candidates.append(legacy_user_path)
+    legacy_local_path = os.path.join(_local_config_dir(), CONFIG_FILENAME)
+    if os.path.isfile(legacy_local_path):
+        candidates.append(legacy_local_path)
+    return candidates
+
+
+def _default_config_dir() -> str:
+    """默认使用用户可写目录，避免配置文件落到源码目录或 macOS app bundle。"""
+    return _user_config_dir()
+
+
 def get_config_path(config_dir: str | None = None) -> str:
-    """返回 extern_app.json 的完整路径。config_dir 为空时使用默认程序目录。"""
+    """返回 extern_app.json 的完整路径。config_dir 为空时使用默认用户目录。"""
     base = config_dir if config_dir else _default_config_dir()
     return os.path.join(base, CONFIG_FILENAME)
 
@@ -80,9 +97,11 @@ def load_config(config_path: str | None = None, config_dir: str | None = None) -
     out: dict[str, Any] = {"apps": []}
     if not os.path.isfile(path):
         if config_path is None and config_dir is None:
-            legacy = _legacy_frozen_config_path()
-            if legacy and os.path.isfile(legacy):
+            for legacy in _legacy_config_paths():
+                if os.path.normcase(os.path.normpath(legacy)) == os.path.normcase(os.path.normpath(path)):
+                    continue
                 path = legacy
+                break
             else:
                 return out
         else:

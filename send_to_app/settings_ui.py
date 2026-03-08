@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 发送到外部应用 - 设置 UI：编辑 extern_app.json 中的应用列表。
-由主程序在需要时打开（如菜单「外部应用设置」），config_dir 由主程序传入。
+由主程序在需要时打开（如菜单「外部应用设置」），默认读写用户目录中的配置文件。
 跨平台：Windows / macOS，选择应用时按平台使用不同文件过滤器。
 """
 from __future__ import annotations
@@ -85,7 +85,7 @@ def show_external_apps_settings_dialog(
 ) -> None:
     """
     显示「外部应用」设置对话框，从 extern_app.json 读写。
-    config_dir: 与主程序同目录，若为 None 则使用 send_to_app 默认目录。
+    config_dir: 可选，显式指定配置目录；为 None 时使用 send_to_app 默认用户目录。
     on_saved: 保存后回调（可用来刷新菜单等）。
     """
     (
