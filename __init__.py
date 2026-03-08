@@ -28,8 +28,8 @@ __all__ = [
 ]
 
 try:
-    from app_common.about_dialog import load_about_info, show_about_dialog
-    __all__.extend(["show_about_dialog", "load_about_info"])
+    from app_common.about_dialog import load_about_images, load_about_info, show_about_dialog
+    __all__.extend(["show_about_dialog", "load_about_info", "load_about_images"])
 except ModuleNotFoundError as exc:
     if not str(getattr(exc, "name", "")).startswith("PyQt"):
         raise

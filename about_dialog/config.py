@@ -73,6 +73,8 @@ def _load_images_from_file(path: str, base_dir: str | None = None) -> list[dict]
         if not raw_path or not isinstance(raw_path, str):
             continue
         resolved = raw_path if os.path.isabs(raw_path) else os.path.normpath(os.path.join(_base, raw_path))
+        if not os.path.isfile(resolved):
+            continue
         result.append({
             "path": resolved,
             "label": _sanitize(str(item.get("label", ""))),
