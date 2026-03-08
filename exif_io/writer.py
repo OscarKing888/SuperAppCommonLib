@@ -324,9 +324,9 @@ _METADATA_CACHE: dict[str, dict] = {}
 _METADATA_CACHE_MAX = 20000  # 超过后按 FIFO 淘汰
 _METADATA_CACHE_LOCK = threading.Lock()  # 多线程读写缓存时加锁
 
-#: 文件列表视图默认读取的标签列表（exiftool -G1 风格）
-# 标题、对焦状态等依赖 XMP/侧载；与 _XMP_INDICATORS 一致，便于 exiftool 与 sidecar 合并。
-DEFAULT_METADATA_TAGS: list[str] = [
+#: 文件列表视图基础标签（exiftool -G1 风格）。
+#: 标题、对焦状态等依赖 XMP/侧载；与 _XMP_INDICATORS 一致，便于 exiftool 与 sidecar 合并。
+_BROWSER_METADATA_TAGS: list[str] = [
     "-XMP-dc:Title", "-XMP-dc:title",  # 标题（sidecar 常用小写 dc:title）
     "-XMP-xmp:Label",
     "-XMP-xmp:Rating",
@@ -344,6 +344,76 @@ DEFAULT_METADATA_TAGS: list[str] = [
     "-IPTC:Country-PrimaryLocationName",
     "-IFD0:XPTitle",
 ]
+
+#: 焦点/横竖/尺寸批量预热所需标签。
+#:
+#: 设计约束：
+#: 1. 文件列表加载元信息时，会顺手把“显示对焦点”所需的文件内 metadata 也读出来；
+#: 2. 这里必须只放“可批量、可复用”的标签，避免把 GUI 预览里的焦点逻辑散落到调用方；
+#: 3. 后续新增机型时，优先在 focus_calc 里扩展解析器，再把对应原始标签补到这里；
+#: 4. 不要轻易删除这些标签，否则会退化成“只有选中过的文件才有焦点缓存”。
+FOCUS_METADATA_TAGS: list[str] = [
+    "-Make",
+    "-Model",
+    "-CameraModelName",
+    "-Manufacturer",
+    "-ExifImageWidth",
+    "-ExifImageHeight",
+    "-ImageWidth",
+    "-ImageHeight",
+    "-RawImageWidth",
+    "-RawImageHeight",
+    "-File:ImageWidth",
+    "-File:ImageHeight",
+    "-Composite:ImageSize",
+    "-Orientation",
+    "-Sony:CameraOrientation",
+    "-SubjectArea",
+    "-SubjectLocation",
+    "-FocusLocation",
+    "-FocusLocation2",
+    "-AFPoint",
+    "-FocusFrameSize",
+    "-FocusFrameSize2",
+    "-Composite:FocusX",
+    "-Composite:FocusY",
+    "-Composite:FocusW",
+    "-Composite:FocusH",
+    "-FocusX",
+    "-FocusY",
+    "-FocusW",
+    "-FocusH",
+    "-RegionInfo:RegionsRegionListRegionAreaX",
+    "-RegionInfo:RegionsRegionListRegionAreaY",
+    "-RegionInfo:RegionsRegionListRegionAreaW",
+    "-RegionInfo:RegionsRegionListRegionAreaH",
+    "-RegionAreaX",
+    "-RegionAreaY",
+    "-RegionAreaW",
+    "-RegionAreaH",
+    "-MakernoteTag0x2027",
+    "-MakernoteTag0x204a",
+]
+
+
+def _merge_metadata_tag_groups(*groups: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for tag in group or []:
+            text = str(tag or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            merged.append(text)
+    return merged
+
+
+# 默认批量读取同时覆盖列表列元信息 + 焦点预热标签。
+DEFAULT_METADATA_TAGS: list[str] = _merge_metadata_tag_groups(
+    _BROWSER_METADATA_TAGS,
+    FOCUS_METADATA_TAGS,
+)
 
 
 def _apply_browser_metadata_aliases(rec: dict) -> None:
@@ -384,7 +454,16 @@ def _batch_read_exiftool(et_path: str, paths: list, extra_tags: list | None) -> 
     exiftool 默认会自动合并同名 XMP sidecar，无需额外处理。
     返回 {os.path.normpath(path): raw_rec_dict}。
     """
-    tag_args = ["-j", "-G1", "-charset", "filename=UTF8"]
+    tag_args = [
+        "-j",
+        "-G1",
+        "-n",
+        "-u",
+        "-charset",
+        "filename=UTF8",
+        "-api",
+        "largefilesupport=1",
+    ]
     tag_args += (extra_tags if extra_tags is not None else DEFAULT_METADATA_TAGS)
     all_args = tag_args + [os.path.normpath(p) for p in paths]
 

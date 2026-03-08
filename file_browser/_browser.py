@@ -63,6 +63,10 @@ from app_common.exif_io import (
     run_exiftool_assignments,
 )
 from app_common.exif_io.photo_meta import PhotoMetaDataProxy, PhotoMetaDataReportDB
+from app_common.focus_calc import (
+    extract_focus_box_for_display,
+    resolve_focus_camera_type_from_metadata,
+)
 from app_common.log import get_logger
 from app_common.file_utils import reveal_in_file_manager, move_to_trash, move_empty_dirs_to_trash
 from app_common.send_to_app import get_external_apps, send_files_to_app
@@ -373,11 +377,13 @@ try:
     _EventResize = QEvent.Type.Resize
     _EventShow = QEvent.Type.Show
     _EventKeyPress = QEvent.Type.KeyPress
+    _EventKeyRelease = QEvent.Type.KeyRelease
     _EventToolTip = QEvent.Type.ToolTip
 except AttributeError:
     _EventResize = QEvent.Resize  # type: ignore[attr-defined]
     _EventShow = QEvent.Show  # type: ignore[attr-defined]
     _EventKeyPress = QEvent.KeyPress  # type: ignore[attr-defined]
+    _EventKeyRelease = QEvent.KeyRelease  # type: ignore[attr-defined]
     _EventToolTip = QEvent.ToolTip  # type: ignore[attr-defined]
 
 _KeyUp = getattr(Qt.Key, "Key_Up", None) or getattr(Qt, "Key_Up", None)
@@ -2944,17 +2950,24 @@ class MetadataLoader(QThread):
     """
 
     metadata_batch_ready = pyqtSignal(object)  # dict {norm_path: metadata_dict}
+    focus_cache_batch_ready = pyqtSignal(object)  # dict {source_path: {"focus_box": tuple, "used_path": str}}
     progress_updated = pyqtSignal(int, int)  # (current_count, total_count)
 
     def __init__(
         self,
         paths: list,
         meta_proxy: PhotoMetaDataProxy,
+        focus_source_paths: dict[str, str] | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self._paths = list(paths)
         self._meta_proxy = meta_proxy
+        self._focus_source_paths = {
+            os.path.normpath(display_path): os.path.normpath(source_path)
+            for display_path, source_path in (focus_source_paths or {}).items()
+            if display_path and source_path
+        }
         self._stop_flag = False
 
     def stop(self) -> None:
@@ -2977,6 +2990,7 @@ class MetadataLoader(QThread):
                     return
                 chunk = paths[i : i + chunk_size]
                 batch = self._meta_proxy.read_batch(chunk)
+                focus_batch = self._build_focus_cache_batch(chunk)
                 parsed_batch: dict = {}
                 for norm_path, flat in batch.items():
                     if self._stop_flag or self.isInterruptionRequested():
@@ -2990,6 +3004,9 @@ class MetadataLoader(QThread):
                         "[MetadataLoader.run] path=%r title=%r rating=%s pick=%s",
                         norm_path, meta.get("title", ""), meta.get("rating"), meta.get("pick"),
                     )
+                if focus_batch and not (self._stop_flag or self.isInterruptionRequested()):
+                    _log.info("[MetadataLoader.run] emit focus_cache_batch_ready batch=%s", len(focus_batch))
+                    self.focus_cache_batch_ready.emit(focus_batch)
                 if parsed_batch and not (self._stop_flag or self.isInterruptionRequested()):
                     _log.info("[MetadataLoader.run] emit metadata_batch_ready batch=%s", len(parsed_batch))
                     self.metadata_batch_ready.emit(parsed_batch)
@@ -3068,6 +3085,70 @@ class MetadataLoader(QThread):
             "country": country,
         }
 
+    def _resolve_focus_source_path(self, display_path: str) -> str:
+        norm_display = os.path.normpath(display_path) if display_path else ""
+        if not norm_display:
+            return ""
+        return self._focus_source_paths.get(norm_display) or norm_display
+
+    def _build_focus_cache_batch(self, chunk: list[str]) -> dict[str, dict]:
+        """
+        在批量元信息读取线程里顺手产出“文件内焦点缓存”。
+
+        这里只处理可直接由文件 metadata 算出的尺寸无关焦点框；
+        report.db 保底逻辑仍留给预览时按需处理，避免这里把 miss 提前写死。
+        """
+        ordered_source_paths: list[str] = []
+        seen_paths: set[str] = set()
+        for display_path in chunk or []:
+            if self._stop_flag or self.isInterruptionRequested():
+                return {}
+            source_path = self._resolve_focus_source_path(display_path)
+            if not source_path or not os.path.isfile(source_path):
+                continue
+            dedup_key = os.path.normcase(os.path.normpath(source_path))
+            if dedup_key in seen_paths:
+                continue
+            seen_paths.add(dedup_key)
+            ordered_source_paths.append(os.path.normpath(source_path))
+        if not ordered_source_paths:
+            return {}
+        try:
+            raw_map = read_batch_metadata(ordered_source_paths)
+        except Exception as exc:
+            _log.warning("[MetadataLoader._build_focus_cache_batch] read_batch_metadata failed: %s", exc)
+            return {}
+        focus_batch: dict[str, dict] = {}
+        for source_path in ordered_source_paths:
+            if self._stop_flag or self.isInterruptionRequested():
+                return {}
+            norm_source = os.path.normpath(source_path)
+            raw = raw_map.get(norm_source) or raw_map.get(source_path)
+            payload = self._build_focus_cache_payload(norm_source, raw)
+            if payload is None:
+                continue
+            focus_batch[norm_source] = payload
+        return focus_batch
+
+    @staticmethod
+    def _build_focus_cache_payload(source_path: str, raw: dict | None) -> dict | None:
+        if not source_path or not isinstance(raw, dict) or not raw:
+            return None
+        try:
+            camera_type = resolve_focus_camera_type_from_metadata(raw)
+            # 这里的 1x1 只是兜底；真正的焦点坐标系尺寸优先从 metadata 宽高字段解析。
+            focus_box = extract_focus_box_for_display(raw, 1, 1, camera_type=camera_type)
+        except Exception:
+            _log.exception("[MetadataLoader._build_focus_cache_payload] path=%r", source_path)
+            return None
+        if not focus_box:
+            return None
+        used_path = str(raw.get("SourceFile") or source_path).strip() or source_path
+        return {
+            "focus_box": focus_box,
+            "used_path": os.path.normpath(used_path),
+        }
+
 
 # ── 图像文件列表面板 ───────────────────────────────────────────────────────────
 
@@ -3085,6 +3166,8 @@ class FileListPanel(QWidget):
 
     file_selected = pyqtSignal(str)
     file_fast_preview_requested = pyqtSignal(str)
+    files_loaded = pyqtSignal(object)
+    focus_cache_batch_ready = pyqtSignal(object)
     _MODE_LIST  = 0
     _MODE_THUMB = 1
 
@@ -3149,6 +3232,7 @@ class FileListPanel(QWidget):
         self._deferred_file_selected_timer: QTimer | None = None
         self._deferred_file_selected_path: str = ""
         self._selection_key_nav_auto_repeat: bool = False
+        self._selection_key_nav_hold_active: bool = False
         self._key_navigation_fps: int = get_key_navigation_fps()
         self._key_navigation_last_step_at: float = 0.0
         self._combo_key_navigation_fps: QComboBox | None = None
@@ -3739,6 +3823,7 @@ class FileListPanel(QWidget):
         _log.info("[_on_directory_scan_finished] _rebuild_views START")
         self._rebuild_views()
         _log.info("[_on_directory_scan_finished] _rebuild_views END")
+        self.files_loaded.emit(self.get_display_file_paths())
         if self._pending_selection_paths:
             self._apply_pending_selection()
             if self._view_mode != self._MODE_THUMB or not self._thumb_model_dirty:
@@ -3756,6 +3841,11 @@ class FileListPanel(QWidget):
     def get_current_dir(self) -> str:
         """返回当前选中的目录路径（与 load_directory 的 path 一致）。"""
         return self._current_dir or ""
+
+    def get_display_file_paths(self) -> list[str]:
+        """返回当前文件列表的稳定快照，供后台预热类任务复用。"""
+        preferred = self._filtered_files or self._all_files
+        return [os.path.normpath(path) for path in preferred if path]
 
     def get_report_cache(self) -> dict:
         """返回当前目录的 report 缓存：stem（不含扩展名）→ report 行 dict。无缓存时返回空 dict。"""
@@ -5584,11 +5674,19 @@ class FileListPanel(QWidget):
             if key in (_KeyUp, _KeyDown, _KeyLeft, _KeyRight):
                 if not self._accept_key_navigation_step(event):
                     return True
-                try:
-                    self._selection_key_nav_auto_repeat = bool(event.isAutoRepeat())
-                except Exception:
-                    self._selection_key_nav_auto_repeat = False
+                self._selection_key_nav_auto_repeat = True
+                self._selection_key_nav_hold_active = True
                 QTimer.singleShot(0, lambda: setattr(self, "_selection_key_nav_auto_repeat", False))
+        if (
+            obj is tree_widget
+            and event is not None
+            and event.type() == _EventKeyRelease
+            and self._view_mode == self._MODE_LIST
+            and tree_widget is not None
+        ):
+            key = event.key()
+            if key in (_KeyUp, _KeyDown, _KeyLeft, _KeyRight):
+                self._commit_deferred_file_selected()
         if (
             obj is list_widget
             and event is not None
@@ -5622,10 +5720,8 @@ class FileListPanel(QWidget):
             elif key == _KeyRight and idx < count - 1:
                 new_idx = idx + 1
             if new_idx >= 0 and new_idx < count:
-                try:
-                    fast_preview = bool(event.isAutoRepeat())
-                except Exception:
-                    fast_preview = False
+                self._selection_key_nav_hold_active = True
+                fast_preview = True
                 shift = _ShiftModifier and (event.modifiers() & _ShiftModifier)
                 new_index = self._thumb_index_for_row(new_idx)
                 if not new_index.isValid():
@@ -5654,6 +5750,16 @@ class FileListPanel(QWidget):
                         defer_full=fast_preview,
                     )
                 return True
+        if (
+            obj is list_widget
+            and event is not None
+            and event.type() == _EventKeyRelease
+            and self._view_mode == self._MODE_THUMB
+            and list_widget is not None
+        ):
+            key = event.key()
+            if key in (_KeyUp, _KeyDown, _KeyLeft, _KeyRight):
+                self._commit_deferred_file_selected()
         return super().eventFilter(obj, event)
 
     def _ensure_thumb_viewport_timer(self) -> None:
@@ -6228,9 +6334,14 @@ class FileListPanel(QWidget):
             return
         self._stop_pending_meta_apply()
         self._begin_meta_apply_session(total)
-        loader = MetadataLoader(paths, meta_proxy=self._meta_proxy)
+        loader = MetadataLoader(
+            paths,
+            meta_proxy=self._meta_proxy,
+            focus_source_paths=self._build_metadata_focus_source_paths(paths),
+        )
         loader.progress_updated.connect(self._on_metadata_progress)
         loader.metadata_batch_ready.connect(self._on_metadata_batch_ready)
+        loader.focus_cache_batch_ready.connect(self._on_metadata_focus_cache_batch_ready)
         loader.finished.connect(self._on_metadata_loader_finished)
         self._metadata_loader = loader
         loader.start()
@@ -6243,6 +6354,12 @@ class FileListPanel(QWidget):
                 self._metadata_loader.metadata_batch_ready,
                 self._on_metadata_batch_ready,
             )
+            try:
+                self._metadata_loader.focus_cache_batch_ready.disconnect(
+                    self._on_metadata_focus_cache_batch_ready
+                )
+            except Exception:
+                pass
             try:
                 self._metadata_loader.progress_updated.disconnect(
                     self._on_metadata_progress
@@ -6258,6 +6375,41 @@ class FileListPanel(QWidget):
             self._metadata_loader = None
         self._meta_progress.hide()
 
+    def _build_metadata_focus_source_paths(self, paths: list[str]) -> dict[str, str]:
+        """
+        为 metadata loader 构建“显示路径 -> 焦点源文件路径”的静态快照。
+
+        这里故意不直接复用 _resolve_source_path_for_action() 的逐条日志版本，
+        否则大目录批量加载时日志会被每个文件刷满。若将来改动解析规则，请同步两边逻辑。
+        """
+        mapping: dict[str, str] = {}
+        for raw_path in paths or []:
+            norm_path = os.path.normpath(raw_path) if raw_path else ""
+            if not norm_path:
+                continue
+            actual_path = self._get_actual_path_for_display(norm_path)
+            if actual_path and os.path.isfile(actual_path):
+                mapping[norm_path] = os.path.normpath(actual_path)
+                continue
+            if os.path.isfile(norm_path):
+                mapping[norm_path] = norm_path
+                continue
+            row = self._get_report_row_for_path(norm_path)
+            cp_abs = self._resolve_report_current_abs_path(norm_path)
+            if row and cp_abs:
+                op = str(row.get("original_path") or "").strip()
+                ext_orig = Path(op).suffix.lower() if op else ""
+                if ext_orig:
+                    sibling_source = os.path.normpath(str(Path(cp_abs).with_suffix(ext_orig)))
+                    if os.path.isfile(sibling_source):
+                        mapping[norm_path] = sibling_source
+                        continue
+                if os.path.isfile(cp_abs):
+                    mapping[norm_path] = os.path.normpath(cp_abs)
+                    continue
+            mapping[norm_path] = norm_path
+        return mapping
+
     def _ensure_deferred_file_selected_timer(self) -> None:
         if self._deferred_file_selected_timer is not None:
             return
@@ -6271,6 +6423,7 @@ class FileListPanel(QWidget):
             self._deferred_file_selected_timer.stop()
         self._deferred_file_selected_path = ""
         self._selection_key_nav_auto_repeat = False
+        self._selection_key_nav_hold_active = False
 
     def _schedule_deferred_file_selected(self, path: str) -> None:
         norm_path = os.path.normpath(path) if path else ""
@@ -6278,12 +6431,19 @@ class FileListPanel(QWidget):
             return
         self._deferred_file_selected_path = norm_path
         self._ensure_deferred_file_selected_timer()
+        if self._deferred_file_selected_timer is not None and self._deferred_file_selected_timer.isActive():
+            self._deferred_file_selected_timer.stop()
+        if self._selection_key_nav_hold_active:
+            return
         self._deferred_file_selected_timer.start(_FAST_PREVIEW_COMMIT_DELAY_MS)
 
     def _commit_deferred_file_selected(self) -> None:
+        if self._deferred_file_selected_timer is not None and self._deferred_file_selected_timer.isActive():
+            self._deferred_file_selected_timer.stop()
         path = self._deferred_file_selected_path
         self._deferred_file_selected_path = ""
         self._selection_key_nav_auto_repeat = False
+        self._selection_key_nav_hold_active = False
         if path:
             self._emit_file_selected_for_path(path)
 
@@ -6988,6 +7148,15 @@ class FileListPanel(QWidget):
             country_cnt,
         )
         self._enqueue_meta_apply(meta_dict)
+
+    def _on_metadata_focus_cache_batch_ready(self, focus_dict: dict) -> None:
+        loader = self.sender()
+        if loader is not self._metadata_loader:
+            return
+        if not focus_dict:
+            return
+        _log.info("[_on_metadata_focus_cache_batch_ready] 收到 focus 批次 %s 条", len(focus_dict))
+        self.focus_cache_batch_ready.emit(focus_dict)
 
     def _on_metadata_loader_finished(self) -> None:
         loader = self.sender()
