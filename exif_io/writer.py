@@ -327,6 +327,17 @@ _METADATA_CACHE_LOCK = threading.Lock()  # 多线程读写缓存时加锁
 #: 文件列表视图基础标签（exiftool -G1 风格）。
 #: 标题、对焦状态等依赖 XMP/侧载；与 _XMP_INDICATORS 一致，便于 exiftool 与 sidecar 合并。
 _BROWSER_METADATA_TAGS: list[str] = [
+    "-ExifIFD:DateTimeOriginal",
+    "-EXIF:DateTimeOriginal",
+    "-XMP-exif:DateTimeOriginal",
+    "-DateTimeOriginal",
+    "-ExifIFD:CreateDate",
+    "-EXIF:CreateDate",
+    "-XMP-xmp:CreateDate",
+    "-CreateDate",
+    "-DateTimeCreated",
+    "-DateCreated",
+    "-MediaCreateDate",
     "-XMP-dc:Title", "-XMP-dc:title",  # 标题（sidecar 常用小写 dc:title）
     "-XMP-xmp:Label",
     "-XMP-xmp:Rating",

@@ -53,9 +53,29 @@ except ImportError:
 # Type alias for overlay callables registered at runtime.
 OverlayLayer = Callable[["QPainter", "QRectF", "object"], None]
 NormalizedBox = tuple[float, float, float, float]
+PREVIEW_COMPOSITION_GRID_MODES: tuple[str, ...] = ("off",)
+PREVIEW_COMPOSITION_GRID_LINE_WIDTHS: tuple[int, ...] = (1,)
 _FOCUS_BOX_OUTER_BLACK_WIDTH = 1
 _FOCUS_BOX_GREEN_WIDTH = 4
 _FOCUS_BOX_INNER_BLACK_WIDTH = 1
+
+
+def normalize_preview_composition_grid_mode(value: object) -> str:
+    """兼容旧接口：当前画布未启用构图网格时始终收敛到关闭态。"""
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in PREVIEW_COMPOSITION_GRID_MODES:
+            return normalized
+    return PREVIEW_COMPOSITION_GRID_MODES[0]
+
+
+def normalize_preview_composition_grid_line_width(value: object) -> int:
+    """兼容旧接口：仅保留正整数线宽并回退到默认值。"""
+    try:
+        width = int(value)
+    except Exception:
+        return PREVIEW_COMPOSITION_GRID_LINE_WIDTHS[0]
+    return width if width > 0 else PREVIEW_COMPOSITION_GRID_LINE_WIDTHS[0]
 
 
 @dataclass(slots=True)
