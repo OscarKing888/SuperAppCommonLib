@@ -121,38 +121,37 @@ def resolve_existing_report_db_path(directory: str) -> Optional[str]:
     return paths[0] if paths else None
 
 
-def find_superpicky_report_db_paths(directory: str, max_levels: int = 3) -> List[str]:
+def find_superpicky_report_db_paths(directory: str, max_levels: Optional[int] = None) -> List[str]:
     """
-    从给定目录开始向上查找 `.superpicky/report.db`，返回命中的数据库路径列表。
+    从给定目录开始向上查找，返回所有已存在的 ``.superpicky/report.db`` 路径。
 
-    说明：
-    - depth=0 表示 ``directory`` 自身。
-    - ``max_levels=3`` 表示最多检查当前目录及向上 3 层父目录。
-    - 仅匹配 `.superpicky/report.db`，不包含裸 `report.db`。
+    这个 helper 供 GUI 在“收到外部文件时”批量补充候选 report.db 使用，
+    只返回 ``.superpicky`` 布局，保持与旧版 SuperViewer/SuperBirdStamp 流程兼容；
+    根目录直放的 ``report.db`` 仍由 ``resolve_existing_report_db_path()`` /
+    ``find_report_root()`` 负责。
     """
-    if not directory or max_levels < 0:
+    if not directory:
         return []
+    paths: List[str] = []
+    seen: set[str] = set()
     try:
         cur = os.path.normpath(directory)
         last = None
         depth = 0
-        found: List[str] = []
-        seen: set[str] = set()
         while cur and cur != last:
-            if depth > max_levels:
+            if max_levels is not None and depth > max_levels:
                 break
-            candidate = os.path.normpath(os.path.join(cur, ".superpicky", ReportDB.DB_FILENAME))
-            candidate_key = os.path.normcase(candidate)
-            if candidate_key not in seen and os.path.isfile(candidate):
-                seen.add(candidate_key)
-                found.append(candidate)
+            db_path = os.path.join(cur, ".superpicky", ReportDB.DB_FILENAME)
+            norm_db_path = os.path.normpath(db_path)
+            if os.path.isfile(norm_db_path) and norm_db_path not in seen:
+                seen.add(norm_db_path)
+                paths.append(norm_db_path)
             last = cur
             parent = os.path.dirname(cur)
             if not parent or parent == cur:
                 break
             cur = parent
             depth += 1
-        return found
     except Exception as e:
         _log.warning(
             "[find_superpicky_report_db_paths] 失败 directory=%r max_levels=%r: %s",
@@ -161,6 +160,13 @@ def find_superpicky_report_db_paths(directory: str, max_levels: int = 3) -> List
             e,
         )
         return []
+    _log.info(
+        "[find_superpicky_report_db_paths] directory=%r max_levels=%r count=%s",
+        directory,
+        max_levels,
+        len(paths),
+    )
+    return paths
 
 
 def find_report_root(directory: str, max_levels: Optional[int] = None) -> Optional[str]:
@@ -200,44 +206,28 @@ def find_report_root(directory: str, max_levels: Optional[int] = None) -> Option
 
 def get_preview_path_for_file(path: str, current_dir: str, report_cache: Dict[str, Any]) -> str:
     """
-    Return the preview cache target path for a source file.
-
-    Rules:
-    1) If ``<root>/.superpicky`` exists, use
-       ``<root>/.superpicky/cache/temp_preview/<stem>.jpg``.
-    2) Otherwise create ``<root>/temp_preview`` and use
-       ``<root>/temp_preview/<stem>.jpg``.
-
-    This function intentionally does not check whether the preview file exists.
-    ``report_cache`` is kept for call-site compatibility.
+    若 report 中有该文件（按文件名 stem 匹配）且存在 temp_jpeg_path（相对 current_dir，如 .superpicky\\cache\\temp_preview\\xxx.jpg），
+    则返回拼出的完整路径用于预览/缩略图，避免重复解码；否则返回原 path。
+    current_dir 为选中目录（含 .superpicky 的父目录），用于解析相对路径的 temp_jpeg_path。
     """
-    _log.debug(
-        "[get_preview_path_for_file] path=%r current_dir=%r cache_keys=%s",
-        path,
-        current_dir,
-        len(report_cache) if isinstance(report_cache, dict) else 0,
-    )
-    if not path or not current_dir:
-        _log.debug("[get_preview_path_for_file] skip path=%r", path)
+    _log.debug("[get_preview_path_for_file] path=%r current_dir=%r cache_keys=%s", path, current_dir, len(report_cache) if isinstance(report_cache, dict) else 0)
+    if not path or not report_cache or not current_dir:
+        _log.debug("[get_preview_path_for_file] 跳过 path=%r", path)
         return path
-
-    root_dir = os.path.normpath(current_dir)
-    superpicky_dir = os.path.join(root_dir, ".superpicky")
-    if os.path.isdir(superpicky_dir):
-        preview_dir = os.path.join(superpicky_dir, "cache", "temp_preview")
-    else:
-        preview_dir = os.path.join(root_dir, "temp_preview")
-
-    try:
-        os.makedirs(preview_dir, exist_ok=True)
-    except Exception as e:
-        _log.warning("[get_preview_path_for_file] mkdir failed dir=%r: %s", preview_dir, e)
-
     stem = os.path.splitext(os.path.basename(path))[0]
-    preview_name = f"{stem}.jpg"
-    resolved = os.path.normpath(os.path.join(preview_dir, preview_name))
-    _log.debug("[get_preview_path_for_file] source=%r preview_target=%r", path, resolved)
-    return resolved
+    row = report_cache.get(stem) if isinstance(report_cache, dict) else None
+    if not row or not isinstance(row, dict):
+        return path
+    temp_path = row.get("temp_jpeg_path")
+    if not temp_path or not str(temp_path).strip():
+        return path
+    temp_path = str(temp_path).strip()
+    resolved = os.path.normpath(os.path.join(current_dir, temp_path)) if not os.path.isabs(temp_path) else os.path.normpath(temp_path)
+    if os.path.isfile(resolved):
+        _log.debug("[get_preview_path_for_file] 使用 temp_jpeg_path path=%r resolved=%r", path, resolved)
+        return resolved
+    _log.debug("[get_preview_path_for_file] temp 文件不存在 使用原 path=%r", path)
+    return path
 
 
 def report_row_to_exiftool_style(row: Dict[str, Any], source_file: str) -> Dict[str, Any]:
@@ -1065,43 +1055,6 @@ class ReportDB:
 
         _log.info("[ReportDB.update_ratings_batch] 完成 count=%s", count)
         return count
-
-    def delete_photos_by_filenames(self, filenames: List[str]) -> int:
-        """
-        按 filename 批量删除照片记录。
-
-        Args:
-            filenames: 照片文件名列表（不含扩展名）
-
-        Returns:
-            实际删除的记录数
-        """
-        _log.info("[ReportDB.delete_photos_by_filenames] requested=%s", len(filenames or []))
-        unique_filenames: list[str] = []
-        seen: set[str] = set()
-        for filename in filenames or []:
-            name = str(filename or "").strip()
-            if not name or name in seen:
-                continue
-            seen.add(name)
-            unique_filenames.append(name)
-        if not unique_filenames:
-            _log.info("[ReportDB.delete_photos_by_filenames] 无有效 filename 返回 0")
-            return 0
-
-        placeholders = ", ".join(["?"] * len(unique_filenames))
-        sql = f"DELETE FROM photos WHERE filename IN ({placeholders})"
-
-        with self._lock:
-            cursor = self._conn.execute(sql, unique_filenames)
-            self._safe_commit()
-            deleted = cursor.rowcount if cursor.rowcount is not None and cursor.rowcount >= 0 else 0
-        _log.info(
-            "[ReportDB.delete_photos_by_filenames] 完成 requested=%s deleted=%s",
-            len(unique_filenames),
-            deleted,
-        )
-        return deleted
 
     def clear_cache_paths(self) -> int:
         """清空缓存相关路径字段（临时 JPG、调试裁切、YOLO 调试图）。"""

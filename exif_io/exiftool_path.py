@@ -16,7 +16,7 @@ def _module_dir() -> str:
 
 
 def _absolute_exiftool_candidates() -> list[str]:
-    """Return platform-specific absolute fallback paths for exiftool."""
+    """返回各平台常见的 exiftool 绝对安装路径。"""
     if sys.platform == "darwin":
         return [
             "/opt/homebrew/bin/exiftool",
@@ -98,7 +98,7 @@ def get_exiftool_executable_path() -> str | None:
             if _is_usable_exiftool(p):
                 return p
 
-    # Finder 启动的 .app 往往拿不到 shell PATH，这里补常见安装路径兜底。
+    # Finder 启动的 .app 往往拿不到 shell PATH，这里补常见绝对路径兜底。
     for p in _absolute_exiftool_candidates():
         if _is_usable_exiftool(p):
             return p
