@@ -190,7 +190,9 @@ def _focus_box_from_numbers(
 
 _SONY_MAKERNOTE_FOCUS_BLOCK_KEYS: tuple[str, ...] = (
     "makernote tag 0x2027",
+    "makernotetag0x2027",
     "makernote tag 0x204a",
+    "makernotetag0x204a",
 )
 
 

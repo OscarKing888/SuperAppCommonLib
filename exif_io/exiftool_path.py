@@ -15,6 +15,23 @@ def _module_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def _absolute_exiftool_candidates() -> list[str]:
+    """Return platform-specific absolute fallback paths for exiftool."""
+    if sys.platform == "darwin":
+        return [
+            "/opt/homebrew/bin/exiftool",
+            "/usr/local/bin/exiftool",
+            "/opt/local/bin/exiftool",
+        ]
+    if sys.platform.startswith("win"):
+        return []
+    return [
+        "/usr/local/bin/exiftool",
+        "/usr/bin/exiftool",
+        "/opt/local/bin/exiftool",
+    ]
+
+
 @lru_cache(maxsize=32)
 def _is_usable_exiftool(executable_path: str) -> bool:
     """
@@ -45,7 +62,8 @@ def _is_usable_exiftool(executable_path: str) -> bool:
 def get_exiftool_executable_path() -> str | None:
     """
     按平台定位 exiftool 可执行文件。
-    优先：模块内 exiftools_mac / exiftools_win → 打包后 _MEIPASS 下同路径 → 系统 PATH。
+    优先：模块内 exiftools_mac / exiftools_win → 打包后 _MEIPASS/.app Resources 下同路径
+    → 常见绝对安装路径 → 系统 PATH。
     Windows 仅使用 .exe，不使用 .pl（避免依赖 Perl）。
     """
     rel_candidates = []
@@ -79,6 +97,11 @@ def get_exiftool_executable_path() -> str | None:
             p = os.path.join(base, rel)
             if _is_usable_exiftool(p):
                 return p
+
+    # Finder 启动的 .app 往往拿不到 shell PATH，这里补常见安装路径兜底。
+    for p in _absolute_exiftool_candidates():
+        if _is_usable_exiftool(p):
+            return p
 
     p = shutil.which("exiftool")
     if p and os.path.isfile(p):
