@@ -3855,6 +3855,75 @@ class FileListPanel(QWidget):
         row = self._get_report_row_for_path(path)
         return dict(row) if isinstance(row, dict) else None
 
+    def sync_metadata_edit_for_path(
+        self,
+        path: str,
+        *,
+        report_fields: dict | None = None,
+        meta_updates: dict | None = None,
+    ) -> bool:
+        norm_path = os.path.normpath(path) if path else ""
+        report_fields = {
+            str(k): v
+            for k, v in (report_fields or {}).items()
+            if str(k) in {"title", "caption"} and v is not None
+        }
+        meta_updates = {
+            str(k): v
+            for k, v in (meta_updates or {}).items()
+            if str(k) and v is not None
+        }
+        if not norm_path or (not report_fields and not meta_updates):
+            return False
+
+        filename = ""
+        row = self._get_report_row_for_path(norm_path)
+        if isinstance(row, dict):
+            filename = str(row.get("filename") or "").strip()
+        if not filename:
+            filename = str(Path(norm_path).stem or "").strip()
+
+        db_updated = False
+        if report_fields and filename:
+            db_dir = self._report_root_dir or self._current_dir
+            db = ReportDB.open_if_exists(db_dir) if db_dir else None
+            if db is not None:
+                try:
+                    if isinstance(row, dict) or db.get_photo(filename):
+                        db_updated = bool(db.update_photo(filename, report_fields))
+                finally:
+                    db.close()
+
+        refresh_paths: list[str] = []
+        if filename:
+            for cache in (self._report_full_cache, self._report_cache):
+                cache_row = cache.get(filename) if isinstance(cache, dict) else None
+                if isinstance(cache_row, dict):
+                    cache_row.update(report_fields)
+            for mapped_path, mapped_row in list((self._report_row_by_path or {}).items()):
+                mapped_filename = str((mapped_row or {}).get("filename") or Path(mapped_path).stem or "").strip()
+                if mapped_filename != filename:
+                    continue
+                if isinstance(mapped_row, dict):
+                    mapped_row.update(report_fields)
+                refresh_paths.append(os.path.normpath(mapped_path))
+
+        if norm_path not in refresh_paths:
+            refresh_paths.append(norm_path)
+
+        if meta_updates:
+            for refresh_path in refresh_paths:
+                meta = self._meta_cache.get(refresh_path)
+                if not isinstance(meta, dict):
+                    meta = {}
+                    self._meta_cache[refresh_path] = meta
+                meta.update(meta_updates)
+
+        if meta_updates:
+            self._refresh_metadata_state_for_paths(refresh_paths)
+
+        return db_updated or bool(meta_updates)
+
     def set_pending_selection(self, paths: list, current_path: str | None = None) -> None:
         """设置「待选路径」：下次目录加载完成后将列表中匹配的项多选并视为当前选中（与目录内多选同等）。若当前已打开该目录且列表已加载，则立即应用。"""
         if not paths:
