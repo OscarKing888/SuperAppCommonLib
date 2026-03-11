@@ -537,7 +537,7 @@ def _summarize_rec_for_log(rec: dict) -> str:
     return "键数=%s 标题=%r Rating=%s Pick=%s" % (key_count, (title[:40] + "..." if title and len(str(title)) > 40 else title), rating, pick)
 
 
-def read_batch_metadata(paths: list, tags: list | None = None) -> dict:
+def read_batch_metadata(paths: list, tags: list | None = None, use_cache: bool = True) -> dict:
     """
     批量读取多个图像文件的元数据（API 透明，调用方无需感知数据来源）。
 
@@ -552,6 +552,7 @@ def read_batch_metadata(paths: list, tags: list | None = None) -> dict:
     参数：
         paths : 图像文件路径列表。
         tags  : 要提取的 exiftool 标签；None 表示使用 DEFAULT_METADATA_TAGS。
+        use_cache : 是否使用 path 级内存缓存；自定义 tag 集建议关闭，避免与默认缓存互串。
 
     返回：
         dict  : { os.path.normpath(path) : flat_dict }，flat_dict 为 exiftool -G1 风格。
@@ -561,17 +562,25 @@ def read_batch_metadata(paths: list, tags: list | None = None) -> dict:
 
     result = {}
     uncached = []
-    with _METADATA_CACHE_LOCK:
-        seen = set()
+    seen = set()
+    if use_cache:
+        with _METADATA_CACHE_LOCK:
+            for p in paths:
+                norm = os.path.normpath(p)
+                if norm in seen:
+                    continue
+                seen.add(norm)
+                if norm in _METADATA_CACHE:
+                    result[norm] = _METADATA_CACHE[norm].copy()
+                else:
+                    uncached.append(p)
+    else:
         for p in paths:
             norm = os.path.normpath(p)
             if norm in seen:
                 continue
             seen.add(norm)
-            if norm in _METADATA_CACHE:
-                result[norm] = _METADATA_CACHE[norm].copy()
-            else:
-                uncached.append(p)
+            uncached.append(p)
 
     cached_norms = set(result.keys())
     _log.info("[read_batch_metadata] 批量查询 paths=%s 缓存命中=%s 未命中=%s", len(paths), len(cached_norms), len(uncached))
@@ -645,12 +654,13 @@ def read_batch_metadata(paths: list, tags: list | None = None) -> dict:
         _log.info("[read_batch_metadata] path=%r 来源=%s %s", norm, source, _summarize_rec_for_log(rec))
 
     # 写入缓存（副本），超出上限时 FIFO 淘汰（加锁保证多线程安全）
-    with _METADATA_CACHE_LOCK:
-        while len(_METADATA_CACHE) + len(new_result) > _METADATA_CACHE_MAX:
-            first = next(iter(_METADATA_CACHE))
-            del _METADATA_CACHE[first]
-        for norm, rec in new_result.items():
-            _METADATA_CACHE[norm] = rec.copy()
+    if use_cache:
+        with _METADATA_CACHE_LOCK:
+            while len(_METADATA_CACHE) + len(new_result) > _METADATA_CACHE_MAX:
+                first = next(iter(_METADATA_CACHE))
+                del _METADATA_CACHE[first]
+            for norm, rec in new_result.items():
+                _METADATA_CACHE[norm] = rec.copy()
 
     _log.info("[read_batch_metadata] 批量查询完成 结果总数=%s", len(result))
     return result

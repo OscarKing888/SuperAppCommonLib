@@ -57,6 +57,7 @@ except ImportError:
     )
 
 from app_common.exif_io import (
+    DEFAULT_METADATA_TAGS,
     find_xmp_sidecar,
     inject_metadata_cache,
     read_batch_metadata,
@@ -231,6 +232,18 @@ except AttributeError:
     _NoPen = Qt.NoPen  # type: ignore[attr-defined]
 
 try:
+    _LeftButton = Qt.MouseButton.LeftButton
+except AttributeError:
+    _LeftButton = Qt.LeftButton  # type: ignore[attr-defined]
+
+try:
+    _SplitHCursor = Qt.CursorShape.SplitHCursor
+    _ArrowCursor = Qt.CursorShape.ArrowCursor
+except AttributeError:
+    _SplitHCursor = Qt.SplitHCursor  # type: ignore[attr-defined]
+    _ArrowCursor = Qt.ArrowCursor  # type: ignore[attr-defined]
+
+try:
     _ResizeStretch = QHeaderView.ResizeMode.Stretch
     _ResizeInteractive = QHeaderView.ResizeMode.Interactive
     _ResizeToContents = QHeaderView.ResizeMode.ResizeToContents
@@ -257,7 +270,43 @@ _TREE_COL_STAR = 4
 _TREE_COL_SHARP = 5
 _TREE_COL_AESTHETIC = 6
 _TREE_COL_FOCUS = 7
-_FILE_TABLE_HEADERS = ["#", "文件名", "标题", "颜色", "星级", "锐度值", "美学评分", "对焦状态"]
+_TREE_COL_SHUTTER = 8
+_TREE_COL_ISO = 9
+_TREE_COL_APERTURE = 10
+_FILE_TABLE_HEADERS = ["#", "文件名", "标题", "颜色", "星级", "锐度值", "美学评分", "对焦状态", "快门", "ISO", "光圈"]
+_SUPERBIRDSTAMP_CAMERA_METADATA_TAGS = [
+    "-ExifIFD:ExposureTime",
+    "-EXIF:ExposureTime",
+    "-XMP-exif:ExposureTime",
+    "-Composite:ShutterSpeed",
+    "-ExifIFD:ISO",
+    "-EXIF:ISO",
+    "-XMP-exif:PhotographicSensitivity",
+    "-XMP-exif:ISOSpeedRatings",
+    "-ExifIFD:FNumber",
+    "-EXIF:FNumber",
+    "-XMP-exif:FNumber",
+    "-Composite:Aperture",
+]
+
+
+def _merge_unique_text_groups(*groups: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for item in group or []:
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            merged.append(text)
+    return merged
+
+
+_SUPERBIRDSTAMP_BROWSER_METADATA_TAGS = _merge_unique_text_groups(
+    DEFAULT_METADATA_TAGS,
+    _SUPERBIRDSTAMP_CAMERA_METADATA_TAGS,
+)
 
 # 缩略图尺寸档位（像素）
 _THUMB_SIZE_STEPS = [128, 256, 512, 1024]
@@ -312,6 +361,96 @@ def _format_optional_number(raw: str, fmt: str) -> str:
         return fmt % float(s)
     except (ValueError, TypeError):
         return s
+
+
+def _first_non_empty(*values):
+    """返回首个非空 metadata 值，保留原始类型。"""
+    for value in values:
+        if value is None:
+            continue
+        if str(value).strip():
+            return value
+    return ""
+
+
+def _parse_positive_fraction_or_float(raw) -> float | None:
+    """兼容 1/2000、0.0005、f/5.6 等常见 EXIF 数值文本。"""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    text = text.lower().replace("seconds", "").replace("second", "").replace("sec", "").strip()
+    if text.startswith("f/"):
+        text = text[2:].strip()
+    if text.endswith("s"):
+        text = text[:-1].strip()
+    if "(" in text and ")" in text:
+        text = text.split("(", 1)[0].strip()
+    if not text:
+        return None
+    if "/" in text:
+        left, _, right = text.partition("/")
+        try:
+            numerator = float(left.strip())
+            denominator = float(right.strip())
+        except (ValueError, TypeError):
+            return None
+        if denominator == 0:
+            return None
+        value = numerator / denominator
+    else:
+        try:
+            value = float(text)
+        except (ValueError, TypeError):
+            return None
+    return value if value > 0 else None
+
+
+def _parse_optional_int(raw) -> int | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    if text.upper().startswith("ISO"):
+        text = text[3:].strip()
+    try:
+        value = int(float(text))
+    except (ValueError, TypeError):
+        return None
+    return value if value >= 0 else None
+
+
+def _format_shutter_value(raw) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    seconds = _parse_positive_fraction_or_float(raw)
+    if seconds is None:
+        return text
+    inverse = 1.0 / seconds if seconds > 0 else 0.0
+    if seconds < 1 and inverse >= 2:
+        denominator = round(inverse)
+        if denominator > 0:
+            return f"1/{denominator}s"
+    return f"{seconds:g}s"
+
+
+def _format_iso_value(raw) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    iso_value = _parse_optional_int(raw)
+    if iso_value is None:
+        return text
+    return str(iso_value)
+
+
+def _format_aperture_value(raw) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    aperture_value = _parse_positive_fraction_or_float(raw)
+    if aperture_value is None:
+        return text
+    return f"f/{aperture_value:g}"
 
 
 def _focus_status_to_display(raw: str) -> str:
@@ -969,6 +1108,9 @@ class FileTableEntry:
     city: str = ""
     state: str = ""
     country: str = ""
+    shutter: str = ""
+    iso: str = ""
+    aperture: str = ""
 
 
 class FileTableModel(QAbstractTableModel):
@@ -1021,6 +1163,9 @@ class FileTableModel(QAbstractTableModel):
         entry.city = str(meta.get("city", "") or "")
         entry.state = str(meta.get("state", "") or "")
         entry.country = str(meta.get("country", "") or "")
+        entry.shutter = str(meta.get("shutter", "") or "")
+        entry.iso = str(meta.get("iso", "") or "")
+        entry.aperture = str(meta.get("aperture", "") or "")
 
     def _build_entry(
         self,
@@ -1061,6 +1206,15 @@ class FileTableModel(QAbstractTableModel):
             return entry.state.lower()
         if column == _TREE_COL_FOCUS:
             return entry.country.lower()
+        if column == _TREE_COL_SHUTTER:
+            seconds = _parse_positive_fraction_or_float(entry.shutter)
+            return (0, seconds) if seconds is not None else (1, entry.shutter.lower())
+        if column == _TREE_COL_ISO:
+            iso_value = _parse_optional_int(entry.iso)
+            return (0, iso_value) if iso_value is not None else (1, entry.iso.lower())
+        if column == _TREE_COL_APERTURE:
+            aperture_value = _parse_positive_fraction_or_float(entry.aperture)
+            return (0, aperture_value) if aperture_value is not None else (1, entry.aperture.lower())
         return ""
 
     def _display_value(self, entry: FileTableEntry, row: int, column: int) -> str:
@@ -1084,6 +1238,12 @@ class FileTableModel(QAbstractTableModel):
             return entry.state
         if column == _TREE_COL_FOCUS:
             return entry.country
+        if column == _TREE_COL_SHUTTER:
+            return entry.shutter
+        if column == _TREE_COL_ISO:
+            return entry.iso
+        if column == _TREE_COL_APERTURE:
+            return entry.aperture
         return ""
 
     def data(self, index: QModelIndex, role: int = int(_DisplayRole)):
@@ -1182,7 +1342,7 @@ class FileTableModel(QAbstractTableModel):
         entry = self._entries[row]
         self._apply_meta_to_entry(entry, meta)
         left = self.index(row, _TREE_COL_TITLE)
-        right = self.index(row, _TREE_COL_FOCUS)
+        right = self.index(row, self.columnCount() - 1)
         self.dataChanged.emit(left, right, [_DisplayRole, _SortRole, _ForegroundRole, _BackgroundRole])
         return True
 
@@ -1232,6 +1392,114 @@ class FileTableSortProxyModel(QSortFilterProxyModel):
             except TypeError:
                 return str(lv) < str(rv)
         return super().lessThan(left, right)
+
+
+class FileTableHeaderView(QHeaderView):
+    """列表模式表头：显式提供分割线 hover 与拖拽改宽。"""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(_Horizontal, parent)
+        self._resize_section: int = -1
+        self._resize_origin_x: int = 0
+        self._resize_origin_size: int = 0
+        self._resize_margin_px: int = 6
+        self.setSectionsClickable(True)
+        self.setSectionsMovable(False)
+        self.setStretchLastSection(False)
+        self.setMinimumSectionSize(24)
+        try:
+            self.setCascadingSectionResizes(False)
+        except Exception:
+            pass
+        self.setMouseTracking(True)
+
+    def _event_pos_x(self, event) -> int:
+        position = getattr(event, "position", None)
+        if callable(position):
+            try:
+                return int(position().x())
+            except Exception:
+                pass
+        pos = getattr(event, "pos", None)
+        if callable(pos):
+            try:
+                return int(pos().x())
+            except Exception:
+                pass
+        return 0
+
+    def _resize_target_for_x(self, x: int) -> int:
+        logical = self.logicalIndexAt(x)
+        if logical < 0:
+            return -1
+        left = self.sectionViewportPosition(logical)
+        size = self.sectionSize(logical)
+        if size <= 0:
+            return -1
+        right = left + size
+        margin = max(3, min(self._resize_margin_px, size // 3 if size > 0 else self._resize_margin_px))
+        if abs(x - right) <= margin and self.sectionResizeMode(logical) == _ResizeInteractive:
+            return logical
+        if abs(x - left) <= margin:
+            visual = self.visualIndex(logical)
+            if visual > 0:
+                prev_logical = self.logicalIndex(visual - 1)
+                if prev_logical >= 0 and self.sectionResizeMode(prev_logical) == _ResizeInteractive:
+                    return prev_logical
+        return -1
+
+    def _update_resize_cursor(self, x: int) -> None:
+        if self._resize_section >= 0 or self._resize_target_for_x(x) >= 0:
+            self.setCursor(_SplitHCursor)
+        else:
+            self.setCursor(_ArrowCursor)
+
+    def mousePressEvent(self, event) -> None:
+        button = getattr(event, "button", lambda: None)()
+        x = self._event_pos_x(event)
+        target = self._resize_target_for_x(x)
+        if button == _LeftButton and target >= 0:
+            self._resize_section = target
+            self._resize_origin_x = x
+            self._resize_origin_size = max(self.minimumSectionSize(), self.sectionSize(target))
+            self.setCursor(_SplitHCursor)
+            try:
+                event.accept()
+            except Exception:
+                pass
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        x = self._event_pos_x(event)
+        if self._resize_section >= 0:
+            delta = x - self._resize_origin_x
+            new_size = max(self.minimumSectionSize(), self._resize_origin_size + delta)
+            self.resizeSection(self._resize_section, new_size)
+            self.setCursor(_SplitHCursor)
+            try:
+                event.accept()
+            except Exception:
+                pass
+            return
+        self._update_resize_cursor(x)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._resize_section >= 0:
+            self._resize_section = -1
+            self._update_resize_cursor(self._event_pos_x(event))
+            try:
+                event.accept()
+            except Exception:
+                pass
+            return
+        super().mouseReleaseEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        if self._resize_section < 0:
+            self.setCursor(_ArrowCursor)
+        super().leaveEvent(event)
 
 
 class FileTableView(QTreeView):
@@ -2958,6 +3226,7 @@ class MetadataLoader(QThread):
         paths: list,
         meta_proxy: PhotoMetaDataProxy,
         focus_source_paths: dict[str, str] | None = None,
+        metadata_tags: list[str] | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -2968,6 +3237,7 @@ class MetadataLoader(QThread):
             for display_path, source_path in (focus_source_paths or {}).items()
             if display_path and source_path
         }
+        self._metadata_tags = list(metadata_tags or [])
         self._stop_flag = False
 
     def stop(self) -> None:
@@ -2989,7 +3259,7 @@ class MetadataLoader(QThread):
                     _log.info("[MetadataLoader.run] interrupted")
                     return
                 chunk = paths[i : i + chunk_size]
-                batch = self._meta_proxy.read_batch(chunk)
+                batch = self._read_metadata_batch(chunk)
                 focus_batch = self._build_focus_cache_batch(chunk)
                 parsed_batch: dict = {}
                 for norm_path, flat in batch.items():
@@ -3015,6 +3285,33 @@ class MetadataLoader(QThread):
         except Exception as e:
             _log.warning("[MetadataLoader.run] exception: %s", e)
         _log.info("[MetadataLoader.run] END")
+
+    def _read_metadata_batch(self, paths: list[str]) -> dict[str, dict]:
+        norm_paths = [os.path.normpath(p) for p in paths]
+        result: dict[str, dict] = {norm: {"SourceFile": norm} for norm in norm_paths}
+        try:
+            raw_batch = read_batch_metadata(
+                paths,
+                tags=self._metadata_tags or None,
+                use_cache=not bool(self._metadata_tags),
+            )
+            for norm_path, flat in raw_batch.items():
+                if norm_path in result and flat:
+                    result[norm_path].update(flat)
+        except Exception as exc:
+            _log.warning("[MetadataLoader._read_metadata_batch] read_batch_metadata failed: %s", exc)
+        report_db = getattr(self._meta_proxy, "report_db", None)
+        if report_db is None:
+            return result
+        for path, norm_path in zip(paths, norm_paths):
+            try:
+                flat = report_db.read(path)
+            except Exception as exc:
+                _log.debug("[MetadataLoader._read_metadata_batch] report_db.read failed path=%r err=%s", path, exc)
+                continue
+            if flat:
+                result[norm_path].update(flat)
+        return result
 
     def _parse_rec(self, rec: dict) -> dict:
         # 标题、对焦状态等支持 XMP sidecar（由 read_batch_metadata 合并），勿删以下键名
@@ -3070,10 +3367,31 @@ class MetadataLoader(QThread):
             or rec.get("XMP-photoshop:Country-PrimaryLocationName")
             or rec.get("IPTC:Country-PrimaryLocationName") or ""
         )
+        shutter_raw = _first_non_empty(
+            rec.get("ExifIFD:ExposureTime"),
+            rec.get("EXIF:ExposureTime"),
+            rec.get("XMP-exif:ExposureTime"),
+            rec.get("Composite:ShutterSpeed"),
+        )
+        iso_raw = _first_non_empty(
+            rec.get("ExifIFD:ISO"),
+            rec.get("EXIF:ISO"),
+            rec.get("XMP-exif:PhotographicSensitivity"),
+            rec.get("XMP-exif:ISOSpeedRatings"),
+        )
+        aperture_raw = _first_non_empty(
+            rec.get("ExifIFD:FNumber"),
+            rec.get("EXIF:FNumber"),
+            rec.get("XMP-exif:FNumber"),
+            rec.get("Composite:Aperture"),
+        )
 
         city = _format_optional_number(city_raw, "%06.2f")    # 锐度
         state = _format_optional_number(state_raw, "%05.2f") # 美学
         country = _focus_status_to_display(country_raw)      # 对焦状态 → 精焦/合焦/偏移/失焦
+        shutter = _format_shutter_value(shutter_raw)
+        iso = _format_iso_value(iso_raw)
+        aperture = _format_aperture_value(aperture_raw)
 
         return {
             "title":   str(title).strip(),
@@ -3083,6 +3401,9 @@ class MetadataLoader(QThread):
             "city":    city,
             "state":   state,
             "country": country,
+            "shutter": shutter,
+            "iso":     iso,
+            "aperture": aperture,
         }
 
     def _resolve_focus_source_path(self, display_path: str) -> str:
@@ -3435,6 +3756,7 @@ class FileListPanel(QWidget):
         # ── 列表模式：多列 QTreeWidget ──
         self._tree_widget = FileTableView()
         self._tree_widget.setModel(self._file_table_proxy)
+        self._tree_widget.setHeader(FileTableHeaderView(self._tree_widget))
         
         # @Agents: 这个列名不要修改
         # 城市 = 锐度值（越高越清晰）
@@ -3443,9 +3765,7 @@ class FileListPanel(QWidget):
         # 🏆 奖杯 = Pick 精选旗标（双维度都出色）
         # 🟢 绿色标签 = 飞鸟
         # 🔴 红色标签 = 精焦（对焦点在鸟头）
-        self._tree_widget.setHeaderLabels([
-            "#", "文件名", "标题", "颜色", "星级", "锐度值", "美学评分", "对焦状态"
-        ])
+        self._tree_widget.setHeaderLabels(_FILE_TABLE_HEADERS)
         self._tree_widget.setSortingEnabled(True)
         self._tree_widget.setRootIsDecorated(False)
         self._tree_widget.setUniformRowHeights(True)
@@ -3457,10 +3777,14 @@ class FileListPanel(QWidget):
         self._tree_widget.setStyleSheet("QTreeView { font-size: 12px; }")
         self._tree_widget.clicked.connect(self._on_tree_item_clicked)
         hdr = self._tree_widget.header()
+        hdr.setStretchLastSection(False)
+        hdr.setSectionsClickable(True)
+        hdr.setSectionsMovable(False)
+        hdr.setMouseTracking(True)
         hdr.sortIndicatorChanged.connect(self._on_tree_sort_indicator_changed)
         self._tree_widget.selectionModel().currentChanged.connect(self._on_tree_current_item_changed)
         self._tree_widget.selectionModel().selectionChanged.connect(self._on_view_selection_changed)
-        for col in range(8):
+        for col in range(len(_FILE_TABLE_HEADERS)):
             hdr.setSectionResizeMode(col, _ResizeInteractive)
         self._tree_widget.setColumnWidth(_TREE_COL_SEQ, 44)
         self._tree_widget.setColumnWidth(_TREE_COL_NAME, 190)
@@ -3470,6 +3794,9 @@ class FileListPanel(QWidget):
         self._tree_widget.setColumnWidth(_TREE_COL_SHARP, 96)
         self._tree_widget.setColumnWidth(_TREE_COL_AESTHETIC, 96)
         self._tree_widget.setColumnWidth(_TREE_COL_FOCUS, 108)
+        self._tree_widget.setColumnWidth(_TREE_COL_SHUTTER, 84)
+        self._tree_widget.setColumnWidth(_TREE_COL_ISO, 72)
+        self._tree_widget.setColumnWidth(_TREE_COL_APERTURE, 72)
         self._tree_widget.sortByColumn(_TREE_COL_NAME, _AscendingOrder)
         self._tree_widget.setContextMenuPolicy(_CustomContextMenu)
         self._tree_widget.customContextMenuRequested.connect(self._on_tree_context_menu)
@@ -5534,7 +5861,7 @@ class FileListPanel(QWidget):
                 norm = os.path.normpath(path)
                 meta = self._meta_cache.get(norm, {})
 
-                ti = SortableTreeItem([str(seq), name, "", "", "", "", "", ""])
+                ti = SortableTreeItem([str(seq), name, *([""] * (len(_FILE_TABLE_HEADERS) - 2))])
                 ti.setTextAlignment(_TREE_COL_SEQ, _AlignCenter)
                 ti.setData(0, _UserRole, path)
                 ti.setData(_TREE_COL_SEQ, _SortRole, 0)
@@ -5659,6 +5986,9 @@ class FileListPanel(QWidget):
         city    = meta.get("city", "")
         state   = meta.get("state", "")
         country = meta.get("country", "")
+        shutter = str(meta.get("shutter", "") or "")
+        iso = str(meta.get("iso", "") or "")
+        aperture = str(meta.get("aperture", "") or "")
 
         item.setText(_TREE_COL_TITLE, title);  item.setData(_TREE_COL_TITLE, _SortRole, title.lower())
         color_display = (_COLOR_LABEL_COLORS.get(color, ("", ""))[1] or color)
@@ -5686,6 +6016,15 @@ class FileListPanel(QWidget):
         item.setText(_TREE_COL_SHARP, city);    item.setData(_TREE_COL_SHARP, _SortRole, city.lower())
         item.setText(_TREE_COL_AESTHETIC, state);   item.setData(_TREE_COL_AESTHETIC, _SortRole, state.lower())
         item.setText(_TREE_COL_FOCUS, country); item.setData(_TREE_COL_FOCUS, _SortRole, country.lower())
+        shutter_seconds = _parse_positive_fraction_or_float(shutter)
+        item.setText(_TREE_COL_SHUTTER, shutter)
+        item.setData(_TREE_COL_SHUTTER, _SortRole, (0, shutter_seconds) if shutter_seconds is not None else (1, shutter.lower()))
+        iso_value = _parse_optional_int(iso)
+        item.setText(_TREE_COL_ISO, iso)
+        item.setData(_TREE_COL_ISO, _SortRole, (0, iso_value) if iso_value is not None else (1, iso.lower()))
+        aperture_value = _parse_positive_fraction_or_float(aperture)
+        item.setText(_TREE_COL_APERTURE, aperture)
+        item.setData(_TREE_COL_APERTURE, _SortRole, (0, aperture_value) if aperture_value is not None else (1, aperture.lower()))
         focus_color = _FOCUS_STATUS_TEXT_COLORS.get(country, "")
         if focus_color:
             item.setForeground(_TREE_COL_FOCUS, QBrush(QColor(focus_color)))
@@ -6407,6 +6746,7 @@ class FileListPanel(QWidget):
             paths,
             meta_proxy=self._meta_proxy,
             focus_source_paths=self._build_metadata_focus_source_paths(paths),
+            metadata_tags=_SUPERBIRDSTAMP_BROWSER_METADATA_TAGS,
         )
         loader.progress_updated.connect(self._on_metadata_progress)
         loader.metadata_batch_ready.connect(self._on_metadata_batch_ready)
@@ -6858,24 +7198,28 @@ class FileListPanel(QWidget):
         self._set_tree_header_fast_mode(False)
 
     def _set_tree_header_fast_mode(self, enabled: bool) -> None:
-        """批量更新期间临时关闭 ResizeToContents，避免 O(N^2) 级重算。"""
+        """批量更新期间切到轻量模式；恢复后保持列宽可手动拖拽。"""
         if enabled == self._tree_header_fast_mode:
             return
         hdr = self._tree_widget.header()
         try:
             if enabled:
-                for col in (_TREE_COL_TITLE, _TREE_COL_COLOR, _TREE_COL_STAR, _TREE_COL_SHARP, _TREE_COL_AESTHETIC, _TREE_COL_FOCUS):
+                for col in (
+                    _TREE_COL_TITLE,
+                    _TREE_COL_COLOR,
+                    _TREE_COL_STAR,
+                    _TREE_COL_SHARP,
+                    _TREE_COL_AESTHETIC,
+                    _TREE_COL_FOCUS,
+                    _TREE_COL_SHUTTER,
+                    _TREE_COL_ISO,
+                    _TREE_COL_APERTURE,
+                ):
                     hdr.setSectionResizeMode(col, _ResizeInteractive)
                 self._tree_header_fast_mode = True
             else:
-                hdr.setSectionResizeMode(_TREE_COL_SEQ, _ResizeInteractive)
-                hdr.setSectionResizeMode(_TREE_COL_NAME, _ResizeInteractive)
-                hdr.setSectionResizeMode(_TREE_COL_TITLE, _ResizeToContents)
-                hdr.setSectionResizeMode(_TREE_COL_COLOR, _ResizeToContents)
-                hdr.setSectionResizeMode(_TREE_COL_STAR, _ResizeToContents)
-                hdr.setSectionResizeMode(_TREE_COL_SHARP, _ResizeToContents)
-                hdr.setSectionResizeMode(_TREE_COL_AESTHETIC, _ResizeToContents)
-                hdr.setSectionResizeMode(_TREE_COL_FOCUS, _ResizeToContents)
+                for col in range(len(_FILE_TABLE_HEADERS)):
+                    hdr.setSectionResizeMode(col, _ResizeInteractive)
                 self._tree_header_fast_mode = False
         except Exception:
             pass
