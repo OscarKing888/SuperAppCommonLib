@@ -7954,11 +7954,28 @@ class DirectoryBrowserWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        lbl = QLabel("  目录")
-        lbl.setStyleSheet(
-            "color: #aaa; font-size: 11px; padding: 4px 6px 2px 6px; background: #252525;"
+        toolbar_widget = QWidget()
+        toolbar_widget.setStyleSheet("background: #252525;")
+        toolbar = QHBoxLayout(toolbar_widget)
+        toolbar.setContentsMargins(6, 4, 6, 2)
+        toolbar.setSpacing(4)
+
+        lbl = QLabel("目录")
+        lbl.setStyleSheet("color: #aaa; font-size: 11px;")
+        toolbar.addWidget(lbl)
+        toolbar.addStretch()
+
+        self._btn_refresh_tree = QToolButton()
+        self._btn_refresh_tree.setText("刷新")
+        self._btn_refresh_tree.setToolTip("刷新文件夹树")
+        self._btn_refresh_tree.setAutoRaise(True)
+        self._btn_refresh_tree.setStyleSheet(
+            "QToolButton { color: #aaa; padding: 2px 6px; border-radius: 3px; }"
+            "QToolButton:hover { color: #fff; background: #333; }"
         )
-        layout.addWidget(lbl)
+        self._btn_refresh_tree.clicked.connect(self.refresh_directory_tree)
+        toolbar.addWidget(self._btn_refresh_tree)
+        layout.addWidget(toolbar_widget)
 
         self._tree = QTreeWidget()
         self._tree.setHeaderHidden(True)
@@ -8070,27 +8087,24 @@ class DirectoryBrowserWidget(QWidget):
                 return child
         return None
 
-    def select_directory(self, path: str, emit_signal: bool = True) -> bool:
-        """
-        按路径展开目录树并选中目标目录。
-        返回是否成功定位到目标目录节点。
-        """
+    def _find_directory_item(self, path: str, expand_chain: bool = False) -> QTreeWidgetItem | None:
+        """按路径定位目录节点；expand_chain=True 时同步展开整条父链。"""
         if not path:
-            return False
+            return None
         try:
             target_path = os.path.normpath(os.path.abspath(path))
         except Exception:
-            return False
+            return None
         if not os.path.isdir(target_path):
-            return False
+            return None
 
         root_item = self._find_best_root_item(target_path)
         if root_item is None:
-            return False
+            return None
 
         root_path = root_item.data(0, _UserRole)
         if not root_path:
-            return False
+            return None
         root_path = os.path.normpath(os.path.abspath(root_path))
 
         chain: list[str] = [target_path]
@@ -8098,22 +8112,95 @@ class DirectoryBrowserWidget(QWidget):
         while self._path_key(cur) != self._path_key(root_path):
             parent = os.path.dirname(cur)
             if not parent or self._path_key(parent) == self._path_key(cur):
-                return False
+                return None
             chain.append(parent)
             cur = parent
         chain.reverse()  # root -> ... -> target
 
         current = root_item
-        self._tree.expandItem(current)
+        if expand_chain:
+            self._tree.expandItem(current)
         for sub_path in chain[1:]:
             self._ensure_children_loaded(current)
-            self._tree.expandItem(current)
+            if expand_chain:
+                self._tree.expandItem(current)
             nxt = self._find_child_item_by_path(current, sub_path)
             if nxt is None:
-                return False
+                return None
             current = nxt
 
-        self._tree.expandItem(current)
+        if expand_chain:
+            self._tree.expandItem(current)
+        return current
+
+    def _collect_expanded_paths(self) -> list[str]:
+        """记录当前已展开目录，供整棵树刷新后恢复展开状态。"""
+        expanded_paths: list[str] = []
+        seen: set[str] = set()
+
+        def walk(item: QTreeWidgetItem) -> None:
+            path = item.data(0, _UserRole)
+            if path and item.isExpanded():
+                norm_path = self._path_key(path)
+                if norm_path not in seen:
+                    seen.add(norm_path)
+                    expanded_paths.append(path)
+                for i in range(item.childCount()):
+                    child = item.child(i)
+                    if child.text(0) != self._PLACEHOLDER:
+                        walk(child)
+
+        for i in range(self._tree.topLevelItemCount()):
+            walk(self._tree.topLevelItem(i))
+        return expanded_paths
+
+    def _find_existing_directory_path(self, path: str | None) -> str | None:
+        """返回仍存在的目录；若原目录已不存在，则向上回退到最近祖先目录。"""
+        if not path:
+            return None
+        try:
+            current = os.path.normpath(os.path.abspath(path))
+        except Exception:
+            return None
+        while True:
+            if os.path.isdir(current):
+                return current
+            parent = os.path.dirname(current)
+            if not parent or self._path_key(parent) == self._path_key(current):
+                return None
+            current = parent
+
+    def refresh_directory_tree(self, emit_signal: bool = False) -> None:
+        """重建目录树，并尽量恢复刷新前的展开状态与当前选中目录。"""
+        current_item = self._tree.currentItem()
+        current_path = current_item.data(0, _UserRole) if current_item is not None else None
+        expanded_paths = self._collect_expanded_paths()
+
+        self._tree.setUpdatesEnabled(False)
+        try:
+            self._tree.clear()
+            self._populate_roots()
+            for path in expanded_paths:
+                self._find_directory_item(path, expand_chain=True)
+
+            restore_path = self._find_existing_directory_path(current_path)
+            if restore_path:
+                self.select_directory(restore_path, emit_signal=emit_signal)
+        finally:
+            self._tree.setUpdatesEnabled(True)
+
+    def select_directory(self, path: str, emit_signal: bool = True) -> bool:
+        """
+        按路径展开目录树并选中目标目录。
+        返回是否成功定位到目标目录节点。
+        """
+        current = self._find_directory_item(path, expand_chain=True)
+        if current is None:
+            return False
+        target_path = current.data(0, _UserRole)
+        if not target_path:
+            return False
+
         self._tree.setCurrentItem(current)
         self._tree.clearSelection()
         current.setSelected(True)
