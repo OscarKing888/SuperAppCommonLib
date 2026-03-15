@@ -41,41 +41,58 @@ from typing import Callable
 
 try:
     from PyQt6.QtCore import QPointF, QRectF, Qt
-    from PyQt6.QtGui import QColor, QPainter, QPixmap
+    from PyQt6.QtGui import QColor, QPainter, QPen, QPixmap
     from PyQt6.QtWidgets import QLabel, QVBoxLayout, QWidget
     _QRect_or_QRectF = "QRect | QRectF"
 except ImportError:
     from PyQt5.QtCore import QPointF, QRectF, Qt  # type: ignore[no-reattr]
-    from PyQt5.QtGui import QColor, QPainter, QPixmap  # type: ignore[no-reattr]
+    from PyQt5.QtGui import QColor, QPainter, QPen, QPixmap  # type: ignore[no-reattr]
     from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget  # type: ignore[no-reattr]
     _QRect_or_QRectF = "QRect | QRectF"
 
 # Type alias for overlay callables registered at runtime.
 OverlayLayer = Callable[["QPainter", "QRectF", "object"], None]
 NormalizedBox = tuple[float, float, float, float]
-PREVIEW_COMPOSITION_GRID_MODES: tuple[str, ...] = ("off",)
-PREVIEW_COMPOSITION_GRID_LINE_WIDTHS: tuple[int, ...] = (1,)
+PREVIEW_COMPOSITION_GRID_MODES: tuple[str, ...] = (
+    "none",
+    "thirds",
+    "golden_thirds",
+    "square",
+    "diag_square",
+    "crosshair",
+)
+PREVIEW_COMPOSITION_GRID_LINE_WIDTHS: tuple[int, ...] = (1, 2, 3, 4)
 _FOCUS_BOX_OUTER_BLACK_WIDTH = 1
 _FOCUS_BOX_GREEN_WIDTH = 4
 _FOCUS_BOX_INNER_BLACK_WIDTH = 1
+_GRID_MODE_ALIASES: dict[str, str] = {
+    "off": "none",
+}
 
 
 def normalize_preview_composition_grid_mode(value: object) -> str:
-    """兼容旧接口：当前画布未启用构图网格时始终收敛到关闭态。"""
+    """将构图线模式收敛到受支持的枚举，并兼容旧配置别名。"""
     if isinstance(value, str):
         normalized = value.strip().lower()
+        normalized = _GRID_MODE_ALIASES.get(normalized, normalized)
         if normalized in PREVIEW_COMPOSITION_GRID_MODES:
             return normalized
     return PREVIEW_COMPOSITION_GRID_MODES[0]
 
 
 def normalize_preview_composition_grid_line_width(value: object) -> int:
-    """兼容旧接口：仅保留正整数线宽并回退到默认值。"""
+    """将构图线线宽收敛到受支持的正整数。"""
     try:
         width = int(value)
     except Exception:
         return PREVIEW_COMPOSITION_GRID_LINE_WIDTHS[0]
-    return width if width > 0 else PREVIEW_COMPOSITION_GRID_LINE_WIDTHS[0]
+    min_width = PREVIEW_COMPOSITION_GRID_LINE_WIDTHS[0]
+    max_width = PREVIEW_COMPOSITION_GRID_LINE_WIDTHS[-1]
+    if width < min_width:
+        return min_width
+    if width > max_width:
+        return max_width
+    return width if width in PREVIEW_COMPOSITION_GRID_LINE_WIDTHS else min_width
 
 
 @dataclass(slots=True)
@@ -97,6 +114,8 @@ class PreviewOverlayOptions:
     """
 
     show_focus_box: bool = True
+    composition_grid_mode: str = PREVIEW_COMPOSITION_GRID_MODES[0]
+    composition_grid_line_width: int = PREVIEW_COMPOSITION_GRID_LINE_WIDTHS[0]
 
 # ---------------------------------------------------------------------------
 # Checker background helper (self-contained, no external deps)
@@ -153,6 +172,8 @@ class PreviewCanvas(QLabel):
         # Built-in: focus box
         self._focus_box: "tuple[float, float, float, float] | None" = None
         self._show_focus_box: bool = True
+        self._composition_grid_mode: str = PREVIEW_COMPOSITION_GRID_MODES[0]
+        self._composition_grid_line_width: int = PREVIEW_COMPOSITION_GRID_LINE_WIDTHS[0]
 
         # Built-in: zoom / pan
         self._use_original_size: bool = False
@@ -199,6 +220,22 @@ class PreviewCanvas(QLabel):
         if self._show_focus_box == parsed:
             return
         self._show_focus_box = parsed
+        self.update()
+
+    def set_composition_grid_mode(self, mode: str | None) -> None:
+        """Set the composition-guide overlay mode."""
+        parsed = normalize_preview_composition_grid_mode(mode)
+        if self._composition_grid_mode == parsed:
+            return
+        self._composition_grid_mode = parsed
+        self.update()
+
+    def set_composition_grid_line_width(self, width: int | str | None) -> None:
+        """Set the composition-guide overlay line width."""
+        parsed = normalize_preview_composition_grid_line_width(width)
+        if self._composition_grid_line_width == parsed:
+            return
+        self._composition_grid_line_width = parsed
         self.update()
 
     # ------------------------------------------------------------------
@@ -328,6 +365,43 @@ class PreviewCanvas(QLabel):
         except ValueError:
             pass
 
+    def render_source_pixmap_with_overlays(self) -> "QPixmap | None":
+        """Render the current source pixmap with overlays at source resolution."""
+        if self._source_pixmap is None or self._source_pixmap.isNull():
+            return None
+        rendered = self._source_pixmap.copy()
+        painter = QPainter(rendered)
+        try:
+            try:
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            except Exception:
+                pass
+            content_rect = rendered.rect()
+            painter.setClipRect(content_rect)
+            self._paint_overlay_layers(
+                painter,
+                QRectF(0.0, 0.0, float(rendered.width()), float(rendered.height())),
+                content_rect,
+            )
+        finally:
+            painter.end()
+        return rendered
+
+    def save_source_pixmap_with_overlays(
+        self,
+        path: str,
+        fmt: str | None = None,
+        quality: int = -1,
+    ) -> bool:
+        """Save the current source pixmap together with active overlays."""
+        rendered = self.render_source_pixmap_with_overlays()
+        if rendered is None or rendered.isNull():
+            return False
+        if fmt is None:
+            return rendered.save(path, quality=quality)
+        return rendered.save(path, fmt, quality)
+
     # ------------------------------------------------------------------
     # Extension hooks (override in subclass – do NOT call super() unless
     # you explicitly want both the base behaviour and your own)
@@ -346,8 +420,20 @@ class PreviewCanvas(QLabel):
     def _apply_overlay_options_data(self, options: "PreviewOverlayOptions") -> bool:
         """Subclass hook: apply overlay options, return whether anything changed."""
         show_focus_box = bool(options.show_focus_box)
+        composition_grid_mode = normalize_preview_composition_grid_mode(
+            getattr(options, "composition_grid_mode", PREVIEW_COMPOSITION_GRID_MODES[0])
+        )
+        composition_grid_line_width = normalize_preview_composition_grid_line_width(
+            getattr(options, "composition_grid_line_width", PREVIEW_COMPOSITION_GRID_LINE_WIDTHS[0])
+        )
         changed = self._show_focus_box != show_focus_box
         self._show_focus_box = show_focus_box
+        if self._composition_grid_mode != composition_grid_mode:
+            self._composition_grid_mode = composition_grid_mode
+            changed = True
+        if self._composition_grid_line_width != composition_grid_line_width:
+            self._composition_grid_line_width = composition_grid_line_width
+            changed = True
         return changed
 
     def _paint_overlays(
@@ -362,6 +448,14 @@ class PreviewCanvas(QLabel):
         runtime-registered layers. The ``painter`` is clipped to *content_rect*
         and still active; call ``painter.end()`` is handled by the base class.
         """
+
+    def _composition_grid_target_rect(
+        self,
+        draw_rect: "QRectF",
+        content_rect: "object",  # QRect
+    ) -> "QRectF":
+        """Hook for subclasses to constrain composition guides to a sub-rect."""
+        return draw_rect
 
     def _on_source_cleared(self) -> None:
         """Subclass hook: called when the source pixmap is set to None/null.
@@ -556,26 +650,134 @@ class PreviewCanvas(QLabel):
             self._source_pixmap,
             QRectF(0, 0, self._source_pixmap.width(), self._source_pixmap.height()),
         )
-
-        # ── built-in: focus box ───────────────────────────────────────
-        if self._show_focus_box and self._focus_box:
-            self._paint_focus_box(painter, draw_rect, content)
-
-        # ── subclass overlays ─────────────────────────────────────────
-        self._paint_overlays(painter, draw_rect, content)
-
-        # ── runtime-registered layers ─────────────────────────────────
-        for layer_fn in self._overlay_layers:
-            try:
-                layer_fn(painter, draw_rect, content)
-            except Exception:
-                pass
+        self._paint_overlay_layers(painter, draw_rect, content)
 
         painter.end()
 
     # ------------------------------------------------------------------
     # Built-in overlay painters (private)
     # ------------------------------------------------------------------
+
+    def _paint_overlay_layers(
+        self,
+        painter: "QPainter",
+        draw_rect: "QRectF",
+        content_rect: "object",  # QRect
+    ) -> None:
+        if self._composition_grid_mode != PREVIEW_COMPOSITION_GRID_MODES[0]:
+            self._paint_composition_grid(painter, draw_rect, content_rect)
+
+        if self._show_focus_box and self._focus_box:
+            self._paint_focus_box(painter, draw_rect, content_rect)
+
+        self._paint_overlays(painter, draw_rect, content_rect)
+
+        for layer_fn in self._overlay_layers:
+            try:
+                layer_fn(painter, draw_rect, content_rect)
+            except Exception:
+                pass
+
+    def _paint_composition_grid(
+        self,
+        painter: "QPainter",
+        draw_rect: "QRectF",
+        content_rect: "object",  # QRect
+    ) -> None:
+        target_rect = self._composition_grid_target_rect(draw_rect, content_rect)
+        if target_rect.width() < 2.0 or target_rect.height() < 2.0:
+            return
+
+        left = float(target_rect.left())
+        top = float(target_rect.top())
+        right = float(target_rect.right())
+        bottom = float(target_rect.bottom())
+        width = float(target_rect.width())
+        height = float(target_rect.height())
+        line_width = self._composition_grid_line_width
+        mode = self._composition_grid_mode
+        golden_ratio_minor = 0.3819660112501051
+        golden_ratio_major = 1.0 - golden_ratio_minor
+
+        segments: list[tuple[QPointF, QPointF]] = []
+
+        def add_vertical(frac: float) -> None:
+            x = left + (width * frac)
+            segments.append((QPointF(x, top), QPointF(x, bottom)))
+
+        def add_horizontal(frac: float) -> None:
+            y = top + (height * frac)
+            segments.append((QPointF(left, y), QPointF(right, y)))
+
+        def add_square_grid() -> None:
+            cell = min(width, height) / 3.0
+            if cell <= 0.0:
+                return
+            start_x = left + max(0.0, (width - cell * 3.0) * 0.5)
+            x = start_x + cell
+            while x < right - 0.5:
+                segments.append((QPointF(x, top), QPointF(x, bottom)))
+                x += cell
+            start_y = top + max(0.0, (height - cell * 3.0) * 0.5)
+            y = start_y + cell
+            while y < bottom - 0.5:
+                segments.append((QPointF(left, y), QPointF(right, y)))
+                y += cell
+
+        if mode == "thirds":
+            add_vertical(1.0 / 3.0)
+            add_vertical(2.0 / 3.0)
+            add_horizontal(1.0 / 3.0)
+            add_horizontal(2.0 / 3.0)
+        elif mode == "golden_thirds":
+            add_vertical(golden_ratio_minor)
+            add_vertical(golden_ratio_major)
+            add_horizontal(golden_ratio_minor)
+            add_horizontal(golden_ratio_major)
+        elif mode == "square":
+            add_square_grid()
+        elif mode == "diag_square":
+            add_square_grid()
+            segments.append((QPointF(left, top), QPointF(right, bottom)))
+            segments.append((QPointF(left, bottom), QPointF(right, top)))
+        elif mode == "crosshair":
+            add_vertical(0.5)
+            add_horizontal(0.5)
+
+        if not segments:
+            return
+
+        painter.save()
+        try:
+            for start, end in segments:
+                self._draw_composition_grid_line(painter, start, end, line_width)
+        finally:
+            painter.restore()
+
+    def _draw_composition_grid_line(
+        self,
+        painter: "QPainter",
+        start: "QPointF",
+        end: "QPointF",
+        line_width: int,
+    ) -> None:
+        shadow_pen = QPen(QColor(0, 0, 0, 112))
+        shadow_pen.setWidth(max(2, int(line_width) + 2))
+        try:
+            shadow_pen.setCosmetic(True)
+        except Exception:
+            pass
+        painter.setPen(shadow_pen)
+        painter.drawLine(start, end)
+
+        line_pen = QPen(QColor(255, 255, 255, 176))
+        line_pen.setWidth(max(1, int(line_width)))
+        try:
+            line_pen.setCosmetic(True)
+        except Exception:
+            pass
+        painter.setPen(line_pen)
+        painter.drawLine(start, end)
 
     def _paint_focus_box(self, painter: "QPainter", draw_rect: "QRectF", content: "object") -> None:
         def _fill_box_ring(
