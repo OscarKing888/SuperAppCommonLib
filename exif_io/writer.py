@@ -587,7 +587,7 @@ def read_batch_metadata(paths: list, tags: list | None = None, use_cache: bool =
     for norm in cached_norms:
         rec = result.get(norm)
         if rec:
-            _log.info("[read_batch_metadata] path=%r 来源=缓存 %s", norm, _summarize_rec_for_log(rec))
+            _log.debug("[read_batch_metadata] path=%r 来源=缓存 %s", norm, _summarize_rec_for_log(rec))
 
     if not uncached:
         return result
@@ -596,15 +596,15 @@ def read_batch_metadata(paths: list, tags: list | None = None, use_cache: bool =
     et = get_exiftool_executable_path()
     if et:
         new_result = _batch_read_exiftool(et, uncached, tags)
-        _log.info("[read_batch_metadata] exiftool 返回 path数=%s", len(new_result))
+        _log.debug("[read_batch_metadata] exiftool 返回 path数=%s", len(new_result))
     else:
         new_result = {}
-        _log.info("[read_batch_metadata] 无 exiftool，跳过文件内读取")
+        _log.debug("[read_batch_metadata] 无 exiftool，跳过文件内读取")
 
     exiftool_norms = set(new_result.keys())
     missing = [p for p in uncached if os.path.normpath(p) not in new_result]
     if missing:
-        _log.info("[read_batch_metadata] exiftool 未返回 改用 XMP sidecar paths=%s", [os.path.normpath(p) for p in missing])
+        _log.debug("[read_batch_metadata] exiftool 未返回 改用 XMP sidecar paths=%s", [os.path.normpath(p) for p in missing])
         sidecar_result = _batch_read_xmp_sidecar(missing)
         new_result.update(sidecar_result)
 
@@ -626,7 +626,7 @@ def read_batch_metadata(paths: list, tags: list | None = None, use_cache: bool =
         and not any(new_result[os.path.normpath(p)].get(f) for f in _XMP_INDICATORS)
     ]
     if need_merge:
-        _log.info("[read_batch_metadata] 合并 XMP sidecar 补全 paths=%s", [os.path.normpath(p) for p in need_merge])
+        _log.debug("[read_batch_metadata] 合并 XMP sidecar 补全 paths=%s", [os.path.normpath(p) for p in need_merge])
         from app_common.exif_io.xmp_sidecar import read_xmp_sidecar
         for path in need_merge:
             norm = os.path.normpath(path)
@@ -651,7 +651,7 @@ def read_batch_metadata(paths: list, tags: list | None = None, use_cache: bool =
             source = "文件内+XMP合并" if norm in need_merge_norms else "文件内(exiftool)"
         else:
             source = "XMP"
-        _log.info("[read_batch_metadata] path=%r 来源=%s %s", norm, source, _summarize_rec_for_log(rec))
+        _log.debug("[read_batch_metadata] path=%r 来源=%s %s", norm, source, _summarize_rec_for_log(rec))
 
     # 写入缓存（副本），超出上限时 FIFO 淘汰（加锁保证多线程安全）
     if use_cache:
@@ -662,7 +662,7 @@ def read_batch_metadata(paths: list, tags: list | None = None, use_cache: bool =
             for norm, rec in new_result.items():
                 _METADATA_CACHE[norm] = rec.copy()
 
-    _log.info("[read_batch_metadata] 批量查询完成 结果总数=%s", len(result))
+    _log.debug("[read_batch_metadata] 批量查询完成 结果总数=%s", len(result))
     return result
 
 

@@ -307,6 +307,7 @@ _SUPERBIRDSTAMP_BROWSER_METADATA_TAGS = _merge_unique_text_groups(
     DEFAULT_METADATA_TAGS,
     _SUPERBIRDSTAMP_CAMERA_METADATA_TAGS,
 )
+_SUPERBIRDSTAMP_BROWSER_METADATA_TAGS_SET = frozenset(_SUPERBIRDSTAMP_BROWSER_METADATA_TAGS)
 
 # 缩略图尺寸档位（像素）
 _THUMB_SIZE_STEPS = [128, 256, 512, 1024]
@@ -3260,7 +3261,7 @@ class MetadataLoader(QThread):
                     return
                 chunk = paths[i : i + chunk_size]
                 batch = self._read_metadata_batch(chunk)
-                focus_batch = self._build_focus_cache_batch(chunk)
+                focus_batch = self._build_focus_cache_batch(chunk) if self._should_prefetch_focus_cache() else {}
                 parsed_batch: dict = {}
                 for norm_path, flat in batch.items():
                     if self._stop_flag or self.isInterruptionRequested():
@@ -3270,7 +3271,7 @@ class MetadataLoader(QThread):
                     if species_cn:
                         meta["bird_species_cn"] = species_cn
                     parsed_batch[norm_path] = meta
-                    _log.info(
+                    _log.debug(
                         "[MetadataLoader.run] path=%r title=%r rating=%s pick=%s",
                         norm_path, meta.get("title", ""), meta.get("rating"), meta.get("pick"),
                     )
@@ -3286,30 +3287,86 @@ class MetadataLoader(QThread):
             _log.warning("[MetadataLoader.run] exception: %s", e)
         _log.info("[MetadataLoader.run] END")
 
+    def _uses_browser_metadata_tags(self) -> bool:
+        if not self._metadata_tags:
+            return False
+        return frozenset(self._metadata_tags) == _SUPERBIRDSTAMP_BROWSER_METADATA_TAGS_SET
+
+    def _should_prefetch_focus_cache(self) -> bool:
+        """
+        文件列表 metadata 加载阶段不要再同步触发第二次 metadata 扫描。
+
+        焦点框预热应走独立 worker；这里若继续顺手批量读一遍 RAW metadata，
+        会直接拖慢列表 metadata 完成时间，导致用户感觉“排序一直不可用”。
+        """
+        return False
+
+    @staticmethod
+    def _has_report_backed_metadata(flat: dict | None) -> bool:
+        if not isinstance(flat, dict) or not flat:
+            return False
+        for key, value in flat.items():
+            if key == "SourceFile":
+                continue
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
+            return True
+        return False
+
+    def _read_report_metadata_batch(self, paths: list[str]) -> dict[str, dict]:
+        report_db = getattr(self._meta_proxy, "report_db", None)
+        if report_db is None:
+            return {}
+        try:
+            raw_batch = report_db.read_batch(paths) or {}
+        except Exception as exc:
+            _log.warning("[MetadataLoader._read_report_metadata_batch] report_db.read_batch failed: %s", exc)
+            return {}
+        result: dict[str, dict] = {}
+        for path, flat in raw_batch.items():
+            norm_path = os.path.normpath(path)
+            if isinstance(flat, dict) and flat:
+                result[norm_path] = flat
+        return result
+
     def _read_metadata_batch(self, paths: list[str]) -> dict[str, dict]:
         norm_paths = [os.path.normpath(p) for p in paths]
         result: dict[str, dict] = {norm: {"SourceFile": norm} for norm in norm_paths}
-        try:
-            raw_batch = read_batch_metadata(
-                paths,
-                tags=self._metadata_tags or None,
-                use_cache=not bool(self._metadata_tags),
-            )
-            for norm_path, flat in raw_batch.items():
-                if norm_path in result and flat:
+        report_batch = self._read_report_metadata_batch(paths)
+        report_only_browser_mode = self._uses_browser_metadata_tags() and EXIF_ONLY_FROM_REPORT_DB
+        raw_paths = list(paths)
+        if report_only_browser_mode and report_batch:
+            raw_paths = []
+            report_hit_count = 0
+            for path, norm_path in zip(paths, norm_paths):
+                flat = report_batch.get(norm_path)
+                if self._has_report_backed_metadata(flat):
                     result[norm_path].update(flat)
-        except Exception as exc:
-            _log.warning("[MetadataLoader._read_metadata_batch] read_batch_metadata failed: %s", exc)
-        report_db = getattr(self._meta_proxy, "report_db", None)
-        if report_db is None:
-            return result
-        for path, norm_path in zip(paths, norm_paths):
+                    report_hit_count += 1
+                    continue
+                raw_paths.append(path)
+            _log.info(
+                "[MetadataLoader._read_metadata_batch] browser metadata served from report.db hits=%s fallback=%s total=%s",
+                report_hit_count,
+                len(raw_paths),
+                len(paths),
+            )
+        if raw_paths:
             try:
-                flat = report_db.read(path)
+                raw_batch = read_batch_metadata(
+                    raw_paths,
+                    tags=self._metadata_tags or None,
+                    use_cache=not bool(self._metadata_tags),
+                )
+                for norm_path, flat in raw_batch.items():
+                    if norm_path in result and flat:
+                        result[norm_path].update(flat)
             except Exception as exc:
-                _log.debug("[MetadataLoader._read_metadata_batch] report_db.read failed path=%r err=%s", path, exc)
-                continue
-            if flat:
+                _log.warning("[MetadataLoader._read_metadata_batch] read_batch_metadata failed: %s", exc)
+        for norm_path, flat in report_batch.items():
+            if norm_path in result and flat:
                 result[norm_path].update(flat)
         return result
 
@@ -3511,8 +3568,11 @@ class FileListPanel(QWidget):
         self._file_table_proxy.setSourceModel(self._file_table_model)
         self._thumb_list_model = ThumbnailListModel(self)
         self._meta_cache:    dict = {}   # norm_path → metadata dict
+        self._directory_scope_cache: dict[bool, dict] = {}  # 当前目录 shallow/recursive 两个 scope 的文件列表缓存
         self._report_cache:  dict = {}   # stem → report row (当前目录/子树筛出的 report 子集)
         self._report_row_by_path: dict = {}
+        self._loaded_directory_recursive: bool = False
+        self._requested_directory_recursive: bool = False
         self._pending_loaders: list = []
         self._path_lookup_pending: set[str] = set()
         self._path_lookup_workers: list[PathLookupWorker] = []
@@ -3681,7 +3741,7 @@ class FileListPanel(QWidget):
             self._filter_edit.setStyleSheet(
                 "QLineEdit { padding: 2px 4px; font-size: 12px; }"
             )
-            self._filter_edit.textChanged.connect(lambda _: self._apply_filter())
+            self._filter_edit.textChanged.connect(self._on_filter_text_changed)
             filter_bar.addWidget(self._filter_edit, stretch=1)
 
             # 精选按钮
@@ -3781,6 +3841,7 @@ class FileListPanel(QWidget):
         hdr.setSectionsClickable(True)
         hdr.setSectionsMovable(False)
         hdr.setMouseTracking(True)
+        hdr.setSortIndicatorShown(True)
         hdr.sortIndicatorChanged.connect(self._on_tree_sort_indicator_changed)
         self._tree_widget.selectionModel().currentChanged.connect(self._on_tree_current_item_changed)
         self._tree_widget.selectionModel().selectionChanged.connect(self._on_view_selection_changed)
@@ -3797,7 +3858,7 @@ class FileListPanel(QWidget):
         self._tree_widget.setColumnWidth(_TREE_COL_SHUTTER, 84)
         self._tree_widget.setColumnWidth(_TREE_COL_ISO, 72)
         self._tree_widget.setColumnWidth(_TREE_COL_APERTURE, 72)
-        self._tree_widget.sortByColumn(_TREE_COL_NAME, _AscendingOrder)
+        self._apply_tree_sort(_TREE_COL_NAME, _AscendingOrder, sync_indicator=True)
         self._tree_widget.setContextMenuPolicy(_CustomContextMenu)
         self._tree_widget.customContextMenuRequested.connect(self._on_tree_context_menu)
         self._tree_widget.installEventFilter(self)
@@ -3996,18 +4057,206 @@ class FileListPanel(QWidget):
             bool(self._filter_focus_status)
         )
 
-    def load_directory(self, path: str, force_reload: bool = False) -> None:
+    def _store_directory_scope_cache(
+        self,
+        *,
+        recursive: bool,
+        files: list[str],
+        report_cache: dict,
+        report_row_by_path: dict,
+    ) -> None:
+        self._directory_scope_cache[bool(recursive)] = {
+            "files": list(files),
+            "report_cache": dict(report_cache or {}),
+            "report_row_by_path": dict(report_row_by_path or {}),
+        }
+
+    def _get_cached_directory_scope(self, recursive: bool) -> dict | None:
+        cached = self._directory_scope_cache.get(bool(recursive))
+        if not isinstance(cached, dict):
+            return None
+        files = cached.get("files")
+        report_cache = cached.get("report_cache")
+        report_row_by_path = cached.get("report_row_by_path")
+        if not isinstance(files, list) or not isinstance(report_cache, dict) or not isinstance(report_row_by_path, dict):
+            return None
+        return {
+            "files": list(files),
+            "report_cache": dict(report_cache),
+            "report_row_by_path": dict(report_row_by_path),
+        }
+
+    def _collect_uncached_metadata_paths(self, paths: list[str]) -> list[str]:
+        uncached: list[str] = []
+        for path in paths:
+            norm_path = os.path.normpath(path) if path else ""
+            if not norm_path:
+                continue
+            if norm_path not in self._meta_cache:
+                uncached.append(path)
+        return uncached
+
+    def _apply_directory_listing_result(
+        self,
+        path: str,
+        files: list[str],
+        report_cache: dict,
+        full_report_cache,
+        *,
+        recursive: bool,
+        report_row_by_path: dict | None = None,
+        from_cache: bool = False,
+    ) -> None:
+        if path != self._current_dir:
+            _log.info("[_apply_directory_listing_result] IGNORE stale path=%r current=%r", path, self._current_dir)
+            return
+        if self._report_root_dir:
+            self._report_full_root_dir = self._report_root_dir
+            if full_report_cache is not None:
+                self._report_full_cache = full_report_cache
+            _log.info(
+                "[_apply_directory_listing_result] full report cache root=%r entries=%s",
+                self._report_full_root_dir,
+                len(self._report_full_cache or {}),
+            )
+        if not from_cache and _DEBUG_FILE_LIST_LIMIT > 0 and len(files) > _DEBUG_FILE_LIST_LIMIT:
+            selected_files = files
+            if _DEBUG_FILE_LIST_MATCH:
+                matched = [p for p in files if _DEBUG_FILE_LIST_MATCH in str(p).lower()]
+                if matched:
+                    matched_set = set(matched)
+                    selected_files = matched + [p for p in files if p not in matched_set]
+                    _log.warning(
+                        "[DEBUG] SuperViewer_DEBUG_FILE_LIST_MATCH=%r matched=%s (prioritized)",
+                        _DEBUG_FILE_LIST_MATCH,
+                        len(matched),
+                    )
+                else:
+                    _log.warning(
+                        "[DEBUG] SuperViewer_DEBUG_FILE_LIST_MATCH=%r no match in current files",
+                        _DEBUG_FILE_LIST_MATCH,
+                    )
+            limited_files = selected_files[:_DEBUG_FILE_LIST_LIMIT]
+            keep_stems = {Path(p).stem for p in limited_files}
+            report_cache = {k: v for k, v in report_cache.items() if k in keep_stems}
+            _log.warning(
+                "[DEBUG] SuperViewer_DEBUG_FILE_LIST_LIMIT=%s active: files %s -> %s, report_entries -> %s",
+                _DEBUG_FILE_LIST_LIMIT,
+                len(files),
+                len(limited_files),
+                len(report_cache),
+            )
+            files = limited_files
+        self._report_cache = dict(report_cache or {})
+        self._meta_proxy.report_db.update_cache(self._report_full_cache or self._report_cache)
+        if report_row_by_path is None:
+            report_row_by_path = {}
+            row_cache_for_path_map = self._report_full_cache or self._report_cache or {}
+            for p in files:
+                norm_p = os.path.normpath(p) if p else ""
+                if not norm_p:
+                    continue
+                row = row_cache_for_path_map.get(Path(norm_p).stem)
+                if isinstance(row, dict):
+                    report_row_by_path[norm_p] = row
+        self._report_row_by_path = dict(report_row_by_path or {})
+        self._all_files = list(files)
+        self._loaded_directory_recursive = bool(recursive)
+        self._store_directory_scope_cache(
+            recursive=recursive,
+            files=self._all_files,
+            report_cache=self._report_cache,
+            report_row_by_path=self._report_row_by_path,
+        )
+        _log.info(
+            "[_apply_directory_listing_result] apply files=%s report_entries=%s recursive=%s from_cache=%s",
+            len(self._all_files),
+            len(self._report_cache),
+            recursive,
+            from_cache,
+        )
+        self._rebuild_views()
+        self.files_loaded.emit(self.get_display_file_paths())
+        if self._pending_selection_paths:
+            self._apply_pending_selection()
+            if self._view_mode != self._MODE_THUMB or not self._thumb_model_dirty:
+                self._pending_selection_paths = None
+                self._pending_selection_current_path = ""
+        uncached_meta_paths = self._collect_uncached_metadata_paths(self._all_files)
+        if uncached_meta_paths:
+            _log.info(
+                "[_apply_directory_listing_result] start metadata loader missing=%s cached=%s total=%s",
+                len(uncached_meta_paths),
+                max(0, len(self._all_files) - len(uncached_meta_paths)),
+                len(self._all_files),
+            )
+            self._start_metadata_loader(uncached_meta_paths)
+        else:
+            _log.info(
+                "[_apply_directory_listing_result] metadata already cached for all files total=%s",
+                len(self._all_files),
+            )
+        self._schedule_persistent_thumb_cache_build(self._all_files)
+
+    def _refresh_filter_scope(self) -> None:
+        if not self._current_dir or not os.path.isdir(self._current_dir):
+            self._apply_filter()
+            return
+        target_recursive = self._has_any_filter()
+        if target_recursive == self._loaded_directory_recursive:
+            self._apply_filter()
+            return
+        # 从当前目录切换到递归范围时，先在现有数据集上即时过滤一版，随后异步补齐子目录结果。
+        if target_recursive and not self._loaded_directory_recursive:
+            self._apply_filter()
+        selected_paths, current_path = self._capture_selection_restore_state()
+        if selected_paths:
+            self.set_pending_selection(selected_paths, current_path=current_path)
+        self.load_directory(
+            self._current_dir,
+            force_reload=True,
+            preserve_meta_cache=True,
+            reuse_cached_listing=True,
+        )
+
+    def load_directory(
+        self,
+        path: str,
+        force_reload: bool = False,
+        *,
+        preserve_meta_cache: bool = False,
+        reuse_cached_listing: bool = False,
+    ) -> None:
         """
         扫描目录，加载支持的图像文件。扫描与 report 加载在后台线程执行，避免阻塞 UI。
-        当任意过滤条件开启（文本 / 🏆精选 / 星级）时，递归遍历该目录及所有子目录（不进入 . 开头目录）；
-        否则仅当前目录。force_reload=True 时忽略「当前目录未变」的短路，用于切换过滤后刷新列表。
+        当任意过滤条件开启（文本 / 🏆精选 / 星级 / 对焦）时，递归遍历该目录及所有子目录（不进入 . 开头目录）；
+        否则仅当前目录。过滤切换同目录 scope 时可复用当前内存中的文件列表和 metadata 缓存，避免重复全量读取。
         """
-        _log.info("[load_directory] 选中目录，将扫描并列出图像文件、随后查询 EXIF path=%r force_reload=%s", path, force_reload)
-        _log.info("[load_directory] START path=%r force_reload=%s", path, force_reload)
-        if not force_reload and path == self._current_dir:
+        recursive = self._has_any_filter()
+        same_dir = path == self._current_dir
+        _log.info(
+            "[load_directory] 选中目录，将扫描并列出图像文件、随后查询 EXIF path=%r force_reload=%s recursive=%s preserve_meta_cache=%s reuse_cached_listing=%s",
+            path,
+            force_reload,
+            recursive,
+            preserve_meta_cache,
+            reuse_cached_listing,
+        )
+        _log.info(
+            "[load_directory] START path=%r force_reload=%s recursive=%s preserve_meta_cache=%s reuse_cached_listing=%s",
+            path,
+            force_reload,
+            recursive,
+            preserve_meta_cache,
+            reuse_cached_listing,
+        )
+        if not force_reload and same_dir and recursive == self._loaded_directory_recursive:
             _log.info("[load_directory] SKIP same dir")
             return
         self._current_dir = path
+        if not same_dir:
+            self._directory_scope_cache.clear()
+            self._loaded_directory_recursive = False
         # 选择目录后，向上最多查找 4 层最近的 report 根目录；子目录共用同一个 report.db
         new_report_root_dir = find_report_root(path, max_levels=4)
         if new_report_root_dir != self._report_root_dir:
@@ -4044,6 +4293,27 @@ class FileListPanel(QWidget):
         self._stop_all_loaders()
         _log.info("[load_directory] _stop_directory_scan_worker")
         self._stop_directory_scan_worker()
+        if same_dir and reuse_cached_listing:
+            cached_scope = self._get_cached_directory_scope(recursive)
+            if cached_scope is not None:
+                _log.info(
+                    "[load_directory] reuse cached directory scope recursive=%s files=%s report_entries=%s",
+                    recursive,
+                    len(cached_scope["files"]),
+                    len(cached_scope["report_cache"]),
+                )
+                self._selected_display_path = ""
+                self._apply_directory_listing_result(
+                    path,
+                    cached_scope["files"],
+                    cached_scope["report_cache"],
+                    self._report_full_cache,
+                    recursive=recursive,
+                    report_row_by_path=cached_scope["report_row_by_path"],
+                    from_cache=True,
+                )
+                _log.info("[load_directory] END reused cached scope")
+                return
         # Folder-level FIFO eviction: release QImages cached for any directory
         # other than the one we are about to enter.  This ensures that browsing
         # through many large folders cannot accumulate an unbounded number of
@@ -4053,14 +4323,23 @@ class FileListPanel(QWidget):
         _evicted = self._thumb_memory_cache.evict_other_dirs(_path_key(path))
         if _evicted:
             _log.info("[load_directory] evicted %.1f MB from other dirs", _evicted / (1024 * 1024))
-        self._meta_cache.clear()
-        self._report_cache = {}
-        self._report_row_by_path = {}
-        self._selected_display_path = ""
-        self._all_files = []
-        _log.info("[load_directory] _rebuild_views (empty)")
-        self._rebuild_views()
-        recursive = self._has_any_filter()
+        if not same_dir or not preserve_meta_cache:
+            self._directory_scope_cache.clear()
+            self._meta_cache.clear()
+            self._report_cache = {}
+            self._report_row_by_path = {}
+            self._selected_display_path = ""
+            self._all_files = []
+            _log.info("[load_directory] _rebuild_views (empty)")
+            self._rebuild_views()
+        else:
+            _log.info(
+                "[load_directory] preserve same-dir meta cache cache_size=%s loaded_recursive=%s target_recursive=%s",
+                len(self._meta_cache),
+                self._loaded_directory_recursive,
+                recursive,
+            )
+        self._requested_directory_recursive = recursive
         _log.info(
             "[load_directory] starting DirectoryScanWorker recursive=%s report_root_dir=%r has_cached_full_report=%s",
             recursive,
@@ -4096,72 +4375,20 @@ class FileListPanel(QWidget):
         if path != self._current_dir:
             _log.info("[_on_directory_scan_finished] IGNORE stale path")
             return
-        if self._report_root_dir:
-            self._report_full_root_dir = self._report_root_dir
-            if full_report_cache is not None:
-                self._report_full_cache = full_report_cache
-            _log.info(
-                "[_on_directory_scan_finished] full report cache root=%r entries=%s",
-                self._report_full_root_dir,
-                len(self._report_full_cache or {}),
-            )
-        if _DEBUG_FILE_LIST_LIMIT > 0 and len(files) > _DEBUG_FILE_LIST_LIMIT:
-            selected_files = files
-            if _DEBUG_FILE_LIST_MATCH:
-                matched = [p for p in files if _DEBUG_FILE_LIST_MATCH in str(p).lower()]
-                if matched:
-                    matched_set = set(matched)
-                    selected_files = matched + [p for p in files if p not in matched_set]
-                    _log.warning(
-                        "[DEBUG] SuperViewer_DEBUG_FILE_LIST_MATCH=%r matched=%s (prioritized)",
-                        _DEBUG_FILE_LIST_MATCH,
-                        len(matched),
-                    )
-                else:
-                    _log.warning(
-                        "[DEBUG] SuperViewer_DEBUG_FILE_LIST_MATCH=%r no match in current files",
-                        _DEBUG_FILE_LIST_MATCH,
-                    )
-            limited_files = selected_files[:_DEBUG_FILE_LIST_LIMIT]
-            keep_stems = {Path(p).stem for p in limited_files}
-            report_cache = {k: v for k, v in report_cache.items() if k in keep_stems}
-            _log.warning(
-                "[DEBUG] SuperViewer_DEBUG_FILE_LIST_LIMIT=%s active: files %s -> %s, report_entries -> %s",
-                _DEBUG_FILE_LIST_LIMIT,
-                len(files),
-                len(limited_files),
-                len(report_cache),
-            )
-            files = limited_files
-        self._report_cache = report_cache
-        self._meta_proxy.report_db.update_cache(self._report_full_cache or self._report_cache)
-        self._report_row_by_path = {}
-        row_cache_for_path_map = self._report_full_cache or self._report_cache or {}
-        for p in files:
-            norm_p = os.path.normpath(p) if p else ""
-            if not norm_p:
-                continue
-            row = row_cache_for_path_map.get(Path(norm_p).stem)
-            if isinstance(row, dict):
-                self._report_row_by_path[norm_p] = row
-        _log.info("[_on_directory_scan_finished] report row path map entries=%s", len(self._report_row_by_path))
-        self._all_files = files
-        _log.info("[_on_directory_scan_finished] 已列出 %s 个文件，重建列表/缩略图视图", len(files))
-        _log.info("[_on_directory_scan_finished] _rebuild_views START")
-        self._rebuild_views()
-        _log.info("[_on_directory_scan_finished] _rebuild_views END")
-        self.files_loaded.emit(self.get_display_file_paths())
-        if self._pending_selection_paths:
-            self._apply_pending_selection()
-            if self._view_mode != self._MODE_THUMB or not self._thumb_model_dirty:
-                self._pending_selection_paths = None
-                self._pending_selection_current_path = ""
-        if files:
-            _log.info("[_on_directory_scan_finished] 为当前目录下列出的 %s 个文件启动 EXIF 查询（report_cache=%s 条，未命中走 exiftool/XMP）", len(files), len(report_cache))
-            self._start_metadata_loader(files)
-        else:
-            _log.info("[_on_directory_scan_finished] 当前目录无图像文件，跳过 EXIF 查询")
-        self._schedule_persistent_thumb_cache_build(files)
+        recursive = self._requested_directory_recursive
+        _log.info(
+            "[_on_directory_scan_finished] apply scan result recursive=%s files=%s report_entries=%s",
+            recursive,
+            len(files),
+            len(report_cache),
+        )
+        self._apply_directory_listing_result(
+            path,
+            files,
+            report_cache,
+            full_report_cache,
+            recursive=recursive,
+        )
         self._directory_scan_worker = None
         _log.info("[_on_directory_scan_finished] END")
 
@@ -4354,8 +4581,7 @@ class FileListPanel(QWidget):
                     view_mode=self._view_mode,
                 )
                 self._scroll_path_into_view(current_target, prefer_active=False)
-            QTimer.singleShot(0, lambda p=current_target: self._scroll_path_into_view(p))
-            QTimer.singleShot(30, lambda p=current_target: self._scroll_path_into_view(p))
+            self._schedule_selection_visibility_restore(current_target, reason="apply_pending_selection")
             self._emit_file_selected_for_path(current_target)
         self._update_selection_status()
 
@@ -4383,6 +4609,40 @@ class FileListPanel(QWidget):
             reason=reason,
         )
 
+    def _schedule_selection_visibility_restore(
+        self,
+        path: str,
+        *,
+        reason: str = "",
+        delays_ms: tuple[int, ...] = (0, 30, 120, 250),
+    ) -> None:
+        """
+        对当前激活视图做几次延迟补定位，覆盖异步 layout / 缩略图补模后的可见性恢复。
+        """
+        norm_path = os.path.normpath(path) if path else ""
+        if not norm_path:
+            return
+        normalized_delays: list[int] = []
+        seen: set[int] = set()
+        for delay in delays_ms:
+            try:
+                delay_ms = max(0, int(delay))
+            except Exception:
+                delay_ms = 0
+            if delay_ms in seen:
+                continue
+            seen.add(delay_ms)
+            normalized_delays.append(delay_ms)
+        self._record_selection_scroll_debug(
+            "restore.schedule",
+            norm_path,
+            reason=reason,
+            delays=tuple(normalized_delays),
+            view_mode=self._view_mode,
+        )
+        for delay_ms in normalized_delays:
+            QTimer.singleShot(delay_ms, lambda p=norm_path: self._scroll_path_into_view(p))
+
     def _replay_selection_visibility_restore(self, reason: str) -> None:
         """在后续 tree refresh / sort 完成后，按需再次确保选中项可见。"""
         norm_path = self._selection_visibility_restore_path
@@ -4396,8 +4656,7 @@ class FileListPanel(QWidget):
             reason=reason,
             view_mode=self._view_mode,
         )
-        QTimer.singleShot(0, lambda p=norm_path: self._scroll_path_into_view(p))
-        QTimer.singleShot(30, lambda p=norm_path: self._scroll_path_into_view(p))
+        self._schedule_selection_visibility_restore(norm_path, reason=f"replay:{reason}")
         if self._selection_visibility_restore_budget <= 0:
             self._selection_visibility_restore_path = ""
 
@@ -4828,15 +5087,20 @@ class FileListPanel(QWidget):
             self._apply_thumb_meta_to_path(norm_path, meta)
 
         if self._tree_widget.isSortingEnabled():
-            self._tree_widget.sortByColumn(self._tree_last_sort_column, self._tree_last_sort_order)
+            self._apply_tree_sort(
+                self._tree_last_sort_column,
+                self._tree_last_sort_order,
+                sync_indicator=True,
+            )
             self._refresh_tree_row_numbers()
-            self._replay_selection_visibility_restore("refresh_metadata_state.sort")
+            if self._view_mode == self._MODE_LIST:
+                self._replay_selection_visibility_restore("refresh_metadata_state.sort")
 
         self._tree_widget.viewport().update()
         if self._view_mode == self._MODE_THUMB:
             self._list_widget.viewport().update()
 
-        if self._filter_pick or self._filter_min_rating > 0 or self._filter_focus_status:
+        if self._filters_require_rebuild_after_metadata_refresh(unique_paths):
             self._apply_filter()
 
         if self._selected_display_path:
@@ -5632,27 +5896,76 @@ class FileListPanel(QWidget):
         return evicted
 
     def _compute_filtered_files(self) -> list[str]:
-        ft = (self._filter_edit.text().strip().lower()) if self._filter_edit else ""
-        fp = self._filter_pick
-        fr = self._filter_min_rating
-        ff = self._filter_focus_status
         filtered: list[str] = []
         for path in self._all_files:
-            norm = os.path.normpath(path)
-            name = Path(path).name
-            meta = self._meta_cache.get(norm, {})
-            pick = meta.get("pick", 0)
-            rating = meta.get("rating", 0)
-            if ft and ft not in name.lower():
-                continue
-            if fp and pick != 1:
-                continue
-            if rating < fr:
-                continue
-            if ff and _focus_status_to_display(meta.get("country", "")) != ff:
-                continue
-            filtered.append(path)
+            if self._path_matches_active_filters(path):
+                filtered.append(path)
         return filtered
+
+    def _path_matches_filters(
+        self,
+        path: str,
+        *,
+        filter_text: str = "",
+        filter_pick: bool = False,
+        filter_min_rating: int = 0,
+        filter_focus_status: str = "",
+    ) -> bool:
+        norm = os.path.normpath(path) if path else ""
+        if not norm:
+            return False
+        name = Path(norm).name
+        meta = self._meta_cache.get(norm, {})
+        try:
+            pick = int(meta.get("pick", 0) or 0)
+        except Exception:
+            pick = 0
+        try:
+            rating = int(meta.get("rating", 0) or 0)
+        except Exception:
+            rating = 0
+        if filter_text and filter_text not in name.lower():
+            return False
+        if filter_pick and pick != 1:
+            return False
+        if rating < filter_min_rating:
+            return False
+        if filter_focus_status and _focus_status_to_display(meta.get("country", "")) != filter_focus_status:
+            return False
+        return True
+
+    def _path_matches_active_filters(self, path: str) -> bool:
+        return self._path_matches_filters(
+            path,
+            filter_text=(self._filter_edit.text().strip().lower()) if self._filter_edit else "",
+            filter_pick=self._filter_pick,
+            filter_min_rating=self._filter_min_rating,
+            filter_focus_status=self._filter_focus_status,
+        )
+
+    def _filters_require_rebuild_after_metadata_refresh(self, paths: list[str]) -> bool:
+        """
+        仅当 metadata 更新真的改变了过滤成员资格时，才重建过滤结果。
+
+        缩略图模式下改星级/精选时，大多数情况只是 badge 变化，不应该因为过滤器
+        正处于激活状态就整表 `_apply_filter()`，否则当前视图和选中项会跳动。
+        """
+        if not (self._filter_pick or self._filter_min_rating > 0 or self._filter_focus_status):
+            return False
+        if not paths:
+            return False
+        visible_keys = {
+            os.path.normcase(os.path.normpath(path))
+            for path in self._filtered_files
+            if path
+        }
+        for norm_path in self._unique_norm_paths(paths):
+            key = os.path.normcase(norm_path)
+            was_visible = key in visible_keys
+            is_visible = self._path_matches_active_filters(norm_path)
+            if was_visible != is_visible:
+                return True
+        return False
 
     def _unused_removed_clear_thumb_cache_button_tooltip(self) -> None:
         return
@@ -5690,6 +6003,24 @@ class FileListPanel(QWidget):
     def _clear_tree_view_state(self) -> None:
         self._file_table_model.clear()
 
+    def _apply_tree_sort(self, column: int, order, *, sync_indicator: bool = False) -> None:
+        """显式驱动 proxy 排序，避免依赖不同 Qt 版本对表头点击排序的隐式行为。"""
+        hdr = self._tree_widget.header()
+        if sync_indicator:
+            try:
+                hdr.blockSignals(True)
+                hdr.setSortIndicator(column, order)
+            finally:
+                hdr.blockSignals(False)
+        model = self._tree_widget.model()
+        if model is not None:
+            try:
+                model.sort(column, order)
+                return
+            except Exception:
+                pass
+        self._tree_widget.sortByColumn(column, order)
+
     def _rebuild_tree_items(self) -> None:
         self._tree_widget.setUpdatesEnabled(False)
         try:
@@ -5708,13 +6039,11 @@ class FileListPanel(QWidget):
             self._tree_widget.setSortingEnabled(True)
             self._set_tree_header_fast_mode(False)
             if self._tree_row_count() > 0:
-                hdr = self._tree_widget.header()
-                try:
-                    hdr.blockSignals(True)
-                    hdr.setSortIndicator(self._tree_last_sort_column, self._tree_last_sort_order)
-                finally:
-                    hdr.blockSignals(False)
-                self._tree_widget.sortByColumn(self._tree_last_sort_column, self._tree_last_sort_order)
+                self._apply_tree_sort(
+                    self._tree_last_sort_column,
+                    self._tree_last_sort_order,
+                    sync_indicator=True,
+                )
             self._tree_widget.setUpdatesEnabled(True)
             self._refresh_tree_row_numbers()
         self._tree_view_dirty = False
@@ -5812,6 +6141,12 @@ class FileListPanel(QWidget):
             self._apply_pending_selection()
             self._pending_selection_paths = None
             self._pending_selection_current_path = ""
+        if self._view_mode == self._MODE_THUMB and self._selection_visibility_restore_path:
+            self._schedule_selection_visibility_restore(
+                self._selection_visibility_restore_path,
+                reason="thumb_model_population_done",
+                delays_ms=(0, 40, 120),
+            )
         _log.info(
             "[_populate_thumb_model_batch] completed total=%s elapsed=%.3fs",
             total,
@@ -5908,17 +6243,19 @@ class FileListPanel(QWidget):
         ft = (self._filter_edit.text().strip().lower()) if self._filter_edit else ""
         fp = self._filter_pick
         fr = self._filter_min_rating
+        ff = self._filter_focus_status
         t0 = _time.perf_counter()
         selected_paths, current_path = self._capture_selection_restore_state()
         filtered = self._compute_filtered_files()
         old_filtered = list(self._filtered_files)
         self._filtered_files = filtered
         _log.info(
-            "[_apply_filter] START files=%s filtered=%s pick=%s min_rating=%s text=%r",
+            "[_apply_filter] START files=%s filtered=%s pick=%s min_rating=%s focus=%r text=%r",
             len(self._all_files),
             len(filtered),
             fp,
             fr,
+            ff or "(none)",
             ft or "(none)",
         )
         tree_ready = self._view_mode != self._MODE_LIST or (not self._tree_view_dirty and self._tree_source_row_count() == len(filtered))
@@ -5931,6 +6268,10 @@ class FileListPanel(QWidget):
             self._request_selection_visibility_restore(current_path or selected_paths[0], reason="apply_filter")
             # 过滤后行号会变化，必须在新模型里按路径重新定位；缩略图异步补模时由 pending selection 继续完成。
             self.set_pending_selection(selected_paths, current_path=current_path)
+            self._schedule_selection_visibility_restore(
+                current_path or selected_paths[0],
+                reason="apply_filter",
+            )
         _log.info(
             "[_apply_filter] END visible=%s hidden=%s elapsed=%.3fs",
             len(filtered),
@@ -5938,20 +6279,20 @@ class FileListPanel(QWidget):
             _time.perf_counter() - t0,
         )
 
+    def _on_filter_text_changed(self, _text: str) -> None:
+        self._refresh_filter_scope()
+
     def _on_pick_filter_toggled(self) -> None:
-        """切换精选过滤：只显示 Pick=1 的文件。有任意过滤时递归子目录，无过滤时仅当前目录。"""
+        """切换精选过滤：只显示 Pick=1 的文件；仅在目录 scope 发生变化时才重扫。"""
         self._filter_pick = self._btn_filter_pick.isChecked()
         if self._filter_min_rating != 0:
             self._filter_min_rating = 0
             for btn in self._star_btns:
                 btn.setChecked(False)
-        if self._current_dir and os.path.isdir(self._current_dir):
-            self.load_directory(self._current_dir, force_reload=True)
-        else:
-            self._apply_filter()
+        self._refresh_filter_scope()
 
     def _on_rating_filter_changed(self, n: int) -> None:
-        """切换星级过滤：只显示 ≥n 星的文件。有任意过滤时递归子目录，无过滤时仅当前目录。"""
+        """切换星级过滤：只显示 ≥n 星的文件；仅在目录 scope 发生变化时才重扫。"""
         if self._filter_min_rating == n:
             self._filter_min_rating = 0
         else:
@@ -5961,10 +6302,7 @@ class FileListPanel(QWidget):
                 self._btn_filter_pick.setChecked(False)
         for i, btn in enumerate(self._star_btns):
             btn.setChecked(i + 1 == self._filter_min_rating)
-        if self._current_dir and os.path.isdir(self._current_dir):
-            self.load_directory(self._current_dir, force_reload=True)
-        else:
-            self._apply_filter()
+        self._refresh_filter_scope()
 
     def _on_focus_filter_changed(self, status: str) -> None:
         if self._filter_focus_status == status:
@@ -5973,10 +6311,7 @@ class FileListPanel(QWidget):
             self._filter_focus_status = status
         for key, btn in self._focus_filter_btns.items():
             btn.setChecked(key == self._filter_focus_status)
-        if self._current_dir and os.path.isdir(self._current_dir):
-            self.load_directory(self._current_dir, force_reload=True)
-        else:
-            self._apply_filter()
+        self._refresh_filter_scope()
 
     def _apply_meta_to_tree_item(self, item: SortableTreeItem, meta: dict) -> None:
         title   = meta.get("title", "")
@@ -6501,17 +6836,19 @@ class FileListPanel(QWidget):
             # 切换到列表视图时显式恢复排序状态，避免因隐藏时列头状态丢失导致按序号列
             # （所有项 _SortRole 均为 0）排序产生不稳定顺序、列表项跳变
             if self._tree_widget.isSortingEnabled() and self._tree_row_count() > 0:
-                hdr = self._tree_widget.header()
-                try:
-                    hdr.blockSignals(True)
-                    hdr.setSortIndicator(self._tree_last_sort_column, self._tree_last_sort_order)
-                finally:
-                    hdr.blockSignals(False)
-                self._tree_widget.sortByColumn(self._tree_last_sort_column, self._tree_last_sort_order)
+                self._apply_tree_sort(
+                    self._tree_last_sort_column,
+                    self._tree_last_sort_order,
+                    sync_indicator=True,
+                )
                 self._refresh_tree_row_numbers()
         if selected_paths:
             self._request_selection_visibility_restore(current_path or selected_paths[0], reason="set_view_mode")
             self.set_pending_selection(selected_paths, current_path=current_path)
+            self._schedule_selection_visibility_restore(
+                current_path or selected_paths[0],
+                reason="set_view_mode",
+            )
         else:
             self._update_selection_status()
 
@@ -7181,6 +7518,7 @@ class FileListPanel(QWidget):
         )
 
     def _stop_pending_meta_apply(self) -> None:
+        sorting_was_disabled = not self._tree_widget.isSortingEnabled()
         if self._meta_apply_timer is not None and self._meta_apply_timer.isActive():
             self._meta_apply_timer.stop()
         if self._meta_filter_refresh_timer is not None and self._meta_filter_refresh_timer.isActive():
@@ -7196,6 +7534,15 @@ class FileListPanel(QWidget):
         self._meta_apply_needs_filter = False
         self._meta_apply_loader_finished = True
         self._set_tree_header_fast_mode(False)
+        if sorting_was_disabled:
+            self._tree_widget.setSortingEnabled(True)
+            if self._tree_row_count() > 0:
+                self._apply_tree_sort(
+                    self._tree_last_sort_column,
+                    self._tree_last_sort_order,
+                    sync_indicator=True,
+                )
+                self._refresh_tree_row_numbers()
 
     def _set_tree_header_fast_mode(self, enabled: bool) -> None:
         """批量更新期间切到轻量模式；恢复后保持列宽可手动拖拽。"""
@@ -7233,17 +7580,16 @@ class FileListPanel(QWidget):
 
     def _on_tree_sort_indicator_changed(self, column: int, order) -> None:
         if column == _TREE_COL_SEQ:
-            hdr = self._tree_widget.header()
-            try:
-                hdr.blockSignals(True)
-                hdr.setSortIndicator(self._tree_last_sort_column, self._tree_last_sort_order)
-            finally:
-                hdr.blockSignals(False)
-            self._tree_widget.sortByColumn(self._tree_last_sort_column, self._tree_last_sort_order)
+            self._apply_tree_sort(
+                self._tree_last_sort_column,
+                self._tree_last_sort_order,
+                sync_indicator=True,
+            )
             QTimer.singleShot(0, self._refresh_tree_row_numbers)
             return
         self._tree_last_sort_column = column
         self._tree_last_sort_order = order
+        self._apply_tree_sort(column, order)
         QTimer.singleShot(0, self._refresh_tree_row_numbers)
 
     def _order_meta_items_by_file_list(self, meta_dict: dict) -> list:
@@ -7313,7 +7659,11 @@ class FileListPanel(QWidget):
         _log.info("[STAT][_meta_apply] enabling tree sorting")
         self._set_tree_header_fast_mode(False)
         self._tree_widget.setSortingEnabled(True)
-        self._tree_widget.sortByColumn(self._tree_last_sort_column, self._tree_last_sort_order)
+        self._apply_tree_sort(
+            self._tree_last_sort_column,
+            self._tree_last_sort_order,
+            sync_indicator=True,
+        )
         self._refresh_tree_row_numbers()
         self._replay_selection_visibility_restore("finish_meta_apply.sort")
         _log.info("[STAT][_meta_apply] tree sorting enabled elapsed=%.3fs", _time.perf_counter() - sort_t0)
