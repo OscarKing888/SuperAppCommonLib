@@ -587,13 +587,53 @@ def _thumb_disk_cache_path(path: str, mtime: float, size: int) -> str:
 
 def _persistent_thumb_cache_max_size() -> int:
     override = _env_int("SuperViewer_PERSISTENT_THUMB_SIZE", 0)
-    if override in (128, 256, 512):
+    if override in (128, 256, 512, 1024):
         return override
     return get_persistent_thumb_max_size()
 
 
 def _persistent_thumb_cache_sizes() -> list[int]:
     return get_persistent_thumb_sizes(_persistent_thumb_cache_max_size())
+
+
+def _effective_persistent_thumb_cache_sizes(preferred_size: int | None = None) -> list[int]:
+    sizes: list[int] = []
+    seen: set[int] = set()
+    for size in _persistent_thumb_cache_sizes():
+        size_int = int(size)
+        if size_int not in _THUMB_SIZE_STEPS or size_int in seen:
+            continue
+        seen.add(size_int)
+        sizes.append(size_int)
+    if preferred_size is not None:
+        try:
+            preferred = int(preferred_size)
+        except Exception:
+            preferred = 0
+        if preferred in _THUMB_SIZE_STEPS and preferred not in seen:
+            sizes.append(preferred)
+    return sorted(sizes)
+
+
+def _preferred_persistent_thumb_sizes_for_request(
+    requested_size: int,
+    candidate_sizes: list[int] | tuple[int, ...] | None = None,
+) -> list[int]:
+    if candidate_sizes is None:
+        return get_preferred_persistent_thumb_sizes(requested_size, _persistent_thumb_cache_max_size())
+    normalized = sorted(
+        {
+            int(size)
+            for size in (candidate_sizes or [])
+            if int(size) in _THUMB_SIZE_STEPS
+        }
+    )
+    if not normalized:
+        return []
+    req = max(1, int(requested_size))
+    larger = [size for size in normalized if size >= req]
+    smaller = [size for size in normalized if size < req]
+    return larger + list(reversed(smaller))
 
 
 def _persistent_thumb_cache_worker_count() -> int:
@@ -695,10 +735,11 @@ def _existing_persistent_thumb_cache_path_for_file(
     *,
     requested_size: int,
     source_stamp: float | None = None,
+    candidate_sizes: list[int] | tuple[int, ...] | None = None,
 ) -> str:
-    for size in get_preferred_persistent_thumb_sizes(
+    for size in _preferred_persistent_thumb_sizes_for_request(
         requested_size,
-        _persistent_thumb_cache_max_size(),
+        candidate_sizes=candidate_sizes,
     ):
         cache_path = _existing_persistent_thumb_cache_path_for_exact_size(
             path,
@@ -2389,6 +2430,7 @@ class ThumbnailLoader(QThread):
             self._current_dir,
             requested_size=self._size,
             source_stamp=source_stamp,
+            candidate_sizes=_effective_persistent_thumb_cache_sizes(self._size),
         )
         if persistent_path:
             return persistent_path
@@ -2732,7 +2774,7 @@ class PersistentThumbCacheWorker(QThread):
             {
                 int(size)
                 for size in (sizes or _persistent_thumb_cache_sizes())
-                if int(size) in (128, 256, 512)
+                if int(size) in _THUMB_SIZE_STEPS
             }
         )
         self._sizes = tuple(normalized_sizes or _persistent_thumb_cache_sizes())
@@ -5675,8 +5717,9 @@ class FileListPanel(QWidget):
             persistent_thumb_path = _existing_persistent_thumb_cache_path_for_file(
                 source_path,
                 preview_base_dir,
-                requested_size=_persistent_thumb_cache_max_size(),
+                requested_size=self._thumb_size,
                 source_stamp=source_stamp,
+                candidate_sizes=_effective_persistent_thumb_cache_sizes(self._thumb_size),
             )
             if persistent_thumb_path:
                 _log.info(
@@ -6945,6 +6988,10 @@ class FileListPanel(QWidget):
                 self._thumb_list_model.clear_all_pixmaps()
                 self._update_thumb_display()
                 self._schedule_visible_thumbnail_update()
+            if self._all_files:
+                self._schedule_persistent_thumb_cache_build(self._all_files)
+            else:
+                self._update_persistent_thumb_progress_widget()
 
     def _update_thumb_display(self) -> None:
         s = self._thumb_size
@@ -7247,7 +7294,7 @@ class FileListPanel(QWidget):
         self._persistent_thumb_progress.setMaximum(max(1, total))
         self._persistent_thumb_progress.setValue(done)
         self._persistent_thumb_progress.setFormat(f"小缩略图 {done}/{total}")
-        sizes = _persistent_thumb_cache_sizes()
+        sizes = _effective_persistent_thumb_cache_sizes(self._thumb_size)
         cache_dirs = [
             _persistent_thumb_cache_dir(self._persistent_thumb_cache_base_dir, size)
             for size in sizes
@@ -7312,7 +7359,7 @@ class FileListPanel(QWidget):
             self._persistent_thumb_cache_pending_paths,
             self._persistent_thumb_cache_base_dir,
             report_cache=self._report_full_cache or self._report_cache or {},
-            sizes=_persistent_thumb_cache_sizes(),
+            sizes=_effective_persistent_thumb_cache_sizes(self._thumb_size),
             worker_count=_persistent_thumb_cache_worker_count(),
             parent=self,
         )
@@ -7324,7 +7371,7 @@ class FileListPanel(QWidget):
             "[_start_persistent_thumb_cache_worker] dir=%r total=%s sizes=%s workers=%s",
             self._persistent_thumb_cache_base_dir,
             len(self._persistent_thumb_cache_pending_paths),
-            _persistent_thumb_cache_sizes(),
+            _effective_persistent_thumb_cache_sizes(self._thumb_size),
             _persistent_thumb_cache_worker_count(),
         )
 
