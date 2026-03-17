@@ -37,15 +37,16 @@ Open/Closed extension points
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Callable
 
 try:
-    from PyQt6.QtCore import QPointF, QRectF, Qt
+    from PyQt6.QtCore import QPointF, QRectF, Qt, pyqtSignal
     from PyQt6.QtGui import QColor, QPainter, QPen, QPixmap
     from PyQt6.QtWidgets import QLabel, QVBoxLayout, QWidget
     _QRect_or_QRectF = "QRect | QRectF"
 except ImportError:
-    from PyQt5.QtCore import QPointF, QRectF, Qt  # type: ignore[no-reattr]
+    from PyQt5.QtCore import QPointF, QRectF, Qt, pyqtSignal  # type: ignore[no-reattr]
     from PyQt5.QtGui import QColor, QPainter, QPen, QPixmap  # type: ignore[no-reattr]
     from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget  # type: ignore[no-reattr]
     _QRect_or_QRectF = "QRect | QRectF"
@@ -62,6 +63,25 @@ PREVIEW_COMPOSITION_GRID_MODES: tuple[str, ...] = (
     "crosshair",
 )
 PREVIEW_COMPOSITION_GRID_LINE_WIDTHS: tuple[int, ...] = (1, 2, 3, 4)
+PREVIEW_SCALE_PRESET_PERCENTS: tuple[int, ...] = (
+    10,
+    20,
+    30,
+    40,
+    50,
+    60,
+    70,
+    80,
+    90,
+    100,
+    150,
+    200,
+    250,
+    300,
+    305,
+    400,
+    500,
+)
 _FOCUS_BOX_OUTER_BLACK_WIDTH = 1
 _FOCUS_BOX_GREEN_WIDTH = 4
 _FOCUS_BOX_INNER_BLACK_WIDTH = 1
@@ -93,6 +113,122 @@ def normalize_preview_composition_grid_line_width(value: object) -> int:
     if width > max_width:
         return max_width
     return width if width in PREVIEW_COMPOSITION_GRID_LINE_WIDTHS else min_width
+
+
+def format_preview_scale_percent(scale_percent: object) -> str:
+    """格式化当前预览缩放百分比。"""
+    try:
+        parsed = float(scale_percent)
+    except Exception:
+        return "-"
+    if not math.isfinite(parsed) or parsed <= 0.0:
+        return "-"
+    rounded = round(parsed)
+    if abs(parsed - float(rounded)) < 0.05:
+        return f"{int(rounded)}%"
+    return f"{parsed:.1f}%"
+
+
+def sync_preview_scale_preset_combo(
+    combo: object,
+    scale_percent: object,
+    *,
+    empty_text: str = "-",
+) -> None:
+    """将当前缩放百分比同步到预设下拉框。"""
+    if combo is None:
+        return
+    try:
+        parsed = float(scale_percent)
+    except Exception:
+        parsed = None
+    if parsed is not None and (not math.isfinite(parsed) or parsed <= 0.0):
+        parsed = None
+
+    old_blocked = False
+    try:
+        old_blocked = bool(combo.blockSignals(True))
+    except Exception:
+        old_blocked = False
+    try:
+        current_index = -1
+        if parsed is not None:
+            rounded = int(round(parsed))
+            if abs(parsed - float(rounded)) < 0.05:
+                try:
+                    current_index = int(combo.findData(rounded))
+                except Exception:
+                    current_index = -1
+        try:
+            combo.setCurrentIndex(current_index)
+        except Exception:
+            pass
+        text = format_preview_scale_percent(parsed) if parsed is not None else str(empty_text)
+        try:
+            combo.setEditText(text)
+        except Exception:
+            pass
+    finally:
+        try:
+            combo.blockSignals(old_blocked)
+        except Exception:
+            pass
+
+
+def configure_preview_scale_preset_combo(
+    combo: object,
+    *,
+    tooltip: str | None = None,
+    fixed_width: int | None = None,
+    empty_text: str = "-",
+) -> None:
+    """配置一个统一的预览缩放预设下拉框。"""
+    if combo is None:
+        return
+    try:
+        combo.setEditable(True)
+    except Exception:
+        pass
+    try:
+        insert_policy = getattr(combo.__class__, "InsertPolicy", None)
+        if insert_policy is not None and hasattr(insert_policy, "NoInsert"):
+            combo.setInsertPolicy(insert_policy.NoInsert)
+    except Exception:
+        pass
+    try:
+        combo.clear()
+    except Exception:
+        pass
+    for percent in PREVIEW_SCALE_PRESET_PERCENTS:
+        try:
+            combo.addItem(f"{percent}%", int(percent))
+        except Exception:
+            continue
+    if fixed_width is not None:
+        try:
+            combo.setFixedWidth(int(fixed_width))
+        except Exception:
+            pass
+    if tooltip:
+        try:
+            combo.setToolTip(str(tooltip))
+        except Exception:
+            pass
+    line_edit = None
+    try:
+        line_edit = combo.lineEdit()
+    except Exception:
+        line_edit = None
+    if line_edit is not None:
+        try:
+            line_edit.setReadOnly(True)
+        except Exception:
+            pass
+        try:
+            line_edit.setPlaceholderText("缩放")
+        except Exception:
+            pass
+    sync_preview_scale_preset_combo(combo, None, empty_text=empty_text)
 
 
 @dataclass(slots=True)
@@ -163,6 +299,8 @@ class PreviewCanvas(QLabel):
     Extend via ``_paint_overlays`` override or ``register_overlay_layer``.
     """
 
+    display_scale_percent_changed = pyqtSignal(object)
+
     def __init__(self, parent: "QWidget | None" = None, *, placeholder_text: str = "暂无预览") -> None:
         super().__init__(placeholder_text, parent)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -183,6 +321,7 @@ class PreviewCanvas(QLabel):
         self._last_drag_pos: "QPointF" = QPointF(0.0, 0.0)
         self._min_zoom: float = 0.02
         self._max_zoom: float = 24.0
+        self._last_emitted_display_scale_percent: float | None = None
 
         # Runtime-registered overlay callables
         self._overlay_layers: list[OverlayLayer] = []
@@ -260,6 +399,7 @@ class PreviewCanvas(QLabel):
             self._clamp_offset()
             self._update_cursor()
             self.update()
+            self._emit_display_scale_percent_changed()
             return
 
         view_ratio = self._view_center_ratio() if preserve_view else None
@@ -274,6 +414,7 @@ class PreviewCanvas(QLabel):
                 self._clamp_offset()
                 self._update_cursor()
                 self.update()
+                self._emit_display_scale_percent_changed()
             return
 
         self._use_original_size = target
@@ -289,6 +430,49 @@ class PreviewCanvas(QLabel):
         self._clamp_offset()
         self._update_cursor()
         self.update()
+        self._emit_display_scale_percent_changed()
+
+    def current_display_scale_percent(self) -> float | None:
+        """返回当前屏幕显示尺寸相对原图像素的百分比。"""
+        if self._source_pixmap is None or self._source_pixmap.isNull():
+            return None
+        total_scale = self._fit_scale() * self._zoom
+        if not math.isfinite(total_scale) or total_scale <= 0.0:
+            return None
+        return total_scale * 100.0
+
+    def set_display_scale_percent(
+        self,
+        scale_percent: float | int,
+        *,
+        preserve_view: bool = True,
+    ) -> bool:
+        """按绝对百分比设置预览显示比例。"""
+        if self._source_pixmap is None or self._source_pixmap.isNull():
+            return False
+        try:
+            parsed = float(scale_percent)
+        except Exception:
+            return False
+        if not math.isfinite(parsed) or parsed <= 0.0:
+            return False
+        fit_scale = self._fit_scale()
+        if fit_scale <= 0.0:
+            return False
+        target_total_scale = parsed / 100.0
+        target_zoom = max(self._min_zoom, min(self._max_zoom, target_total_scale / fit_scale))
+        view_ratio = self._view_center_ratio() if preserve_view else None
+        if abs(target_zoom - self._zoom) < 1e-9 and view_ratio is None:
+            self._emit_display_scale_percent_changed(force=True)
+            return True
+        self._zoom = target_zoom
+        if view_ratio is not None:
+            self._apply_view_center_ratio(view_ratio)
+        self._clamp_offset()
+        self._update_cursor()
+        self.update()
+        self._emit_display_scale_percent_changed(force=True)
+        return True
 
     # ------------------------------------------------------------------
     # Public API – source pixmap
@@ -318,6 +502,7 @@ class PreviewCanvas(QLabel):
             self.setText("暂无预览")
             self._update_cursor()
             self.update()
+            self._emit_display_scale_percent_changed(force=True)
             return
 
         if preserve_scale and old_pixmap is not None and not old_pixmap.isNull():
@@ -344,6 +529,7 @@ class PreviewCanvas(QLabel):
         self._update_cursor()
         self.setText("")
         self.update()
+        self._emit_display_scale_percent_changed(force=True)
 
     # ------------------------------------------------------------------
     # Runtime overlay registration
@@ -519,6 +705,17 @@ class PreviewCanvas(QLabel):
         center = QPointF(content.center()) + self._offset
         return QRectF(center.x() - dw * 0.5, center.y() - dh * 0.5, dw, dh)
 
+    def _emit_display_scale_percent_changed(self, *, force: bool = False) -> None:
+        current = self.current_display_scale_percent()
+        last = self._last_emitted_display_scale_percent
+        if not force:
+            if current is None and last is None:
+                return
+            if current is not None and last is not None and abs(current - last) < 1e-6:
+                return
+        self._last_emitted_display_scale_percent = current
+        self.display_scale_percent_changed.emit(current)
+
     def _can_pan(self) -> bool:
         dr = self._display_rect()
         if dr is None:
@@ -560,6 +757,7 @@ class PreviewCanvas(QLabel):
         super().resizeEvent(event)
         self._clamp_offset()
         self._update_cursor()
+        self._emit_display_scale_percent_changed()
 
     def wheelEvent(self, event) -> None:  # type: ignore[override]
         if self._source_pixmap is None:
@@ -594,6 +792,7 @@ class PreviewCanvas(QLabel):
         self._clamp_offset()
         self._update_cursor()
         self.update()
+        self._emit_display_scale_percent_changed(force=True)
         event.accept()
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
@@ -870,6 +1069,8 @@ class PreviewWithStatusBar(QWidget):
         w.set_focus_box(...)               # forwarded to canvas
     """
 
+    display_scale_percent_changed = pyqtSignal(object)
+
     def __init__(
         self,
         parent: "QWidget | None" = None,
@@ -878,7 +1079,7 @@ class PreviewWithStatusBar(QWidget):
     ) -> None:
         super().__init__(parent)
         self._canvas: "PreviewCanvas" = canvas if canvas is not None else PreviewCanvas()
-        self._status_label = QLabel("原始分辨率: - | 裁切后分辨率: -")
+        self._status_label = QLabel("原始分辨率: - | 裁切后分辨率: - | 缩放比例: -")
         self._display_pixmap: "QPixmap | None" = None
         self._original_size: "tuple[int, int] | None" = None
         self._cropped_size: "tuple[int, int] | None" = None
@@ -889,6 +1090,8 @@ class PreviewWithStatusBar(QWidget):
         layout.setSpacing(4)
         layout.addWidget(self._canvas, stretch=1)
         layout.addWidget(self._status_label)
+        if hasattr(self._canvas, "display_scale_percent_changed"):
+            self._canvas.display_scale_percent_changed.connect(self._on_canvas_display_scale_percent_changed)
 
     @property
     def canvas(self) -> "PreviewCanvas":
@@ -933,6 +1136,19 @@ class PreviewWithStatusBar(QWidget):
         self._source_mode = str(mode).strip()
         self._refresh_status_bar()
 
+    def current_display_scale_percent(self) -> float | None:
+        """返回当前预览显示比例百分比。"""
+        return self._canvas.current_display_scale_percent()
+
+    def set_display_scale_percent(
+        self,
+        scale_percent: float | int,
+        *,
+        preserve_view: bool = True,
+    ) -> bool:
+        """按绝对百分比设置内层画布缩放。"""
+        return self._canvas.set_display_scale_percent(scale_percent, preserve_view=preserve_view)
+
     def apply_overlay_state(self, state: "PreviewOverlayState | None") -> None:
         """Forward batched overlay payloads to the inner canvas."""
         self._canvas.apply_overlay_state(state)
@@ -944,6 +1160,10 @@ class PreviewWithStatusBar(QWidget):
     def _refresh_status_bar(self) -> None:
         segments = self._get_status_segments()
         self._status_label.setText(" | ".join(s for s in segments if s))
+
+    def _on_canvas_display_scale_percent_changed(self, scale_percent: object) -> None:
+        self._refresh_status_bar()
+        self.display_scale_percent_changed.emit(scale_percent)
 
     def _get_status_segments(self) -> list[str]:
         """Build status bar segments. Override in subclass to extend (open/closed)."""
@@ -957,7 +1177,11 @@ class PreviewWithStatusBar(QWidget):
         if self._cropped_size is not None:
             cropped_str = f"{self._cropped_size[0]}x{self._cropped_size[1]}"
 
-        out = [f"原始分辨率: {orig_str}", f"裁切后分辨率: {cropped_str}"]
+        out = [
+            f"原始分辨率: {orig_str}",
+            f"裁切后分辨率: {cropped_str}",
+            f"缩放比例: {format_preview_scale_percent(self.current_display_scale_percent())}",
+        ]
         if self._source_mode:
             out.append(f"({self._source_mode})")
         return out

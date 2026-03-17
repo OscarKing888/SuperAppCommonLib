@@ -35,23 +35,31 @@ Example::
 from app_common.preview_canvas.canvas import (
     PREVIEW_COMPOSITION_GRID_LINE_WIDTHS,
     PREVIEW_COMPOSITION_GRID_MODES,
+    PREVIEW_SCALE_PRESET_PERCENTS,
     PreviewCanvas,
     PreviewOverlayOptions,
     PreviewOverlayState,
     PreviewWithStatusBar,
+    configure_preview_scale_preset_combo,
     draw_checker_background,
+    format_preview_scale_percent,
     normalize_preview_composition_grid_line_width,
     normalize_preview_composition_grid_mode,
+    sync_preview_scale_preset_combo,
 )
 
 __all__ = [
     "PREVIEW_COMPOSITION_GRID_LINE_WIDTHS",
     "PREVIEW_COMPOSITION_GRID_MODES",
+    "PREVIEW_SCALE_PRESET_PERCENTS",
     "PreviewCanvas",
     "PreviewOverlayState",
     "PreviewOverlayOptions",
     "PreviewWithStatusBar",
+    "configure_preview_scale_preset_combo",
     "draw_checker_background",
+    "format_preview_scale_percent",
     "normalize_preview_composition_grid_line_width",
     "normalize_preview_composition_grid_mode",
+    "sync_preview_scale_preset_combo",
 ]
