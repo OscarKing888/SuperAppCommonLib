@@ -530,9 +530,23 @@ _KeyUp = getattr(Qt.Key, "Key_Up", None) or getattr(Qt, "Key_Up", None)
 _KeyDown = getattr(Qt.Key, "Key_Down", None) or getattr(Qt, "Key_Down", None)
 _KeyLeft = getattr(Qt.Key, "Key_Left", None) or getattr(Qt, "Key_Left", None)
 _KeyRight = getattr(Qt.Key, "Key_Right", None) or getattr(Qt, "Key_Right", None)
+_KeyDelete = getattr(Qt.Key, "Key_Delete", None) or getattr(Qt, "Key_Delete", None)
+_KeyPeriod = getattr(Qt.Key, "Key_Period", None) or getattr(Qt, "Key_Period", None)
 _ShiftModifier = (
     getattr(Qt.KeyboardModifier, "ShiftModifier", None)
     or getattr(Qt, "ShiftModifier", None)
+)
+_ControlModifier = (
+    getattr(Qt.KeyboardModifier, "ControlModifier", None)
+    or getattr(Qt, "ControlModifier", None)
+)
+_AltModifier = (
+    getattr(Qt.KeyboardModifier, "AltModifier", None)
+    or getattr(Qt, "AltModifier", None)
+)
+_MetaModifier = (
+    getattr(Qt.KeyboardModifier, "MetaModifier", None)
+    or getattr(Qt, "MetaModifier", None)
 )
 
 try:
@@ -5020,6 +5034,143 @@ class FileListPanel(QWidget):
                 break
         return 0 if all_rejected else -1
 
+    def _rating_toggle_target_for_paths(self, paths: list[str], target_rating: int) -> int:
+        unique_paths = self._unique_norm_paths(paths)
+        rating_value = max(0, min(5, int(target_rating)))
+        if rating_value <= 0 or not unique_paths:
+            return rating_value
+        all_target_rating = True
+        for path in unique_paths:
+            rating, _pick = self._rating_state_for_path(path)
+            if rating != rating_value:
+                all_target_rating = False
+                break
+        return 0 if all_target_rating else rating_value
+
+    def _paths_for_active_shortcut_action(self) -> list[str]:
+        paths = self._active_view_selected_paths()
+        if paths:
+            return self._unique_norm_paths(paths)
+        current_path = self._active_view_current_path()
+        if current_path:
+            return [os.path.normpath(current_path)]
+        return []
+
+    def _event_has_blocked_shortcut_modifier(self, event, *, include_shift: bool = False) -> bool:
+        if event is None:
+            return False
+        blocked_modifiers = [_ControlModifier, _AltModifier, _MetaModifier]
+        if include_shift:
+            blocked_modifiers.append(_ShiftModifier)
+        modifiers = event.modifiers()
+        for blocked_modifier in blocked_modifiers:
+            if blocked_modifier is None:
+                continue
+            try:
+                if modifiers & blocked_modifier:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _toggle_rating_for_paths(self, paths: list[str], target_rating: int) -> None:
+        unique_paths = self._unique_norm_paths(paths)
+        if not unique_paths:
+            return
+        rating_target = self._rating_toggle_target_for_paths(unique_paths, target_rating)
+        if rating_target <= 0:
+            self._set_rating_state_for_paths(unique_paths, rating=0)
+            return
+
+        rejected_paths: list[str] = []
+        other_paths: list[str] = []
+        for path in unique_paths:
+            _rating, pick = self._rating_state_for_path(path)
+            if pick == -1:
+                rejected_paths.append(path)
+            else:
+                other_paths.append(path)
+
+        if other_paths:
+            self._set_rating_state_for_paths(other_paths, rating=rating_target)
+        if rejected_paths:
+            # 给星级时只清除排除标记，不影响已有 Pick。
+            self._set_rating_state_for_paths(rejected_paths, rating=rating_target, pick=0)
+
+    def _toggle_pick_for_paths(self, paths: list[str]) -> None:
+        unique_paths = self._unique_norm_paths(paths)
+        if not unique_paths:
+            return
+        self._set_rating_state_for_paths(unique_paths, pick=self._pick_target_for_paths(unique_paths))
+
+    def _toggle_reject_for_paths(self, paths: list[str]) -> None:
+        unique_paths = self._unique_norm_paths(paths)
+        if not unique_paths:
+            return
+        self._set_rating_state_for_paths(unique_paths, pick=self._reject_target_for_paths(unique_paths))
+
+    def _shortcut_text_from_event(self, event) -> str:
+        text = str(event.text() or "")
+        if text:
+            return text
+        if event.key() == _KeyPeriod:
+            return "."
+        return ""
+
+    def _handle_rating_shortcut_keypress(self, event) -> bool:
+        if event is None:
+            return False
+        if self._event_has_blocked_shortcut_modifier(event):
+            return False
+
+        text = self._shortcut_text_from_event(event)
+        if not text:
+            return False
+        normalized = text.lower()
+        action_kind = ""
+        action_value = 0
+        if normalized in {"1", "2", "3", "4", "5"}:
+            action_kind = "rating"
+            action_value = int(normalized)
+        elif normalized == "q":
+            action_kind = "reject"
+        elif text in {".", "·"}:
+            action_kind = "pick"
+        else:
+            return False
+
+        try:
+            if event.isAutoRepeat():
+                return True
+        except Exception:
+            pass
+
+        paths = self._paths_for_active_shortcut_action()
+        if not paths:
+            return True
+        if action_kind == "rating":
+            self._toggle_rating_for_paths(paths, action_value)
+        elif action_kind == "pick":
+            self._toggle_pick_for_paths(paths)
+        else:
+            self._toggle_reject_for_paths(paths)
+        return True
+
+    def _handle_delete_shortcut_keypress(self, event) -> bool:
+        if event is None or event.key() != _KeyDelete:
+            return False
+        if self._event_has_blocked_shortcut_modifier(event, include_shift=True):
+            return False
+        try:
+            if event.isAutoRepeat():
+                return True
+        except Exception:
+            pass
+        paths = self._paths_for_active_shortcut_action()
+        if paths:
+            self._move_paths_to_trash(paths)
+        return True
+
     def _resolve_rating_write_source(
         self,
         path: str,
@@ -5307,23 +5458,32 @@ class FileListPanel(QWidget):
         )
         rating_menu.addSeparator()
         for stars in range(1, 6):
-            action = rating_menu.addAction("★" * stars)
+            action = rating_menu.addAction(f"{'★' * stars}\t{stars}")
             action.triggered.connect(
-                lambda checked=False, value=stars: self._set_rating_state_for_paths(unique_paths, rating=value)
+                lambda checked=False, value=stars: self._toggle_rating_for_paths(unique_paths, value)
             )
         rating_menu.addSeparator()
         pick_target = self._pick_target_for_paths(unique_paths)
         pick_label = "取消🏆 Pick" if pick_target == 0 else "🏆 Pick"
         pick_action = rating_menu.addAction(pick_label)
         pick_action.triggered.connect(
-            lambda checked=False, value=pick_target: self._set_rating_state_for_paths(unique_paths, pick=value)
+            lambda checked=False: self._toggle_pick_for_paths(unique_paths)
         )
+        pick_action.setText(f"{pick_label}\t·")
         reject_target = self._reject_target_for_paths(unique_paths)
         reject_label = "取消🚫 排除" if reject_target == 0 else "🚫 标记为排除"
         reject_action = rating_menu.addAction(reject_label)
         reject_action.triggered.connect(
-            lambda checked=False, value=reject_target: self._set_rating_state_for_paths(unique_paths, pick=value)
+            lambda checked=False: self._toggle_reject_for_paths(unique_paths)
         )
+        reject_action.setText(f"{reject_label}\tQ")
+
+    def _add_delete_menu_action(self, menu: QMenu, paths: list[str]) -> None:
+        unique_paths = self._unique_norm_paths(paths)
+        if not unique_paths:
+            return
+        act_delete = menu.addAction("删除\tDel")
+        act_delete.triggered.connect(lambda: self._move_paths_to_trash(unique_paths))
 
     def _get_actual_path_for_display(self, path: str) -> str | None:
         actual = _get_cached_actual_path(path)
@@ -6449,6 +6609,38 @@ class FileListPanel(QWidget):
             if et in (_EventResize, _EventShow):
                 self._invalidate_visible_thumbnail_signature()
                 self._schedule_visible_thumbnail_update()
+        if (
+            event is not None
+            and event.type() == _EventKeyPress
+            and (
+                (
+                    self._view_mode == self._MODE_LIST
+                    and obj in (tree_widget, tree_viewport)
+                )
+                or (
+                    self._view_mode == self._MODE_THUMB
+                    and obj in (list_widget, list_viewport)
+                )
+            )
+            and self._handle_rating_shortcut_keypress(event)
+        ):
+            return True
+        if (
+            event is not None
+            and event.type() == _EventKeyPress
+            and (
+                (
+                    self._view_mode == self._MODE_LIST
+                    and obj in (tree_widget, tree_viewport)
+                )
+                or (
+                    self._view_mode == self._MODE_THUMB
+                    and obj in (list_widget, list_viewport)
+                )
+            )
+            and self._handle_delete_shortcut_keypress(event)
+        ):
+            return True
         if (
             obj is tree_widget
             and event is not None
@@ -8167,8 +8359,7 @@ class FileListPanel(QWidget):
             act_reveal.triggered.connect(lambda: reveal_in_file_manager(reveal_path))
         self._add_browse_preview_menu_action(menu, primary_path)
         menu.addSeparator()
-        act_delete = menu.addAction("删除")
-        act_delete.triggered.connect(lambda: self._move_paths_to_trash(paths))
+        self._add_delete_menu_action(menu, paths)
         _exec_menu(menu, self._tree_widget.viewport().mapToGlobal(pos))
 
     def _collect_report_filenames_for_paths(self, paths: list[str]) -> list[str]:
@@ -8306,8 +8497,7 @@ class FileListPanel(QWidget):
             act_reveal.triggered.connect(lambda: reveal_in_file_manager(reveal_path))
         self._add_browse_preview_menu_action(menu, primary_path)
         menu.addSeparator()
-        act_delete = menu.addAction("删除")
-        act_delete.triggered.connect(lambda: self._move_paths_to_trash(paths))
+        self._add_delete_menu_action(menu, paths)
         _exec_menu(menu, self._list_widget.viewport().mapToGlobal(pos))
 
 

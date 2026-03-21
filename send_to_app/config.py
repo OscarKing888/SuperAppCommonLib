@@ -3,6 +3,9 @@
 send_to_app 配置：从独立的 extern_app.json 读取/写入外部应用列表。
 默认写入用户目录（也可由调用方通过 config_dir 指定）。跨平台：Windows / macOS。
 支持可选 app_id，用于按本地 socket 协议热发送到已运行实例。
+
+SuperViewer 会在加载配置时顺带检查同级目录是否存在 SuperBirdStamp，
+若存在则自动补充到 extern_app.json，减少首次使用时的手工配置。
 """
 from __future__ import annotations
 
@@ -14,6 +17,8 @@ from typing import Any
 CONFIG_FILENAME = "extern_app.json"
 APP_CONFIG_DIRNAME = "SuperViewer"
 LEGACY_APP_CONFIG_DIRNAMES = ("BirdStamp",)
+AUTO_BIRDSTAMP_APP_NAME = "SuperBirdStamp"
+AUTO_BIRDSTAMP_APP_ID = "birdstamp"
 
 
 def _normalize_app_entry(item: Any) -> dict[str, str] | None:
@@ -28,6 +33,163 @@ def _normalize_app_entry(item: Any) -> dict[str, str] | None:
     if app_id:
         normalized["app_id"] = app_id
     return normalized
+
+
+def _normalize_compare_path(path: str) -> str:
+    """将应用路径归一化为便于比较的形式，兼容 macOS .app 简写路径。"""
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    candidate = os.path.abspath(text)
+    if sys.platform == "darwin" and not candidate.lower().endswith(".app"):
+        app_bundle = candidate + ".app"
+        if os.path.isdir(app_bundle):
+            candidate = app_bundle
+        elif os.path.isdir(candidate):
+            folder_name = os.path.basename(candidate)
+            nested_bundle = os.path.join(candidate, folder_name + ".app")
+            if os.path.isdir(nested_bundle):
+                candidate = nested_bundle
+    return os.path.normcase(os.path.normpath(candidate))
+
+
+def _mac_bundle_root_from_executable(executable_path: str) -> str | None:
+    """从 macOS 可执行文件路径回溯 .app bundle，再返回 bundle 所在目录。"""
+    current = os.path.abspath(executable_path)
+    while True:
+        if current.lower().endswith(".app"):
+            return os.path.dirname(current)
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+
+
+def _candidate_probe_roots() -> list[str]:
+    """返回自动探测外部应用时需要检查的根目录列表。"""
+    roots: list[str] = []
+
+    def add_root(path: str | None) -> None:
+        text = str(path or "").strip()
+        if not text:
+            return
+        normalized = os.path.normcase(os.path.normpath(os.path.abspath(text)))
+        if normalized not in roots:
+            roots.append(normalized)
+
+    local_dir = _local_config_dir()
+    add_root(local_dir)
+    add_root(os.path.dirname(local_dir))
+
+    launch_path = os.path.abspath(
+        sys.executable if getattr(sys, "frozen", False) else (sys.argv[0] if sys.argv else ".")
+    )
+    add_root(os.path.dirname(launch_path))
+    add_root(os.path.dirname(os.path.dirname(launch_path)))
+
+    if sys.platform == "darwin":
+        bundle_root = _mac_bundle_root_from_executable(launch_path)
+        add_root(bundle_root)
+
+    if not getattr(sys, "frozen", False):
+        add_root(os.getcwd())
+        add_root(os.path.dirname(os.getcwd()))
+
+    return roots
+
+
+def _candidate_birdstamp_paths() -> list[str]:
+    """返回按当前平台推断出来的 SuperBirdStamp 候选路径。"""
+    relative_candidates: tuple[str, ...]
+    if sys.platform == "darwin":
+        relative_candidates = (
+            "SuperBirdStamp.app",
+            os.path.join("dist", "SuperBirdStamp.app"),
+        )
+    elif sys.platform == "win32":
+        relative_candidates = (
+            "SuperBirdStamp.exe",
+            os.path.join("SuperBirdStamp", "SuperBirdStamp.exe"),
+            os.path.join("dist", "SuperBirdStamp.exe"),
+            os.path.join("dist", "SuperBirdStamp", "SuperBirdStamp.exe"),
+        )
+    else:
+        relative_candidates = (
+            "SuperBirdStamp",
+            os.path.join("dist", "SuperBirdStamp"),
+        )
+
+    candidates: list[str] = []
+    for root in _candidate_probe_roots():
+        for relative in relative_candidates:
+            path = os.path.normpath(os.path.join(root, relative))
+            if path not in candidates:
+                candidates.append(path)
+    return candidates
+
+
+def _discover_birdstamp_app() -> dict[str, str] | None:
+    """若同级目录存在 SuperBirdStamp，则返回自动补充的外部应用项。"""
+    for path in _candidate_birdstamp_paths():
+        if path.lower().endswith(".app"):
+            exists = os.path.isdir(path)
+        else:
+            exists = os.path.isfile(path)
+        if not exists:
+            continue
+        return {
+            "name": AUTO_BIRDSTAMP_APP_NAME,
+            "path": path,
+            "app_id": AUTO_BIRDSTAMP_APP_ID,
+        }
+    return None
+
+
+def _merge_auto_app(apps: list[dict[str, str]], auto_app: dict[str, str]) -> bool:
+    """
+    将自动发现的应用合并到现有配置中。
+
+    - 已有相同路径时，仅补齐缺失的 app_id / name。
+    - 已有相同 app_id 时，保留用户自定义路径，只补齐缺失名称。
+    - 都不存在时追加新项。
+    """
+    auto_path = _normalize_compare_path(auto_app.get("path", ""))
+    auto_app_id = str(auto_app.get("app_id", "")).strip()
+    for index, app in enumerate(apps):
+        existing = dict(app)
+        existing_path = _normalize_compare_path(existing.get("path", ""))
+        existing_app_id = str(existing.get("app_id", "")).strip()
+        changed = False
+
+        if auto_path and existing_path == auto_path:
+            if auto_app_id and not existing_app_id:
+                existing["app_id"] = auto_app_id
+                changed = True
+            if not str(existing.get("name", "")).strip():
+                existing["name"] = auto_app["name"]
+                changed = True
+            if changed:
+                apps[index] = existing
+            return changed
+
+        if auto_app_id and existing_app_id.lower() == auto_app_id.lower():
+            if not str(existing.get("name", "")).strip():
+                existing["name"] = auto_app["name"]
+                changed = True
+            if changed:
+                apps[index] = existing
+            return changed
+
+    apps.append(dict(auto_app))
+    return True
+
+
+def _ensure_auto_external_apps(apps: list[dict[str, str]]) -> bool:
+    """自动探测并补充内置推荐的外部应用。"""
+    auto_app = _discover_birdstamp_app()
+    if not auto_app:
+        return False
+    return _merge_auto_app(apps, auto_app)
 
 
 def _build_user_config_dir(app_dir_name: str) -> str:
@@ -102,17 +264,19 @@ def load_config(config_path: str | None = None, config_dir: str | None = None) -
                     continue
                 path = legacy
                 break
-            else:
-                return out
-        else:
-            return out
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict) and "apps" in data and isinstance(data["apps"], list):
-            out["apps"] = [entry for item in data["apps"] if (entry := _normalize_app_entry(item)) is not None]
-    except Exception:
-        pass
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and "apps" in data and isinstance(data["apps"], list):
+                out["apps"] = [entry for item in data["apps"] if (entry := _normalize_app_entry(item)) is not None]
+        except Exception:
+            pass
+    if _ensure_auto_external_apps(out["apps"]):
+        try:
+            save_config(out["apps"], config_path=path)
+        except Exception:
+            pass
     return out
 
 
