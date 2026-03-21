@@ -3827,11 +3827,13 @@ class FileListPanel(QWidget):
         self._size_slider.setTickPosition(_TicksBelow)
         self._size_slider.setTickInterval(1)
         self._size_slider.setPageStep(1)
+        self._size_slider.setToolTip("调整缩略图尺寸；列表模式下也会影响快速预览使用的小图尺寸")
         self._size_slider.valueChanged.connect(self._on_size_slider_changed)
 
         self._size_label = QLabel(f"{_THUMB_SIZE_STEPS[0]}px")
         self._size_label.setStyleSheet("color: #aaa; font-size: 11px;")
         self._size_label.setFixedWidth(42)
+        self._size_label.setToolTip("当前缩略图/快速预览尺寸")
 
         toolbar.addWidget(self._btn_list)
         toolbar.addWidget(self._btn_thumb)
@@ -5588,7 +5590,38 @@ class FileListPanel(QWidget):
         actual_path = self._get_actual_path_for_display(norm_path)
         return actual_path or norm_path
 
-    def _resolve_existing_preview_image_path(self, path: str) -> str:
+    def _resolve_existing_sized_preview_image_path(self, path: str) -> str:
+        norm_path = os.path.normpath(path) if path else ""
+        if not norm_path:
+            return ""
+        preview_base_dir = self._report_root_dir or self._current_dir
+        if not preview_base_dir:
+            return ""
+        actual_path = self._get_actual_path_for_display(norm_path)
+        report_cache = self._report_full_cache or self._report_cache or {}
+        source_path = actual_path or norm_path
+        thumb_source = _resolve_thumb_source_path(source_path, report_cache, preview_base_dir)
+        source_stamp = _thumb_source_stamp(source_path, thumb_source)
+        persistent_thumb_path = _existing_persistent_thumb_cache_path_for_file(
+            source_path,
+            preview_base_dir,
+            requested_size=self._thumb_size,
+            source_stamp=source_stamp,
+            candidate_sizes=_effective_persistent_thumb_cache_sizes(self._thumb_size),
+        )
+        if persistent_thumb_path:
+            return persistent_thumb_path
+        if thumb_source and os.path.isfile(thumb_source):
+            try:
+                thumb_mtime = float(os.path.getmtime(thumb_source))
+            except Exception:
+                thumb_mtime = 0.0
+            thumb_disk_path = _thumb_disk_cache_path(thumb_source, thumb_mtime, self._thumb_size)
+            if thumb_disk_path and os.path.isfile(thumb_disk_path):
+                return thumb_disk_path
+        return ""
+
+    def _resolve_existing_selected_preview_image_path(self, path: str) -> str:
         norm_path = os.path.normpath(path) if path else ""
         if not norm_path:
             return ""
@@ -7144,9 +7177,8 @@ class FileListPanel(QWidget):
             self._update_selection_status()
 
     def _update_size_controls(self) -> None:
-        enabled = self._view_mode == self._MODE_THUMB
-        self._size_slider.setEnabled(enabled)
-        self._size_label.setEnabled(enabled)
+        self._size_slider.setEnabled(True)
+        self._size_label.setEnabled(True)
 
     def _sync_key_navigation_fps_combo(self) -> None:
         combo = self._combo_key_navigation_fps
@@ -8373,12 +8405,29 @@ class FileListPanel(QWidget):
             act_paste_species.triggered.connect(lambda: self._paste_species_to_paths(paths))
 
     def _add_browse_preview_menu_action(self, menu: QMenu, source_path: str | None) -> None:
-        preview_path = self._resolve_existing_preview_image_path(source_path or "")
+        sized_preview_path = self._resolve_existing_sized_preview_image_path(source_path or "")
         act_preview = menu.addAction("浏览预览图像")
-        act_preview.setEnabled(bool(preview_path))
-        if preview_path:
-            _log.info("[_add_browse_preview_menu_action] source=%r preview=%r", source_path, preview_path)
-            act_preview.triggered.connect(lambda checked=False, p=preview_path: reveal_in_file_manager(p))
+        act_preview.setEnabled(bool(sized_preview_path))
+        if sized_preview_path:
+            _log.info(
+                "[_add_browse_preview_menu_action] source=%r sized_preview=%r",
+                source_path,
+                sized_preview_path,
+            )
+            act_preview.triggered.connect(lambda checked=False, p=sized_preview_path: reveal_in_file_manager(p))
+
+        selected_preview_path = self._resolve_existing_selected_preview_image_path(source_path or "")
+        act_selected_preview = menu.addAction("浏览选鸟预览图像")
+        act_selected_preview.setEnabled(bool(selected_preview_path))
+        if selected_preview_path:
+            _log.info(
+                "[_add_browse_preview_menu_action] source=%r selected_preview=%r",
+                source_path,
+                selected_preview_path,
+            )
+            act_selected_preview.triggered.connect(
+                lambda checked=False, p=selected_preview_path: reveal_in_file_manager(p)
+            )
 
     def _on_tree_context_menu(self, pos) -> None:
         index = self._tree_widget.indexAt(pos)
