@@ -702,12 +702,64 @@ def _persistent_thumb_cache_dir(current_dir: str | None, size: int) -> str:
     return os.path.join(superpicky_dir, "cache", _persistent_thumb_cache_dirname(size))
 
 
-def _persistent_thumb_cache_path_for_file(path: str, current_dir: str | None, size: int) -> str:
+def _persistent_thumb_cache_filename_for_file(path: str, current_dir: str | None = None) -> str:
+    """生成平铺缓存文件名，优先保留相对路径信息以避免子目录重名冲突。"""
+    norm_path = os.path.normpath(path)
+    name = ""
+    if current_dir:
+        try:
+            rel = os.path.relpath(norm_path, os.path.normpath(current_dir))
+        except Exception:
+            rel = ""
+        if rel and rel != os.curdir and rel != os.pardir and not rel.startswith(os.pardir + os.sep):
+            name = rel.replace("\\", "__").replace("/", "__")
+    if not name:
+        name = os.path.basename(norm_path)
+    if not name:
+        digest = hashlib.sha1(_path_key(path).encode("utf-8")).hexdigest()[:12]
+        return f"{digest}.thumb.jpg"
+    for ch in '<>:"/\\|?*':
+        name = name.replace(ch, "_")
+    max_base_length = 180
+    if len(name) > max_base_length:
+        digest = hashlib.sha1(_path_key(path).encode("utf-8")).hexdigest()[:8]
+        stem, ext = os.path.splitext(name)
+        keep = max(24, max_base_length - len(ext) - len(digest) - 2)
+        name = f"{stem[:keep]}__{digest}{ext}"
+    return f"{name}.thumb.jpg"
+
+
+def _legacy_persistent_thumb_cache_path_for_file(path: str, current_dir: str | None, size: int) -> str:
     cache_dir = _persistent_thumb_cache_dir(current_dir, size)
     if not cache_dir or not path:
         return ""
     digest = hashlib.sha1(_path_key(path).encode("utf-8")).hexdigest()
     return os.path.join(cache_dir, digest[:2], f"{digest}.jpg")
+
+
+def _persistent_thumb_cache_path_for_file(path: str, current_dir: str | None, size: int) -> str:
+    cache_dir = _persistent_thumb_cache_dir(current_dir, size)
+    if not cache_dir or not path:
+        return ""
+    return os.path.join(cache_dir, _persistent_thumb_cache_filename_for_file(path, current_dir))
+
+
+def _migrate_legacy_persistent_thumb_cache_path(target_path: str, legacy_path: str) -> str:
+    """将旧的二级目录缓存迁移到新的平铺目录；失败时仍回退使用旧路径。"""
+    if not target_path or not legacy_path or not os.path.isfile(legacy_path):
+        return ""
+    if os.path.isfile(target_path):
+        return target_path
+    try:
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        os.replace(legacy_path, target_path)
+        try:
+            os.rmdir(os.path.dirname(legacy_path))
+        except Exception:
+            pass
+        return target_path
+    except Exception:
+        return legacy_path
 
 
 def _thumb_source_stamp(path: str, auxiliary_path: str = "") -> float:
@@ -730,7 +782,11 @@ def _existing_persistent_thumb_cache_path_for_exact_size(
 ) -> str:
     cache_path = _persistent_thumb_cache_path_for_file(path, current_dir, size)
     if not cache_path or not os.path.isfile(cache_path):
-        return ""
+        legacy_path = _legacy_persistent_thumb_cache_path_for_file(path, current_dir, size)
+        if legacy_path and os.path.isfile(legacy_path):
+            cache_path = _migrate_legacy_persistent_thumb_cache_path(cache_path, legacy_path)
+        if not cache_path or not os.path.isfile(cache_path):
+            return ""
     if source_stamp is None:
         source_stamp = _thumb_source_stamp(path)
     if source_stamp and source_stamp > 0:
