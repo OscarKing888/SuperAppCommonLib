@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
+import inspect
 from collections.abc import Iterable
 from typing import Any, Callable
 
@@ -17,6 +19,13 @@ from app_common.log import get_logger
 
 # 协议：客户端发送一行 JSON：{"files": ["path1", "path2", ...]}，UTF-8
 _PROTOCOL_ENCODING = "utf-8"
+_PROTOCOL_FRAME_SEPARATOR = b"\n"
+_PROTOCOL_VERSION = 2
+_PROTOCOL_CONNECT_TIMEOUT_MS = 3000
+_PROTOCOL_NEGOTIATION_TIMEOUT_MS = 1200
+_PROTOCOL_IO_TIMEOUT_MS = 5000
+_SOCKET_SEND_CHUNK_SIZE = 64
+_CHUNKED_TRANSFER_THRESHOLD = 10
 _log = get_logger("send_to_app")
 
 _QT_APIS = ("PyQt6", "PyQt5", "PySide6")
@@ -353,6 +362,188 @@ def _server_name(app_id: str) -> str:
     return _server_names(app_id)[0]
 
 
+def _callback_accepts_completion_callback(callback: Callable[..., Any]) -> bool:
+    try:
+        signature = inspect.signature(callback)
+    except Exception:
+        return False
+    positional_count = 0
+    for parameter in signature.parameters.values():
+        if parameter.kind == inspect.Parameter.VAR_POSITIONAL:
+            return True
+        if parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
+            positional_count += 1
+    return positional_count >= 2
+
+
+def _callback_accepts_progress_callback(callback: Callable[..., Any]) -> bool:
+    try:
+        signature = inspect.signature(callback)
+    except Exception:
+        return False
+    positional_count = 0
+    for parameter in signature.parameters.values():
+        if parameter.kind == inspect.Parameter.VAR_POSITIONAL:
+            return True
+        if parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
+            positional_count += 1
+    return positional_count >= 3
+
+
+def _unconnected_socket_state(socket_like: Any) -> Any:
+    socket_cls = socket_like if isinstance(socket_like, type) else type(socket_like)
+    enum_holder = getattr(socket_cls, "LocalSocketState", None)
+    if enum_holder is not None:
+        state = getattr(enum_holder, "UnconnectedState", None)
+        if state is not None:
+            return state
+    return getattr(socket_cls, "UnconnectedState", 0)
+
+
+def _as_non_negative_int(value: Any, default: int = 0) -> int:
+    try:
+        normalized = int(value)
+    except Exception:
+        return max(0, int(default))
+    return max(0, normalized)
+
+
+def _write_json_frame(sock: Any, payload: dict[str, Any]) -> bool:
+    try:
+        frame = json.dumps(payload, ensure_ascii=False).encode(_PROTOCOL_ENCODING) + _PROTOCOL_FRAME_SEPARATOR
+        if sock.write(frame) < 0:
+            return False
+        try:
+            sock.flush()
+        except Exception:
+            pass
+        bytes_to_write = getattr(sock, "bytesToWrite", None)
+        if callable(bytes_to_write) and bytes_to_write() > 0:
+            return bool(sock.waitForBytesWritten(_PROTOCOL_IO_TIMEOUT_MS))
+        return True
+    except Exception:
+        return False
+
+
+def _build_progress_payload(
+    *,
+    transfer_id: str,
+    phase: str,
+    current: int,
+    total: int,
+    message: str = "",
+) -> dict[str, Any]:
+    payload = {
+        "type": "progress",
+        "protocol": _PROTOCOL_VERSION,
+        "transfer_id": str(transfer_id or "").strip(),
+        "phase": str(phase or "").strip(),
+        "current": max(0, int(current)),
+        "total": max(0, int(total)),
+    }
+    text = str(message or "").strip()
+    if text:
+        payload["message"] = text
+    return payload
+
+
+def _read_protocol_frame(sock: Any, buffer: bytearray, *, timeout_ms: int) -> dict[str, Any] | None:
+    deadline = time.monotonic() + (max(1, int(timeout_ms)) / 1000.0)
+    while True:
+        separator_index = buffer.find(_PROTOCOL_FRAME_SEPARATOR)
+        if separator_index >= 0:
+            raw_line = bytes(buffer[:separator_index]).strip()
+            del buffer[: separator_index + len(_PROTOCOL_FRAME_SEPARATOR)]
+            if not raw_line:
+                continue
+            try:
+                obj = json.loads(raw_line.decode(_PROTOCOL_ENCODING))
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                return obj
+            continue
+
+        remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+        if remaining_ms <= 0:
+            return None
+        if not sock.waitForReadyRead(remaining_ms):
+            data = sock.readAll().data() if getattr(sock, "bytesAvailable", lambda: 0)() > 0 else b""
+            if data:
+                buffer.extend(data)
+                continue
+            return None
+        data = sock.readAll().data()
+        if data:
+            buffer.extend(data)
+
+
+def _wait_for_expected_frame(
+    sock: Any,
+    buffer: bytearray,
+    *,
+    expected_types: set[str],
+    transfer_id: str = "",
+    timeout_ms: int = _PROTOCOL_IO_TIMEOUT_MS,
+    on_progress_frame: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any] | None:
+    deadline = time.monotonic() + (max(1, int(timeout_ms)) / 1000.0)
+    while True:
+        remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+        if remaining_ms <= 0:
+            return None
+        frame = _read_protocol_frame(sock, buffer, timeout_ms=remaining_ms)
+        if frame is None:
+            return None
+        frame_type = str(frame.get("type") or "").strip().lower()
+        if not frame_type:
+            continue
+        frame_transfer_id = str(frame.get("transfer_id") or "").strip()
+        if transfer_id and frame_transfer_id and frame_transfer_id != transfer_id:
+            continue
+        if frame_type == "progress":
+            if callable(on_progress_frame):
+                try:
+                    on_progress_frame(frame)
+                except Exception:
+                    pass
+            continue
+        if frame_type in expected_types:
+            return frame
+        if frame_type == "error":
+            return None
+
+
+def _probe_chunked_socket_protocol(server_name: str) -> bool:
+    _, QtNetwork, _ = _load_qt_modules(need_network=True)
+    if QtNetwork is None:
+        return False
+    QLocalSocket = QtNetwork.QLocalSocket
+    sock = QLocalSocket()
+    try:
+        sock.connectToServer(server_name)
+        if not sock.waitForConnected(_PROTOCOL_CONNECT_TIMEOUT_MS):
+            return False
+        if not _write_json_frame(sock, {"type": "probe", "protocol": _PROTOCOL_VERSION}):
+            return False
+        frame = _read_protocol_frame(sock, bytearray(), timeout_ms=_PROTOCOL_NEGOTIATION_TIMEOUT_MS)
+        if not isinstance(frame, dict):
+            return False
+        return (
+            str(frame.get("type") or "").strip().lower() == "probe_ack"
+            and _as_non_negative_int(frame.get("protocol"), 0) >= _PROTOCOL_VERSION
+        )
+    except Exception:
+        return False
+    finally:
+        try:
+            sock.disconnectFromServer()
+            if sock.state() != _unconnected_socket_state(QLocalSocket):
+                sock.abort()
+        except Exception:
+            pass
+
+
 def _send_via_socket(server_name: str, file_paths: list[str]) -> bool:
     """作为客户端连接已有实例，发送 file_paths 后返回。成功返回 True。"""
     _, QtNetwork, _ = _load_qt_modules(need_network=True)
@@ -361,17 +552,151 @@ def _send_via_socket(server_name: str, file_paths: list[str]) -> bool:
     QLocalSocket = QtNetwork.QLocalSocket
     sock = QLocalSocket()
     sock.connectToServer(server_name)
-    if not sock.waitForConnected(3000):
+    if not sock.waitForConnected(_PROTOCOL_CONNECT_TIMEOUT_MS):
         return False
     payload = json.dumps({"files": normalize_file_paths(file_paths)}, ensure_ascii=False)
     sock.write(payload.encode(_PROTOCOL_ENCODING))
     sock.flush()
     sock.waitForBytesWritten(2000)
     sock.disconnectFromServer()
-    unconnected = getattr(QLocalSocket.LocalSocketState, "UnconnectedState", None) or getattr(QLocalSocket, "UnconnectedState", 0)
+    unconnected = _unconnected_socket_state(QLocalSocket)
     if sock.state() != unconnected:
         sock.abort()
     return True
+
+
+def _send_via_chunked_socket(
+    server_name: str,
+    file_paths: list[str],
+    *,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> bool:
+    _, QtNetwork, _ = _load_qt_modules(need_network=True)
+    if QtNetwork is None:
+        return False
+    QLocalSocket = QtNetwork.QLocalSocket
+    sock = QLocalSocket()
+    buffer = bytearray()
+    transfer_id = f"{os.getpid()}_{int(time.time() * 1000)}_{len(file_paths)}"
+    total = len(file_paths)
+    chunk_size = max(1, _SOCKET_SEND_CHUNK_SIZE)
+
+    if callable(progress_callback):
+        try:
+            progress_callback(0, total, f"热发送 0/{total}")
+        except Exception:
+            pass
+
+    def forward_progress_frame(frame: dict[str, Any]) -> None:
+        if not callable(progress_callback):
+            return
+        try:
+            current_value = _as_non_negative_int(frame.get("current"), 0)
+            total_value = max(total, _as_non_negative_int(frame.get("total"), total))
+            text = str(frame.get("message") or "").strip()
+            phase = str(frame.get("phase") or "").strip().lower()
+            if not text:
+                if phase == "receiving":
+                    text = f"接收方正在接收 {current_value}/{total_value}"
+                elif phase in {"import_pending", "importing"}:
+                    text = f"接收方正在导入 {current_value}/{total_value}"
+                elif phase in {"imported", "completed"}:
+                    text = f"接收方已导入 {current_value}/{total_value}"
+                else:
+                    text = f"接收方处理中 {current_value}/{total_value}"
+            progress_callback(min(current_value, max(1, total_value)), total_value, text)
+        except Exception:
+            pass
+
+    try:
+        sock.connectToServer(server_name)
+        if not sock.waitForConnected(_PROTOCOL_CONNECT_TIMEOUT_MS):
+            return False
+
+        begin_payload = {
+            "type": "begin",
+            "protocol": _PROTOCOL_VERSION,
+            "transfer_id": transfer_id,
+            "total_files": total,
+        }
+        if not _write_json_frame(sock, begin_payload):
+            return False
+        if _wait_for_expected_frame(sock, buffer, expected_types={"begin_ack"}, transfer_id=transfer_id) is None:
+            return False
+
+        for start in range(0, total, chunk_size):
+            if callable(cancel_check) and cancel_check():
+                _write_json_frame(
+                    sock,
+                    {
+                        "type": "cancel",
+                        "protocol": _PROTOCOL_VERSION,
+                        "transfer_id": transfer_id,
+                    },
+                )
+                return False
+
+            chunk = file_paths[start : start + chunk_size]
+            payload = {
+                "type": "chunk",
+                "protocol": _PROTOCOL_VERSION,
+                "transfer_id": transfer_id,
+                "total_files": total,
+                "files": chunk,
+            }
+            if not _write_json_frame(sock, payload):
+                return False
+            ack = _wait_for_expected_frame(sock, buffer, expected_types={"chunk_ack"}, transfer_id=transfer_id)
+            if ack is None:
+                return False
+            current = min(total, _as_non_negative_int(ack.get("received_files"), start + len(chunk)))
+            if callable(progress_callback):
+                try:
+                    progress_callback(current, total, f"热发送 {current}/{total}")
+                except Exception:
+                    pass
+
+        if not _write_json_frame(
+            sock,
+            {
+                "type": "end",
+                "protocol": _PROTOCOL_VERSION,
+                "transfer_id": transfer_id,
+                "total_files": total,
+            },
+        ):
+            return False
+        if callable(progress_callback):
+            try:
+                progress_callback(total, total, "已发送路径，等待接收端完成导入...")
+            except Exception:
+                pass
+        if _wait_for_expected_frame(
+            sock,
+            buffer,
+            expected_types={"end_ack"},
+            transfer_id=transfer_id,
+            on_progress_frame=forward_progress_frame,
+        ) is None:
+            return False
+
+        if callable(progress_callback):
+            try:
+                progress_callback(total, total, f"热发送 {total}/{total}")
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            sock.disconnectFromServer()
+            unconnected = _unconnected_socket_state(QLocalSocket)
+            if sock.state() != unconnected:
+                sock.abort()
+        except Exception:
+            pass
 
 
 def _can_connect_to_server(server_name: str, timeout_ms: int = 300) -> bool:
@@ -398,9 +723,17 @@ class SingleInstanceReceiver:
     当其它进程通过 send_file_list_to_running_app 发来文件列表时，触发 on_files_received(paths)。
     """
 
-    def __init__(self, app_id: str, on_files_received: Callable[[list[str]], None]):
+    def __init__(
+        self,
+        app_id: str,
+        on_files_received: Callable[[list[str]], None],
+        on_transfer_progress: Callable[[dict[str, Any]], None] | None = None,
+    ):
         self._app_id = app_id
         self._on_files = on_files_received
+        self._on_files_supports_completion_callback = _callback_accepts_completion_callback(on_files_received)
+        self._on_files_supports_progress_callback = _callback_accepts_progress_callback(on_files_received)
+        self._on_transfer_progress = on_transfer_progress
         self._servers: list[Any] = []
         self._names = _server_names(app_id)
 
@@ -471,6 +804,190 @@ class SingleInstanceReceiver:
         if not conn:
             return
         done = []
+        buffer = bytearray()
+        session: dict[str, Any] = {
+            "transfer_id": "",
+            "total_files": 0,
+            "paths": [],
+            "seen": set(),
+            "chunked": False,
+        }
+
+        def close_connection() -> None:
+            try:
+                conn.disconnectFromServer()
+                if conn.state() != getattr(conn, "UnconnectedState", 0):
+                    conn.abort()
+            except Exception:
+                pass
+            conn.deleteLater()
+
+        def emit_progress(phase: str, current: int, total: int) -> None:
+            callback = self._on_transfer_progress
+            if not callable(callback):
+                return
+            payload = {
+                "phase": phase,
+                "current": max(0, int(current)),
+                "total": max(0, int(total)),
+                "transfer_id": str(session.get("transfer_id") or ""),
+            }
+            try:
+                callback(payload)
+            except Exception as exc:
+                _log.warning("receiver progress callback failed: %s", exc)
+
+        def forward_progress_to_sender(payload: dict[str, Any] | None) -> None:
+            if not isinstance(payload, dict):
+                return
+            progress_payload = _build_progress_payload(
+                transfer_id=str(session.get("transfer_id") or ""),
+                phase=str(payload.get("phase") or "").strip(),
+                current=_as_non_negative_int(payload.get("current"), 0),
+                total=_as_non_negative_int(payload.get("total"), 0),
+                message=str(payload.get("message") or "").strip(),
+            )
+            _write_json_frame(conn, progress_payload)
+
+        def append_session_paths(raw_paths: Any) -> int:
+            if not isinstance(raw_paths, list):
+                return 0
+            appended = 0
+            normalized_paths = normalize_file_paths(raw_paths)
+            seen: set[str] = session["seen"]
+            paths: list[str] = session["paths"]
+            for path_text in normalized_paths:
+                dedup_key = os.path.normcase(os.path.normpath(path_text))
+                if dedup_key in seen:
+                    continue
+                seen.add(dedup_key)
+                paths.append(path_text)
+                appended += 1
+            return appended
+
+        def finalize_legacy_payload() -> None:
+            if done or session["chunked"]:
+                return
+            raw_payload = bytes(buffer).strip()
+            if not raw_payload:
+                return
+            try:
+                obj = json.loads(raw_payload.decode(_PROTOCOL_ENCODING))
+            except Exception:
+                return
+            paths = obj.get("files")
+            if not isinstance(paths, list):
+                return
+            normalized = normalize_file_paths(paths)
+            if normalized:
+                emit_progress("received", len(normalized), len(normalized))
+                done.append(1)
+                self._on_files(normalized)
+
+        def handle_protocol_frame(frame: dict[str, Any]) -> None:
+            frame_type = str(frame.get("type") or "").strip().lower()
+            if not frame_type:
+                return
+
+            if frame_type == "probe":
+                _write_json_frame(conn, {"type": "probe_ack", "protocol": _PROTOCOL_VERSION})
+                return
+
+            session["chunked"] = True
+            if frame_type == "begin":
+                session["transfer_id"] = str(frame.get("transfer_id") or "").strip()
+                session["total_files"] = _as_non_negative_int(frame.get("total_files"), 0)
+                session["paths"] = []
+                session["seen"] = set()
+                emit_progress("receiving", 0, session["total_files"])
+                _write_json_frame(
+                    conn,
+                    {
+                        "type": "begin_ack",
+                        "protocol": _PROTOCOL_VERSION,
+                        "transfer_id": session["transfer_id"],
+                        "total_files": session["total_files"],
+                    },
+                )
+                return
+
+            if frame_type == "chunk":
+                if not session["transfer_id"]:
+                    session["transfer_id"] = str(frame.get("transfer_id") or "").strip()
+                session["total_files"] = max(
+                    session["total_files"],
+                    _as_non_negative_int(frame.get("total_files"), len(session["paths"])),
+                )
+                append_session_paths(frame.get("files"))
+                current = len(session["paths"])
+                total = max(session["total_files"], current)
+                emit_progress("receiving", current, total)
+                _write_json_frame(
+                    conn,
+                    {
+                        "type": "chunk_ack",
+                        "protocol": _PROTOCOL_VERSION,
+                        "transfer_id": session["transfer_id"],
+                        "received_files": current,
+                        "total_files": total,
+                    },
+                )
+                return
+
+            if frame_type == "cancel":
+                emit_progress("cancelled", len(session["paths"]), max(session["total_files"], len(session["paths"])))
+                done.append(1)
+                _write_json_frame(
+                    conn,
+                    {
+                        "type": "cancel_ack",
+                        "protocol": _PROTOCOL_VERSION,
+                        "transfer_id": session["transfer_id"],
+                    },
+                )
+                return
+
+            if frame_type == "end":
+                current = len(session["paths"])
+                total = max(session["total_files"], current)
+                ack_sent = []
+
+                def finalize_transfer() -> None:
+                    if ack_sent:
+                        return
+                    ack_sent.append(1)
+                    _write_json_frame(
+                        conn,
+                        {
+                            "type": "end_ack",
+                            "protocol": _PROTOCOL_VERSION,
+                            "transfer_id": session["transfer_id"],
+                            "received_files": current,
+                            "total_files": total,
+                        },
+                    )
+                    emit_progress("received", current, total)
+                    if not done:
+                        done.append(1)
+                    close_connection()
+
+                if current <= 0:
+                    finalize_transfer()
+                    return
+
+                try:
+                    if self._on_files_supports_progress_callback:
+                        self._on_files(list(session["paths"]), finalize_transfer, forward_progress_to_sender)
+                        return
+                    if self._on_files_supports_completion_callback:
+                        self._on_files(list(session["paths"]), finalize_transfer)
+                        return
+                except Exception:
+                    finalize_transfer()
+                    return
+
+                finalize_transfer()
+                self._on_files(list(session["paths"]))
 
         def read_and_callback() -> None:
             if done:
@@ -478,24 +995,39 @@ class SingleInstanceReceiver:
             try:
                 data = conn.readAll().data()
                 if data:
-                    obj = json.loads(data.decode(_PROTOCOL_ENCODING))
-                    paths = obj.get("files")
-                    if isinstance(paths, list):
-                        done.append(1)
-                        self._on_files(normalize_file_paths(paths))
+                    buffer.extend(data)
+                if not session["chunked"] and _PROTOCOL_FRAME_SEPARATOR not in buffer:
+                    return
+                session["chunked"] = True
+                while True:
+                    separator_index = buffer.find(_PROTOCOL_FRAME_SEPARATOR)
+                    if separator_index < 0:
+                        break
+                    raw_line = bytes(buffer[:separator_index]).strip()
+                    del buffer[: separator_index + len(_PROTOCOL_FRAME_SEPARATOR)]
+                    if not raw_line:
+                        continue
+                    try:
+                        obj = json.loads(raw_line.decode(_PROTOCOL_ENCODING))
+                    except Exception:
+                        continue
+                    if isinstance(obj, dict):
+                        handle_protocol_frame(obj)
+                        if done:
+                            break
             except Exception:
                 pass
-            finally:
-                try:
-                    conn.disconnectFromServer()
-                    if conn.state() != getattr(conn, "UnconnectedState", 0):
-                        conn.abort()
-                except Exception:
-                    pass
-                conn.deleteLater()
+            if done:
+                close_connection()
+
+        def finish_connection() -> None:
+            if not done:
+                finalize_legacy_payload()
+            close_connection()
 
         try:
             conn.readyRead.connect(read_and_callback)
+            conn.disconnected.connect(finish_connection)
             if conn.bytesAvailable() > 0:
                 read_and_callback()
         except Exception:
@@ -520,7 +1052,13 @@ class SingleInstanceReceiver:
                 pass
 
 
-def send_file_list_to_running_app(app_id: str, file_paths: list[str]) -> bool:
+def send_file_list_to_running_app(
+    app_id: str,
+    file_paths: list[str],
+    *,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> bool:
     """
     将文件列表发给已在运行的同名应用实例（通过单例 IPC）。
     若成功发送则返回 True，调用方应随后退出（由已运行实例处理）；
@@ -529,7 +1067,31 @@ def send_file_list_to_running_app(app_id: str, file_paths: list[str]) -> bool:
     normalized_paths = normalize_file_paths(file_paths)
     if not normalized_paths:
         return False
+    prefer_chunked = len(normalized_paths) > _CHUNKED_TRANSFER_THRESHOLD or callable(progress_callback)
     for server_name in _server_names(app_id):
+        if prefer_chunked and _probe_chunked_socket_protocol(server_name):
+            if _send_via_chunked_socket(
+                server_name,
+                normalized_paths,
+                progress_callback=progress_callback,
+                cancel_check=cancel_check,
+            ):
+                return True
+            if callable(cancel_check) and cancel_check():
+                return False
+            continue
+        if callable(progress_callback):
+            try:
+                progress_callback(0, len(normalized_paths), "目标应用未启用分块热发送，正在兼容发送...")
+            except Exception:
+                pass
         if _send_via_socket(server_name, normalized_paths):
+            if callable(progress_callback):
+                try:
+                    progress_callback(len(normalized_paths), len(normalized_paths), f"热发送 {len(normalized_paths)}/{len(normalized_paths)}")
+                except Exception:
+                    pass
             return True
+        if callable(cancel_check) and cancel_check():
+            return False
     return False
