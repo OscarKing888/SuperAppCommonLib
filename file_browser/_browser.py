@@ -24,6 +24,7 @@ import queue as _queue
 import sys
 import threading
 import time as _time
+import unicodedata
 from pathlib import Path
 
 # ── Qt 导入 ───────────────────────────────────────────────────────────────────
@@ -532,6 +533,18 @@ _KeyLeft = getattr(Qt.Key, "Key_Left", None) or getattr(Qt, "Key_Left", None)
 _KeyRight = getattr(Qt.Key, "Key_Right", None) or getattr(Qt, "Key_Right", None)
 _KeyDelete = getattr(Qt.Key, "Key_Delete", None) or getattr(Qt, "Key_Delete", None)
 _KeyPeriod = getattr(Qt.Key, "Key_Period", None) or getattr(Qt, "Key_Period", None)
+_KeyQ = getattr(Qt.Key, "Key_Q", None) or getattr(Qt, "Key_Q", None)
+_KeyQuoteLeft = getattr(Qt.Key, "Key_QuoteLeft", None) or getattr(Qt, "Key_QuoteLeft", None)
+_KeyAsciiTilde = getattr(Qt.Key, "Key_AsciiTilde", None) or getattr(Qt, "Key_AsciiTilde", None)
+_KeyRatingDigits = {}
+for _digit in range(1, 6):
+    _key = getattr(Qt.Key, f"Key_{_digit}", None) or getattr(Qt, f"Key_{_digit}", None)
+    if _key is not None:
+        _KeyRatingDigits[_key] = _digit
+        try:
+            _KeyRatingDigits[int(_key)] = _digit
+        except Exception:
+            pass
 _ShiftModifier = (
     getattr(Qt.KeyboardModifier, "ShiftModifier", None)
     or getattr(Qt, "ShiftModifier", None)
@@ -548,6 +561,21 @@ _MetaModifier = (
     getattr(Qt.KeyboardModifier, "MetaModifier", None)
     or getattr(Qt, "MetaModifier", None)
 )
+try:
+    _WindowShortcut = Qt.ShortcutContext.WindowShortcut
+except AttributeError:
+    _WindowShortcut = Qt.WindowShortcut  # type: ignore[attr-defined]
+
+
+def _key_matches(value, key) -> bool:
+    if key is None:
+        return False
+    if value == key:
+        return True
+    try:
+        return int(value) == int(key)
+    except Exception:
+        return False
 
 try:
     _StateSelected = QStyle.StateFlag.State_Selected
@@ -4075,6 +4103,10 @@ class FileListPanel(QWidget):
         except Exception:
             pass
         copy_shortcut.activated.connect(self._copy_current_selection_to_clipboard)
+        self._file_action_shortcuts: list[QShortcut] = []
+        self._install_file_action_shortcut("Q", "reject")
+        self._install_file_action_shortcut("`", "pick")
+        self._install_file_action_shortcut("~", "pick")
 
     def _copy_current_selection_to_clipboard(self) -> None:
         """将当前视图（列表/缩略图）中选中的文件路径复制到剪贴板。"""
@@ -4086,6 +4118,19 @@ class FileListPanel(QWidget):
         else:
             paths = []
         self._copy_paths_to_clipboard(paths)
+
+    def _install_file_action_shortcut(self, sequence: str, action_kind: str) -> None:
+        shortcut = QShortcut(QKeySequence(sequence), self)
+        try:
+            shortcut.setContext(_WindowShortcut)
+        except Exception:
+            pass
+        try:
+            shortcut.setAutoRepeat(False)
+        except Exception:
+            pass
+        shortcut.activated.connect(lambda kind=action_kind: self._trigger_active_shortcut_action(kind))
+        self._file_action_shortcuts.append(shortcut)
 
     def _on_view_selection_changed(self, *_args) -> None:
         self._update_selection_status()
@@ -5171,9 +5216,79 @@ class FileListPanel(QWidget):
         text = str(event.text() or "")
         if text:
             return text
-        if event.key() == _KeyPeriod:
+        if _key_matches(event.key(), _KeyPeriod):
             return "."
+        if _key_matches(event.key(), _KeyQ):
+            return "q"
+        if _key_matches(event.key(), _KeyQuoteLeft):
+            return "`"
+        if _key_matches(event.key(), _KeyAsciiTilde):
+            return "~"
         return ""
+
+    def _shortcut_rating_value_from_event(self, event, text: str) -> int:
+        if len(text) == 1:
+            try:
+                digit = int(unicodedata.digit(text))
+            except Exception:
+                digit = 0
+            if 1 <= digit <= 5:
+                return digit
+        if text:
+            return 0
+        try:
+            key = event.key()
+            value = _KeyRatingDigits.get(key)
+            if value is None:
+                value = _KeyRatingDigits.get(int(key))
+            return int(value or 0)
+        except Exception:
+            return 0
+
+    def _shortcut_is_pick_keypress(self, event, text: str) -> bool:
+        if text in {".", "\u00b7", "\uff0e", "\u3002", "`", "\uff40", "~", "\uff5e"}:
+            return True
+        if text:
+            return False
+        return (
+            _key_matches(event.key(), _KeyPeriod)
+            or _key_matches(event.key(), _KeyQuoteLeft)
+            or _key_matches(event.key(), _KeyAsciiTilde)
+        )
+
+    def _shortcut_is_reject_keypress(self, event, text: str) -> bool:
+        return text.lower() == "q" or _key_matches(event.key(), _KeyQ)
+
+    def _keyboard_shortcut_focus_allows_file_action(self) -> bool:
+        focus = QApplication.focusWidget()
+        if focus is None:
+            return True
+        try:
+            if focus.window() is not self.window():
+                return False
+        except Exception:
+            pass
+        if isinstance(focus, (QLineEdit, QComboBox)):
+            return False
+        try:
+            class_name = str(focus.metaObject().className())
+        except Exception:
+            class_name = focus.__class__.__name__
+        blocked_name_parts = ("LineEdit", "TextEdit", "PlainTextEdit", "SpinBox", "ComboBox")
+        return not any(part in class_name for part in blocked_name_parts)
+
+    def _trigger_active_shortcut_action(self, action_kind: str, action_value: int = 0) -> None:
+        if not self._keyboard_shortcut_focus_allows_file_action():
+            return
+        paths = self._paths_for_active_shortcut_action()
+        if not paths:
+            return
+        if action_kind == "rating":
+            self._toggle_rating_for_paths(paths, action_value)
+        elif action_kind == "pick":
+            self._toggle_pick_for_paths(paths)
+        elif action_kind == "reject":
+            self._toggle_reject_for_paths(paths)
 
     def _handle_rating_shortcut_keypress(self, event) -> bool:
         if event is None:
@@ -5182,17 +5297,15 @@ class FileListPanel(QWidget):
             return False
 
         text = self._shortcut_text_from_event(event)
-        if not text:
-            return False
-        normalized = text.lower()
         action_kind = ""
         action_value = 0
-        if normalized in {"1", "2", "3", "4", "5"}:
+        rating_value = self._shortcut_rating_value_from_event(event, text)
+        if rating_value:
             action_kind = "rating"
-            action_value = int(normalized)
-        elif normalized == "q":
+            action_value = rating_value
+        elif self._shortcut_is_reject_keypress(event, text):
             action_kind = "reject"
-        elif text in {".", "·"}:
+        elif self._shortcut_is_pick_keypress(event, text):
             action_kind = "pick"
         else:
             return False
@@ -5527,7 +5640,7 @@ class FileListPanel(QWidget):
         pick_action.triggered.connect(
             lambda checked=False: self._toggle_pick_for_paths(unique_paths)
         )
-        pick_action.setText(f"{pick_label}\t·")
+        pick_action.setText(f"{pick_label}\t`")
         reject_target = self._reject_target_for_paths(unique_paths)
         reject_label = "取消🚫 排除" if reject_target == 0 else "🚫 标记为排除"
         reject_action = rating_menu.addAction(reject_label)
