@@ -31,6 +31,10 @@ from app_common.exif_io.photo_meta import (
     PhotoMetaDataXMP,
     PhotoMetaDataReportDB,
     PhotoMetaDataProxy,
+    extract_exposure_settings,
+    format_aperture_value,
+    format_iso_value,
+    format_shutter_value,
 )
 
 __all__ = [
@@ -57,4 +61,8 @@ __all__ = [
     "PhotoMetaDataXMP",
     "PhotoMetaDataReportDB",
     "PhotoMetaDataProxy",
+    "extract_exposure_settings",
+    "format_aperture_value",
+    "format_iso_value",
+    "format_shutter_value",
 ]

@@ -64,7 +64,7 @@ from app_common.exif_io import (
     read_batch_metadata,
     run_exiftool_assignments,
 )
-from app_common.exif_io.photo_meta import PhotoMetaDataProxy, PhotoMetaDataReportDB
+from app_common.exif_io.photo_meta import PhotoMetaDataProxy, PhotoMetaDataReportDB, extract_exposure_settings
 from app_common.focus_calc import (
     extract_focus_box_for_display,
     resolve_focus_camera_type_from_metadata,
@@ -4567,6 +4567,64 @@ class FileListPanel(QWidget):
     def get_report_row_for_path(self, path: str) -> dict | None:
         row = self._get_report_row_for_path(path)
         return dict(row) if isinstance(row, dict) else None
+
+    def get_photo_metadata_for_path(self, path: str, *, allow_slow_read: bool = False) -> dict:
+        """
+        Return metadata for one photo through the panel's PhotoMetaDataProxy.
+
+        Fast path uses already-loaded browser metadata or report.db cache.  Set
+        ``allow_slow_read=True`` only for committed selections where a direct
+        EXIF/XMP read is acceptable.
+        """
+        norm_path = os.path.normpath(path) if path else ""
+        if not norm_path:
+            return {}
+        candidates = [norm_path]
+        selected_display = os.path.normpath(self._selected_display_path) if self._selected_display_path else ""
+        if selected_display and selected_display not in candidates:
+            candidates.append(selected_display)
+        for candidate in candidates:
+            cached = self._meta_cache.get(candidate)
+            if isinstance(cached, dict) and cached:
+                return dict(cached)
+        for candidate in candidates:
+            try:
+                report_data = self._meta_proxy.report_db.read(candidate)
+            except Exception:
+                report_data = {}
+            if isinstance(report_data, dict) and report_data:
+                return dict(report_data)
+        if not allow_slow_read:
+            return {}
+        try:
+            data = self._meta_proxy.read(norm_path)
+        except Exception:
+            return {}
+        return dict(data) if isinstance(data, dict) else {}
+
+    def get_photo_exposure_settings_for_path(
+        self,
+        path: str,
+        *,
+        allow_slow_read: bool = False,
+    ) -> tuple[str, str, str]:
+        """
+        Return display-ready ``(shutter, aperture, iso)`` using PhotoMetaDataProxy.
+
+        Cached browser metadata and report.db rows are used first; committed
+        selections may fall back to direct proxy reads.
+        """
+        metadata = self.get_photo_metadata_for_path(path, allow_slow_read=False)
+        exposure = extract_exposure_settings(metadata)
+        if any(exposure) or not allow_slow_read:
+            return exposure
+        norm_path = os.path.normpath(path) if path else ""
+        if not norm_path:
+            return exposure
+        try:
+            return self._meta_proxy.read_exposure_settings(norm_path)
+        except Exception:
+            return exposure
 
     def sync_metadata_edit_for_path(
         self,

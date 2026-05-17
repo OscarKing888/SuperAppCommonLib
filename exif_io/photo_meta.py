@@ -395,6 +395,159 @@ class PhotoMetaDataXMP(PhotoMetaData):
 
 
 # ---------------------------------------------------------------------------
+# Camera exposure summary helpers
+# ---------------------------------------------------------------------------
+
+_EXPOSURE_SHUTTER_KEYS: tuple[str, ...] = (
+    "shutter",
+    "shutter_speed",
+    "ExposureTime",
+    "ShutterSpeed",
+    "Composite:ShutterSpeed",
+    "ExifIFD:ExposureTime",
+    "EXIF:ExposureTime",
+    "XMP-exif:ExposureTime",
+)
+_EXPOSURE_APERTURE_KEYS: tuple[str, ...] = (
+    "aperture",
+    "FNumber",
+    "Aperture",
+    "Composite:Aperture",
+    "ExifIFD:FNumber",
+    "EXIF:FNumber",
+    "XMP-exif:FNumber",
+)
+_EXPOSURE_ISO_KEYS: tuple[str, ...] = (
+    "iso",
+    "ISO",
+    "PhotographicSensitivity",
+    "ISOSpeedRatings",
+    "ExifIFD:ISO",
+    "EXIF:ISO",
+    "EXIF:ISOSpeedRatings",
+    "XMP-exif:PhotographicSensitivity",
+    "XMP-exif:ISOSpeedRatings",
+)
+
+
+def _first_metadata_value(metadata: dict[str, Any] | None, keys: tuple[str, ...]) -> Any:
+    if not isinstance(metadata, dict):
+        return ""
+    for key in keys:
+        value = metadata.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            if value.strip():
+                return value
+            continue
+        return value
+    return ""
+
+
+def _parse_positive_fraction_or_float(raw: Any) -> float | None:
+    if isinstance(raw, (tuple, list)) and len(raw) == 2:
+        try:
+            numerator = float(raw[0])
+            denominator = float(raw[1])
+        except (ValueError, TypeError):
+            return None
+        if denominator == 0:
+            return None
+        value = numerator / denominator
+        return value if value > 0 else None
+
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    text = text.lower().replace("seconds", "").replace("second", "").replace("sec", "").strip()
+    if text.startswith("f/"):
+        text = text[2:].strip()
+    if text.endswith("s"):
+        text = text[:-1].strip()
+    if "(" in text and ")" in text:
+        text = text.split("(", 1)[0].strip()
+    if not text:
+        return None
+    if "/" in text:
+        left, _, right = text.partition("/")
+        try:
+            numerator = float(left.strip())
+            denominator = float(right.strip())
+        except (ValueError, TypeError):
+            return None
+        if denominator == 0:
+            return None
+        value = numerator / denominator
+    else:
+        try:
+            value = float(text)
+        except (ValueError, TypeError):
+            return None
+    return value if value > 0 else None
+
+
+def _parse_optional_int(raw: Any) -> int | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    if text.upper().startswith("ISO"):
+        text = text[3:].strip()
+    try:
+        value = int(float(text))
+    except (ValueError, TypeError):
+        return None
+    return value if value >= 0 else None
+
+
+def format_shutter_value(raw: Any) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    seconds = _parse_positive_fraction_or_float(raw)
+    if seconds is None:
+        return text
+    inverse = 1.0 / seconds if seconds > 0 else 0.0
+    if seconds < 1 and inverse >= 2:
+        denominator = round(inverse)
+        if denominator > 0:
+            return f"1/{denominator}s"
+    return f"{seconds:g}s"
+
+
+def format_iso_value(raw: Any) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    iso_value = _parse_optional_int(raw)
+    if iso_value is None:
+        return text
+    return str(iso_value)
+
+
+def format_aperture_value(raw: Any) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    aperture_value = _parse_positive_fraction_or_float(raw)
+    if aperture_value is None:
+        return text
+    return f"f/{aperture_value:g}"
+
+
+def extract_exposure_settings(metadata: dict[str, Any] | None) -> tuple[str, str, str]:
+    """Return display-ready ``(shutter, aperture, iso)`` from proxy metadata."""
+    shutter_raw = _first_metadata_value(metadata, _EXPOSURE_SHUTTER_KEYS)
+    aperture_raw = _first_metadata_value(metadata, _EXPOSURE_APERTURE_KEYS)
+    iso_raw = _first_metadata_value(metadata, _EXPOSURE_ISO_KEYS)
+    return (
+        format_shutter_value(shutter_raw),
+        format_aperture_value(aperture_raw),
+        format_iso_value(iso_raw),
+    )
+
+
+# ---------------------------------------------------------------------------
 # ReportDB
 # ---------------------------------------------------------------------------
 
@@ -417,6 +570,9 @@ class PhotoMetaDataReportDB(PhotoMetaData):
         "pick",
         "bird_species_cn",
         "bird_species_en",
+        "iso",
+        "shutter_speed",
+        "aperture",
         "burst_id",
         "burst_position",
     })
@@ -685,6 +841,10 @@ class PhotoMetaDataProxy(PhotoMetaData):
             except Exception:
                 pass
         return merged
+
+    def read_exposure_settings(self, path: str) -> tuple[str, str, str]:
+        """Read and format camera exposure settings as ``(shutter, aperture, iso)``."""
+        return extract_exposure_settings(self.read(path))
 
     def read_batch(self, paths: list[str]) -> dict[str, dict[str, Any]]:
         """Merge batch reads from all three sources (EXIF uses single exiftool call)."""
