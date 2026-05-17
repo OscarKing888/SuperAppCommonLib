@@ -85,6 +85,10 @@ PHOTO_COLUMNS = [
     ("temp_jpeg_path",   "TEXT", None),
     ("debug_crop_path",  "TEXT", None),   # 裁切鸟+mask (crop_debug/)
     ("yolo_debug_path",  "TEXT", None),   # 全图+YOLO框 (yolo_debug/)
+
+    # V5: 连拍分组
+    ("burst_id",         "INTEGER", None),
+    ("burst_position",   "INTEGER", None),
     
     ("created_at",    "TEXT", None),
     ("updated_at",    "TEXT", None),
@@ -491,14 +495,6 @@ class ReportDB:
                     "CREATE UNIQUE INDEX IF NOT EXISTS idx_photos_filename "
                     "ON photos(filename)"
                 )
-                self._conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_photos_rating "
-                    "ON photos(rating)"
-                )
-                self._conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_photos_has_bird "
-                    "ON photos(has_bird)"
-                )
 
                 # 元数据表
                 self._conn.execute("""
@@ -520,6 +516,7 @@ class ReportDB:
 
         # Schema 升级在独立事务中执行，避免嵌套 commit 冲突
         self._upgrade_schema_if_needed()
+        self._ensure_report_indexes()
         _log.info("[ReportDB._init_schema] END")
 
     def _upgrade_schema_if_needed(self):
@@ -635,6 +632,7 @@ class ReportDB:
                     self._update_schema_version("5")
                 current_version = "5"
                 _log.info("[ReportDB._upgrade_schema_if_needed] 已升级到 v5")
+            self._ensure_expected_photo_columns()
         _log.debug("[ReportDB._upgrade_schema_if_needed] END current_version=%s", current_version)
 
     def _update_schema_version(self, version):
@@ -649,6 +647,52 @@ class ReportDB:
     # ==========================================================================
     #  写入操作
     # ==========================================================================
+
+    def _ensure_report_indexes(self) -> None:
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_photos_filename "
+                    "ON photos(filename)"
+                )
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_photos_rating "
+                    "ON photos(rating)"
+                )
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_photos_has_bird "
+                    "ON photos(has_bird)"
+                )
+
+    def _photo_table_columns(self) -> set[str]:
+        cursor = self._conn.execute("PRAGMA table_info(photos)")
+        return {str(row[1]) for row in cursor.fetchall()}
+
+    def _ensure_expected_photo_columns(self) -> None:
+        """Repair existing DBs whose schema_version is current but columns are missing."""
+        existing_columns = self._photo_table_columns()
+        added_columns: list[tuple[str, object]] = []
+        with self._conn:
+            for col_name, col_type, default in PHOTO_COLUMNS:
+                if col_name in existing_columns or col_name == "filename":
+                    continue
+                self._conn.execute(f"ALTER TABLE photos ADD COLUMN {col_name} {col_type}")
+                existing_columns.add(col_name)
+                added_columns.append((col_name, default))
+            for col_name, default in added_columns:
+                if default is not None:
+                    self._conn.execute(
+                        f"UPDATE photos SET {col_name} = ? WHERE {col_name} IS NULL",
+                        (default,),
+                    )
+            if "pick" in existing_columns:
+                self._conn.execute("UPDATE photos SET pick = 0 WHERE pick IS NULL")
+            self._update_schema_version(SCHEMA_VERSION)
+        if added_columns:
+            _log.info(
+                "[ReportDB._ensure_expected_photo_columns] added=%s",
+                [name for name, _default in added_columns],
+            )
 
     def insert_photo(self, data: dict) -> None:
         """
@@ -1206,7 +1250,7 @@ class ReportDB:
                 continue
 
             # 整数字段
-            if key in ("rating", "pick", "iso", "focal_length_35mm"):
+            if key in ("rating", "pick", "iso", "focal_length_35mm", "burst_id", "burst_position"):
                 try:
                     cleaned[key] = int(float(value))
                 except (ValueError, TypeError):

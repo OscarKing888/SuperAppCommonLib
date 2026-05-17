@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import abc
 import os
+import tempfile
+import xml.etree.ElementTree as ET
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -123,8 +126,78 @@ class PhotoMetaDataEXIFEmbeded(PhotoMetaData):
 # XMP Sidecar
 # ---------------------------------------------------------------------------
 
+_XMP_META_NS = "adobe:ns:meta/"
+_RDF_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+_DC_NS = "http://purl.org/dc/elements/1.1/"
+_XMP_DC_SUBJECT_TAG = f"{{{_DC_NS}}}subject"
+_RDF_DESCRIPTION_TAG = f"{{{_RDF_NS}}}Description"
+_RDF_BAG_TAG = f"{{{_RDF_NS}}}Bag"
+_RDF_LI_TAG = f"{{{_RDF_NS}}}li"
+_RDF_ABOUT_ATTR = f"{{{_RDF_NS}}}about"
+_RDF_RESOURCE_ATTR = f"{{{_RDF_NS}}}resource"
+
+_XMP_SUBJECT_KEYS: frozenset[str] = frozenset({
+    "xmp-dc:subject",
+    "xmp-dc:subjects",
+    "xmp:subject",
+    "xmp:subjects",
+    "subject",
+    "subjects",
+    "keywords",
+    "iptc:keywords",
+})
+
+
+def _is_xmp_subject_key(key: str) -> bool:
+    return str(key or "").strip().lower() in _XMP_SUBJECT_KEYS
+
+
+def _normalise_text_values(values: Iterable[Any], *, split_strings: bool = False) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, bytes):
+            text = value.decode("utf-8", errors="replace")
+        else:
+            text = str(value)
+        parts = text.split(";") if split_strings else [text]
+        for part in parts:
+            clean = part.strip()
+            if not clean or clean in seen:
+                continue
+            seen.add(clean)
+            result.append(clean)
+    return result
+
+
+def _normalise_subject_value(value: Any, *, split_strings: bool = False) -> list[str]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        return _normalise_text_values([value], split_strings=split_strings)
+    return _normalise_text_values(value, split_strings=split_strings)
+
+
 class PhotoMetaDataXMP(PhotoMetaData):
-    """Reads metadata from XMP sidecar files; writes via exiftool ``-o``."""
+    """Reads metadata from XMP sidecar files.
+
+    Generic field writes still use exiftool when available.  Keyword-style
+    custom tags are exposed as ``dc:subject`` and can be read/written directly
+    in the sidecar XML, independent of report.db.
+    """
+
+    SUBJECT_KEYS = _XMP_SUBJECT_KEYS
+
+    def sidecar_path_for(self, path: str) -> Path:
+        """Return the existing or default sidecar path for ``path``."""
+        try:
+            from .xmp_sidecar import find_xmp_sidecar
+            found = find_xmp_sidecar(path)
+            if found:
+                return Path(found)
+        except Exception:
+            pass
+        return Path(os.path.splitext(os.path.normpath(path))[0] + ".xmp")
 
     def read(self, path: str) -> dict[str, Any]:
         try:
@@ -135,6 +208,8 @@ class PhotoMetaDataXMP(PhotoMetaData):
             rec: dict[str, Any] = {"SourceFile": path}
             for group, name, value in rows:
                 rec[f"{group}:{name}"] = value
+                if group == "XMP-dc" and str(name).lower() == "subject":
+                    rec["XMP-dc:Subject"] = value
             return rec
         except Exception:
             return {}
@@ -143,18 +218,33 @@ class PhotoMetaDataXMP(PhotoMetaData):
         """Write fields into the XMP sidecar (creates/updates ``<stem>.xmp``)."""
         if not fields:
             return True
+
+        subject_seen = False
+        subject_values: list[str] = []
+        remaining_fields: dict[str, Any] = {}
+        for key, value in fields.items():
+            if _is_xmp_subject_key(key):
+                subject_seen = True
+                subject_values.extend(_normalise_subject_value(value, split_strings=True))
+            else:
+                remaining_fields[key] = value
+
+        success = True
+        if subject_seen:
+            success = self.write_subjects(path, subject_values) and success
+        if not remaining_fields:
+            return success
+
         try:
             from .exiftool_path import get_exiftool_executable_path
-            from .writer import run_exiftool_assignments
             et = get_exiftool_executable_path()
             if not et:
                 return False
-            stem = os.path.splitext(os.path.normpath(path))[0]
-            xmp_path = f"{stem}.xmp"
+            xmp_path = str(self.sidecar_path_for(path))
             # exiftool: write to sidecar only
-            assignments = [f"-{k}={v}" for k, v in fields.items()]
+            assignments = [f"-{k}={v}" for k, v in remaining_fields.items()]
             # We write to the sidecar by passing the image path and using -o
-            import subprocess, tempfile
+            import subprocess
             all_args = assignments + [f"-o={xmp_path}", os.path.normpath(path)]
             fd, argfile = tempfile.mkstemp(suffix=".args", prefix="et_xmp_")
             try:
@@ -173,6 +263,132 @@ class PhotoMetaDataXMP(PhotoMetaData):
                     pass
         except Exception:
             return False
+
+    def read_subjects(self, path: str) -> list[str]:
+        """Read XMP ``dc:subject`` values as an ordered, de-duplicated list."""
+        sidecar_path = self.sidecar_path_for(path)
+        if not sidecar_path.is_file():
+            return []
+        try:
+            root = ET.parse(sidecar_path).getroot()
+        except Exception:
+            return []
+
+        values: list[str] = []
+        for desc in root.iter(_RDF_DESCRIPTION_TAG):
+            attr_value = desc.attrib.get(_XMP_DC_SUBJECT_TAG)
+            if attr_value:
+                values.extend(_normalise_subject_value(attr_value, split_strings=True))
+            for child in desc:
+                if child.tag != _XMP_DC_SUBJECT_TAG:
+                    continue
+                values.extend(self._subject_values_from_element(child))
+        return _normalise_text_values(values)
+
+    def write_subjects(self, path: str, subjects: Iterable[Any]) -> bool:
+        """Replace XMP ``dc:subject`` values in the sidecar.
+
+        Existing non-subject XMP properties are preserved.  Empty ``subjects``
+        removes the ``dc:subject`` node while leaving the sidecar itself intact.
+        """
+        clean_subjects = _normalise_text_values(subjects)
+        sidecar_path = self.sidecar_path_for(path)
+        try:
+            tree = self._load_or_create_xmp_tree(sidecar_path)
+            if tree is None:
+                return False
+            root = tree.getroot()
+            desc = self._ensure_description(root)
+            self._replace_subject_node(desc, clean_subjects)
+            sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+            return self._write_tree_atomic(tree, sidecar_path)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _new_xmp_tree() -> ET.ElementTree:
+        ET.register_namespace("x", _XMP_META_NS)
+        ET.register_namespace("rdf", _RDF_NS)
+        ET.register_namespace("dc", _DC_NS)
+        root = ET.Element(f"{{{_XMP_META_NS}}}xmpmeta")
+        rdf = ET.SubElement(root, f"{{{_RDF_NS}}}RDF")
+        ET.SubElement(rdf, _RDF_DESCRIPTION_TAG, {_RDF_ABOUT_ATTR: ""})
+        return ET.ElementTree(root)
+
+    @classmethod
+    def _load_or_create_xmp_tree(cls, sidecar_path: Path) -> ET.ElementTree | None:
+        ET.register_namespace("x", _XMP_META_NS)
+        ET.register_namespace("rdf", _RDF_NS)
+        ET.register_namespace("dc", _DC_NS)
+        if not sidecar_path.exists():
+            return cls._new_xmp_tree()
+        try:
+            return ET.parse(sidecar_path)
+        except ET.ParseError:
+            return None
+
+    @staticmethod
+    def _ensure_description(root: ET.Element) -> ET.Element:
+        desc = root.find(f".//{_RDF_DESCRIPTION_TAG}")
+        if desc is not None:
+            return desc
+
+        rdf = root if root.tag == f"{{{_RDF_NS}}}RDF" else root.find(f".//{{{_RDF_NS}}}RDF")
+        if rdf is None:
+            rdf = ET.SubElement(root, f"{{{_RDF_NS}}}RDF")
+        return ET.SubElement(rdf, _RDF_DESCRIPTION_TAG, {_RDF_ABOUT_ATTR: ""})
+
+    @staticmethod
+    def _replace_subject_node(desc: ET.Element, subjects: list[str]) -> None:
+        for child in list(desc):
+            if child.tag == _XMP_DC_SUBJECT_TAG:
+                desc.remove(child)
+        if not subjects:
+            return
+
+        subject = ET.SubElement(desc, _XMP_DC_SUBJECT_TAG)
+        bag = ET.SubElement(subject, _RDF_BAG_TAG)
+        for value in subjects:
+            item = ET.SubElement(bag, _RDF_LI_TAG)
+            item.text = value
+
+    @staticmethod
+    def _subject_values_from_element(element: ET.Element) -> list[str]:
+        values: list[str] = []
+        for container_tag in ("Bag", "Seq", "Alt"):
+            container = element.find(f"{{{_RDF_NS}}}{container_tag}")
+            if container is None:
+                continue
+            for item in container.findall(_RDF_LI_TAG):
+                value = item.text or item.attrib.get(_RDF_RESOURCE_ATTR) or item.attrib.get("resource")
+                if value:
+                    values.append(value)
+            return _normalise_text_values(values)
+        if element.text and element.text.strip():
+            return _normalise_subject_value(element.text, split_strings=True)
+        return []
+
+    @staticmethod
+    def _write_tree_atomic(tree: ET.ElementTree, sidecar_path: Path) -> bool:
+        if hasattr(ET, "indent"):
+            ET.indent(tree, space="  ")
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{sidecar_path.name}.",
+            suffix=".tmp",
+            dir=str(sidecar_path.parent),
+        )
+        os.close(fd)
+        tmp_path = Path(tmp_name)
+        try:
+            tree.write(tmp_path, encoding="utf-8", xml_declaration=True)
+            os.replace(tmp_path, sidecar_path)
+            return True
+        finally:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
 
     def supports_write(self) -> bool:
         return True
@@ -196,6 +412,15 @@ class PhotoMetaDataReportDB(PhotoMetaData):
     directory changes.
     """
 
+    RAW_READ_FIELDS: frozenset[str] = frozenset({
+        "rating",
+        "pick",
+        "bird_species_cn",
+        "bird_species_en",
+        "burst_id",
+        "burst_position",
+    })
+
     def __init__(
         self,
         report_root: str | None = None,
@@ -208,12 +433,63 @@ class PhotoMetaDataReportDB(PhotoMetaData):
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _path_key(self, path: str) -> str:
+        if not path:
+            return ""
+        try:
+            return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+        except Exception:
+            return os.path.normcase(os.path.normpath(path))
+
+    def _row_candidate_paths(self, row: dict[str, Any]) -> list[str]:
+        candidates: list[str] = []
+        base_dir = self._report_root or ""
+        for key in ("current_path", "_current_path_report_raw", "original_path"):
+            text = str((row or {}).get(key) or "").strip()
+            if not text:
+                continue
+            text = text.replace("\\", os.sep).replace("/", os.sep)
+            if os.path.isabs(text):
+                candidates.append(os.path.normpath(text))
+            elif base_dir:
+                candidates.append(os.path.normpath(os.path.join(base_dir, text)))
+            else:
+                candidates.append(os.path.normpath(text))
+
+        current_text = str((row or {}).get("current_path") or "").strip().replace("\\", os.sep).replace("/", os.sep)
+        original_text = str((row or {}).get("original_path") or "").strip().replace("\\", os.sep).replace("/", os.sep)
+        original_ext = Path(original_text).suffix if original_text else ""
+        if current_text and original_ext:
+            try:
+                current_full = current_text if os.path.isabs(current_text) else os.path.join(base_dir, current_text)
+                candidates.append(os.path.normpath(str(Path(current_full).with_suffix(original_ext))))
+            except Exception:
+                pass
+        return candidates
+
+    def _row_matches_path(self, row: dict[str, Any], path: str) -> bool:
+        stem = Path(path).stem if path else ""
+        if stem and str((row or {}).get("filename") or "").strip() == stem:
+            return True
+        for key in ("current_path", "_current_path_report_raw", "original_path"):
+            text = str((row or {}).get(key) or "").strip()
+            if text and Path(text.replace("\\", os.sep).replace("/", os.sep)).stem == stem:
+                return True
+        target_key = self._path_key(path)
+        return bool(target_key and any(self._path_key(candidate) == target_key for candidate in self._row_candidate_paths(row)))
+
     def _row_for(self, path: str) -> dict[str, Any] | None:
         stem = Path(path).stem
 
         # Fast path: in-memory cache
         if self._cache is not None:
-            return self._cache.get(stem)
+            cached = self._cache.get(stem)
+            if cached is not None:
+                return cached
+            for row in self._cache.values():
+                if isinstance(row, dict) and self._row_matches_path(row, path):
+                    return row
+            return None
 
         # Slow path: open DB directly
         root = self._report_root
@@ -230,11 +506,26 @@ class PhotoMetaDataReportDB(PhotoMetaData):
             db = ReportDB.open_if_exists(root)
             if db is None:
                 return None
-            row = db.get_photo(stem)
-            db.close()
-            return row
+            try:
+                row = db.get_photo(stem)
+                if row is not None:
+                    return row
+                for candidate in db.get_all_photos():
+                    if isinstance(candidate, dict) and self._row_matches_path(candidate, path):
+                        return candidate
+                return None
+            finally:
+                db.close()
         except Exception:
             return None
+
+    def _filename_for_path(self, path: str) -> str:
+        row = self._row_for(path)
+        if isinstance(row, dict):
+            filename = str(row.get("filename") or "").strip()
+            if filename:
+                return filename
+        return Path(path).stem
 
     # ------------------------------------------------------------------
     # PhotoMetaData interface
@@ -247,10 +538,10 @@ class PhotoMetaDataReportDB(PhotoMetaData):
         try:
             from app_common.report_db import report_row_to_exiftool_style
             flat = report_row_to_exiftool_style(row, path)
-            # Also carry raw DB fields that UI layers read directly (e.g. bird species)
-            for key in ("bird_species_cn", "bird_species_en"):
-                val = str(row.get(key) or "").strip()
-                if val:
+            # Also carry raw DB fields that UI layers read directly.
+            for key in self.RAW_READ_FIELDS:
+                val = row.get(key)
+                if val is not None and (not isinstance(val, str) or val.strip()):
                     flat[key] = val
             return flat
         except Exception:
@@ -264,7 +555,7 @@ class PhotoMetaDataReportDB(PhotoMetaData):
         """Insert-or-update the DB row for this file's stem with ``fields``."""
         if not fields:
             return True
-        stem = Path(path).stem
+        filename = self._filename_for_path(path)
         root = self._report_root
         if not root:
             try:
@@ -279,13 +570,17 @@ class PhotoMetaDataReportDB(PhotoMetaData):
             db = ReportDB.open_if_exists(root)
             if db is None:
                 return False
-            db.insert_photo({"filename": stem, **fields})
-            db.close()
+            try:
+                if not db.update_photo(filename, fields):
+                    db.insert_photo({"filename": filename, **fields})
+            finally:
+                db.close()
             # Keep in-memory cache in sync
             if self._cache is not None:
-                row = dict(self._cache.get(stem) or {})
+                row = dict(self._cache.get(filename) or {})
+                row["filename"] = filename
                 row.update(fields)
-                self._cache[stem] = row
+                self._cache[filename] = row
             return True
         except Exception:
             return False
@@ -321,6 +616,7 @@ _REPORT_DB_ONLY_FIELDS: frozenset[str] = frozenset({
     "adj_sharpness", "adj_topiq",
     "bird_species_cn", "bird_species_en", "birdid_confidence",
     "exposure_status",
+    "burst_id", "burst_position",
 })
 
 

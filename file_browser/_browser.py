@@ -5481,30 +5481,50 @@ class FileListPanel(QWidget):
         rating: int | None = None,
         pick: int | None = None,
     ) -> list[str]:
+        db_dir = self._report_root_dir or self._current_dir
+        db = ReportDB.open_if_exists(db_dir) if db_dir else None
+        if db is None:
+            _log.warning("[_apply_rating_state_via_report_db] db_dir=%r open failed", db_dir)
+            return []
         updated_paths: list[str] = []
-        for path in self._unique_norm_paths(paths):
-            row = self._get_report_row_for_path(path)
-            if not isinstance(row, dict):
-                continue
-            filename = str(row.get("filename") or Path(path).stem or "").strip()
-            if not filename:
-                continue
-            data: dict[str, int] = {}
-            if rating is not None:
-                data["rating"] = max(0, min(5, int(rating)))
-            if pick is not None:
-                data["pick"] = max(-1, min(1, int(pick)))
-            if not data:
-                continue
-            ok = self._meta_proxy.report_db.write(path, data)
-            if not ok:
-                _log.warning("[_apply_rating_state_via_report_db] source=%r filename=%r write failed", path, filename)
-                continue
-            cache_row = self._ensure_report_cache_row(path, filename)
-            for key, value in data.items():
-                cache_row[key] = value
-            self._apply_rating_state_to_meta_cache(path, rating=rating, pick=pick)
-            updated_paths.append(path)
+        try:
+            for path in self._unique_norm_paths(paths):
+                row = self._get_report_row_for_path(path)
+                if not isinstance(row, dict):
+                    continue
+                filename = str(row.get("filename") or Path(path).stem or "").strip()
+                if not filename:
+                    continue
+                data: dict[str, int] = {}
+                if rating is not None:
+                    data["rating"] = max(0, min(5, int(rating)))
+                if pick is not None:
+                    data["pick"] = max(-1, min(1, int(pick)))
+                if not data:
+                    continue
+                try:
+                    ok = db.update_photo(filename, data)
+                    if not ok:
+                        db.insert_photo({"filename": filename, **data})
+                        ok = True
+                except Exception as exc:
+                    _log.warning(
+                        "[_apply_rating_state_via_report_db] source=%r filename=%r write failed: %s",
+                        path,
+                        filename,
+                        exc,
+                    )
+                    continue
+                if not ok:
+                    _log.warning("[_apply_rating_state_via_report_db] source=%r filename=%r write failed", path, filename)
+                    continue
+                cache_row = self._ensure_report_cache_row(path, filename)
+                for key, value in data.items():
+                    cache_row[key] = value
+                self._apply_rating_state_to_meta_cache(path, rating=rating, pick=pick)
+                updated_paths.append(path)
+        finally:
+            db.close()
         return updated_paths
 
     def _apply_rating_state_via_exif(
