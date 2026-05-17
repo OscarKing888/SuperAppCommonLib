@@ -1,0 +1,564 @@
+# -*- coding: utf-8 -*-
+"""Background workers for app_common.file_browser."""
+from __future__ import annotations
+
+from app_common.file_browser._browser_core import *
+
+class DirectoryScanWorker(QThread):
+    """在后台执行目录扫描与 report.db 加载，完成后通过信号回传结果。"""
+
+    scan_finished = pyqtSignal(str, object, object, object)  # (path, files_list, selected_report_cache, full_report_cache_or_none)
+
+    def __init__(
+        self,
+        path: str,
+        recursive: bool,
+        report_root: str | None = None,
+        report_cache_full: dict | None = None,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._path = path
+        self._recursive = recursive
+        self._report_root = report_root
+        self._report_cache_full = report_cache_full
+
+    def run(self) -> None:
+        _log.info(
+            "[DirectoryScanWorker.run] START path=%r recursive=%s report_root=%r has_cached_full_report=%s",
+            self._path,
+            self._recursive,
+            self._report_root,
+            self._report_cache_full is not None,
+        )
+        report_cache: dict = {}
+        full_report_cache: dict | None = self._report_cache_full
+        report_source_available = self._report_cache_full is not None
+        try:
+            if self._report_cache_full is not None:
+                report_cache = self._report_cache_full
+                _log.info("[DirectoryScanWorker.run] reuse cached full report_cache %s entries", len(report_cache))
+            else:
+                db_dir = self._report_root or self._path
+                db = ReportDB.open_if_exists(db_dir)
+                if db:
+                    report_source_available = True
+                    full_report_cache = {}
+                    try:
+                        for row in db.get_all_photos():
+                            r = _normalize_report_row_paths(dict(row))
+                            stem = r.get("filename")
+                            if stem is not None:
+                                full_report_cache[stem] = r
+                    finally:
+                        db.close()
+                    report_cache = full_report_cache
+                _log.info("[DirectoryScanWorker.run] report_cache loaded %s entries", len(report_cache))
+        except Exception as e:
+            _log.warning("[DirectoryScanWorker.run] report load failed: %s", e)
+        if self.isInterruptionRequested():
+            _log.info("[DirectoryScanWorker.run] interrupted after report")
+            return
+        files: list = []
+        if report_source_available and self._report_root:
+            # 当 report.db 有记录时，用 DB 中 current_path（相对选中目录）拼出完整路径，扩展名用 original_path 的（如 .ARW）
+            selected_dir = os.path.normpath(self._path)
+            report_root = os.path.normpath(self._report_root)
+            files, report_cache = _select_report_scope_files(
+                selected_dir=selected_dir,
+                report_root=report_root,
+                full_report_cache=report_cache,
+            )
+            selected_rel = ""
+            if _is_same_or_child_path(report_root, selected_dir):
+                try:
+                    selected_rel = os.path.relpath(selected_dir, report_root)
+                except Exception:
+                    selected_rel = ""
+            selected_rel_norm = _norm_rel_path_for_match(selected_rel)
+            _log.info(
+                "[DirectoryScanWorker.run] selected scope files=%s selected_report_cache=%s selected_dir=%r selected_rel=%r report_root=%r",
+                len(files), len(report_cache), selected_dir, selected_rel_norm or ".", report_root,
+            )
+            _log.info(
+                "[DirectoryScanWorker.run] 使用 DB current_path 拼出完整路径构建文件列表 files=%s（跳过文件系统扫描）",
+                len(files),
+            )
+            try:
+                # In report mode the DB view is subtree-based even without UI filters,
+                # so actual file supplementation must recurse under the selected dir.
+                actual_files = _collect_image_files_impl(self._path, True)
+                full_cache = full_report_cache or report_cache or {}
+                existing = {_path_key(p) for p in files if p}
+                file_index_by_stem = {Path(p).stem: i for i, p in enumerate(files) if p}
+                supplemented = 0
+                replaced = 0
+                for actual_path in actual_files:
+                    stem = Path(actual_path).stem
+                    row = full_cache.get(stem)
+                    if not isinstance(row, dict):
+                        continue
+                    actual_norm = os.path.normpath(actual_path)
+                    actual_key = _path_key(actual_norm)
+                    if actual_key in existing:
+                        continue
+                    existing_idx = file_index_by_stem.get(stem)
+                    if existing_idx is not None:
+                        old_path = files[existing_idx]
+                        if old_path and not os.path.isfile(old_path):
+                            old_key = _path_key(old_path)
+                            files[existing_idx] = actual_norm
+                            existing.discard(old_key)
+                            existing.add(actual_key)
+                            replaced += 1
+                        continue
+                    files.append(actual_norm)
+                    existing.add(actual_key)
+                    file_index_by_stem[stem] = len(files) - 1
+                    supplemented += 1
+                    report_cache[stem] = row
+                _log.info(
+                    "[DirectoryScanWorker.run] supplement actual files matched_by_stem=%s replaced_missing=%s total_files=%s selected_report_cache=%s",
+                    supplemented,
+                    replaced,
+                    len(files),
+                    len(report_cache),
+                )
+            except Exception as e:
+                _log.warning("[DirectoryScanWorker.run] supplement actual files failed: %s", e)
+            # Fallback: if DB-based approach produced no files, scan filesystem directly.
+            # This handles empty/uninitialized report.db or mismatched paths.
+            if not files:
+                _log.warning(
+                    "[DirectoryScanWorker.run] DB-based scan yielded 0 files, falling back to filesystem scan path=%r",
+                    self._path,
+                )
+                try:
+                    for root, dirs, names in os.walk(self._path, topdown=True):
+                        if self.isInterruptionRequested():
+                            return
+                        dirs[:] = [d for d in dirs if not d.startswith(".")]
+                        for name in sorted(names, key=str.lower):
+                            if Path(name).suffix.lower() in IMAGE_EXTENSIONS:
+                                files.append(os.path.join(root, name))
+                except (PermissionError, OSError) as e:
+                    _log.warning("[DirectoryScanWorker.run] fallback scan error: %s", e)
+        else:
+            try:
+                if self._recursive:
+                    for root, dirs, names in os.walk(self._path, topdown=True):
+                        if self.isInterruptionRequested():
+                            _log.info("[DirectoryScanWorker.run] interrupted during walk")
+                            return
+                        dirs[:] = [d for d in dirs if not d.startswith(".")]
+                        for name in sorted(names, key=str.lower):
+                            if Path(name).suffix.lower() in IMAGE_EXTENSIONS:
+                                files.append(os.path.join(root, name))
+                else:
+                    for entry in sorted(os.scandir(self._path), key=lambda e: e.name.lower()):
+                        if self.isInterruptionRequested():
+                            return
+                        if entry.is_file() and Path(entry.name).suffix.lower() in IMAGE_EXTENSIONS:
+                            files.append(entry.path)
+            except (PermissionError, OSError) as e:
+                _log.warning("[DirectoryScanWorker.run] scan error: %s", e)
+        _log.info("[DirectoryScanWorker.run] 目录扫描完成：列出 %s 个图像文件，report_cache %s 条，即将通知主线程加载 EXIF", len(files), len(report_cache))
+        _log.info("[DirectoryScanWorker.run] scan done files=%s", len(files))
+        if not self.isInterruptionRequested():
+            self.scan_finished.emit(self._path, files, report_cache, full_report_cache)
+            _log.info("[DirectoryScanWorker.run] emit scan_finished END")
+
+
+# ── 后台元数据加载线程 ─────────────────────────────────────────────────────────
+
+def _score_path_lookup_candidate(source_path: str, candidate_path: str, root_dir: str) -> tuple[int, int, int]:
+    try:
+        source_rel = os.path.relpath(source_path, root_dir)
+    except Exception:
+        source_rel = source_path
+    try:
+        cand_rel = os.path.relpath(candidate_path, root_dir)
+    except Exception:
+        cand_rel = candidate_path
+    source_parts = [p.lower() for p in Path(os.path.dirname(source_rel)).parts if p not in ("", ".")]
+    cand_parts = [p.lower() for p in Path(os.path.dirname(cand_rel)).parts if p not in ("", ".")]
+    common_suffix = 0
+    while common_suffix < min(len(source_parts), len(cand_parts)):
+        if source_parts[-1 - common_suffix] != cand_parts[-1 - common_suffix]:
+            break
+        common_suffix += 1
+    same_parent = 1 if source_parts and cand_parts and source_parts[-1] == cand_parts[-1] else 0
+    return (common_suffix, same_parent, -len(cand_parts))
+
+
+class PathLookupWorker(QThread):
+    resolved = pyqtSignal(str, object)  # (source_path, actual_path_or_none)
+
+    def __init__(self, source_path: str, root_dir: str, parent=None) -> None:
+        super().__init__(parent)
+        self._source_path = os.path.normpath(source_path) if source_path else ""
+        self._root_dir = os.path.normpath(root_dir) if root_dir else ""
+
+    def run(self) -> None:
+        source_path = self._source_path
+        root_dir = self._root_dir
+        actual_path = None
+        _log.info("[PathLookupWorker.run] START source=%r root=%r", source_path, root_dir)
+        if source_path and os.path.isfile(source_path):
+            actual_path = source_path
+        elif root_dir and os.path.isdir(root_dir) and source_path:
+            target_name = Path(source_path).name.lower()
+            best_score = None
+            best_path = None
+            scanned_dirs = 0
+            candidates = 0
+            try:
+                for walk_root, dirs, names in os.walk(root_dir, topdown=True):
+                    if self.isInterruptionRequested():
+                        _log.info("[PathLookupWorker.run] interrupted source=%r", source_path)
+                        return
+                    dirs[:] = [d for d in dirs if not d.startswith(".")]
+                    scanned_dirs += 1
+                    for name in names:
+                        if name.lower() != target_name:
+                            continue
+                        candidate = os.path.normpath(os.path.join(walk_root, name))
+                        score = _score_path_lookup_candidate(source_path, candidate, root_dir)
+                        candidates += 1
+                        if best_score is None or score > best_score:
+                            best_score = score
+                            best_path = candidate
+                actual_path = best_path
+                _log.info(
+                    "[PathLookupWorker.run] END source=%r root=%r scanned_dirs=%s candidates=%s actual=%r",
+                    source_path,
+                    root_dir,
+                    scanned_dirs,
+                    candidates,
+                    actual_path,
+                )
+            except Exception as e:
+                _log.warning("[PathLookupWorker.run] failed source=%r root=%r: %s", source_path, root_dir, e)
+        self.resolved.emit(source_path, actual_path)
+
+
+class MetadataLoader(QThread):
+    """
+    批量读取图像文件的列表列元数据。
+    通过 PhotoMetaDataProxy 做分块查询；每个 chunk 完成后立即把结果回推到主线程。
+    """
+
+    metadata_batch_ready = pyqtSignal(object)  # dict {norm_path: metadata_dict}
+    focus_cache_batch_ready = pyqtSignal(object)  # dict {source_path: {"focus_box": tuple, "used_path": str}}
+    progress_updated = pyqtSignal(int, int)  # (current_count, total_count)
+
+    def __init__(
+        self,
+        paths: list,
+        meta_proxy: PhotoMetaDataProxy,
+        focus_source_paths: dict[str, str] | None = None,
+        metadata_tags: list[str] | None = None,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._paths = list(paths)
+        self._meta_proxy = meta_proxy
+        self._focus_source_paths = {
+            os.path.normpath(display_path): os.path.normpath(source_path)
+            for display_path, source_path in (focus_source_paths or {}).items()
+            if display_path and source_path
+        }
+        self._metadata_tags = list(metadata_tags or [])
+        self._stop_flag = False
+
+    def stop(self) -> None:
+        self._stop_flag = True
+        self.requestInterruption()
+
+    def run(self) -> None:
+        if not self._paths or self._stop_flag:
+            _log.debug("[MetadataLoader.run] no paths or stopped")
+            return
+        _log.info("[MetadataLoader.run] START paths=%s", len(self._paths))
+        try:
+            paths = self._paths
+            total = len(paths)
+            chunk_size = max(1, _METADATA_CHUNK_SIZE)
+            processed = 0
+            for i in range(0, total, chunk_size):
+                if self._stop_flag or self.isInterruptionRequested():
+                    _log.info("[MetadataLoader.run] interrupted")
+                    return
+                chunk = paths[i : i + chunk_size]
+                batch = self._read_metadata_batch(chunk)
+                focus_batch = self._build_focus_cache_batch(chunk) if self._should_prefetch_focus_cache() else {}
+                parsed_batch: dict = {}
+                for norm_path, flat in batch.items():
+                    if self._stop_flag or self.isInterruptionRequested():
+                        return
+                    meta = self._parse_rec(flat)
+                    species_cn = str(flat.get("bird_species_cn") or "").strip()
+                    if species_cn:
+                        meta["bird_species_cn"] = species_cn
+                    parsed_batch[norm_path] = meta
+                    _log.debug(
+                        "[MetadataLoader.run] path=%r title=%r rating=%s pick=%s",
+                        norm_path, meta.get("title", ""), meta.get("rating"), meta.get("pick"),
+                    )
+                if focus_batch and not (self._stop_flag or self.isInterruptionRequested()):
+                    _log.info("[MetadataLoader.run] emit focus_cache_batch_ready batch=%s", len(focus_batch))
+                    self.focus_cache_batch_ready.emit(focus_batch)
+                if parsed_batch and not (self._stop_flag or self.isInterruptionRequested()):
+                    _log.info("[MetadataLoader.run] emit metadata_batch_ready batch=%s", len(parsed_batch))
+                    self.metadata_batch_ready.emit(parsed_batch)
+                processed += len(chunk)
+                self.progress_updated.emit(min(processed, total), total)
+        except Exception as e:
+            _log.warning("[MetadataLoader.run] exception: %s", e)
+        _log.info("[MetadataLoader.run] END")
+
+    def _uses_browser_metadata_tags(self) -> bool:
+        if not self._metadata_tags:
+            return False
+        return frozenset(self._metadata_tags) == _SUPERBIRDSTAMP_BROWSER_METADATA_TAGS_SET
+
+    def _should_prefetch_focus_cache(self) -> bool:
+        """
+        文件列表 metadata 加载阶段不要再同步触发第二次 metadata 扫描。
+
+        焦点框预热应走独立 worker；这里若继续顺手批量读一遍 RAW metadata，
+        会直接拖慢列表 metadata 完成时间，导致用户感觉“排序一直不可用”。
+        """
+        return False
+
+    @staticmethod
+    def _has_report_backed_metadata(flat: dict | None) -> bool:
+        if not isinstance(flat, dict) or not flat:
+            return False
+        for key, value in flat.items():
+            if key == "SourceFile":
+                continue
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
+            return True
+        return False
+
+    def _read_report_metadata_batch(self, paths: list[str]) -> dict[str, dict]:
+        report_db = getattr(self._meta_proxy, "report_db", None)
+        if report_db is None:
+            return {}
+        try:
+            raw_batch = report_db.read_batch(paths) or {}
+        except Exception as exc:
+            _log.warning("[MetadataLoader._read_report_metadata_batch] report_db.read_batch failed: %s", exc)
+            return {}
+        result: dict[str, dict] = {}
+        for path, flat in raw_batch.items():
+            norm_path = os.path.normpath(path)
+            if isinstance(flat, dict) and flat:
+                result[norm_path] = flat
+        return result
+
+    def _read_metadata_batch(self, paths: list[str]) -> dict[str, dict]:
+        norm_paths = [os.path.normpath(p) for p in paths]
+        result: dict[str, dict] = {norm: {"SourceFile": norm} for norm in norm_paths}
+        report_batch = self._read_report_metadata_batch(paths)
+        report_only_browser_mode = self._uses_browser_metadata_tags() and EXIF_ONLY_FROM_REPORT_DB
+        raw_paths = list(paths)
+        if report_only_browser_mode and report_batch:
+            raw_paths = []
+            report_hit_count = 0
+            for path, norm_path in zip(paths, norm_paths):
+                flat = report_batch.get(norm_path)
+                if self._has_report_backed_metadata(flat):
+                    result[norm_path].update(flat)
+                    report_hit_count += 1
+                    continue
+                raw_paths.append(path)
+            _log.info(
+                "[MetadataLoader._read_metadata_batch] browser metadata served from report.db hits=%s fallback=%s total=%s",
+                report_hit_count,
+                len(raw_paths),
+                len(paths),
+            )
+        if raw_paths:
+            try:
+                raw_batch = read_batch_metadata(
+                    raw_paths,
+                    tags=self._metadata_tags or None,
+                    use_cache=not bool(self._metadata_tags),
+                )
+                for norm_path, flat in raw_batch.items():
+                    if norm_path in result and flat:
+                        result[norm_path].update(flat)
+            except Exception as exc:
+                _log.warning("[MetadataLoader._read_metadata_batch] read_batch_metadata failed: %s", exc)
+        for norm_path, flat in report_batch.items():
+            if norm_path in result and flat:
+                result[norm_path].update(flat)
+        return result
+
+    def _parse_rec(self, rec: dict) -> dict:
+        # 标题、对焦状态等支持 XMP sidecar（由 read_batch_metadata 合并），勿删以下键名
+        # 标题：XMP dc:title（sidecar 多为小写 tag）、IFD0/XPTitle、IPTC
+        title = (
+            rec.get("XMP-dc:Title") or rec.get("XMP-dc:title")
+            or rec.get("IFD0:XPTitle") or rec.get("IPTC:ObjectName") or ""
+        )
+        color = rec.get("XMP-xmp:Label") or ""
+        rating_raw = rec.get("XMP-xmp:Rating")
+        try:
+            rating_num = int(float(str(rating_raw or 0)))
+        except Exception:
+            rating_num = 0
+        rating = max(0, min(5, rating_num))
+        # Pick/Reject 旗标（1=精选🏆, 0=无旗标, -1=排除🚫）
+        # 实际 XMP 多为 <xmpDM:pick>1</xmpDM:pick>（Dynamic Media 命名空间），其次 xmp:Pick 等
+        pick_raw = (
+            rec.get("XMP-xmpDM:pick") or rec.get("XMP-xmpDM:Pick")
+            or rec.get("XMP-xmp:Pick") or rec.get("XMP-xmp:PickLabel")
+            or rec.get("XMP-1.0:Pick") or rec.get("XMP-1.0:PickLabel")
+            or rec.get("XMP-lr:Pick") or rec.get("XMP-lr:PickLabel")
+            or rec.get("XMP:Pick") or rec.get("XMP:PickLabel")
+            or ""
+        )
+        try:
+            s = str(pick_raw).strip().lower()
+            if s in ("true", "1", "yes"):
+                pick = 1
+            elif s in ("false", "0", "no", ""):
+                pick = 0
+            elif s in ("-1", "reject"):
+                pick = -1
+            else:
+                pick = max(-1, min(1, int(float(s))))
+        except Exception:
+            pick = 0
+        if pick == 0 and rating_num < 0:
+            pick = -1
+
+        # 城市 = 锐度（XMP:City 数值），省/直辖市/自治区 = 美学评分（XMP:State 数值），国家/地区 = 对焦状态（XMP:Country）
+        city_raw = (
+            rec.get("XMP:City") or rec.get("XMP-photoshop:City")
+            or rec.get("IPTC:City") or ""
+        )
+        state_raw = (
+            rec.get("XMP:State") or rec.get("XMP-photoshop:State")
+            or rec.get("IPTC:Province-State") or ""
+        )
+        country_raw = (
+            rec.get("XMP:Country")
+            or rec.get("XMP-photoshop:Country")
+            or rec.get("XMP-photoshop:Country-PrimaryLocationName")
+            or rec.get("IPTC:Country-PrimaryLocationName") or ""
+        )
+        shutter_raw = _first_non_empty(
+            rec.get("ExifIFD:ExposureTime"),
+            rec.get("EXIF:ExposureTime"),
+            rec.get("XMP-exif:ExposureTime"),
+            rec.get("Composite:ShutterSpeed"),
+        )
+        iso_raw = _first_non_empty(
+            rec.get("ExifIFD:ISO"),
+            rec.get("EXIF:ISO"),
+            rec.get("XMP-exif:PhotographicSensitivity"),
+            rec.get("XMP-exif:ISOSpeedRatings"),
+        )
+        aperture_raw = _first_non_empty(
+            rec.get("ExifIFD:FNumber"),
+            rec.get("EXIF:FNumber"),
+            rec.get("XMP-exif:FNumber"),
+            rec.get("Composite:Aperture"),
+        )
+
+        city = _format_optional_number(city_raw, "%06.2f")    # 锐度
+        state = _format_optional_number(state_raw, "%05.2f") # 美学
+        country = _focus_status_to_display(country_raw)      # 对焦状态 → 精焦/合焦/偏移/失焦
+        shutter = _format_shutter_value(shutter_raw)
+        iso = _format_iso_value(iso_raw)
+        aperture = _format_aperture_value(aperture_raw)
+
+        return {
+            "title":   str(title).strip(),
+            "color":   str(color).strip(),
+            "rating":  rating,
+            "pick":    pick,
+            "city":    city,
+            "state":   state,
+            "country": country,
+            "shutter": shutter,
+            "iso":     iso,
+            "aperture": aperture,
+        }
+
+    def _resolve_focus_source_path(self, display_path: str) -> str:
+        norm_display = os.path.normpath(display_path) if display_path else ""
+        if not norm_display:
+            return ""
+        return self._focus_source_paths.get(norm_display) or norm_display
+
+    def _build_focus_cache_batch(self, chunk: list[str]) -> dict[str, dict]:
+        """
+        在批量元信息读取线程里顺手产出“文件内焦点缓存”。
+
+        这里只处理可直接由文件 metadata 算出的尺寸无关焦点框；
+        report.db 保底逻辑仍留给预览时按需处理，避免这里把 miss 提前写死。
+        """
+        ordered_source_paths: list[str] = []
+        seen_paths: set[str] = set()
+        for display_path in chunk or []:
+            if self._stop_flag or self.isInterruptionRequested():
+                return {}
+            source_path = self._resolve_focus_source_path(display_path)
+            if not source_path or not os.path.isfile(source_path):
+                continue
+            dedup_key = os.path.normcase(os.path.normpath(source_path))
+            if dedup_key in seen_paths:
+                continue
+            seen_paths.add(dedup_key)
+            ordered_source_paths.append(os.path.normpath(source_path))
+        if not ordered_source_paths:
+            return {}
+        try:
+            raw_map = read_batch_metadata(ordered_source_paths)
+        except Exception as exc:
+            _log.warning("[MetadataLoader._build_focus_cache_batch] read_batch_metadata failed: %s", exc)
+            return {}
+        focus_batch: dict[str, dict] = {}
+        for source_path in ordered_source_paths:
+            if self._stop_flag or self.isInterruptionRequested():
+                return {}
+            norm_source = os.path.normpath(source_path)
+            raw = raw_map.get(norm_source) or raw_map.get(source_path)
+            payload = self._build_focus_cache_payload(norm_source, raw)
+            if payload is None:
+                continue
+            focus_batch[norm_source] = payload
+        return focus_batch
+
+    @staticmethod
+    def _build_focus_cache_payload(source_path: str, raw: dict | None) -> dict | None:
+        if not source_path or not isinstance(raw, dict) or not raw:
+            return None
+        try:
+            camera_type = resolve_focus_camera_type_from_metadata(raw)
+            # 这里的 1x1 只是兜底；真正的焦点坐标系尺寸优先从 metadata 宽高字段解析。
+            focus_box = extract_focus_box_for_display(raw, 1, 1, camera_type=camera_type)
+        except Exception:
+            _log.exception("[MetadataLoader._build_focus_cache_payload] path=%r", source_path)
+            return None
+        if not focus_box:
+            return None
+        used_path = str(raw.get("SourceFile") or source_path).strip() or source_path
+        return {
+            "focus_box": focus_box,
+            "used_path": os.path.normpath(used_path),
+        }
+
+
+# ── 图像文件列表面板 ───────────────────────────────────────────────────────────
+
+
+__all__ = [name for name in globals() if not name.startswith('__')]
