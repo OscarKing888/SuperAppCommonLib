@@ -506,6 +506,39 @@ class FileListPanel(QWidget):
             current_path = selected_paths[0]
         return self._unique_norm_paths(selected_paths), (os.path.normpath(current_path) if current_path else "")
 
+    def _selection_restore_target(self, selected_paths: list[str], current_path: str = "") -> str:
+        """Return the path that filter/view rebuilds should keep visible."""
+        for path in selected_paths or []:
+            norm_path = os.path.normpath(path) if path else ""
+            if norm_path:
+                return norm_path
+        return os.path.normpath(current_path) if current_path else ""
+
+    def _restore_selection_after_view_change(
+        self,
+        selected_paths: list[str],
+        current_path: str = "",
+        *,
+        reason: str,
+        apply_immediately: bool = True,
+    ) -> None:
+        target_path = self._selection_restore_target(selected_paths, current_path)
+        if not target_path:
+            self._update_selection_status()
+            return
+        restore_paths = selected_paths or [target_path]
+        self._request_selection_visibility_restore(target_path, budget=5, reason=reason)
+        self.set_pending_selection(
+            restore_paths,
+            current_path=target_path,
+            apply_immediately=apply_immediately,
+        )
+        self._schedule_selection_visibility_restore(
+            target_path,
+            reason=reason,
+            delays_ms=(0, 40, 120, 300, 600),
+        )
+
     def _update_selection_status(self) -> None:
         label = getattr(self, "_selection_status_label", None)
         if label is None:
@@ -711,7 +744,12 @@ class FileListPanel(QWidget):
             self._apply_filter()
         selected_paths, current_path = self._capture_selection_restore_state()
         if selected_paths:
-            self.set_pending_selection(selected_paths, current_path=current_path)
+            self._restore_selection_after_view_change(
+                selected_paths,
+                current_path,
+                reason="refresh_filter_scope",
+                apply_immediately=False,
+            )
         self.load_directory(
             self._current_dir,
             force_reload=True,
@@ -1036,7 +1074,13 @@ class FileListPanel(QWidget):
 
         return db_updated or bool(meta_updates)
 
-    def set_pending_selection(self, paths: list, current_path: str | None = None) -> None:
+    def set_pending_selection(
+        self,
+        paths: list,
+        current_path: str | None = None,
+        *,
+        apply_immediately: bool = True,
+    ) -> None:
         """设置「待选路径」：下次目录加载完成后将列表中匹配的项多选并视为当前选中（与目录内多选同等）。若当前已打开该目录且列表已加载，则立即应用。"""
         if not paths:
             self._pending_selection_paths = None
@@ -1053,7 +1097,8 @@ class FileListPanel(QWidget):
             preferred_current = normalized[0]
         self._pending_selection_current_path = preferred_current
         if (
-            self._current_dir
+            apply_immediately
+            and self._current_dir
             and (
                 self._tree_row_count() > 0
                 or self._thumb_row_count() > 0
@@ -3085,17 +3130,19 @@ class FileListPanel(QWidget):
         tree_ready = self._view_mode != self._MODE_LIST or (not self._tree_view_dirty and self._tree_source_row_count() == len(filtered))
         thumb_ready = self._view_mode != self._MODE_THUMB or (not self._thumb_model_dirty and self._thumb_row_count() == len(filtered))
         if old_filtered == filtered and tree_ready and thumb_ready:
+            self._restore_selection_after_view_change(
+                selected_paths,
+                current_path,
+                reason="apply_filter_unchanged",
+            )
             _log.info("[_apply_filter] SKIP unchanged elapsed=%.3fs", _time.perf_counter() - t0)
             return
         self._rebuild_views(stop_loaders=False)
-        if selected_paths:
-            self._request_selection_visibility_restore(current_path or selected_paths[0], reason="apply_filter")
-            # 过滤后行号会变化，必须在新模型里按路径重新定位；缩略图异步补模时由 pending selection 继续完成。
-            self.set_pending_selection(selected_paths, current_path=current_path)
-            self._schedule_selection_visibility_restore(
-                current_path or selected_paths[0],
-                reason="apply_filter",
-            )
+        self._restore_selection_after_view_change(
+            selected_paths,
+            current_path,
+            reason="apply_filter",
+        )
         _log.info(
             "[_apply_filter] END visible=%s hidden=%s elapsed=%.3fs",
             len(filtered),
