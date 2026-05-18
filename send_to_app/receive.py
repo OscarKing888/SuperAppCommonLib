@@ -737,6 +737,23 @@ class SingleInstanceReceiver:
         self._servers: list[Any] = []
         self._names = _server_names(app_id)
 
+    def _emit_transfer_progress(self, phase: str, current: int, total: int, *, transfer_id: str = "") -> None:
+        callback = self._on_transfer_progress
+        if callback is None:
+            return
+        payload = {
+            "phase": str(phase or "").strip(),
+            "current": max(0, int(current)),
+            "total": max(0, int(total)),
+        }
+        transfer_id_text = str(transfer_id or "").strip()
+        if transfer_id_text:
+            payload["transfer_id"] = transfer_id_text
+        try:
+            callback(payload)
+        except Exception as exc:
+            _log.warning("receiver transfer progress callback failed: %s", exc)
+
     def start(self) -> bool:
         """创建并监听本地 socket。若已被占用则返回 False（表示本进程应为第二实例）。"""
         _, QtNetwork, _ = _load_qt_modules(need_network=True)
@@ -823,19 +840,12 @@ class SingleInstanceReceiver:
             conn.deleteLater()
 
         def emit_progress(phase: str, current: int, total: int) -> None:
-            callback = self._on_transfer_progress
-            if not callable(callback):
-                return
-            payload = {
-                "phase": phase,
-                "current": max(0, int(current)),
-                "total": max(0, int(total)),
-                "transfer_id": str(session.get("transfer_id") or ""),
-            }
-            try:
-                callback(payload)
-            except Exception as exc:
-                _log.warning("receiver progress callback failed: %s", exc)
+            self._emit_transfer_progress(
+                phase,
+                current,
+                total,
+                transfer_id=str(session.get("transfer_id") or ""),
+            )
 
         def forward_progress_to_sender(payload: dict[str, Any] | None) -> None:
             if not isinstance(payload, dict):
@@ -880,9 +890,11 @@ class SingleInstanceReceiver:
                 return
             normalized = normalize_file_paths(paths)
             if normalized:
-                emit_progress("received", len(normalized), len(normalized))
+                total = len(normalized)
                 done.append(1)
+                emit_progress("receiving", 0, total)
                 self._on_files(normalized)
+                emit_progress("received", total, total)
 
         def handle_protocol_frame(frame: dict[str, Any]) -> None:
             frame_type = str(frame.get("type") or "").strip().lower()
