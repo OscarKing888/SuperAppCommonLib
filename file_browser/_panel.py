@@ -37,7 +37,7 @@ class FileListPanel(QWidget):
         self._report_full_root_dir: str | None = None
         self._report_full_cache: dict | None = None
         self._meta_proxy = PhotoMetaDataProxy(report_db=PhotoMetaDataReportDB())
-        self._view_mode = self._MODE_LIST
+        self._view_mode = self._MODE_THUMB
         self._thumb_size = 128
         self._thumbnail_loader: ThumbnailLoader | None = None
         self._metadata_loader:  MetadataLoader  | None = None
@@ -173,20 +173,21 @@ class FileListPanel(QWidget):
         toolbar = QHBoxLayout()
         toolbar.setSpacing(3)
 
-        self._btn_list = QToolButton()
-        self._btn_list.setText("≡")
-        self._btn_list.setToolTip("列表视图")
-        self._btn_list.setCheckable(True)
-        self._btn_list.setChecked(True)
-        self._btn_list.setFixedWidth(28)
-        self._btn_list.clicked.connect(lambda: self._set_view_mode(self._MODE_LIST))
-
         self._btn_thumb = QToolButton()
         self._btn_thumb.setText("⊞")
         self._btn_thumb.setToolTip("缩略图视图")
         self._btn_thumb.setCheckable(True)
+        self._btn_thumb.setChecked(self._view_mode == self._MODE_THUMB)
         self._btn_thumb.setFixedWidth(28)
         self._btn_thumb.clicked.connect(lambda: self._set_view_mode(self._MODE_THUMB))
+
+        self._btn_list = QToolButton()
+        self._btn_list.setText("≡")
+        self._btn_list.setToolTip("列表视图")
+        self._btn_list.setCheckable(True)
+        self._btn_list.setChecked(self._view_mode == self._MODE_LIST)
+        self._btn_list.setFixedWidth(28)
+        self._btn_list.clicked.connect(lambda: self._set_view_mode(self._MODE_LIST))
 
         self._size_slider = QSlider(_Horizontal)
         self._size_slider.setRange(0, len(_THUMB_SIZE_STEPS) - 1)
@@ -432,7 +433,9 @@ class FileListPanel(QWidget):
         status_bar.addWidget(self._persistent_thumb_progress, 1)
         layout.addLayout(status_bar)
 
-        self._stack.setCurrentIndex(0)
+        self._stack.setCurrentIndex(0 if self._view_mode == self._MODE_LIST else 1)
+        if self._view_mode == self._MODE_THUMB:
+            self._update_thumb_display()
         self._update_size_controls()
         self._update_selection_status()
 
