@@ -597,6 +597,27 @@ def _filter_badge_stylesheet(
     )
 
 
+def apply_compact_filter_badge_menu(
+    inline_buttons,
+    menu_button,
+    compact: bool,
+    *,
+    menu_text: str,
+    menu_tooltip: str = "",
+) -> None:
+    """在空间不足时将一组过滤 badge 切换为单个下拉菜单按钮。"""
+    for button in inline_buttons or ():
+        if button is None:
+            continue
+        button.setVisible(not compact)
+    if menu_button is None:
+        return
+    menu_button.setVisible(bool(compact))
+    menu_button.setText(str(menu_text or ""))
+    if menu_tooltip:
+        menu_button.setToolTip(menu_tooltip)
+
+
 def _focus_filter_button_stylesheet(status: str) -> str:
     color = _FOCUS_STATUS_TEXT_COLORS.get(status, COLORS["text_secondary"])
     checked_fg = "#111111" if status in ("??", "??") else "#f5f5f5"
@@ -662,6 +683,68 @@ try:
     _WindowShortcut = Qt.ShortcutContext.WindowShortcut
 except AttributeError:
     _WindowShortcut = Qt.WindowShortcut  # type: ignore[attr-defined]
+
+try:
+    _WidgetWithChildrenShortcut = Qt.ShortcutContext.WidgetWithChildrenShortcut
+except AttributeError:
+    _WidgetWithChildrenShortcut = Qt.WidgetWithChildrenShortcut  # type: ignore[attr-defined]
+
+
+def _platform_copy_key_sequence() -> "QKeySequence":
+    """Return the native Copy shortcut sequence for macOS / Windows."""
+    standard_key = None
+    standard_key_enum = getattr(QKeySequence, "StandardKey", None)
+    if standard_key_enum is not None:
+        standard_key = getattr(standard_key_enum, "Copy", None)
+    if standard_key is None:
+        standard_key = getattr(QKeySequence, "Copy", None)
+    if standard_key is not None:
+        try:
+            bindings = QKeySequence.keyBindings(standard_key)
+            if bindings:
+                return bindings[0]
+        except Exception:
+            pass
+        try:
+            return QKeySequence(standard_key)
+        except Exception:
+            pass
+    return QKeySequence("Meta+C" if sys.platform == "darwin" else "Ctrl+C")
+
+
+def _key_sequence_native_text(sequence: "QKeySequence") -> str:
+    try:
+        native_format = QKeySequence.SequenceFormat.NativeText
+    except AttributeError:
+        native_format = QKeySequence.NativeText  # type: ignore[attr-defined]
+    try:
+        text = sequence.toString(native_format)
+    except Exception:
+        text = sequence.toString()
+    if text:
+        return text
+    return "⌘C" if sys.platform == "darwin" else "Ctrl+C"
+
+
+def _apply_context_menu_shortcut(action, sequence: "QKeySequence") -> None:
+    """Attach a shortcut to a context-menu action and force it to be displayed."""
+    if action is None:
+        return
+    action.setShortcut(sequence)
+    try:
+        action.setShortcutContext(_WidgetWithChildrenShortcut)
+    except Exception:
+        pass
+    try:
+        action.setShortcutVisibleInContextMenu(True)
+        return
+    except Exception:
+        pass
+    text = str(action.text() or "")
+    if "\t" not in text:
+        shortcut_text = _key_sequence_native_text(sequence)
+        if shortcut_text:
+            action.setText(f"{text}\t{shortcut_text}")
 
 
 def _key_matches(value, key) -> bool:

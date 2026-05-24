@@ -31,6 +31,7 @@ class FileListPanel(QWidget):
     _MODE_THUMB = 1
     _WHEEL_SCROLL_ROWS = 3
     _WHEEL_ANGLE_STEP = 120
+    rating_filter_compact_width = 620
 
     def __init__(self, parent=None, *, create_filter_bar: bool | None = None) -> None:
         super().__init__(parent)
@@ -156,9 +157,13 @@ class FileListPanel(QWidget):
         }
         # 过滤状态
         self._filter_pick: bool = False   # 只显示精选(🏆)
-        self._filter_min_rating: int = 0  # 最低星级(0=不限)
+        self._filter_reject: bool = False  # 只显示排除(🚫)
+        self._filter_min_rating: int = 0  # 星级过滤(0=不限)
         self._filter_focus_status: str = ""
         self._star_btns: list = []
+        self._rating_filter_badge_buttons: list = []
+        self._btn_filter_rating_menu: QToolButton | None = None
+        self._rating_filter_compact: bool = False
         self._focus_filter_btns: dict[str, QToolButton] = {}
         if create_filter_bar is None:
             create_filter_bar = getattr(type(self), "create_filter_bar", True)
@@ -225,6 +230,7 @@ class FileListPanel(QWidget):
         if self._create_filter_bar:
             filter_bar = QHBoxLayout()
             filter_bar.setSpacing(3)
+            self._filter_bar_layout = filter_bar
 
             self._filter_edit = QLineEdit()
             self._filter_edit.setPlaceholderText("过滤文件名…")
@@ -249,14 +255,31 @@ class FileListPanel(QWidget):
                 )
             )
             self._btn_filter_pick.clicked.connect(self._on_pick_filter_toggled)
-            # filter_bar.addWidget(self._btn_filter_pick)
+            self._rating_filter_badge_buttons.append(self._btn_filter_pick)
+            filter_bar.addWidget(self._btn_filter_pick)
+
+            self._btn_filter_reject = QToolButton()
+            self._btn_filter_reject.setText("🚫")
+            self._btn_filter_reject.setToolTip("只显示排除（Pick=-1）")
+            self._btn_filter_reject.setCheckable(True)
+            self._btn_filter_reject.setAutoRaise(False)
+            self._btn_filter_reject.setStyleSheet(
+                _filter_badge_stylesheet(
+                    "#d45d5d",
+                    min_width=34,
+                    checked_fg="#f5f5f5",
+                )
+            )
+            self._btn_filter_reject.clicked.connect(self._on_reject_filter_toggled)
+            self._rating_filter_badge_buttons.append(self._btn_filter_reject)
+            filter_bar.addWidget(self._btn_filter_reject)
 
             # 星级按钮（1～5，单选，点击已激活按钮则取消）
             star_widths = [22, 28, 34, 40, 46]
             for n in range(1, 6):
                 btn = QToolButton()
                 btn.setText("★" * n)
-                btn.setToolTip(f"只显示 ≥{n} 星")
+                btn.setToolTip(f"只显示 {n} 星")
                 btn.setCheckable(True)
                 btn.setAutoRaise(False)
                 btn.setStyleSheet(
@@ -270,7 +293,24 @@ class FileListPanel(QWidget):
                     lambda checked, rating=n: self._on_rating_filter_changed(rating)
                 )
                 self._star_btns.append(btn)
-                # filter_bar.addWidget(btn)
+                self._rating_filter_badge_buttons.append(btn)
+                filter_bar.addWidget(btn)
+
+            self._btn_filter_rating_menu = QToolButton()
+            self._btn_filter_rating_menu.setText("评级")
+            self._btn_filter_rating_menu.setToolTip("选择 Pick、排除或星级过滤")
+            self._btn_filter_rating_menu.setAutoRaise(False)
+            self._btn_filter_rating_menu.setStyleSheet(
+                _filter_badge_stylesheet(
+                    _STAR_SILVER_COLOR,
+                    min_width=46,
+                    checked_fg="#111111",
+                )
+            )
+            self._btn_filter_rating_menu.clicked.connect(
+                lambda checked=False: self._show_rating_filter_menu()
+            )
+            filter_bar.addWidget(self._btn_filter_rating_menu)
 
             for focus_status in _FOCUS_FILTER_OPTIONS:
                 btn = QToolButton()
@@ -296,9 +336,14 @@ class FileListPanel(QWidget):
             filter_bar.addWidget(self._combo_key_navigation_fps)
 
             layout.addLayout(filter_bar)
+            self._sync_rating_filter_compact_mode(force=True)
+            QTimer.singleShot(0, lambda: self._sync_rating_filter_compact_mode(force=True))
         else:
             self._filter_edit = None
             self._btn_filter_pick = None
+            self._btn_filter_reject = None
+            self._btn_filter_rating_menu = None
+            self._filter_bar_layout = None
             self._combo_key_navigation_fps = None
 
         # 视图堆叠
@@ -448,10 +493,9 @@ class FileListPanel(QWidget):
         self._update_selection_status()
 
         # Cmd+C / Ctrl+C 复制选中文件到剪贴板
-        _copy_key = getattr(QKeySequence.StandardKey, "Copy", None) or getattr(QKeySequence, "Copy", QKeySequence("Ctrl+C"))
-        copy_shortcut = QShortcut(_copy_key, self)
+        copy_shortcut = QShortcut(_platform_copy_key_sequence(), self)
         try:
-            copy_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            copy_shortcut.setContext(_WidgetWithChildrenShortcut)
         except Exception:
             pass
         copy_shortcut.activated.connect(self._copy_current_selection_to_clipboard)
@@ -597,6 +641,7 @@ class FileListPanel(QWidget):
         return (
             bool(self._filter_edit.text().strip()) or
             self._filter_pick or
+            self._filter_reject or
             self._filter_min_rating > 0 or
             bool(self._filter_focus_status)
         )
@@ -2804,6 +2849,7 @@ class FileListPanel(QWidget):
         *,
         filter_text: str = "",
         filter_pick: bool = False,
+        filter_reject: bool = False,
         filter_min_rating: int = 0,
         filter_focus_status: str = "",
     ) -> bool:
@@ -2824,7 +2870,9 @@ class FileListPanel(QWidget):
             return False
         if filter_pick and pick != 1:
             return False
-        if rating < filter_min_rating:
+        if filter_reject and pick != -1:
+            return False
+        if filter_min_rating > 0 and rating != filter_min_rating:
             return False
         if filter_focus_status and _focus_status_to_display(meta.get("country", "")) != filter_focus_status:
             return False
@@ -2835,6 +2883,7 @@ class FileListPanel(QWidget):
             path,
             filter_text=(self._filter_edit.text().strip().lower()) if self._filter_edit else "",
             filter_pick=self._filter_pick,
+            filter_reject=self._filter_reject,
             filter_min_rating=self._filter_min_rating,
             filter_focus_status=self._filter_focus_status,
         )
@@ -2846,7 +2895,7 @@ class FileListPanel(QWidget):
         缩略图模式下改星级/精选时，大多数情况只是 badge 变化，不应该因为过滤器
         正处于激活状态就整表 `_apply_filter()`，否则当前视图和选中项会跳动。
         """
-        if not (self._filter_pick or self._filter_min_rating > 0 or self._filter_focus_status):
+        if not (self._filter_pick or self._filter_reject or self._filter_min_rating > 0 or self._filter_focus_status):
             return False
         if not paths:
             return False
@@ -3138,6 +3187,7 @@ class FileListPanel(QWidget):
         """根据当前过滤条件（文件名、精选、星级、对焦）重算过滤结果并刷新视图。"""
         ft = (self._filter_edit.text().strip().lower()) if self._filter_edit else ""
         fp = self._filter_pick
+        fx = self._filter_reject
         fr = self._filter_min_rating
         ff = self._filter_focus_status
         t0 = _time.perf_counter()
@@ -3146,10 +3196,11 @@ class FileListPanel(QWidget):
         old_filtered = list(self._filtered_files)
         self._filtered_files = filtered
         _log.info(
-            "[_apply_filter] START files=%s filtered=%s pick=%s min_rating=%s focus=%r text=%r",
+            "[_apply_filter] START files=%s filtered=%s pick=%s reject=%s min_rating=%s focus=%r text=%r",
             len(self._all_files),
             len(filtered),
             fp,
+            fx,
             fr,
             ff or "(none)",
             ft or "(none)",
@@ -3180,27 +3231,158 @@ class FileListPanel(QWidget):
     def _on_filter_text_changed(self, _text: str) -> None:
         self._refresh_filter_scope()
 
-    def _on_pick_filter_toggled(self) -> None:
-        """切换精选过滤：只显示 Pick=1 的文件；仅在目录 scope 发生变化时才重扫。"""
-        self._filter_pick = self._btn_filter_pick.isChecked()
-        if self._filter_min_rating != 0:
-            self._filter_min_rating = 0
-            for btn in self._star_btns:
-                btn.setChecked(False)
-        self._refresh_filter_scope()
+    def _rating_filter_menu_text(self) -> str:
+        if self._filter_pick:
+            return "🏆"
+        if self._filter_reject:
+            return "🚫"
+        if self._filter_min_rating > 0:
+            return f"{self._filter_min_rating}★"
+        return "评级"
 
-    def _on_rating_filter_changed(self, n: int) -> None:
-        """切换星级过滤：只显示 ≥n 星的文件；仅在目录 scope 发生变化时才重扫。"""
-        if self._filter_min_rating == n:
-            self._filter_min_rating = 0
-        else:
-            self._filter_min_rating = n
-            if self._filter_pick:
-                self._filter_pick = False
-                self._btn_filter_pick.setChecked(False)
+    def _rating_filter_menu_tooltip(self) -> str:
+        if self._filter_pick:
+            return "当前过滤：只显示精选。点击选择评级过滤。"
+        if self._filter_reject:
+            return "当前过滤：只显示排除。点击选择评级过滤。"
+        if self._filter_min_rating > 0:
+            return f"当前过滤：只显示 {self._filter_min_rating} 星。点击选择评级过滤。"
+        return "选择 Pick、排除或星级过滤"
+
+    def _rating_filter_should_compact(self) -> bool:
+        if not self._create_filter_bar:
+            return False
+        try:
+            threshold = int(getattr(type(self), "rating_filter_compact_width", 620))
+        except Exception:
+            threshold = 620
+        return threshold > 0 and self.width() > 0 and self.width() < threshold
+
+    def _sync_rating_filter_buttons(self) -> None:
+        if self._btn_filter_pick is not None:
+            self._btn_filter_pick.setChecked(bool(self._filter_pick))
+        if self._btn_filter_reject is not None:
+            self._btn_filter_reject.setChecked(bool(self._filter_reject))
         for i, btn in enumerate(self._star_btns):
             btn.setChecked(i + 1 == self._filter_min_rating)
-        self._refresh_filter_scope()
+        if self._btn_filter_rating_menu is not None:
+            self._btn_filter_rating_menu.setText(self._rating_filter_menu_text())
+            self._btn_filter_rating_menu.setToolTip(self._rating_filter_menu_tooltip())
+
+    def _sync_rating_filter_compact_mode(self, *, force: bool = False) -> None:
+        if not self._create_filter_bar:
+            return
+        compact = self._rating_filter_should_compact()
+        if force or compact != self._rating_filter_compact:
+            self._rating_filter_compact = compact
+        apply_compact_filter_badge_menu(
+            self._rating_filter_badge_buttons,
+            self._btn_filter_rating_menu,
+            compact,
+            menu_text=self._rating_filter_menu_text(),
+            menu_tooltip=self._rating_filter_menu_tooltip(),
+        )
+
+    def _set_rating_filter_state(
+        self,
+        *,
+        pick: bool = False,
+        reject: bool = False,
+        min_rating: int = 0,
+    ) -> None:
+        try:
+            rating = int(min_rating)
+        except Exception:
+            rating = 0
+        rating = max(0, min(5, rating))
+        pick = bool(pick)
+        reject = bool(reject)
+        if pick:
+            reject = False
+            rating = 0
+        elif reject:
+            pick = False
+            rating = 0
+        elif rating > 0:
+            pick = False
+            reject = False
+        changed = (
+            self._filter_pick != pick or
+            self._filter_reject != reject or
+            self._filter_min_rating != rating
+        )
+        self._filter_pick = pick
+        self._filter_reject = reject
+        self._filter_min_rating = rating
+        self._sync_rating_filter_buttons()
+        self._sync_rating_filter_compact_mode()
+        if changed:
+            self._refresh_filter_scope()
+
+    def _show_rating_filter_menu(self) -> None:
+        button = self._btn_filter_rating_menu
+        if button is None:
+            return
+        menu = QMenu(button)
+
+        def add_state_action(text: str, checked: bool, callback) -> None:
+            action = menu.addAction(text)
+            action.setCheckable(True)
+            action.setChecked(bool(checked))
+            action.triggered.connect(lambda _checked=False, cb=callback: cb())
+
+        has_rating_filter = (
+            self._filter_pick or
+            self._filter_reject or
+            self._filter_min_rating > 0
+        )
+        add_state_action(
+            "不限",
+            not has_rating_filter,
+            lambda: self._set_rating_filter_state(),
+        )
+        menu.addSeparator()
+        add_state_action(
+            "🏆 Pick",
+            self._filter_pick,
+            lambda: self._set_rating_filter_state(
+                pick=not self._filter_pick,
+            ),
+        )
+        add_state_action(
+            "🚫 排除",
+            self._filter_reject,
+            lambda: self._set_rating_filter_state(
+                reject=not self._filter_reject,
+            ),
+        )
+        menu.addSeparator()
+        for rating in range(1, 6):
+            add_state_action(
+                f"{rating} 星",
+                self._filter_min_rating == rating,
+                lambda r=rating: self._set_rating_filter_state(
+                    min_rating=0 if self._filter_min_rating == r else r,
+                ),
+            )
+
+        _exec_menu(menu, button.mapToGlobal(button.rect().bottomLeft()))
+        self._sync_rating_filter_buttons()
+
+    def _on_pick_filter_toggled(self) -> None:
+        """切换精选过滤：只显示 Pick=1 的文件；仅在目录 scope 发生变化时才重扫。"""
+        checked = bool(self._btn_filter_pick and self._btn_filter_pick.isChecked())
+        self._set_rating_filter_state(pick=checked)
+
+    def _on_reject_filter_toggled(self) -> None:
+        """切换排除过滤：只显示 Pick=-1 的文件；仅在目录 scope 发生变化时才重扫。"""
+        checked = bool(self._btn_filter_reject and self._btn_filter_reject.isChecked())
+        self._set_rating_filter_state(reject=checked)
+
+    def _on_rating_filter_changed(self, n: int) -> None:
+        """切换星级过滤：只显示 n 星的文件；仅在目录 scope 发生变化时才重扫。"""
+        rating = 0 if self._filter_min_rating == n else n
+        self._set_rating_filter_state(min_rating=rating)
 
     def _on_focus_filter_changed(self, status: str) -> None:
         if self._filter_focus_status == status:
@@ -3367,6 +3549,10 @@ class FileListPanel(QWidget):
         except Exception:
             pass
         return True
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._sync_rating_filter_compact_mode()
 
     def eventFilter(self, obj, event):
         tree_widget = getattr(self, "_tree_widget", None)
@@ -4569,7 +4755,12 @@ class FileListPanel(QWidget):
         self._meta_apply_loop_started_at = self._meta_apply_started_at
         self._meta_apply_tree_hits = 0
         self._meta_apply_list_hits = 0
-        self._meta_apply_needs_filter = bool(self._filter_pick or self._filter_min_rating > 0 or self._filter_focus_status)
+        self._meta_apply_needs_filter = bool(
+            self._filter_pick
+            or self._filter_reject
+            or self._filter_min_rating > 0
+            or self._filter_focus_status
+        )
         self._meta_apply_loader_finished = False
         self._set_tree_header_fast_mode(True)
         self._tree_widget.setSortingEnabled(False)
@@ -5194,8 +5385,9 @@ class FileListPanel(QWidget):
             return
         menu = QMenu(self)
         act_copy = menu.addAction("复制")
+        _apply_context_menu_shortcut(act_copy, _platform_copy_key_sequence())
         act_copy.triggered.connect(lambda: self._copy_paths_to_clipboard(paths))
-        act_copy_filename = menu.addAction("复制文件名")
+        act_copy_filename = menu.addAction("复制文件全路径")
         act_copy_filename.triggered.connect(lambda: self._copy_filenames_to_clipboard(paths))
         self._add_rating_menu_actions(menu, paths)
         menu.addSeparator()
@@ -5214,8 +5406,8 @@ class FileListPanel(QWidget):
             act_reveal = menu.addAction(label)
             act_reveal.triggered.connect(lambda: reveal_in_file_manager(reveal_path))
         # self._add_browse_preview_menu_action(menu, primary_path)
-        # menu.addSeparator()
-        # self._add_delete_menu_action(menu, paths)
+        menu.addSeparator()
+        self._add_delete_menu_action(menu, paths)
         _exec_menu(menu, self._tree_widget.viewport().mapToGlobal(pos))
 
     def _collect_report_filenames_for_paths(self, paths: list[str]) -> list[str]:
@@ -5338,8 +5530,9 @@ class FileListPanel(QWidget):
             return
         menu = QMenu(self)
         act_copy = menu.addAction("复制")
+        _apply_context_menu_shortcut(act_copy, _platform_copy_key_sequence())
         act_copy.triggered.connect(lambda: self._copy_paths_to_clipboard(paths))
-        act_copy_filename = menu.addAction("复制文件名")
+        act_copy_filename = menu.addAction("复制文件全路径")
         act_copy_filename.triggered.connect(lambda: self._copy_filenames_to_clipboard(paths))
         self._add_rating_menu_actions(menu, paths)
         menu.addSeparator()
@@ -5358,6 +5551,6 @@ class FileListPanel(QWidget):
             act_reveal = menu.addAction(label)
             act_reveal.triggered.connect(lambda: reveal_in_file_manager(reveal_path))
         # self._add_browse_preview_menu_action(menu, primary_path)
-        # menu.addSeparator()
-        # self._add_delete_menu_action(menu, paths)
+        menu.addSeparator()
+        self._add_delete_menu_action(menu, paths)
         _exec_menu(menu, self._list_widget.viewport().mapToGlobal(pos))
