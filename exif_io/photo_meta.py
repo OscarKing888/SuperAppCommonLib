@@ -130,6 +130,7 @@ _XMP_META_NS = "adobe:ns:meta/"
 _RDF_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
 _DC_NS = "http://purl.org/dc/elements/1.1/"
 _XMP_DC_SUBJECT_TAG = f"{{{_DC_NS}}}subject"
+_XMP_DC_DESCRIPTION_TAG = f"{{{_DC_NS}}}description"
 _RDF_DESCRIPTION_TAG = f"{{{_RDF_NS}}}Description"
 _RDF_BAG_TAG = f"{{{_RDF_NS}}}Bag"
 _RDF_LI_TAG = f"{{{_RDF_NS}}}li"
@@ -146,10 +147,19 @@ _XMP_SUBJECT_KEYS: frozenset[str] = frozenset({
     "keywords",
     "iptc:keywords",
 })
+_XMP_DESCRIPTION_KEYS: frozenset[str] = frozenset({
+    "xmp-dc:description",
+    "xmp:description",
+    "description",
+})
 
 
 def _is_xmp_subject_key(key: str) -> bool:
     return str(key or "").strip().lower() in _XMP_SUBJECT_KEYS
+
+
+def _is_xmp_description_key(key: str) -> bool:
+    return str(key or "").strip().lower() in _XMP_DESCRIPTION_KEYS
 
 
 def _normalise_text_values(values: Iterable[Any], *, split_strings: bool = False) -> list[str]:
@@ -221,17 +231,24 @@ class PhotoMetaDataXMP(PhotoMetaData):
 
         subject_seen = False
         subject_values: list[str] = []
+        description_seen = False
+        description_value = ""
         remaining_fields: dict[str, Any] = {}
         for key, value in fields.items():
             if _is_xmp_subject_key(key):
                 subject_seen = True
                 subject_values.extend(_normalise_subject_value(value, split_strings=True))
+            elif _is_xmp_description_key(key):
+                description_seen = True
+                description_value = "" if value is None else str(value)
             else:
                 remaining_fields[key] = value
 
         success = True
         if subject_seen:
             success = self.write_subjects(path, subject_values) and success
+        if description_seen:
+            success = self.write_description(path, description_value) and success
         if not remaining_fields:
             return success
 
@@ -305,6 +322,22 @@ class PhotoMetaDataXMP(PhotoMetaData):
         except Exception:
             return False
 
+    def write_description(self, path: str, description: Any) -> bool:
+        """Replace XMP ``dc:description`` text in the sidecar."""
+        text = "" if description is None else str(description)
+        sidecar_path = self.sidecar_path_for(path)
+        try:
+            tree = self._load_or_create_xmp_tree(sidecar_path)
+            if tree is None:
+                return False
+            root = tree.getroot()
+            desc = self._ensure_description(root)
+            self._replace_simple_text_node(desc, _XMP_DC_DESCRIPTION_TAG, text)
+            sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+            return self._write_tree_atomic(tree, sidecar_path)
+        except Exception:
+            return False
+
     @staticmethod
     def _new_xmp_tree() -> ET.ElementTree:
         ET.register_namespace("x", _XMP_META_NS)
@@ -351,6 +384,16 @@ class PhotoMetaDataXMP(PhotoMetaData):
         for value in subjects:
             item = ET.SubElement(bag, _RDF_LI_TAG)
             item.text = value
+
+    @staticmethod
+    def _replace_simple_text_node(desc: ET.Element, tag: str, text: str) -> None:
+        for child in list(desc):
+            if child.tag == tag:
+                desc.remove(child)
+        if text == "":
+            return
+        node = ET.SubElement(desc, tag)
+        node.text = text
 
     @staticmethod
     def _subject_values_from_element(element: ET.Element) -> list[str]:
