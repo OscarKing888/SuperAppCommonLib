@@ -1284,6 +1284,7 @@ class FileListPanel(QWidget):
             idx_first = self._thumb_index_for_path(current_target)
             if idx_first.isValid():
                 self._list_widget.setCurrentIndex(idx_first)
+                self._thumb_selection_anchor_row = idx_first.row()
                 self._record_selection_scroll_debug(
                     "apply_pending.thumb",
                     current_target,
@@ -3659,6 +3660,14 @@ class FileListPanel(QWidget):
             if et in (_EventResize, _EventShow):
                 self._invalidate_visible_thumbnail_signature()
                 self._schedule_visible_thumbnail_update()
+            elif et == _EventMouseButtonPress and list_widget is not None:
+                try:
+                    has_shift = bool(_ShiftModifier and (event.modifiers() & _ShiftModifier))
+                except Exception:
+                    has_shift = False
+                if not has_shift:
+                    idx = list_widget.indexAt(event.pos())
+                    self._thumb_selection_anchor_row = idx.row() if idx.isValid() else -1
         if event is not None and event.type() == _EventWheel:
             if (
                 self._view_mode == self._MODE_LIST
@@ -3784,12 +3793,12 @@ class FileListPanel(QWidget):
                         anchor = idx
                     self._thumb_selection_anchor_row = anchor
                     lo, hi = min(anchor, new_idx), max(anchor, new_idx)
+                    list_widget.setCurrentIndex(new_index)
                     list_widget.clearSelection()
                     for i in range(lo, hi + 1):
                         it = self._thumb_index_for_row(i)
                         if it.isValid() and sm is not None:
                             sm.select(it, _Select)
-                    list_widget.setCurrentIndex(new_index)
                 else:
                     self._thumb_selection_anchor_row = new_idx
                     list_widget.clearSelection()
@@ -4128,6 +4137,7 @@ class FileListPanel(QWidget):
             return
         selected_paths, current_path = self._capture_selection_restore_state()
         self._view_mode = mode
+        self._thumb_selection_anchor_row = -1
         self._btn_list.setChecked(mode == self._MODE_LIST)
         self._btn_thumb.setChecked(mode == self._MODE_THUMB)
         self._stack.setCurrentIndex(0 if mode == self._MODE_LIST else 1)

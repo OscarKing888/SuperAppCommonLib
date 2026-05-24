@@ -712,6 +712,7 @@ try:
     _EventKeyRelease = QEvent.Type.KeyRelease
     _EventToolTip = QEvent.Type.ToolTip
     _EventWheel = QEvent.Type.Wheel
+    _EventMouseButtonPress = QEvent.Type.MouseButtonPress
 except AttributeError:
     _EventResize = QEvent.Resize  # type: ignore[attr-defined]
     _EventShow = QEvent.Show  # type: ignore[attr-defined]
@@ -719,6 +720,7 @@ except AttributeError:
     _EventKeyRelease = QEvent.KeyRelease  # type: ignore[attr-defined]
     _EventToolTip = QEvent.ToolTip  # type: ignore[attr-defined]
     _EventWheel = QEvent.Wheel  # type: ignore[attr-defined]
+    _EventMouseButtonPress = QEvent.MouseButtonPress  # type: ignore[attr-defined]
 
 _KeyUp = getattr(Qt.Key, "Key_Up", None) or getattr(Qt, "Key_Up", None)
 _KeyDown = getattr(Qt.Key, "Key_Down", None) or getattr(Qt, "Key_Down", None)
