@@ -777,6 +777,8 @@ class FileListPanel(QWidget):
             if self._view_mode != self._MODE_THUMB or not self._thumb_model_dirty:
                 self._pending_selection_paths = None
                 self._pending_selection_current_path = ""
+        else:
+            self._select_first_file_if_needed(reason="directory_listing")
         uncached_meta_paths = self._collect_uncached_metadata_paths(self._all_files)
         if uncached_meta_paths:
             _log.info(
@@ -1251,6 +1253,51 @@ class FileListPanel(QWidget):
             self._schedule_selection_visibility_restore(current_target, reason="apply_pending_selection")
             self._emit_file_selected_for_path(current_target)
         self._update_selection_status()
+
+    def _select_first_file_if_needed(self, *, reason: str = "") -> None:
+        """目录首次加载且没有外部指定选择时，默认选中当前列表第一张。"""
+        if self._pending_selection_paths or self._selected_display_path or not self._filtered_files:
+            return
+        if self._active_view_selected_paths():
+            return
+        target = os.path.normpath(self._filtered_files[0])
+        if not target:
+            return
+
+        if self._view_mode == self._MODE_LIST:
+            view = self._tree_widget
+            index = self._tree_index_for_path(target)
+        else:
+            view = self._list_widget
+            index = self._thumb_index_for_path(target)
+
+        if not index.isValid():
+            self.set_pending_selection([target], current_path=target, apply_immediately=False)
+            _log.info("[_select_first_file_if_needed] pending reason=%s target=%r", reason, target)
+            return
+
+        view_was_blocked = view.blockSignals(True)
+        sm = view.selectionModel()
+        sm_was_blocked = sm.blockSignals(True) if sm is not None else False
+        try:
+            view.clearSelection()
+            view.setCurrentIndex(index)
+            if sm is not None:
+                sm.select(index, _ClearAndSelect)
+        finally:
+            if sm is not None:
+                sm.blockSignals(sm_was_blocked)
+            view.blockSignals(view_was_blocked)
+
+        self._record_selection_scroll_debug(
+            "select_first",
+            target,
+            row=index.row(),
+            view_mode=self._view_mode,
+            reason=reason,
+        )
+        self._schedule_selection_visibility_restore(target, reason=f"select_first:{reason}")
+        self._emit_file_selected_for_path(target)
 
     def _record_selection_scroll_debug(self, event: str, path: str = "", **fields) -> None:
         """缓存选中/滚动诊断信息，退出时统一汇总输出，避免运行中刷屏。"""
