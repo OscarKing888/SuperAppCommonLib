@@ -4449,9 +4449,64 @@ class FileListPanel(QWidget):
             return
         self._selected_display_path = os.path.normpath(path)
         resolved_path = self._resolve_source_path_for_action(path)
-        if not resolved_path or not os.path.isfile(resolved_path):
+        preview_path = self.resolve_preview_path(path, prefer_fast_preview=True)
+        if (
+            preview_path
+            and resolved_path
+            and _path_key(preview_path) == _path_key(resolved_path)
+        ):
+            preview_path = ""
+        if not preview_path or not os.path.isfile(preview_path):
+            preview_path = self._materialize_current_thumbnail_fast_preview(path)
+        if (not preview_path or not os.path.isfile(preview_path)) and (
+            not resolved_path or not os.path.isfile(resolved_path)
+        ):
             self._request_actual_path_lookup(path)
-        self.file_fast_preview_requested.emit(resolved_path or path)
+        self.file_fast_preview_requested.emit(preview_path or resolved_path or path)
+
+    def _materialize_current_thumbnail_fast_preview(self, path: str) -> str:
+        """把当前缩略图视图中已有的同尺寸缩略图落盘，供方向键快速预览复用。"""
+        norm_path = os.path.normpath(path) if path else ""
+        if not norm_path or self._view_mode != self._MODE_THUMB:
+            return ""
+        idx = self._thumb_index_for_path(norm_path)
+        if not idx.isValid():
+            return ""
+        pixmap = self._thumb_list_model.data(idx, _ThumbPixmapRole)
+        if not isinstance(pixmap, QPixmap) or pixmap.isNull():
+            return ""
+        try:
+            entry_size = int(self._thumb_list_model.data(idx, _ThumbSizeRole) or 0)
+        except Exception:
+            entry_size = 0
+        if entry_size != int(self._thumb_size):
+            return ""
+        source_path = self._get_actual_path_for_display(norm_path) or norm_path
+        preview_base_dir = self._report_root_dir or self._current_dir
+        report_cache = self._report_full_cache or self._report_cache or {}
+        load_target_path = _resolve_thumb_source_path(
+            source_path,
+            report_cache if self._use_preview_cache else {},
+            preview_base_dir,
+        )
+        if not load_target_path or not os.path.isfile(load_target_path):
+            load_target_path = source_path
+        try:
+            mtime = float(os.path.getmtime(load_target_path))
+        except Exception:
+            mtime = 0.0
+        cache_path = _thumb_disk_cache_path(load_target_path, mtime, self._thumb_size)
+        if not cache_path:
+            return ""
+        if os.path.isfile(cache_path):
+            return cache_path
+        try:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            if pixmap.save(cache_path, "JPEG", 85):
+                return cache_path
+        except Exception:
+            return ""
+        return ""
 
     def _handle_selection_preview_request(
         self,
