@@ -406,8 +406,10 @@ class MetadataLoader(QThread):
         return result
 
     def _parse_rec(self, rec: dict) -> dict:
-        # 标题、对焦状态等支持 XMP sidecar（由 read_batch_metadata 合并），勿删以下键名
-        # 标题：XMP dc:title（sidecar 多为小写 tag）、IFD0/XPTitle、IPTC
+        # 注释、标签、星级等支持 XMP sidecar（由 read_batch_metadata 合并），勿删以下键名。
+        comment = _metadata_comment_from_meta(rec)
+        tags = _metadata_tags_from_meta(rec)
+        # 标题仍保留在 meta 里，供旧代码和缩略图兼容使用。
         title = (
             rec.get("XMP-dc:Title") or rec.get("XMP-dc:title")
             or rec.get("IFD0:XPTitle") or rec.get("IPTC:ObjectName") or ""
@@ -487,6 +489,8 @@ class MetadataLoader(QThread):
 
         return {
             "title":   str(title).strip(),
+            "comment": comment,
+            "tags":    tags,
             "color":   str(color).strip(),
             "rating":  rating,
             "pick":    pick,

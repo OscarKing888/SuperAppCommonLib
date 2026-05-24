@@ -25,6 +25,9 @@ class FileTableEntry:
     name: str
     tooltip: str = ""
     mismatch: bool = False
+    comment: str = ""
+    tags: list[str] = field(default_factory=list)
+    tags_display: str = ""
     title: str = ""
     color: str = ""
     color_display: str = ""
@@ -74,6 +77,9 @@ class FileTableModel(QAbstractTableModel):
 
     def _apply_meta_to_entry(self, entry: FileTableEntry, meta: dict | None) -> None:
         meta = meta or {}
+        entry.comment = _metadata_comment_from_meta(meta)
+        entry.tags = _metadata_tags_from_meta(meta)
+        entry.tags_display = _FILE_TAG_DISPLAY_SEPARATOR.join(entry.tags)
         entry.title = str(meta.get("title", "") or "")
         entry.color = str(meta.get("color", "") or "")
         entry.color_display = _COLOR_LABEL_COLORS.get(entry.color, ("", ""))[1] or entry.color
@@ -111,64 +117,33 @@ class FileTableModel(QAbstractTableModel):
         return entry
 
     def _sort_value(self, entry: FileTableEntry, column: int):
-        if column == _TREE_COL_SEQ:
-            return 0
         if column == _TREE_COL_NAME:
             return entry.name.lower()
-        if column == _TREE_COL_TITLE:
-            return entry.title.lower()
-        if column == _TREE_COL_COLOR:
-            return _COLOR_SORT_ORDER.get(entry.color, 99)
+        if column == _TREE_COL_COMMENT:
+            return entry.comment.lower()
         if column == _TREE_COL_STAR:
             if entry.pick == 1:
                 return 10
             if entry.pick == -1:
                 return -1
             return entry.rating
-        if column == _TREE_COL_SHARP:
-            return entry.city.lower()
-        if column == _TREE_COL_AESTHETIC:
-            return entry.state.lower()
-        if column == _TREE_COL_FOCUS:
-            return entry.country.lower()
-        if column == _TREE_COL_SHUTTER:
-            seconds = _parse_positive_fraction_or_float(entry.shutter)
-            return (0, seconds) if seconds is not None else (1, entry.shutter.lower())
-        if column == _TREE_COL_ISO:
-            iso_value = _parse_optional_int(entry.iso)
-            return (0, iso_value) if iso_value is not None else (1, entry.iso.lower())
-        if column == _TREE_COL_APERTURE:
-            aperture_value = _parse_positive_fraction_or_float(entry.aperture)
-            return (0, aperture_value) if aperture_value is not None else (1, entry.aperture.lower())
+        if column == _TREE_COL_TAGS:
+            return entry.tags_display.lower()
         return ""
 
     def _display_value(self, entry: FileTableEntry, row: int, column: int) -> str:
-        if column == _TREE_COL_SEQ:
-            return str(row + 1)
         if column == _TREE_COL_NAME:
             return entry.name
-        if column == _TREE_COL_TITLE:
-            return entry.title
-        if column == _TREE_COL_COLOR:
-            return entry.color_display
+        if column == _TREE_COL_COMMENT:
+            return entry.comment
         if column == _TREE_COL_STAR:
             if entry.pick == 1:
                 return "🏆"
             if entry.pick == -1:
                 return "🚫"
             return "★" * max(0, entry.rating)
-        if column == _TREE_COL_SHARP:
-            return entry.city
-        if column == _TREE_COL_AESTHETIC:
-            return entry.state
-        if column == _TREE_COL_FOCUS:
-            return entry.country
-        if column == _TREE_COL_SHUTTER:
-            return entry.shutter
-        if column == _TREE_COL_ISO:
-            return entry.iso
-        if column == _TREE_COL_APERTURE:
-            return entry.aperture
+        if column == _TREE_COL_TAGS:
+            return entry.tags_display
         return ""
 
     def data(self, index: QModelIndex, role: int = int(_DisplayRole)):
@@ -187,21 +162,10 @@ class FileTableModel(QAbstractTableModel):
             return entry.tooltip
         if role == _SortRole:
             return self._sort_value(entry, column)
-        if role == _TextAlignmentRole and column == _TREE_COL_SEQ:
-            return int(_AlignCenter)
         if role == _ForegroundRole:
             if column == _TREE_COL_NAME and entry.mismatch:
                 return QBrush(QColor("#c0392b"))
-            if column == _TREE_COL_COLOR and entry.color in _COLOR_LABEL_COLORS:
-                return QBrush(QColor("#333" if entry.color in ("Yellow", "White") else "#fff"))
-            if column == _TREE_COL_FOCUS:
-                focus_color = _FOCUS_STATUS_TEXT_COLORS.get(entry.country, "")
-                if focus_color:
-                    return QBrush(QColor(focus_color))
             return None
-        if role == _BackgroundRole and column == _TREE_COL_COLOR and entry.color in _COLOR_LABEL_COLORS:
-            hex_c, _label = _COLOR_LABEL_COLORS[entry.color]
-            return QBrush(QColor(hex_c))
         return None
 
     def clear(self) -> None:
@@ -266,7 +230,7 @@ class FileTableModel(QAbstractTableModel):
             return False
         entry = self._entries[row]
         self._apply_meta_to_entry(entry, meta)
-        left = self.index(row, _TREE_COL_TITLE)
+        left = self.index(row, _TREE_COL_COMMENT)
         right = self.index(row, self.columnCount() - 1)
         self.dataChanged.emit(left, right, [_DisplayRole, _SortRole, _ForegroundRole, _BackgroundRole])
         return True
@@ -303,8 +267,6 @@ class FileTableSortProxyModel(QSortFilterProxyModel):
             pass
 
     def data(self, index: QModelIndex, role: int = int(_DisplayRole)):
-        if role == _DisplayRole and index.isValid() and index.column() == _TREE_COL_SEQ:
-            return str(index.row() + 1)
         return super().data(index, role)
 
     def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:

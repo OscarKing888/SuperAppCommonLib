@@ -339,6 +339,13 @@ _BROWSER_METADATA_TAGS: list[str] = [
     "-DateCreated",
     "-MediaCreateDate",
     "-XMP-dc:Title", "-XMP-dc:title",  # 标题（sidecar 常用小写 dc:title）
+    "-XMP-dc:Description", "-XMP-dc:description",
+    "-IFD0:ImageDescription", "-EXIF:ImageDescription",
+    "-ExifIFD:UserComment", "-EXIF:UserComment",
+    "-IFD0:XPComment",
+    "-IPTC:Caption-Abstract",
+    "-XMP-dc:Subject", "-XMP-dc:subject",
+    "-IPTC:Keywords",
     "-XMP-xmp:Label",
     "-XMP-xmp:Rating",
     "-XMP-xmpDM:pick",        # 实际 XMP 结构 <xmpDM:pick>1</xmpDM:pick>（Dynamic Media）
@@ -434,6 +441,8 @@ def _apply_browser_metadata_aliases(rec: dict) -> None:
     当前重点：
     - 对焦状态：XMP-photoshop:Country / Country-PrimaryLocationName -> XMP:Country
     - 标题：XMP-dc:title -> XMP-dc:Title
+    - 注释：XMP-dc:description -> XMP-dc:Description
+    - 标签：XMP-dc:subject -> XMP-dc:Subject
     """
     if not isinstance(rec, dict):
         return
@@ -443,6 +452,10 @@ def _apply_browser_metadata_aliases(rec: dict) -> None:
         rec["XMP:Country"] = rec["XMP-photoshop:Country-PrimaryLocationName"]
     if rec.get("XMP-dc:title") and not rec.get("XMP-dc:Title"):
         rec["XMP-dc:Title"] = rec["XMP-dc:title"]
+    if rec.get("XMP-dc:description") and not rec.get("XMP-dc:Description"):
+        rec["XMP-dc:Description"] = rec["XMP-dc:description"]
+    if rec.get("XMP-dc:subject") and not rec.get("XMP-dc:Subject"):
+        rec["XMP-dc:Subject"] = rec["XMP-dc:subject"]
 
 
 def _xmp_rows_to_flat_dict(path: str, xmp_rows: list) -> dict:

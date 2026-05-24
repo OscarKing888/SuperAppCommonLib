@@ -354,13 +354,6 @@ class FileListPanel(QWidget):
         self._tree_widget.setModel(self._file_table_proxy)
         self._tree_widget.setHeader(FileTableHeaderView(self._tree_widget))
 
-        # @Agents: 这个列名不要修改
-        # 城市 = 锐度值（越高越清晰）
-        # 省/直辖市/自治区 = 美学评分（越高越好看）
-        # 国家/地区 = 对焦状态（精焦/合焦/偏移/失焦）
-        # 🏆 奖杯 = Pick 精选旗标（双维度都出色）
-        # 🟢 绿色标签 = 飞鸟
-        # 🔴 红色标签 = 精焦（对焦点在鸟头）
         self._tree_widget.setHeaderLabels(_FILE_TABLE_HEADERS)
         self._tree_widget.setSortingEnabled(True)
         self._tree_widget.setRootIsDecorated(False)
@@ -383,17 +376,10 @@ class FileListPanel(QWidget):
         self._tree_widget.selectionModel().selectionChanged.connect(self._on_view_selection_changed)
         for col in range(len(_FILE_TABLE_HEADERS)):
             hdr.setSectionResizeMode(col, _ResizeInteractive)
-        self._tree_widget.setColumnWidth(_TREE_COL_SEQ, 44)
-        self._tree_widget.setColumnWidth(_TREE_COL_NAME, 190)
-        self._tree_widget.setColumnWidth(_TREE_COL_TITLE, 150)
-        self._tree_widget.setColumnWidth(_TREE_COL_COLOR, 86)
+        self._tree_widget.setColumnWidth(_TREE_COL_NAME, 240)
+        self._tree_widget.setColumnWidth(_TREE_COL_COMMENT, 280)
         self._tree_widget.setColumnWidth(_TREE_COL_STAR, 72)
-        self._tree_widget.setColumnWidth(_TREE_COL_SHARP, 96)
-        self._tree_widget.setColumnWidth(_TREE_COL_AESTHETIC, 96)
-        self._tree_widget.setColumnWidth(_TREE_COL_FOCUS, 108)
-        self._tree_widget.setColumnWidth(_TREE_COL_SHUTTER, 84)
-        self._tree_widget.setColumnWidth(_TREE_COL_ISO, 72)
-        self._tree_widget.setColumnWidth(_TREE_COL_APERTURE, 72)
+        self._tree_widget.setColumnWidth(_TREE_COL_TAGS, 240)
         self._apply_tree_sort(_TREE_COL_NAME, _AscendingOrder, sync_indicator=True)
         self._tree_widget.setContextMenuPolicy(_CustomContextMenu)
         self._tree_widget.customContextMenuRequested.connect(self._on_tree_context_menu)
@@ -3183,15 +3169,13 @@ class FileListPanel(QWidget):
             ft = (self._filter_edit.text().strip().lower()) if self._filter_edit else ""
             _log.info("[_rebuild_views] filter_text=%r adding items", ft or "(none)")
 
-            for seq, path in enumerate(self._filtered_files, start=1):
+            for path in self._filtered_files:
                 name = Path(path).name
                 norm = os.path.normpath(path)
                 meta = self._meta_cache.get(norm, {})
 
-                ti = SortableTreeItem([str(seq), name, *([""] * (len(_FILE_TABLE_HEADERS) - 2))])
-                ti.setTextAlignment(_TREE_COL_SEQ, _AlignCenter)
+                ti = SortableTreeItem([name, *([""] * (len(_FILE_TABLE_HEADERS) - 1))])
                 ti.setData(0, _UserRole, path)
-                ti.setData(_TREE_COL_SEQ, _SortRole, 0)
                 ti.setData(_TREE_COL_NAME, _SortRole, name.lower())
                 self._set_tree_item_tooltip_all_columns(ti, self._build_list_path_tooltip(path))
                 if meta:
@@ -3441,29 +3425,19 @@ class FileListPanel(QWidget):
         self._refresh_filter_scope()
 
     def _apply_meta_to_tree_item(self, item: SortableTreeItem, meta: dict) -> None:
-        title   = meta.get("title", "")
-        color   = meta.get("color", "")
-        rating  = meta.get("rating", 0)
-        pick    = meta.get("pick", 0)
-        city    = meta.get("city", "")
-        state   = meta.get("state", "")
-        country = meta.get("country", "")
-        shutter = str(meta.get("shutter", "") or "")
-        iso = str(meta.get("iso", "") or "")
-        aperture = str(meta.get("aperture", "") or "")
+        comment = _metadata_comment_from_meta(meta)
+        tags_display = _metadata_tags_display(meta)
+        try:
+            rating = int(meta.get("rating", 0) or 0)
+        except Exception:
+            rating = 0
+        try:
+            pick = int(meta.get("pick", 0) or 0)
+        except Exception:
+            pick = 0
 
-        item.setText(_TREE_COL_TITLE, title);  item.setData(_TREE_COL_TITLE, _SortRole, title.lower())
-        color_display = (_COLOR_LABEL_COLORS.get(color, ("", ""))[1] or color)
-        item.setText(_TREE_COL_COLOR, color_display);  item.setData(_TREE_COL_COLOR, _SortRole, _COLOR_SORT_ORDER.get(color, 99))
-        if color in _COLOR_LABEL_COLORS:
-            hex_c, _ = _COLOR_LABEL_COLORS[color]
-            item.setBackground(_TREE_COL_COLOR, QBrush(QColor(hex_c)))
-            item.setForeground(_TREE_COL_COLOR, QBrush(QColor(
-                "#333" if color in ("Yellow", "White") else "#fff"
-            )))
-
-        # 星级列：pick 旗标优先于星级显示
-        # 排序键：精选=10 > 5星=5 > ... > 未标=0 > 排除=-1
+        item.setText(_TREE_COL_COMMENT, comment)
+        item.setData(_TREE_COL_COMMENT, _SortRole, comment.lower())
         if pick == 1:
             star_text = "🏆"
             sort_val  = 10
@@ -3474,24 +3448,8 @@ class FileListPanel(QWidget):
             star_text = "★" * rating if rating > 0 else ""
             sort_val  = rating
         item.setText(_TREE_COL_STAR, star_text); item.setData(_TREE_COL_STAR, _SortRole, sort_val)
-
-        item.setText(_TREE_COL_SHARP, city);    item.setData(_TREE_COL_SHARP, _SortRole, city.lower())
-        item.setText(_TREE_COL_AESTHETIC, state);   item.setData(_TREE_COL_AESTHETIC, _SortRole, state.lower())
-        item.setText(_TREE_COL_FOCUS, country); item.setData(_TREE_COL_FOCUS, _SortRole, country.lower())
-        shutter_seconds = _parse_positive_fraction_or_float(shutter)
-        item.setText(_TREE_COL_SHUTTER, shutter)
-        item.setData(_TREE_COL_SHUTTER, _SortRole, (0, shutter_seconds) if shutter_seconds is not None else (1, shutter.lower()))
-        iso_value = _parse_optional_int(iso)
-        item.setText(_TREE_COL_ISO, iso)
-        item.setData(_TREE_COL_ISO, _SortRole, (0, iso_value) if iso_value is not None else (1, iso.lower()))
-        aperture_value = _parse_positive_fraction_or_float(aperture)
-        item.setText(_TREE_COL_APERTURE, aperture)
-        item.setData(_TREE_COL_APERTURE, _SortRole, (0, aperture_value) if aperture_value is not None else (1, aperture.lower()))
-        focus_color = _FOCUS_STATUS_TEXT_COLORS.get(country, "")
-        if focus_color:
-            item.setForeground(_TREE_COL_FOCUS, QBrush(QColor(focus_color)))
-        else:
-            item.setForeground(_TREE_COL_FOCUS, QBrush())
+        item.setText(_TREE_COL_TAGS, tags_display)
+        item.setData(_TREE_COL_TAGS, _SortRole, tags_display.lower())
 
     # ── 视图模式切换 ────────────────────────────────────────────────────────────
     def _view_uses_pixel_scroll(self, view) -> bool:
@@ -4855,24 +4813,9 @@ class FileListPanel(QWidget):
             return
         hdr = self._tree_widget.header()
         try:
-            if enabled:
-                for col in (
-                    _TREE_COL_TITLE,
-                    _TREE_COL_COLOR,
-                    _TREE_COL_STAR,
-                    _TREE_COL_SHARP,
-                    _TREE_COL_AESTHETIC,
-                    _TREE_COL_FOCUS,
-                    _TREE_COL_SHUTTER,
-                    _TREE_COL_ISO,
-                    _TREE_COL_APERTURE,
-                ):
-                    hdr.setSectionResizeMode(col, _ResizeInteractive)
-                self._tree_header_fast_mode = True
-            else:
-                for col in range(len(_FILE_TABLE_HEADERS)):
-                    hdr.setSectionResizeMode(col, _ResizeInteractive)
-                self._tree_header_fast_mode = False
+            for col in range(len(_FILE_TABLE_HEADERS)):
+                hdr.setSectionResizeMode(col, _ResizeInteractive)
+            self._tree_header_fast_mode = bool(enabled)
         except Exception:
             pass
 
@@ -5178,26 +5121,17 @@ class FileListPanel(QWidget):
         t0 = _time.perf_counter()
         total = len(meta_dict)
         self._meta_cache.update(meta_dict)
-        title_cnt = 0
-        color_cnt = 0
+        comment_cnt = 0
+        tag_cnt = 0
         rating_pos_cnt = 0
-        city_cnt = 0
-        state_cnt = 0
-        country_cnt = 0
         for m in meta_dict.values():
             try:
-                if str(m.get("title", "")).strip():
-                    title_cnt += 1
-                if str(m.get("color", "")).strip():
-                    color_cnt += 1
+                if _metadata_comment_from_meta(m):
+                    comment_cnt += 1
+                if _metadata_tags_from_meta(m):
+                    tag_cnt += 1
                 if int(float(str(m.get("rating", 0) or 0))) > 0:
                     rating_pos_cnt += 1
-                if str(m.get("city", "")).strip():
-                    city_cnt += 1
-                if str(m.get("state", "")).strip():
-                    state_cnt += 1
-                if str(m.get("country", "")).strip():
-                    country_cnt += 1
             except Exception:
                 pass
         _log.info(
@@ -5207,13 +5141,10 @@ class FileListPanel(QWidget):
             _time.perf_counter() - t0,
         )
         _log.info(
-            "[STAT][_on_metadata_batch_ready] richness title=%s color=%s rating>0=%s city=%s state=%s country=%s",
-            title_cnt,
-            color_cnt,
+            "[STAT][_on_metadata_batch_ready] richness comment=%s tags=%s rating>0=%s",
+            comment_cnt,
+            tag_cnt,
             rating_pos_cnt,
-            city_cnt,
-            state_cnt,
-            country_cnt,
         )
         self._enqueue_meta_apply(meta_dict)
 

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import concurrent.futures as _futures
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import html
 import io as _io
@@ -263,18 +263,21 @@ _ThumbPixmapRole = int(_UserRole) + 20
 _ThumbSizeRole = int(_UserRole) + 21
 _MetaSpeciesCnRole = int(_UserRole) + 22
 
-_TREE_COL_SEQ = 0
-_TREE_COL_NAME = 1
-_TREE_COL_TITLE = 2
-_TREE_COL_COLOR = 3
-_TREE_COL_STAR = 4
-_TREE_COL_SHARP = 5
-_TREE_COL_AESTHETIC = 6
-_TREE_COL_FOCUS = 7
-_TREE_COL_SHUTTER = 8
-_TREE_COL_ISO = 9
-_TREE_COL_APERTURE = 10
-_FILE_TABLE_HEADERS = ["#", "文件名", "标题", "颜色", "星级", "锐度值", "美学评分", "对焦状态", "快门", "ISO", "光圈"]
+_TREE_COL_SEQ = -1
+_TREE_COL_NAME = 0
+_TREE_COL_COMMENT = 1
+_TREE_COL_STAR = 2
+_TREE_COL_TAGS = 3
+_TREE_COL_TITLE = _TREE_COL_COMMENT
+_TREE_COL_COLOR = _TREE_COL_TAGS
+_TREE_COL_SHARP = _TREE_COL_TAGS
+_TREE_COL_AESTHETIC = _TREE_COL_TAGS
+_TREE_COL_FOCUS = _TREE_COL_TAGS
+_TREE_COL_SHUTTER = _TREE_COL_TAGS
+_TREE_COL_ISO = _TREE_COL_TAGS
+_TREE_COL_APERTURE = _TREE_COL_TAGS
+_FILE_TABLE_HEADERS = ["文件名", "注释", "星级", "标签"]
+_FILE_TAG_DISPLAY_SEPARATOR = "、"
 _SUPERBIRDSTAMP_CAMERA_METADATA_TAGS = [
     "-ExifIFD:ExposureTime",
     "-EXIF:ExposureTime",
@@ -468,6 +471,79 @@ def _first_non_empty(*values):
         if str(value).strip():
             return value
     return ""
+
+
+def _normalise_metadata_tag_values(value) -> list[str]:
+    """将 XMP/IPTC tag/subject 值收敛为有序去重字符串列表。"""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set, frozenset)):
+        values = list(value)
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return []
+        values = text.split(";") if ";" in text else [text]
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        clean = str(item or "").strip()
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        result.append(clean)
+    return result
+
+
+def _metadata_tags_from_meta(meta: dict | None) -> list[str]:
+    if not isinstance(meta, dict):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for key in (
+        "tags",
+        "photo_tags",
+        "XMP-dc:Subject",
+        "XMP-dc:subject",
+        "XMP:Subject",
+        "Subject",
+        "subject",
+        "subjects",
+        "IPTC:Keywords",
+        "Keywords",
+    ):
+        for tag in _normalise_metadata_tag_values(meta.get(key)):
+            if tag in seen:
+                continue
+            seen.add(tag)
+            result.append(tag)
+    return result
+
+
+def _metadata_tags_display(meta: dict | None) -> str:
+    return _FILE_TAG_DISPLAY_SEPARATOR.join(_metadata_tags_from_meta(meta))
+
+
+def _metadata_comment_from_meta(meta: dict | None) -> str:
+    if not isinstance(meta, dict):
+        return ""
+    value = _first_non_empty(
+        meta.get("comment"),
+        meta.get("description"),
+        meta.get("Description"),
+        meta.get("XMP-dc:Description"),
+        meta.get("XMP-dc:description"),
+        meta.get("XMP:Description"),
+        meta.get("IFD0:ImageDescription"),
+        meta.get("EXIF:ImageDescription"),
+        meta.get("ExifIFD:UserComment"),
+        meta.get("EXIF:UserComment"),
+        meta.get("UserComment"),
+        meta.get("IFD0:XPComment"),
+        meta.get("IPTC:Caption-Abstract"),
+        meta.get("caption"),
+    )
+    return str(value or "").strip()
 
 
 def _parse_positive_fraction_or_float(raw) -> float | None:
