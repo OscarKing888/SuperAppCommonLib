@@ -15,7 +15,7 @@ class DirectoryScanWorker(QThread):
         recursive: bool,
         report_root: str | None = None,
         report_cache_full: dict | None = None,
-        use_report_db: bool = True,
+        use_report_db: bool = False,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -322,11 +322,6 @@ class MetadataLoader(QThread):
             _log.warning("[MetadataLoader.run] exception: %s", e)
         _log.info("[MetadataLoader.run] END")
 
-    def _uses_browser_metadata_tags(self) -> bool:
-        if not self._metadata_tags:
-            return False
-        return frozenset(self._metadata_tags) == _SUPERBIRDSTAMP_BROWSER_METADATA_TAGS_SET
-
     def _should_prefetch_focus_cache(self) -> bool:
         """
         文件列表 metadata 加载阶段不要再同步触发第二次 metadata 扫描。
@@ -336,73 +331,20 @@ class MetadataLoader(QThread):
         """
         return False
 
-    @staticmethod
-    def _has_report_backed_metadata(flat: dict | None) -> bool:
-        if not isinstance(flat, dict) or not flat:
-            return False
-        for key, value in flat.items():
-            if key == "SourceFile":
-                continue
-            if value is None:
-                continue
-            if isinstance(value, str) and not value.strip():
-                continue
-            return True
-        return False
-
-    def _read_report_metadata_batch(self, paths: list[str]) -> dict[str, dict]:
-        report_db = getattr(self._meta_proxy, "report_db", None)
-        if report_db is None:
-            return {}
-        try:
-            raw_batch = report_db.read_batch(paths) or {}
-        except Exception as exc:
-            _log.warning("[MetadataLoader._read_report_metadata_batch] report_db.read_batch failed: %s", exc)
-            return {}
-        result: dict[str, dict] = {}
-        for path, flat in raw_batch.items():
-            norm_path = os.path.normpath(path)
-            if isinstance(flat, dict) and flat:
-                result[norm_path] = flat
-        return result
-
     def _read_metadata_batch(self, paths: list[str]) -> dict[str, dict]:
         norm_paths = [os.path.normpath(p) for p in paths]
         result: dict[str, dict] = {norm: {"SourceFile": norm} for norm in norm_paths}
-        report_batch = self._read_report_metadata_batch(paths)
-        report_only_browser_mode = self._uses_browser_metadata_tags() and EXIF_ONLY_FROM_REPORT_DB
-        raw_paths = list(paths)
-        if report_only_browser_mode and report_batch:
-            raw_paths = []
-            report_hit_count = 0
-            for path, norm_path in zip(paths, norm_paths):
-                flat = report_batch.get(norm_path)
-                if self._has_report_backed_metadata(flat):
-                    result[norm_path].update(flat)
-                    report_hit_count += 1
-                    continue
-                raw_paths.append(path)
-            _log.info(
-                "[MetadataLoader._read_metadata_batch] browser metadata served from report.db hits=%s fallback=%s total=%s",
-                report_hit_count,
-                len(raw_paths),
-                len(paths),
+        try:
+            raw_batch = read_batch_metadata(
+                paths,
+                tags=self._metadata_tags or None,
+                use_cache=not bool(self._metadata_tags),
             )
-        if raw_paths:
-            try:
-                raw_batch = read_batch_metadata(
-                    raw_paths,
-                    tags=self._metadata_tags or None,
-                    use_cache=not bool(self._metadata_tags),
-                )
-                for norm_path, flat in raw_batch.items():
-                    if norm_path in result and flat:
-                        result[norm_path].update(flat)
-            except Exception as exc:
-                _log.warning("[MetadataLoader._read_metadata_batch] read_batch_metadata failed: %s", exc)
-        for norm_path, flat in report_batch.items():
-            if norm_path in result and flat:
-                result[norm_path].update(flat)
+            for norm_path, flat in raw_batch.items():
+                if norm_path in result and flat:
+                    result[norm_path].update(flat)
+        except Exception as exc:
+            _log.warning("[MetadataLoader._read_metadata_batch] read_batch_metadata failed: %s", exc)
         return result
 
     def _parse_rec(self, rec: dict) -> dict:

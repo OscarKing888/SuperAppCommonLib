@@ -7,11 +7,10 @@ Hierarchy
 PhotoMetaData (ABC)
 ├── PhotoMetaDataEXIFEmbeded  – embedded EXIF via exiftool / Pillow fallback
 ├── PhotoMetaDataXMP           – XMP sidecar files (.xmp)
-└── PhotoMetaDataReportDB      – SuperPicky report.db (SQLite)
+└── PhotoMetaDataReportDB      – legacy SuperPicky report.db adapter (standalone)
 
-PhotoMetaDataProxy             – composite; merges all three with priority
-                                 ReportDB > XMP > EXIF (for reads)
-                                 routes writes to appropriate backend(s)
+PhotoMetaDataProxy             – composite; merges XMP sidecar > EXIF
+                                 and routes writes to sidecar / embedded metadata.
 
 All `read()` methods return an **exiftool-G1-style flat dict** so callers do
 not need to care about the underlying source.  Existing functions in
@@ -208,9 +207,34 @@ def _normalise_pick_value(value: Any) -> int:
             return 1
         if text in ("false", "no", ""):
             return 0
+        if text == "reject":
+            return -1
         return max(-1, min(1, int(float(text))))
     except Exception:
         return 0
+
+
+def _normalise_rating_pick_aliases(rec: dict[str, Any]) -> None:
+    """Populate normalized browser fields from embedded or sidecar XMP aliases."""
+    if not isinstance(rec, dict):
+        return
+    raw_rating = None
+    pick_seen = False
+    for key, value in list(rec.items()):
+        if _is_xmp_rating_key(key):
+            raw_rating = value
+            rec.setdefault("XMP-xmp:Rating", value)
+            rec["rating"] = _normalise_rating_value(value)
+        elif _is_xmp_pick_key(key):
+            pick_seen = True
+            rec.setdefault("XMP-xmpDM:pick", value)
+            rec["pick"] = _normalise_pick_value(value)
+    if not pick_seen and raw_rating is not None:
+        try:
+            if int(float(str(raw_rating))) < 0:
+                rec["pick"] = -1
+        except Exception:
+            pass
 
 
 def _normalise_text_values(values: Iterable[Any], *, split_strings: bool = False) -> list[str]:
@@ -956,53 +980,32 @@ class PhotoMetaDataReportDB(PhotoMetaData):
 # Proxy (composite)
 # ---------------------------------------------------------------------------
 
-# Fields that belong exclusively to report.db (not embedded in the image file).
-# When the proxy routes a write, these go to ReportDB; everything else to EXIF/XMP.
-_REPORT_DB_ONLY_FIELDS: frozenset[str] = frozenset({
-    "rating", "pick",
-    "has_bird", "confidence",
-    "head_sharp", "left_eye", "right_eye", "beak",
-    "nima_score", "is_flying", "flight_conf",
-    "focus_status", "focus_x", "focus_y",
-    "adj_sharpness", "adj_topiq",
-    "bird_species_cn", "bird_species_en", "birdid_confidence",
-    "exposure_status",
-    "burst_id", "burst_position",
-})
-
-
 class PhotoMetaDataProxy(PhotoMetaData):
-    """Composite metadata source that merges ReportDB, XMP sidecar and embedded EXIF.
+    """Composite metadata source that merges XMP sidecar and embedded EXIF.
 
     Read priority (highest → lowest)
     ---------------------------------
-    1. **ReportDB** – curated ratings, species, focus, AI scores
-    2. **XMP sidecar** – Lightroom-compatible tags (Title, Rating, Label …)
-    3. **EXIF embedded** – camera-original (ISO, shutter, GPS …)
+    1. **XMP sidecar** – Lightroom-compatible tags (Title, Rating, Label …)
+    2. **EXIF embedded** – camera-original and embedded XMP
 
     Write routing
     -------------
-    * ``_REPORT_DB_ONLY_FIELDS`` → :class:`PhotoMetaDataReportDB`
-    * All other fields → :class:`PhotoMetaDataEXIFEmbeded`
-      (XMP-prefixed keys also written to :class:`PhotoMetaDataXMP` sidecar)
+    * XMP-style fields, including ``rating`` / ``pick``, are written to sidecar.
+    * Non-XMP fields are written through :class:`PhotoMetaDataEXIFEmbeded`.
 
     Parameters
     ----------
-    exif, xmp, report_db:
-        Provide pre-constructed instances to share state (e.g. the same
-        ``PhotoMetaDataReportDB`` that ``DirectoryScanWorker`` updates).
-        If omitted, default instances with no pre-loaded cache are used.
+    exif, xmp:
+        Provide pre-constructed instances to share state.
     """
 
     def __init__(
         self,
         exif: PhotoMetaDataEXIFEmbeded | None = None,
         xmp: PhotoMetaDataXMP | None = None,
-        report_db: PhotoMetaDataReportDB | None = None,
     ) -> None:
         self._exif = exif or PhotoMetaDataEXIFEmbeded()
         self._xmp = xmp or PhotoMetaDataXMP()
-        self._report_db = report_db or PhotoMetaDataReportDB()
 
     # ------------------------------------------------------------------
     # Properties for direct access to sub-sources
@@ -1016,25 +1019,22 @@ class PhotoMetaDataProxy(PhotoMetaData):
     def xmp(self) -> PhotoMetaDataXMP:
         return self._xmp
 
-    @property
-    def report_db(self) -> PhotoMetaDataReportDB:
-        return self._report_db
-
     # ------------------------------------------------------------------
     # PhotoMetaData interface
     # ------------------------------------------------------------------
 
     def read(self, path: str) -> dict[str, Any]:
-        """Merge all three sources; higher-priority keys overwrite lower ones."""
+        """Merge EXIF and sidecar metadata; sidecar keys overwrite embedded keys."""
         merged: dict[str, Any] = {"SourceFile": path}
         # Apply in ascending priority order so later sources win
-        for source in (self._exif, self._xmp, self._report_db):
+        for source in (self._exif, self._xmp):
             try:
                 data = source.read(path)
                 if data:
                     merged.update(data)
             except Exception:
                 pass
+        _normalise_rating_pick_aliases(merged)
         return merged
 
     def read_exposure_settings(self, path: str) -> tuple[str, str, str]:
@@ -1042,7 +1042,7 @@ class PhotoMetaDataProxy(PhotoMetaData):
         return extract_exposure_settings(self.read(path))
 
     def read_batch(self, paths: list[str]) -> dict[str, dict[str, Any]]:
-        """Merge batch reads from all three sources (EXIF uses single exiftool call)."""
+        """Merge batch reads from EXIF and XMP sidecars."""
         norm_paths = [os.path.normpath(p) for p in paths]
         result: dict[str, dict[str, Any]] = {n: {"SourceFile": n} for n in norm_paths}
 
@@ -1063,34 +1063,37 @@ class PhotoMetaDataProxy(PhotoMetaData):
             except Exception:
                 pass
 
-        # 3. ReportDB (O(1) per file if cache loaded)
-        for p, norm in zip(paths, norm_paths):
-            try:
-                data = self._report_db.read(p)
-                if data and norm in result:
-                    result[norm].update(data)
-            except Exception:
-                pass
-
+        for rec in result.values():
+            _normalise_rating_pick_aliases(rec)
         return result
 
     def write(self, path: str, fields: dict[str, Any]) -> bool:
-        """Route fields to appropriate backends and return overall success."""
+        """Route fields to sidecar / embedded metadata and return overall success."""
         if not fields:
             return True
 
-        db_fields = {k: v for k, v in fields.items() if k in _REPORT_DB_ONLY_FIELDS}
-        file_fields = {k: v for k, v in fields.items() if k not in _REPORT_DB_ONLY_FIELDS}
-        xmp_fields = {k: v for k, v in file_fields.items() if k.upper().startswith("XMP")}
+        def is_sidecar_field(key: str) -> bool:
+            return (
+                str(key).upper().startswith("XMP")
+                or _is_xmp_rating_key(key)
+                or _is_xmp_pick_key(key)
+                or _is_xmp_subject_key(key)
+                or _is_xmp_description_key(key)
+            )
+
+        xmp_fields = {k: v for k, v in fields.items() if is_sidecar_field(k)}
+        file_fields = {k: v for k, v in fields.items() if k not in xmp_fields}
 
         success = True
-        if db_fields:
-            success = self._report_db.write(path, db_fields) and success
         if file_fields:
             success = self._exif.write(path, file_fields) and success
         if xmp_fields:
-            # Also mirror XMP fields into the sidecar (best-effort, non-fatal)
-            self._xmp.write(path, xmp_fields)
+            success = self._xmp.write(path, xmp_fields) and success
+            # Also mirror XMP fields into the source when possible; sidecar is authoritative.
+            try:
+                self._exif.write(path, xmp_fields)
+            except Exception:
+                pass
         return success
 
     def supports_write(self) -> bool:

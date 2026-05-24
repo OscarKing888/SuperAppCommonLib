@@ -64,7 +64,7 @@ from app_common.exif_io import (
     read_batch_metadata,
     run_exiftool_assignments,
 )
-from app_common.exif_io.photo_meta import PhotoMetaDataProxy, PhotoMetaDataReportDB, extract_exposure_settings
+from app_common.exif_io.photo_meta import PhotoMetaDataProxy, extract_exposure_settings
 from app_common.focus_calc import (
     extract_focus_box_for_display,
     resolve_focus_camera_type_from_metadata,
@@ -75,7 +75,6 @@ from app_common.send_to_app import get_external_apps, send_files_to_app
 from app_common.report_db import (
     ReportDB,
     report_row_to_exiftool_style,
-    EXIF_ONLY_FROM_REPORT_DB,
     get_preview_path_for_file,
     find_report_root,
 )
@@ -989,11 +988,21 @@ def _persistent_thumb_cache_dirname(size: int) -> str:
     return f"thumb_preview_{int(size)}"
 
 
-def _find_superpicky_dir(current_dir: str, max_levels: int = 4) -> str:
-    """Walk up from current_dir (up to max_levels) to find the nearest .superpicky directory.
-    Returns the .superpicky path if found, otherwise returns current_dir/.superpicky (may not exist yet)."""
+def _find_superpicky_dir(current_dir: str, max_levels: int | None = None) -> str:
+    """向上查找最近的现有 .superpicky 目录；找不到时返回空字符串。
+
+    缓存写入方只应在用户已经有 .superpicky 的目录树内创建 cache 子目录，
+    不应为了缓存主动创建新的 .superpicky 根目录。
+    """
+    if not current_dir:
+        return ""
     candidate = os.path.normpath(current_dir)
-    for _ in range(max_levels + 1):
+    if os.path.basename(candidate) == ".superpicky" and os.path.isdir(candidate):
+        return candidate
+    depth = 0
+    while candidate:
+        if max_levels is not None and depth > max_levels:
+            break
         superpicky = os.path.join(candidate, ".superpicky")
         if os.path.isdir(superpicky):
             return superpicky
@@ -1001,14 +1010,24 @@ def _find_superpicky_dir(current_dir: str, max_levels: int = 4) -> str:
         if parent == candidate:
             break
         candidate = parent
-    # Not found — default to creating one in the current dir
-    return os.path.join(os.path.normpath(current_dir), ".superpicky")
+        depth += 1
+    return ""
+
+
+def _superpicky_cache_root_dir(current_dir: str | None) -> str:
+    """返回持有 .superpicky 的 root 目录；找不到现有 .superpicky 时返回空。"""
+    superpicky_dir = _find_superpicky_dir(current_dir or "")
+    if not superpicky_dir:
+        return ""
+    return os.path.dirname(superpicky_dir)
 
 
 def _preview_cache_target_for_file(path: str, current_dir: str | None) -> str:
     if not path or not current_dir:
         return ""
     superpicky_dir = _find_superpicky_dir(current_dir)
+    if not superpicky_dir:
+        return ""
     preview_dir = os.path.join(superpicky_dir, "cache", "temp_preview")
     stem = os.path.splitext(os.path.basename(path))[0]
     if not stem:
@@ -1027,6 +1046,8 @@ def _persistent_thumb_cache_dir(current_dir: str | None, size: int) -> str:
     if not current_dir:
         return ""
     superpicky_dir = _find_superpicky_dir(current_dir)
+    if not superpicky_dir:
+        return ""
     return os.path.join(superpicky_dir, "cache", _persistent_thumb_cache_dirname(size))
 
 
@@ -1069,7 +1090,8 @@ def _persistent_thumb_cache_path_for_file(path: str, current_dir: str | None, si
     cache_dir = _persistent_thumb_cache_dir(current_dir, size)
     if not cache_dir or not path:
         return ""
-    return os.path.join(cache_dir, _persistent_thumb_cache_filename_for_file(path, current_dir))
+    cache_root_dir = _superpicky_cache_root_dir(current_dir)
+    return os.path.join(cache_dir, _persistent_thumb_cache_filename_for_file(path, cache_root_dir or current_dir))
 
 
 def _migrate_legacy_persistent_thumb_cache_path(target_path: str, legacy_path: str) -> str:

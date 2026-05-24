@@ -24,8 +24,8 @@ class FileListPanel(QWidget):
 
     # 子类可重载为 False 以不创建过滤栏（filter_bar）
     create_filter_bar = True
-    # 子类可重载为 False，以纯文件系统 + sidecar 模式工作，不读取/写入 report.db。
-    use_report_db = True
+    # report.db metadata 已停用；文件列表只读取 sidecar 和文件内 EXIF/XMP。
+    use_report_db = False
     # 子类可重载为 False，避免使用 .superpicky/cache 下的派生预览图与持久缩略图。
     use_preview_cache = True
 
@@ -47,7 +47,7 @@ class FileListPanel(QWidget):
         self._report_root_dir: str | None = None  # 当前使用的 report 根目录（含 .superpicky 的目录）
         self._report_full_root_dir: str | None = None
         self._report_full_cache: dict | None = None
-        self._meta_proxy = PhotoMetaDataProxy(report_db=PhotoMetaDataReportDB())
+        self._meta_proxy = PhotoMetaDataProxy()
         self._view_mode = self._MODE_THUMB
         self._thumb_size = 128
         self._thumbnail_loader: ThumbnailLoader | None = None
@@ -59,7 +59,7 @@ class FileListPanel(QWidget):
         self._thumb_list_model = ThumbnailListModel(self)
         self._meta_cache:    dict = {}   # norm_path → metadata dict
         self._directory_scope_cache: dict[bool, dict] = {}  # 当前目录 shallow/recursive 两个 scope 的文件列表缓存
-        self._report_cache:  dict = {}   # stem → report row (当前目录/子树筛出的 report 子集)
+        self._report_cache:  dict = {}   # legacy report row cache；sidecar/EXIF 模式下保持为空
         self._report_row_by_path: dict = {}
         self._loaded_directory_recursive: bool = False
         self._requested_directory_recursive: bool = False
@@ -78,10 +78,8 @@ class FileListPanel(QWidget):
         self._meta_apply_needs_filter: bool = False
         self._meta_apply_loader_finished: bool = True
         self._meta_filter_refresh_timer: QTimer | None = None
-        self._use_report_db = bool(getattr(type(self), "use_report_db", True))
+        self._use_report_db = False
         self._use_preview_cache = bool(getattr(type(self), "use_preview_cache", True))
-        if not self._use_report_db:
-            self._meta_proxy.report_db.update_cache({})
         self._tree_header_fast_mode: bool = False
         self._tree_last_sort_column: int = _TREE_COL_NAME
         self._tree_last_sort_order = _AscendingOrder
@@ -108,6 +106,7 @@ class FileListPanel(QWidget):
         self._deferred_file_selected_path: str = ""
         self._selection_key_nav_auto_repeat: bool = False
         self._selection_key_nav_hold_active: bool = False
+        self._thumb_selection_anchor_row: int = -1
         self._key_navigation_fps: int = get_key_navigation_fps()
         self._key_navigation_last_step_at: float = 0.0
         self._combo_key_navigation_fps: QComboBox | None = None
@@ -795,7 +794,6 @@ class FileListPanel(QWidget):
             )
             files = limited_files
         self._report_cache = dict(report_cache or {})
-        self._meta_proxy.report_db.update_cache(self._report_full_cache or self._report_cache)
         if report_row_by_path is None:
             report_row_by_path = {}
             row_cache_for_path_map = self._report_full_cache or self._report_cache or {}
@@ -911,8 +909,7 @@ class FileListPanel(QWidget):
         if not same_dir:
             self._directory_scope_cache.clear()
             self._loaded_directory_recursive = False
-        # 选择目录后，向上最多查找 4 层最近的 report 根目录；子目录共用同一个 report.db。
-        # 纯 sidecar 模式子类会关闭该行为，直接扫描原始目录。
+        # report.db metadata 已停用；保留旧字段清理，目录列表直接从文件系统扫描。
         new_report_root_dir = find_report_root(path, max_levels=4) if self._use_report_db else None
         if new_report_root_dir != self._report_root_dir:
             _log.info(
@@ -921,7 +918,6 @@ class FileListPanel(QWidget):
                 new_report_root_dir,
             )
         self._report_root_dir = new_report_root_dir
-        self._meta_proxy.report_db.update_report_root(self._report_root_dir)
         if self._report_root_dir:
             if self._report_full_root_dir != self._report_root_dir:
                 _log.info(
@@ -1084,13 +1080,6 @@ class FileListPanel(QWidget):
             cached = self._meta_cache.get(candidate)
             if isinstance(cached, dict) and cached:
                 return dict(cached)
-        for candidate in candidates:
-            try:
-                report_data = self._meta_proxy.report_db.read(candidate)
-            except Exception:
-                report_data = {}
-            if isinstance(report_data, dict) and report_data:
-                return dict(report_data)
         if not allow_slow_read:
             return {}
         try:
@@ -1108,8 +1097,8 @@ class FileListPanel(QWidget):
         """
         Return display-ready ``(shutter, aperture, iso)`` using PhotoMetaDataProxy.
 
-        Cached browser metadata and report.db rows are used first; committed
-        selections may fall back to direct proxy reads.
+        Cached browser metadata is used first; committed selections may fall
+        back to direct sidecar / embedded metadata reads.
         """
         metadata = self.get_photo_metadata_for_path(path, allow_slow_read=False)
         exposure = extract_exposure_settings(metadata)
@@ -3205,6 +3194,7 @@ class FileListPanel(QWidget):
 
     def _rebuild_views(self, stop_loaders: bool = True) -> None:
         """根据当前过滤结果重建列表/树视图与缩略图项。"""
+        self._thumb_selection_anchor_row = -1
         if stop_loaders:
             self._stop_all_loaders()
         else:
@@ -3789,7 +3779,10 @@ class FileListPanel(QWidget):
                     return True
                 if shift:
                     sm = list_widget.selectionModel()
-                    anchor = sm.anchorIndex().row() if sm and sm.anchorIndex().isValid() else idx
+                    anchor = self._thumb_selection_anchor_row
+                    if anchor < 0 or anchor >= count:
+                        anchor = idx
+                    self._thumb_selection_anchor_row = anchor
                     lo, hi = min(anchor, new_idx), max(anchor, new_idx)
                     list_widget.clearSelection()
                     for i in range(lo, hi + 1):
@@ -3798,6 +3791,7 @@ class FileListPanel(QWidget):
                             sm.select(it, _Select)
                     list_widget.setCurrentIndex(new_index)
                 else:
+                    self._thumb_selection_anchor_row = new_idx
                     list_widget.clearSelection()
                     list_widget.setCurrentIndex(new_index)
                     sm = list_widget.selectionModel()
@@ -4344,7 +4338,11 @@ class FileListPanel(QWidget):
                 float(cache_stats.get("bytes", 0)) / (1024.0 * 1024.0),
             )
 
-        preview_base_dir = (self._report_root_dir or self._current_dir) if self._use_preview_cache else ""
+        preview_base_dir = (
+            _superpicky_cache_root_dir(self._report_root_dir or self._current_dir)
+            if self._use_preview_cache
+            else ""
+        )
         self._thumb_request_token += 1
         loader = ThumbnailLoader(
             self._thumb_size,
@@ -4653,7 +4651,7 @@ class FileListPanel(QWidget):
             self._persistent_thumb_cache_done = 0
             self._update_persistent_thumb_progress_widget()
             return
-        base_dir = self._report_root_dir or self._current_dir
+        base_dir = _superpicky_cache_root_dir(self._report_root_dir or self._current_dir)
         pending_paths = ThumbnailLoader._normalize_unique_paths(paths or [])
         self._persistent_thumb_cache_pending_paths = pending_paths
         self._persistent_thumb_cache_base_dir = base_dir or ""
@@ -4664,6 +4662,12 @@ class FileListPanel(QWidget):
         self._persistent_thumb_cache_done = 0
         self._persistent_thumb_cache_current_path = ""
         if not pending_paths or not self._persistent_thumb_cache_base_dir:
+            if pending_paths:
+                _log.info(
+                    "[_schedule_persistent_thumb_cache_build] skip persistent cache: no existing .superpicky root current_dir=%r report_root=%r",
+                    self._current_dir,
+                    self._report_root_dir,
+                )
             self._update_persistent_thumb_progress_widget()
             return
         self._update_persistent_thumb_progress_widget()
@@ -5835,7 +5839,6 @@ class FileListPanel(QWidget):
                 for path, row in self._report_row_by_path.items()
                 if str((row or {}).get("filename") or Path(path).stem or "").strip() not in filename_set
             }
-        self._meta_proxy.report_db.update_cache(self._report_full_cache or self._report_cache)
         _log.info(
             "[_remove_report_cache_entries_for_filenames] removed=%s full_cache=%s selected_cache=%s path_map=%s",
             len(filename_set),
@@ -5883,7 +5886,12 @@ class FileListPanel(QWidget):
         source_path = os.path.normpath(source_path) if source_path else ""
         if not source_path:
             return []
-        preview_base_dir = self._report_root_dir or self._current_dir or os.path.dirname(source_path)
+        preview_base_dir = (
+            _superpicky_cache_root_dir(self._report_root_dir or self._current_dir or os.path.dirname(source_path))
+            or self._report_root_dir
+            or self._current_dir
+            or os.path.dirname(source_path)
+        )
         report_cache = self._report_full_cache or self._report_cache or {}
         try:
             thumb_source = _resolve_thumb_source_path(
