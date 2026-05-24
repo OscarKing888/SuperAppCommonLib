@@ -437,7 +437,7 @@ class FileTableView(QTreeView):
             self._header_labels = []
 
 
-# ── 缩略图 delegate（颜色标签 + 星级徽章）─────────────────────────────────────
+# ── 缩略图 delegate（缩略图 + 星级徽章）───────────────────────────────────────
 
 @dataclass(frozen=True)
 class ThumbViewportEntry:
@@ -813,11 +813,8 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
         selected = bool(opt.state & _StateSelected)
         hovered = bool(opt.state & _StateMouseOver)
         name = str(index.data() or "")
-        color_label = index.data(_MetaColorRole)
         rating = index.data(_MetaRatingRole)
         pick = index.data(_MetaPickRole)
-        focus_status = str(index.data(_MetaFocusRole) or "").strip()
-        species_cn = str(index.data(_MetaSpeciesCnRole) or "").strip()
         pixmap = index.data(_ThumbPixmapRole)
         if not isinstance(pixmap, QPixmap):
             pixmap = None
@@ -845,23 +842,6 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
             painter.setPen(QColor(70, 70, 70))
             painter.drawRoundedRect(thumb_rect, 6, 6)
 
-            if species_cn:
-                pad = 4
-                font_species = QFont(opt.font)
-                font_species.setPixelSize(max(9, min(11, thumb_rect.width() // 12)))
-                painter.setFont(font_species)
-                fm_s = painter.fontMetrics()
-                max_w = max(40, thumb_rect.width() - pad * 2)
-                elided_cn = fm_s.elidedText(species_cn, _ElideRight, max_w)
-                tw = min(max_w, fm_s.horizontalAdvance(elided_cn) if hasattr(fm_s, "horizontalAdvance") else fm_s.width(elided_cn)) + 8
-                th = fm_s.lineSpacing() + 4
-                badge_cn = QRect(thumb_rect.left() + pad, thumb_rect.top() + pad, tw, th)
-                painter.setBrush(QBrush(QColor(0, 0, 0, 160)))
-                painter.setPen(_NoPen)
-                painter.drawRoundedRect(badge_cn, 4, 4)
-                painter.setPen(QColor("#ffffff"))
-                painter.drawText(badge_cn.adjusted(4, 0, -4, 0), _AlignCenter, elided_cn)
-
             if pixmap is not None and not pixmap.isNull():
                 pw = max(1, pixmap.width())
                 ph = max(1, pixmap.height())
@@ -876,7 +856,6 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
                 )
                 painter.drawPixmap(draw_rect, pixmap)
 
-            has_color = bool(color_label and color_label in _COLOR_LABEL_COLORS)
             if pick == 1:
                 right_badge_text = "🏆"
                 right_badge_bg = QColor(0, 0, 0, 160)
@@ -891,19 +870,6 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
                 right_badge_fg = QColor(_STAR_SILVER_COLOR)
             else:
                 right_badge_text = ""
-
-            if has_color:
-                hex_c, cn = _COLOR_LABEL_COLORS[color_label]
-                bw, bh = 30, 16
-                badge = QRect(draw_rect.left() + 2, draw_rect.bottom() - bh - 2, bw, bh)
-                painter.setBrush(QBrush(QColor(hex_c)))
-                painter.setPen(_NoPen)
-                painter.drawRoundedRect(badge, 4, 4)
-                painter.setPen(QColor("#333" if color_label in ("Yellow", "White") else "#fff"))
-                f = QFont(opt.font)
-                f.setPixelSize(9)
-                painter.setFont(f)
-                painter.drawText(badge, _AlignCenter, cn)
 
             if right_badge_text:
                 f2 = QFont(opt.font)
@@ -921,24 +887,6 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
                 painter.drawRoundedRect(badge2, 4, 4)
                 painter.setPen(right_badge_fg)
                 painter.drawText(badge2, _AlignCenter, right_badge_text)
-
-            if focus_status:
-                focus_color = _FOCUS_STATUS_TEXT_COLORS.get(focus_status, COLORS["text_secondary"])
-                focus_font = QFont(opt.font)
-                focus_font.setPixelSize(max(10, opt.font.pixelSize() if opt.font.pixelSize() > 0 else 10))
-                painter.setFont(focus_font)
-                fm3 = painter.fontMetrics()
-                try:
-                    sw3 = fm3.horizontalAdvance(focus_status)
-                except AttributeError:
-                    sw3 = fm3.width(focus_status)
-                bw3, bh3 = sw3 + 10, 16
-                badge3 = QRect(draw_rect.right() - bw3 - 2, draw_rect.bottom() - bh3 - 2, bw3, bh3)
-                painter.setBrush(QBrush(QColor(0, 0, 0, 150)))
-                painter.setPen(_NoPen)
-                painter.drawRoundedRect(badge3, 4, 4)
-                painter.setPen(QColor(focus_color))
-                painter.drawText(badge3, _AlignCenter, focus_status)
 
             text_rect = QRect(cell.left(), thumb_rect.bottom() + 4, cell.width(), name_height)
             text_color = opt.palette.highlightedText().color() if selected else opt.palette.text().color()

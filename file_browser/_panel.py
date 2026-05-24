@@ -12,7 +12,7 @@ class FileListPanel(QWidget):
     图像文件列表面板。
 
     - 列表模式：含「文件名/标题/颜色/星级/城市/省区/国家」七列，可点击列头排序。
-    - 缩略图模式：图标网格，缩略图左下显示颜色标签、右下显示星级，
+    - 缩略图模式：图标网格，缩略图显示文件名与星级/Pick 标记，
       工具栏滑块可选 128/256/512/1024 px 四档大小。
     """
 
@@ -241,7 +241,7 @@ class FileListPanel(QWidget):
                 )
             )
             self._btn_filter_pick.clicked.connect(self._on_pick_filter_toggled)
-            filter_bar.addWidget(self._btn_filter_pick)
+            # filter_bar.addWidget(self._btn_filter_pick)
 
             # 星级按钮（1～5，单选，点击已激活按钮则取消）
             star_widths = [22, 28, 34, 40, 46]
@@ -262,7 +262,7 @@ class FileListPanel(QWidget):
                     lambda checked, rating=n: self._on_rating_filter_changed(rating)
                 )
                 self._star_btns.append(btn)
-                filter_bar.addWidget(btn)
+                # filter_bar.addWidget(btn)
 
             for focus_status in _FOCUS_FILTER_OPTIONS:
                 btn = QToolButton()
@@ -275,7 +275,7 @@ class FileListPanel(QWidget):
                     lambda checked, status=focus_status: self._on_focus_filter_changed(status)
                 )
                 self._focus_filter_btns[focus_status] = btn
-                filter_bar.addWidget(btn)
+                # filter_bar.addWidget(btn)
 
             filter_bar.addSpacing(8)
             filter_bar.addWidget(QLabel("方向键:"))
@@ -5087,17 +5087,25 @@ class FileListPanel(QWidget):
         _log.info("[_copy_filenames_to_clipboard] platform=%r copied=%s", sys.platform, copied_paths)
 
     def _add_send_to_external_app_actions(self, menu: QMenu, paths: list[str]) -> None:
-        """在右键菜单中平铺加入「发送到外部应用」各项，使用当前选中的文件列表。无配置时显示灰色提示项。"""
+        """在右键菜单中加入「发送到其它应用」子菜单，使用当前选中的文件列表。"""
+        send_menu = menu.addMenu("发送到其它应用")
         apps = get_external_apps()
         if not apps:
-            hint = menu.addAction("请在「文件 → 外部应用设置」中添加应用")
+            hint = send_menu.addAction("请在「文件 → 外部应用设置」中添加应用")
             hint.setEnabled(False)
             return
         base_dir = self.get_current_dir() or ""
+        selected_paths = list(paths or [])
         for app in apps:
-            name = f"发送到：{(app.get('name') or app.get('path') or '未命名').strip()}"
-            act = menu.addAction(name)
-            act.triggered.connect(lambda checked=False, a=app, p=paths: send_files_to_app(p, a, base_directory=base_dir))
+            name = (app.get("name") or app.get("path") or "未命名").strip()
+            act = send_menu.addAction(name)
+            act.triggered.connect(
+                lambda checked=False, a=app, p=selected_paths: send_files_to_app(
+                    p,
+                    a,
+                    base_directory=base_dir,
+                )
+            )
 
     def _add_species_menu_actions(self, menu: QMenu, primary_path: str | None, paths: list[str]) -> None:
         source_path = primary_path or (paths[0] if paths else "")
@@ -5126,7 +5134,7 @@ class FileListPanel(QWidget):
             act_preview.triggered.connect(lambda checked=False, p=sized_preview_path: reveal_in_file_manager(p))
 
         selected_preview_path = self._resolve_existing_selected_preview_image_path(source_path or "")
-        act_selected_preview = menu.addAction("浏览选鸟预览图像")
+        act_selected_preview = menu.addAction("浏览预览图像")
         act_selected_preview.setEnabled(bool(selected_preview_path))
         if selected_preview_path:
             _log.info(
@@ -5160,8 +5168,11 @@ class FileListPanel(QWidget):
         act_copy_filename.triggered.connect(lambda: self._copy_filenames_to_clipboard(paths))
         self._add_rating_menu_actions(menu, paths)
         menu.addSeparator()
-        self._add_species_menu_actions(menu, self._tree_path_from_index(index) if index.isValid() else (paths[0] if paths else ""), paths)
+        #self._add_species_menu_actions(menu, self._tree_path_from_index(index) if index.isValid() else (paths[0] if paths else ""), paths)
+        
+        self._add_photo_tag_menu_actions(menu, paths)
         menu.addSeparator()
+        
         self._add_send_to_external_app_actions(menu, paths)
         menu.addSeparator()
         label = "在Finder中显示" if sys.platform == "darwin" else "在资源管理器中显示"
@@ -5171,9 +5182,9 @@ class FileListPanel(QWidget):
             _log.info("[_on_tree_context_menu] reveal_path=%r paths=%s", reveal_path, len(paths))
             act_reveal = menu.addAction(label)
             act_reveal.triggered.connect(lambda: reveal_in_file_manager(reveal_path))
-        self._add_browse_preview_menu_action(menu, primary_path)
-        menu.addSeparator()
-        self._add_delete_menu_action(menu, paths)
+        # self._add_browse_preview_menu_action(menu, primary_path)
+        # menu.addSeparator()
+        # self._add_delete_menu_action(menu, paths)
         _exec_menu(menu, self._tree_widget.viewport().mapToGlobal(pos))
 
     def _collect_report_filenames_for_paths(self, paths: list[str]) -> list[str]:
@@ -5298,8 +5309,11 @@ class FileListPanel(QWidget):
         act_copy_filename.triggered.connect(lambda: self._copy_filenames_to_clipboard(paths))
         self._add_rating_menu_actions(menu, paths)
         menu.addSeparator()
-        self._add_species_menu_actions(menu, self._thumb_path_from_index(index) if index.isValid() else (paths[0] if paths else ""), paths)
+        #self._add_species_menu_actions(menu, self._thumb_path_from_index(index) if index.isValid() else (paths[0] if paths else ""), paths)
+        
+        self._add_photo_tag_menu_actions(menu, paths)
         menu.addSeparator()
+
         self._add_send_to_external_app_actions(menu, paths)
         menu.addSeparator()
         label = "在Finder中显示" if sys.platform == "darwin" else "在资源管理器中显示"
@@ -5309,7 +5323,7 @@ class FileListPanel(QWidget):
             _log.info("[_on_list_context_menu] reveal_path=%r paths=%s", reveal_path, len(paths))
             act_reveal = menu.addAction(label)
             act_reveal.triggered.connect(lambda: reveal_in_file_manager(reveal_path))
-        self._add_browse_preview_menu_action(menu, primary_path)
-        menu.addSeparator()
-        self._add_delete_menu_action(menu, paths)
+        # self._add_browse_preview_menu_action(menu, primary_path)
+        # menu.addSeparator()
+        # self._add_delete_menu_action(menu, paths)
         _exec_menu(menu, self._list_widget.viewport().mapToGlobal(pos))
