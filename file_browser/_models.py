@@ -4,6 +4,59 @@ from __future__ import annotations
 
 from app_common.file_browser._browser_core import *
 
+
+def _metadata_rating_value(meta: dict | None) -> int:
+    """从规范字段或原始 XMP 字段解析 0-5 星级。"""
+    if not isinstance(meta, dict):
+        return 0
+    raw = _first_non_empty(
+        meta.get("rating"),
+        meta.get("XMP-xmp:Rating"),
+        meta.get("XMP:Rating"),
+        meta.get("XMP-xmp:rating"),
+    )
+    try:
+        return max(0, min(5, int(float(str(raw or 0)))))
+    except Exception:
+        return 0
+
+
+def _metadata_pick_value(meta: dict | None) -> int:
+    """从规范字段或原始 XMP 字段解析 Pick/Reject：1/0/-1。"""
+    if not isinstance(meta, dict):
+        return 0
+    raw = _first_non_empty(
+        meta.get("pick"),
+        meta.get("XMP-xmpDM:pick"),
+        meta.get("XMP-xmpDM:Pick"),
+        meta.get("XMP-xmp:Pick"),
+        meta.get("XMP-xmp:PickLabel"),
+        meta.get("XMP:Pick"),
+        meta.get("XMP:PickLabel"),
+    )
+    if not str(raw or "").strip():
+        rating_raw = _first_non_empty(
+            meta.get("XMP-xmp:Rating"),
+            meta.get("XMP:Rating"),
+            meta.get("XMP-xmp:rating"),
+            meta.get("rating"),
+        )
+        try:
+            if int(float(str(rating_raw or 0))) < 0:
+                return -1
+        except Exception:
+            pass
+    try:
+        text = str(raw or "").strip().lower()
+        if text in ("true", "yes"):
+            return 1
+        if text in ("false", "no", ""):
+            return 0
+        return max(-1, min(1, int(float(text))))
+    except Exception:
+        return 0
+
+
 class SortableTreeItem(QTreeWidgetItem):
     """支持数值感知排序的 QTreeWidgetItem（通过 _SortRole 存储排序键）。"""
 
@@ -83,14 +136,8 @@ class FileTableModel(QAbstractTableModel):
         entry.title = str(meta.get("title", "") or "")
         entry.color = str(meta.get("color", "") or "")
         entry.color_display = _COLOR_LABEL_COLORS.get(entry.color, ("", ""))[1] or entry.color
-        try:
-            entry.rating = int(meta.get("rating", 0) or 0)
-        except Exception:
-            entry.rating = 0
-        try:
-            entry.pick = int(meta.get("pick", 0) or 0)
-        except Exception:
-            entry.pick = 0
+        entry.rating = _metadata_rating_value(meta)
+        entry.pick = _metadata_pick_value(meta)
         entry.city = str(meta.get("city", "") or "")
         entry.state = str(meta.get("state", "") or "")
         entry.country = str(meta.get("country", "") or "")
@@ -481,14 +528,8 @@ class ThumbnailListModel(QAbstractListModel):
     ) -> ThumbnailListEntry:
         norm = os.path.normpath(path)
         meta = meta_cache.get(norm, {}) if isinstance(meta_cache, dict) else {}
-        try:
-            rating = int(meta.get("rating", 0) or 0)
-        except Exception:
-            rating = 0
-        try:
-            pick = int(meta.get("pick", 0) or 0)
-        except Exception:
-            pick = 0
+        rating = _metadata_rating_value(meta)
+        pick = _metadata_pick_value(meta)
         return ThumbnailListEntry(
             path=path,
             name=Path(path).name,
@@ -604,17 +645,11 @@ class ThumbnailListModel(QAbstractListModel):
         if entry.color != new_color:
             entry.color = new_color
             changed_roles.append(_MetaColorRole)
-        try:
-            new_rating = int(meta.get("rating", 0) or 0)
-        except Exception:
-            new_rating = 0
+        new_rating = _metadata_rating_value(meta)
         if entry.rating != new_rating:
             entry.rating = new_rating
             changed_roles.append(_MetaRatingRole)
-        try:
-            new_pick = int(meta.get("pick", 0) or 0)
-        except Exception:
-            new_pick = 0
+        new_pick = _metadata_pick_value(meta)
         if entry.pick != new_pick:
             entry.pick = new_pick
             changed_roles.append(_MetaPickRole)
@@ -629,7 +664,7 @@ class ThumbnailListModel(QAbstractListModel):
         if not changed_roles:
             return False
         idx = self.index(row, 0)
-        self.dataChanged.emit(idx, idx, changed_roles)
+        self.dataChanged.emit(idx, idx, list(dict.fromkeys(changed_roles + [_DisplayRole])))
         return True
 
     def set_pixmap_for_path(self, path: str, pixmap: QPixmap | None, thumb_size: int) -> int | None:
@@ -818,37 +853,42 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
                 )
                 painter.drawPixmap(draw_rect, pixmap)
 
-            if pick == 1:
-                right_badge_text = "🏆"
-                right_badge_bg = QColor(0, 0, 0, 160)
-                right_badge_fg = QColor(COLORS["star_gold"])
-            elif pick == -1:
-                right_badge_text = "🚫"
-                right_badge_bg = QColor(0, 0, 0, 160)
-                right_badge_fg = QColor("#ffffff")
-            elif isinstance(rating, int) and rating > 0:
-                right_badge_text = "★" * min(5, rating)
-                right_badge_bg = QColor(0, 0, 0, 140)
-                right_badge_fg = QColor(_STAR_SILVER_COLOR)
-            else:
-                right_badge_text = ""
-
-            if right_badge_text:
+            def draw_badge(text: str, bg: QColor, fg: QColor, *, left: bool) -> None:
                 f2 = QFont(opt.font)
                 f2.setPixelSize(11)
                 painter.setFont(f2)
                 fm2 = painter.fontMetrics()
                 try:
-                    sw = fm2.horizontalAdvance(right_badge_text)
+                    sw = fm2.horizontalAdvance(text)
                 except AttributeError:
-                    sw = fm2.width(right_badge_text)
+                    sw = fm2.width(text)
                 bw2, bh2 = sw + 10, 16
-                badge2 = QRect(draw_rect.right() - bw2 - 2, draw_rect.top() + 2, bw2, bh2)
-                painter.setBrush(QBrush(right_badge_bg))
+                if left:
+                    badge2 = QRect(draw_rect.left() + 2, draw_rect.top() + 2, bw2, bh2)
+                else:
+                    badge2 = QRect(draw_rect.right() - bw2 - 2, draw_rect.top() + 2, bw2, bh2)
+                painter.setBrush(QBrush(bg))
                 painter.setPen(_NoPen)
                 painter.drawRoundedRect(badge2, 4, 4)
-                painter.setPen(right_badge_fg)
-                painter.drawText(badge2, _AlignCenter, right_badge_text)
+                painter.setPen(fg)
+                painter.drawText(badge2, _AlignCenter, text)
+
+            if pick == 1:
+                draw_badge("🏆", QColor(0, 0, 0, 160), QColor(COLORS["star_gold"]), left=True)
+            elif pick == -1:
+                draw_badge("🚫", QColor(0, 0, 0, 160), QColor("#ffffff"), left=True)
+
+            try:
+                rating_value = int(rating or 0)
+            except Exception:
+                rating_value = 0
+            if rating_value > 0:
+                draw_badge(
+                    "★" * min(5, rating_value),
+                    QColor(0, 0, 0, 140),
+                    QColor(_STAR_SILVER_COLOR),
+                    left=False,
+                )
 
             text_rect = QRect(cell.left(), thumb_rect.bottom() + 4, cell.width(), name_height)
             text_color = opt.palette.highlightedText().color() if selected else opt.palette.text().color()

@@ -415,7 +415,12 @@ class MetadataLoader(QThread):
             or rec.get("IFD0:XPTitle") or rec.get("IPTC:ObjectName") or ""
         )
         color = rec.get("XMP-xmp:Label") or ""
-        rating_raw = rec.get("XMP-xmp:Rating")
+        rating_raw = _first_non_empty(
+            rec.get("XMP-xmp:Rating"),
+            rec.get("XMP:Rating"),
+            rec.get("XMP-xmp:rating"),
+            rec.get("rating"),
+        )
         try:
             rating_num = int(float(str(rating_raw or 0)))
         except Exception:
@@ -429,6 +434,7 @@ class MetadataLoader(QThread):
             or rec.get("XMP-1.0:Pick") or rec.get("XMP-1.0:PickLabel")
             or rec.get("XMP-lr:Pick") or rec.get("XMP-lr:PickLabel")
             or rec.get("XMP:Pick") or rec.get("XMP:PickLabel")
+            or rec.get("pick")
             or ""
         )
         try:

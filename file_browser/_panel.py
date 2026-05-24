@@ -667,9 +667,39 @@ class FileListPanel(QWidget):
             norm_path = os.path.normpath(path) if path else ""
             if not norm_path:
                 continue
-            if norm_path not in self._meta_cache:
+            if not self._metadata_cache_has_browser_fields(self._meta_cache.get(norm_path)):
                 uncached.append(path)
         return uncached
+
+    @staticmethod
+    def _metadata_cache_has_browser_fields(meta: dict | None) -> bool:
+        """
+        判断文件列表所需的 metadata 是否已加载。
+
+        SuperViewer 会先把自定义标签同步到 _meta_cache；仅有 tags 时不能视为
+        浏览器 metadata 已加载，否则会跳过 XMP 星级/Pick/注释读取。
+        """
+        if not isinstance(meta, dict) or not meta:
+            return False
+        for key in (
+            "rating",
+            "pick",
+            "comment",
+            "title",
+            "color",
+            "country",
+            "shutter",
+            "iso",
+            "aperture",
+            "XMP-xmp:Rating",
+            "XMP-xmpDM:pick",
+            "XMP-xmpDM:Pick",
+            "XMP-xmp:Pick",
+            "XMP:Pick",
+        ):
+            if key in meta:
+                return True
+        return False
 
     def _apply_directory_listing_result(
         self,
@@ -2122,6 +2152,11 @@ class FileListPanel(QWidget):
                     exc,
                 )
                 continue
+            try:
+                from app_common.exif_io.writer import invalidate_metadata_cache
+                invalidate_metadata_cache(source_paths)
+            except Exception:
+                pass
             for source_path in source_paths:
                 self._apply_rating_state_to_meta_cache(source_path, rating=rating, pick=pick)
                 updated_paths.append(source_path)
@@ -5531,11 +5566,73 @@ class FileListPanel(QWidget):
         )
         return deleted
 
+    def _collect_thumbnail_cache_paths_for_source(self, source_path: str) -> list[str]:
+        """收集源文件对应的缩略图缓存路径；需在移动/删除源文件前调用。"""
+        source_path = os.path.normpath(source_path) if source_path else ""
+        if not source_path:
+            return []
+        preview_base_dir = self._report_root_dir or self._current_dir or os.path.dirname(source_path)
+        report_cache = self._report_full_cache or self._report_cache or {}
+        try:
+            thumb_source = _resolve_thumb_source_path(
+                source_path,
+                report_cache if self._use_preview_cache else {},
+                preview_base_dir,
+            )
+        except Exception:
+            thumb_source = ""
+        candidates = [source_path]
+        if thumb_source:
+            candidates.append(os.path.normpath(thumb_source))
+
+        cache_paths: list[str] = []
+        seen: set[str] = set()
+
+        def add_cache_path(cache_path: str) -> None:
+            if not cache_path:
+                return
+            norm = os.path.normpath(cache_path)
+            key = _path_key(norm)
+            if key in seen:
+                return
+            seen.add(key)
+            cache_paths.append(norm)
+
+        for candidate in candidates:
+            if not candidate:
+                continue
+            try:
+                mtime = float(os.path.getmtime(candidate))
+            except Exception:
+                mtime = 0.0
+            for size in _THUMB_SIZE_STEPS:
+                add_cache_path(_thumb_disk_cache_path(candidate, mtime, size))
+
+        # 持久小缩略图以原图路径命名；新版平铺和旧版 hash 分目录都清理。
+        if preview_base_dir:
+            for size in _THUMB_SIZE_STEPS:
+                add_cache_path(_persistent_thumb_cache_path_for_file(source_path, preview_base_dir, size))
+                add_cache_path(_legacy_persistent_thumb_cache_path_for_file(source_path, preview_base_dir, size))
+        return cache_paths
+
+    def _delete_thumbnail_cache_paths(self, cache_paths: list[str]) -> int:
+        deleted = 0
+        for cache_path in cache_paths or []:
+            if not cache_path or not os.path.isfile(cache_path):
+                continue
+            try:
+                os.remove(cache_path)
+                deleted += 1
+            except Exception as exc:
+                _log.debug("[_delete_thumbnail_cache_paths] failed path=%r: %s", cache_path, exc)
+        return deleted
+
     def _move_paths_to_trash(self, paths: list) -> None:
         """将选中路径移动到垃圾桶，并同步删除 report.db 中对应记录。"""
         if not paths:
             return
         ok_count = 0
+        deleted_thumb_cache_count = 0
         moved_display_paths: list[str] = []
         for p in paths:
             norm_path = os.path.normpath(p) if p else ""
@@ -5544,9 +5641,11 @@ class FileListPanel(QWidget):
             target_path = self._resolve_source_path_for_action(norm_path)
             target_path = os.path.normpath(target_path) if target_path else norm_path
             if target_path and os.path.exists(target_path):
+                thumb_cache_paths = self._collect_thumbnail_cache_paths_for_source(target_path)
                 if move_to_trash(target_path):
                     ok_count += 1
                     moved_display_paths.append(norm_path)
+                    deleted_thumb_cache_count += self._delete_thumbnail_cache_paths(thumb_cache_paths)
                     _log.info(
                         "[_move_paths_to_trash] moved source=%r target=%r",
                         norm_path,
@@ -5560,6 +5659,8 @@ class FileListPanel(QWidget):
                 )
         if moved_display_paths:
             self._delete_report_rows_for_paths(moved_display_paths)
+        if deleted_thumb_cache_count:
+            _log.info("[_move_paths_to_trash] deleted_thumb_cache=%s", deleted_thumb_cache_count)
         if ok_count and self._current_dir:
             self.load_directory(self._current_dir, force_reload=True)
 
