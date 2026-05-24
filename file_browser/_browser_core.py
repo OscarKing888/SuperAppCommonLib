@@ -785,7 +785,51 @@ def _platform_copy_key_sequence() -> "QKeySequence":
             return QKeySequence(standard_key)
         except Exception:
             pass
-    return QKeySequence("Meta+C" if sys.platform == "darwin" else "Ctrl+C")
+    return QKeySequence("Ctrl+C")
+
+
+def _platform_cut_key_sequence() -> "QKeySequence":
+    """Return the native Cut shortcut sequence for macOS / Windows."""
+    standard_key = None
+    standard_key_enum = getattr(QKeySequence, "StandardKey", None)
+    if standard_key_enum is not None:
+        standard_key = getattr(standard_key_enum, "Cut", None)
+    if standard_key is None:
+        standard_key = getattr(QKeySequence, "Cut", None)
+    if standard_key is not None:
+        try:
+            bindings = QKeySequence.keyBindings(standard_key)
+            if bindings:
+                return bindings[0]
+        except Exception:
+            pass
+        try:
+            return QKeySequence(standard_key)
+        except Exception:
+            pass
+    return QKeySequence("Ctrl+X")
+
+
+def _platform_paste_key_sequence() -> "QKeySequence":
+    """Return the native Paste shortcut sequence for macOS / Windows."""
+    standard_key = None
+    standard_key_enum = getattr(QKeySequence, "StandardKey", None)
+    if standard_key_enum is not None:
+        standard_key = getattr(standard_key_enum, "Paste", None)
+    if standard_key is None:
+        standard_key = getattr(QKeySequence, "Paste", None)
+    if standard_key is not None:
+        try:
+            bindings = QKeySequence.keyBindings(standard_key)
+            if bindings:
+                return bindings[0]
+        except Exception:
+            pass
+        try:
+            return QKeySequence(standard_key)
+        except Exception:
+            pass
+    return QKeySequence("Ctrl+V")
 
 
 def _key_sequence_native_text(sequence: "QKeySequence") -> str:

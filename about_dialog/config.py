@@ -10,8 +10,7 @@ import os
 _DEFAULT_ABOUT = {
     "app_name": "{app_name}",
     "version": "{version}",
-    "作者": "徒步追鸟(osk.ch)",
-    "我的小红书": "https://xhslink.com/m/A2cowPsYj8P",
+    "作者": "徒步追鸟(osk.ch)"
 }
 
 

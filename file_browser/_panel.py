@@ -2,10 +2,16 @@
 """File list panel implementation for app_common.file_browser."""
 from __future__ import annotations
 
+import json
+import shutil
+
 from app_common.file_browser._browser_core import *
 from app_common.file_browser._models import *
 from app_common.file_browser._thumbnail import *
 from app_common.file_browser._workers import *
+
+_FILE_CLIPBOARD_ACTION_MIME = "application/x-superbirdtools-file-action"
+_FILE_CLIPBOARD_ENTRIES_MIME = "application/x-superbirdtools-file-entries"
 
 class FileListPanel(QWidget):
     """
@@ -478,14 +484,33 @@ class FileListPanel(QWidget):
         self._update_size_controls()
         self._update_selection_status()
 
-        # Cmd+C / Ctrl+C 复制选中文件到剪贴板
+        self._file_action_shortcuts: list[QShortcut] = []
+
+        # macOS 使用 Cmd，Windows/Linux 使用 Ctrl；菜单显示也复用同一组快捷键。
         copy_shortcut = QShortcut(_platform_copy_key_sequence(), self)
         try:
             copy_shortcut.setContext(_WidgetWithChildrenShortcut)
         except Exception:
             pass
         copy_shortcut.activated.connect(self._copy_current_selection_to_clipboard)
-        self._file_action_shortcuts: list[QShortcut] = []
+        self._file_action_shortcuts.append(copy_shortcut)
+
+        cut_shortcut = QShortcut(_platform_cut_key_sequence(), self)
+        try:
+            cut_shortcut.setContext(_WidgetWithChildrenShortcut)
+        except Exception:
+            pass
+        cut_shortcut.activated.connect(self._cut_current_selection_to_clipboard)
+        self._file_action_shortcuts.append(cut_shortcut)
+
+        paste_shortcut = QShortcut(_platform_paste_key_sequence(), self)
+        try:
+            paste_shortcut.setContext(_WidgetWithChildrenShortcut)
+        except Exception:
+            pass
+        paste_shortcut.activated.connect(self._paste_clipboard_to_current_dir)
+        self._file_action_shortcuts.append(paste_shortcut)
+
         self._install_file_action_shortcut("Q", "reject")
         self._install_file_action_shortcut("`", "pick")
         self._install_file_action_shortcut("~", "pick")
@@ -500,6 +525,17 @@ class FileListPanel(QWidget):
         else:
             paths = []
         self._copy_paths_to_clipboard(paths)
+
+    def _cut_current_selection_to_clipboard(self) -> None:
+        """将当前选中文件及其 sidecar 标记为剪切。"""
+        w = self._stack.currentWidget()
+        if w is self._tree_widget:
+            paths = self._tree_selected_paths()
+        elif w is self._list_widget:
+            paths = self._thumb_selected_paths()
+        else:
+            paths = []
+        self._cut_paths_to_clipboard(paths)
 
     def _install_file_action_shortcut(self, sequence: str, action_kind: str) -> None:
         shortcut = QShortcut(QKeySequence(sequence), self)
@@ -5319,49 +5355,92 @@ class FileListPanel(QWidget):
         if path:
             self._handle_selection_preview_request(path)
 
-    def _copy_paths_to_clipboard(self, paths: list) -> None:
-        """将本地文件路径写入剪贴板；若存在同名 XMP sidecar 也一并复制。"""
-        expanded_paths: list[str] = []
+    def _collect_file_clipboard_entries(self, paths: list) -> list[dict[str, str]]:
+        """收集主文件与 sidecar 配对，供复制/剪切/粘贴复用。"""
+        entries: list[dict[str, str]] = []
         seen: set[str] = set()
-
         for p in paths:
             if not p:
                 continue
             abs_path = self._resolve_source_path_for_action(p)
             source_exists = bool(abs_path and os.path.isfile(abs_path))
-            if source_exists:
-                abs_path = os.path.abspath(abs_path)
-                norm_key = os.path.normcase(os.path.normpath(abs_path))
-                if norm_key not in seen:
-                    expanded_paths.append(abs_path)
-                    seen.add(norm_key)
+            if not source_exists:
+                _log.info("[_collect_file_clipboard_entries] source=%r resolved=%r reason=missing", p, abs_path)
+                continue
+            abs_path = os.path.abspath(abs_path)
+            norm_key = os.path.normcase(os.path.normpath(abs_path))
+            if norm_key in seen:
+                continue
+            seen.add(norm_key)
 
             # 同步带上 sidecar（如 IMG_0001.CR3 -> IMG_0001.xmp）
             xmp_path = self._resolve_sidecar_path(p)
             xmp_exists = bool(xmp_path and os.path.isfile(xmp_path))
+            abs_xmp = ""
             if xmp_exists:
                 abs_xmp = os.path.abspath(xmp_path)
-                xmp_key = os.path.normcase(os.path.normpath(abs_xmp))
-                if xmp_key not in seen:
-                    expanded_paths.append(abs_xmp)
-                    seen.add(xmp_key)
+            entries.append({"source": abs_path, "sidecar": abs_xmp})
             _log.info(
-                "[_copy_paths_to_clipboard] source=%r resolved_source=%r source_exists=%s xmp_path=%r xmp_exists=%s",
+                "[_collect_file_clipboard_entries] source=%r resolved_source=%r source_exists=%s xmp_path=%r xmp_exists=%s",
                 p,
                 abs_path,
                 source_exists,
                 xmp_path,
                 xmp_exists,
             )
+        return entries
+
+    @staticmethod
+    def _expanded_paths_from_clipboard_entries(entries: list[dict[str, str]]) -> list[str]:
+        expanded_paths: list[str] = []
+        seen: set[str] = set()
+        for entry in entries or []:
+            for key in ("source", "sidecar"):
+                path = str((entry or {}).get(key) or "").strip()
+                if not path:
+                    continue
+                norm_key = os.path.normcase(os.path.normpath(path))
+                if norm_key in seen:
+                    continue
+                seen.add(norm_key)
+                expanded_paths.append(path)
+        return expanded_paths
+
+    def _set_file_clipboard(self, entries: list[dict[str, str]], *, action: str) -> None:
+        expanded_paths = self._expanded_paths_from_clipboard_entries(entries)
 
         if not expanded_paths:
-            _log.info("[_copy_paths_to_clipboard] nothing_to_copy input=%s", len(paths))
+            _log.info("[_set_file_clipboard] nothing_to_clipboard action=%r entries=%s", action, len(entries or []))
             return
         mime = QMimeData()
         mime.setUrls([QUrl.fromLocalFile(p) for p in expanded_paths])
         mime.setText("\n".join(expanded_paths))
+        try:
+            mime.setData(_FILE_CLIPBOARD_ACTION_MIME, str(action or "copy").encode("utf-8"))
+            mime.setData(
+                _FILE_CLIPBOARD_ENTRIES_MIME,
+                json.dumps(entries, ensure_ascii=False).encode("utf-8"),
+            )
+        except Exception as exc:
+            _log.warning("[_set_file_clipboard] custom mime failed action=%r: %s", action, exc)
         QApplication.clipboard().setMimeData(mime)
-        _log.info("[_copy_paths_to_clipboard] platform=%r copied=%s", sys.platform, expanded_paths)
+        _log.info("[_set_file_clipboard] platform=%r action=%r paths=%s", sys.platform, action, expanded_paths)
+
+    def _copy_paths_to_clipboard(self, paths: list) -> None:
+        """将本地文件路径写入剪贴板；若存在同名 XMP sidecar 也一并复制。"""
+        entries = self._collect_file_clipboard_entries(paths)
+        if not entries:
+            _log.info("[_copy_paths_to_clipboard] nothing_to_copy input=%s", len(paths))
+            return
+        self._set_file_clipboard(entries, action="copy")
+
+    def _cut_paths_to_clipboard(self, paths: list) -> None:
+        """将本地文件路径写入剪贴板并标记为剪切；sidecar 会跟随主文件。"""
+        entries = self._collect_file_clipboard_entries(paths)
+        if not entries:
+            _log.info("[_cut_paths_to_clipboard] nothing_to_cut input=%s", len(paths))
+            return
+        self._set_file_clipboard(entries, action="cut")
 
     def _copy_filenames_to_clipboard(self, paths: list[str]) -> None:
         """Copy file full paths as plain text, one per line, without sidecars."""
@@ -5391,6 +5470,239 @@ class FileListPanel(QWidget):
 
         QApplication.clipboard().setText("\n".join(copied_paths))
         _log.info("[_copy_filenames_to_clipboard] platform=%r copied=%s", sys.platform, copied_paths)
+
+    def _clipboard_file_payload(self) -> tuple[str, list[dict[str, str]]]:
+        """读取剪贴板文件 payload；内部剪切/复制优先，外部 URL 作为复制处理。"""
+        mime = QApplication.clipboard().mimeData()
+        if mime is None:
+            return "copy", []
+        action = "copy"
+        entries: list[dict[str, str]] = []
+        try:
+            if mime.hasFormat(_FILE_CLIPBOARD_ACTION_MIME):
+                raw_action = bytes(mime.data(_FILE_CLIPBOARD_ACTION_MIME)).decode("utf-8", errors="replace").strip().lower()
+                if raw_action in ("copy", "cut"):
+                    action = raw_action
+            if mime.hasFormat(_FILE_CLIPBOARD_ENTRIES_MIME):
+                raw_entries = bytes(mime.data(_FILE_CLIPBOARD_ENTRIES_MIME)).decode("utf-8", errors="replace")
+                decoded = json.loads(raw_entries)
+                if isinstance(decoded, list):
+                    for item in decoded:
+                        if not isinstance(item, dict):
+                            continue
+                        source = os.path.abspath(str(item.get("source") or ""))
+                        sidecar = os.path.abspath(str(item.get("sidecar") or "")) if item.get("sidecar") else ""
+                        if source and os.path.isfile(source):
+                            entries.append({"source": source, "sidecar": sidecar if os.path.isfile(sidecar) else ""})
+                    if entries:
+                        return action, entries
+        except Exception as exc:
+            _log.warning("[_clipboard_file_payload] custom payload parse failed: %s", exc)
+
+        url_paths: list[str] = []
+        try:
+            for url in mime.urls() if mime.hasUrls() else []:
+                if not url.isLocalFile():
+                    continue
+                path = os.path.abspath(url.toLocalFile())
+                if os.path.isfile(path):
+                    url_paths.append(path)
+        except Exception:
+            url_paths = []
+        return "copy", self._clipboard_entries_from_urls(url_paths)
+
+    @staticmethod
+    def _clipboard_entries_from_urls(paths: list[str]) -> list[dict[str, str]]:
+        """将外部文件 URL 尽量按主文件 + 同 stem .xmp 配对。"""
+        norm_paths: list[str] = []
+        seen: set[str] = set()
+        for path in paths or []:
+            if not path:
+                continue
+            abs_path = os.path.abspath(path)
+            key = os.path.normcase(os.path.normpath(abs_path))
+            if key in seen or not os.path.isfile(abs_path):
+                continue
+            seen.add(key)
+            norm_paths.append(abs_path)
+
+        xmp_by_stem: dict[tuple[str, str], str] = {}
+        for path in norm_paths:
+            if Path(path).suffix.lower() == ".xmp":
+                xmp_by_stem[(os.path.normcase(os.path.dirname(path)), Path(path).stem)] = path
+
+        paired_xmps: set[str] = set()
+        entries: list[dict[str, str]] = []
+        for path in norm_paths:
+            if Path(path).suffix.lower() == ".xmp":
+                continue
+            sidecar = xmp_by_stem.get((os.path.normcase(os.path.dirname(path)), Path(path).stem), "")
+            if sidecar:
+                paired_xmps.add(os.path.normcase(os.path.normpath(sidecar)))
+            entries.append({"source": path, "sidecar": sidecar})
+
+        for path in norm_paths:
+            key = os.path.normcase(os.path.normpath(path))
+            if Path(path).suffix.lower() == ".xmp" and key not in paired_xmps:
+                entries.append({"source": path, "sidecar": ""})
+        return entries
+
+    def _can_paste_files_from_clipboard(self) -> bool:
+        dest_dir = self.get_current_dir()
+        if not dest_dir or not os.path.isdir(dest_dir):
+            return False
+        _action, entries = self._clipboard_file_payload()
+        return bool(entries)
+
+    @staticmethod
+    def _same_file_path(path_a: str, path_b: str) -> bool:
+        if not path_a or not path_b:
+            return False
+        try:
+            return os.path.samefile(path_a, path_b)
+        except Exception:
+            return os.path.normcase(os.path.normpath(path_a)) == os.path.normcase(os.path.normpath(path_b))
+
+    def _unique_paste_destination_pair(
+        self,
+        source_path: str,
+        sidecar_path: str,
+        dest_dir: str,
+        *,
+        action: str,
+    ) -> tuple[str, str]:
+        """计算主文件和 sidecar 的目标路径，避免覆盖并保持 sidecar 同 stem。"""
+        source = Path(source_path)
+        sidecar_suffix = Path(sidecar_path).suffix if sidecar_path else ".xmp"
+        base_stem = source.stem
+        suffix = source.suffix
+
+        for i in range(0, 10000):
+            if i == 0:
+                stem = base_stem
+            elif action == "copy":
+                stem = f"{base_stem} copy" if i == 1 else f"{base_stem} copy {i}"
+            else:
+                stem = f"{base_stem} {i}"
+            dest_source = os.path.normpath(os.path.join(dest_dir, f"{stem}{suffix}"))
+            dest_sidecar = os.path.normpath(os.path.join(dest_dir, f"{stem}{sidecar_suffix}")) if sidecar_path else ""
+
+            source_conflict = os.path.exists(dest_source) and not (
+                action == "cut" and self._same_file_path(source_path, dest_source)
+            )
+            sidecar_conflict = bool(dest_sidecar) and os.path.exists(dest_sidecar) and not (
+                action == "cut" and self._same_file_path(sidecar_path, dest_sidecar)
+            )
+            if not source_conflict and not sidecar_conflict:
+                return dest_source, dest_sidecar
+        raise RuntimeError(f"无法为 {source.name} 生成不冲突的目标文件名。")
+
+    def _paste_clipboard_to_current_dir(self) -> None:
+        """将剪贴板中的文件粘贴到当前目录；内部剪切会移动，复制会复制。"""
+        dest_dir = self.get_current_dir()
+        if not dest_dir or not os.path.isdir(dest_dir):
+            _log.info("[_paste_clipboard_to_current_dir] skip reason=no_current_dir dir=%r", dest_dir)
+            return
+        action, entries = self._clipboard_file_payload()
+        if not entries:
+            _log.info("[_paste_clipboard_to_current_dir] skip reason=no_clipboard_files")
+            return
+
+        pasted_sources: list[str] = []
+        touched_paths: list[str] = []
+        failures: list[str] = []
+        for entry in entries:
+            source_path = os.path.abspath(str(entry.get("source") or ""))
+            sidecar_path = os.path.abspath(str(entry.get("sidecar") or "")) if entry.get("sidecar") else ""
+            if not source_path or not os.path.isfile(source_path):
+                failures.append(source_path or "(empty)")
+                continue
+            try:
+                dest_source, dest_sidecar = self._unique_paste_destination_pair(
+                    source_path,
+                    sidecar_path if sidecar_path and os.path.isfile(sidecar_path) else "",
+                    dest_dir,
+                    action=action,
+                )
+                if action == "cut":
+                    if not self._same_file_path(source_path, dest_source):
+                        shutil.move(source_path, dest_source)
+                        touched_paths.extend([source_path, dest_source])
+                    if sidecar_path and os.path.isfile(sidecar_path) and dest_sidecar and not self._same_file_path(sidecar_path, dest_sidecar):
+                        shutil.move(sidecar_path, dest_sidecar)
+                        touched_paths.extend([sidecar_path, dest_sidecar])
+                else:
+                    shutil.copy2(source_path, dest_source)
+                    touched_paths.extend([dest_source])
+                    if sidecar_path and os.path.isfile(sidecar_path) and dest_sidecar:
+                        shutil.copy2(sidecar_path, dest_sidecar)
+                        touched_paths.extend([dest_sidecar])
+                pasted_sources.append(dest_source)
+                _log.info(
+                    "[_paste_clipboard_to_current_dir] action=%r source=%r sidecar=%r dest=%r dest_sidecar=%r",
+                    action,
+                    source_path,
+                    sidecar_path,
+                    dest_source,
+                    dest_sidecar,
+                )
+            except Exception as exc:
+                _log.warning(
+                    "[_paste_clipboard_to_current_dir] action=%r source=%r sidecar=%r failed: %s",
+                    action,
+                    source_path,
+                    sidecar_path,
+                    exc,
+                )
+                failures.append(source_path)
+
+        if touched_paths:
+            try:
+                from app_common.exif_io.writer import invalidate_metadata_cache
+                invalidate_metadata_cache(touched_paths)
+            except Exception:
+                pass
+        if action == "cut" and pasted_sources and not failures:
+            try:
+                QApplication.clipboard().clear()
+            except Exception:
+                pass
+        if pasted_sources:
+            self.load_directory(dest_dir, force_reload=True)
+            self.set_pending_selection(pasted_sources, current_path=pasted_sources[0], apply_immediately=True)
+        _log.info(
+            "[_paste_clipboard_to_current_dir] action=%r pasted=%s failed=%s dest_dir=%r",
+            action,
+            len(pasted_sources),
+            len(failures),
+            dest_dir,
+        )
+
+    def _add_file_clipboard_menu_actions(self, menu: QMenu, paths: list[str]) -> None:
+        act_copy = menu.addAction("复制")
+        _apply_context_menu_shortcut(act_copy, _platform_copy_key_sequence())
+        act_copy.triggered.connect(lambda checked=False, p=list(paths or []): self._copy_paths_to_clipboard(p))
+
+        act_cut = menu.addAction("剪切")
+        _apply_context_menu_shortcut(act_cut, _platform_cut_key_sequence())
+        act_cut.setEnabled(bool(paths))
+        act_cut.triggered.connect(lambda checked=False, p=list(paths or []): self._cut_paths_to_clipboard(p))
+
+        act_paste = menu.addAction("粘贴到当前目录")
+        _apply_context_menu_shortcut(act_paste, _platform_paste_key_sequence())
+        act_paste.setEnabled(self._can_paste_files_from_clipboard())
+        act_paste.triggered.connect(lambda checked=False: self._paste_clipboard_to_current_dir())
+
+    def _show_empty_file_context_menu(self, viewport, pos) -> bool:
+        """空目录/空白区域右键时，只要剪贴板可粘贴就显示粘贴菜单。"""
+        if not self._can_paste_files_from_clipboard():
+            return False
+        menu = QMenu(self)
+        act_paste = menu.addAction("粘贴到当前目录")
+        _apply_context_menu_shortcut(act_paste, _platform_paste_key_sequence())
+        act_paste.triggered.connect(lambda checked=False: self._paste_clipboard_to_current_dir())
+        _exec_menu(menu, viewport.mapToGlobal(pos))
+        return True
 
     def _add_send_to_external_app_actions(self, menu: QMenu, paths: list[str]) -> None:
         """在右键菜单中加入「发送到其它应用」子菜单，使用当前选中的文件列表。"""
@@ -5466,11 +5778,11 @@ class FileListPanel(QWidget):
             if p:
                 paths = [p]
         if not paths:
+            if self._show_empty_file_context_menu(self._tree_widget.viewport(), pos):
+                return
             return
         menu = QMenu(self)
-        act_copy = menu.addAction("复制")
-        _apply_context_menu_shortcut(act_copy, _platform_copy_key_sequence())
-        act_copy.triggered.connect(lambda: self._copy_paths_to_clipboard(paths))
+        self._add_file_clipboard_menu_actions(menu, paths)
         act_copy_filename = menu.addAction("复制文件全路径")
         act_copy_filename.triggered.connect(lambda: self._copy_filenames_to_clipboard(paths))
         self._add_rating_menu_actions(menu, paths)
@@ -5677,11 +5989,11 @@ class FileListPanel(QWidget):
             if p:
                 paths = [p]
         if not paths:
+            if self._show_empty_file_context_menu(self._list_widget.viewport(), pos):
+                return
             return
         menu = QMenu(self)
-        act_copy = menu.addAction("复制")
-        _apply_context_menu_shortcut(act_copy, _platform_copy_key_sequence())
-        act_copy.triggered.connect(lambda: self._copy_paths_to_clipboard(paths))
+        self._add_file_clipboard_menu_actions(menu, paths)
         act_copy_filename = menu.addAction("复制文件全路径")
         act_copy_filename.triggered.connect(lambda: self._copy_filenames_to_clipboard(paths))
         self._add_rating_menu_actions(menu, paths)
