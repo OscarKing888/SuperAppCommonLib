@@ -5174,20 +5174,36 @@ class FileListPanel(QWidget):
 
     def _emit_file_selected_for_path(self, path: str) -> None:
         """更新当前显示路径并发出 file_selected，供点击与键盘选择共用。"""
+        t0 = _time.perf_counter()
         if not path:
             return
         self._selected_display_path = os.path.normpath(path)
+        status_t0 = _time.perf_counter()
         self._update_selection_status()
+        status_ms = (_time.perf_counter() - status_t0) * 1000.0
+        resolve_t0 = _time.perf_counter()
         resolved_path = self._resolve_source_path_for_action(path)
         if not resolved_path or not os.path.isfile(resolved_path):
             self._request_actual_path_lookup(path)
+        resolve_ms = (_time.perf_counter() - resolve_t0) * 1000.0
         _log.info(
             "[_emit_file_selected_for_path] source=%r resolved=%r exists=%s",
             path,
             resolved_path,
             os.path.isfile(resolved_path) if resolved_path else False,
         )
+        emit_t0 = _time.perf_counter()
         self.file_selected.emit(resolved_path or path)
+        emit_ms = (_time.perf_counter() - emit_t0) * 1000.0
+        _log.info(
+            "[PERF][image_switch][FileListPanel.emit_file_selected] source=%r resolved=%r status_ms=%.1f resolve_ms=%.1f emit_slots_ms=%.1f total_ms=%.1f",
+            path,
+            resolved_path or path,
+            status_ms,
+            resolve_ms,
+            emit_ms,
+            (_time.perf_counter() - t0) * 1000.0,
+        )
 
     def _on_tree_item_clicked(self, index) -> None:
         path = self._tree_path_from_index(index)

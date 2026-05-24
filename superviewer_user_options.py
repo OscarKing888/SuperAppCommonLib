@@ -7,8 +7,8 @@ import sys
 import threading
 
 USER_OPTIONS_FILENAME = "SuperViewerUser.cfg"
-PERSISTENT_THUMB_SIZE_LEVELS = (128, 256, 512)
-KEY_NAVIGATION_FPS_OPTIONS = (8, 10, 12, 13, 15, 20, 24, 25, 30, 40, 48, 50, 60, 120)
+PERSISTENT_THUMB_SIZE_LEVELS = (128, 256, 512, 1024)
+KEY_NAVIGATION_FPS_OPTIONS = (1, 2, 4, 8, 10, 12, 13, 15, 20, 24, 25, 30, 40, 45, 50, 60, 120)
 
 _OPTIONS_LOCK = threading.RLock()
 _DEFAULT_CPU_COUNT = max(1, os.cpu_count() or 1)
