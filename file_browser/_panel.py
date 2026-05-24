@@ -18,6 +18,10 @@ class FileListPanel(QWidget):
 
     # 子类可重载为 False 以不创建过滤栏（filter_bar）
     create_filter_bar = True
+    # 子类可重载为 False，以纯文件系统 + sidecar 模式工作，不读取/写入 report.db。
+    use_report_db = True
+    # 子类可重载为 False，避免使用 .superpicky/cache 下的派生预览图与持久缩略图。
+    use_preview_cache = True
 
     file_selected = pyqtSignal(str)
     file_fast_preview_requested = pyqtSignal(str)
@@ -67,6 +71,10 @@ class FileListPanel(QWidget):
         self._meta_apply_needs_filter: bool = False
         self._meta_apply_loader_finished: bool = True
         self._meta_filter_refresh_timer: QTimer | None = None
+        self._use_report_db = bool(getattr(type(self), "use_report_db", True))
+        self._use_preview_cache = bool(getattr(type(self), "use_preview_cache", True))
+        if not self._use_report_db:
+            self._meta_proxy.report_db.update_cache({})
         self._tree_header_fast_mode: bool = False
         self._tree_last_sort_column: int = _TREE_COL_NAME
         self._tree_last_sort_order = _AscendingOrder
@@ -646,6 +654,12 @@ class FileListPanel(QWidget):
         if path != self._current_dir:
             _log.info("[_apply_directory_listing_result] IGNORE stale path=%r current=%r", path, self._current_dir)
             return
+        if not self._use_report_db:
+            report_cache = {}
+            full_report_cache = None
+            report_row_by_path = {}
+            self._report_full_root_dir = None
+            self._report_full_cache = None
         if self._report_root_dir:
             self._report_full_root_dir = self._report_root_dir
             if full_report_cache is not None:
@@ -798,8 +812,9 @@ class FileListPanel(QWidget):
         if not same_dir:
             self._directory_scope_cache.clear()
             self._loaded_directory_recursive = False
-        # 选择目录后，向上最多查找 4 层最近的 report 根目录；子目录共用同一个 report.db
-        new_report_root_dir = find_report_root(path, max_levels=4)
+        # 选择目录后，向上最多查找 4 层最近的 report 根目录；子目录共用同一个 report.db。
+        # 纯 sidecar 模式子类会关闭该行为，直接扫描原始目录。
+        new_report_root_dir = find_report_root(path, max_levels=4) if self._use_report_db else None
         if new_report_root_dir != self._report_root_dir:
             _log.info(
                 "[load_directory] report_root_dir changed old=%r new=%r",
@@ -892,7 +907,8 @@ class FileListPanel(QWidget):
             recursive,
             self._report_root_dir,
             self._report_full_cache if self._report_root_dir and self._report_full_root_dir == self._report_root_dir else None,
-            self,
+            use_report_db=self._use_report_db,
+            parent=self,
         )
         self._directory_scan_worker.scan_finished.connect(self._on_directory_scan_finished)
         self._directory_scan_worker.start()
@@ -1037,7 +1053,7 @@ class FileListPanel(QWidget):
             filename = str(Path(norm_path).stem or "").strip()
 
         db_updated = False
-        if report_fields and filename:
+        if self._use_report_db and report_fields and filename:
             db_dir = self._report_root_dir or self._current_dir
             db = ReportDB.open_if_exists(db_dir) if db_dir else None
             if db is not None:
@@ -1453,6 +1469,9 @@ class FileListPanel(QWidget):
         if not payload:
             _log.info("[_paste_species_to_paths] skip reason=no_copied_species")
             return
+        if not self._use_report_db:
+            _log.info("[_paste_species_to_paths] skip reason=report_db_disabled")
+            return
         db_dir = self._report_root_dir or self._current_dir
         db = ReportDB.open_if_exists(db_dir) if db_dir else None
         if db is None:
@@ -1795,7 +1814,7 @@ class FileListPanel(QWidget):
         *,
         report_db_available: bool,
     ) -> str:
-        if report_db_available:
+        if self._use_report_db and report_db_available:
             row = self._get_report_row_for_path(path)
             if isinstance(row, dict):
                 filename = str(row.get("filename") or Path(path).stem or "").strip()
@@ -1928,6 +1947,9 @@ class FileListPanel(QWidget):
         rating: int | None = None,
         pick: int | None = None,
     ) -> list[str]:
+        if not self._use_report_db:
+            _log.info("[_apply_rating_state_via_report_db] skip reason=report_db_disabled")
+            return []
         db_dir = self._report_root_dir or self._current_dir
         db = ReportDB.open_if_exists(db_dir) if db_dir else None
         if db is None:
@@ -2037,9 +2059,9 @@ class FileListPanel(QWidget):
         unique_paths = self._unique_norm_paths(paths)
         if not unique_paths:
             return
-        db_dir = self._report_root_dir or self._current_dir
         db_exists = False
-        if db_dir:
+        db_dir = self._report_root_dir or self._current_dir
+        if self._use_report_db and db_dir:
             db_probe = ReportDB.open_if_exists(db_dir)
             db_exists = db_probe is not None
             if db_probe is not None:
@@ -2159,7 +2181,7 @@ class FileListPanel(QWidget):
 
     def _resolve_preview_path_for_tooltip(self, path: str) -> str:
         norm_path = os.path.normpath(path) if path else ""
-        if not norm_path:
+        if not norm_path or not self._use_preview_cache:
             return ""
         preview_base_dir = self._report_root_dir or self._current_dir
         report_cache = self._report_full_cache or self._report_cache or {}
@@ -2172,7 +2194,7 @@ class FileListPanel(QWidget):
 
     def _resolve_existing_sized_preview_image_path(self, path: str) -> str:
         norm_path = os.path.normpath(path) if path else ""
-        if not norm_path:
+        if not norm_path or not self._use_preview_cache:
             return ""
         preview_base_dir = self._report_root_dir or self._current_dir
         if not preview_base_dir:
@@ -2203,7 +2225,7 @@ class FileListPanel(QWidget):
 
     def _resolve_existing_selected_preview_image_path(self, path: str) -> str:
         norm_path = os.path.normpath(path) if path else ""
-        if not norm_path:
+        if not norm_path or not self._use_preview_cache:
             return ""
         preview_base_dir = self._report_root_dir or self._current_dir
         if not preview_base_dir:
@@ -2537,6 +2559,8 @@ class FileListPanel(QWidget):
         if not norm_path:
             return path
         actual_path = self._get_actual_path_for_display(norm_path)
+        if not self._use_preview_cache:
+            return actual_path or norm_path
         preview_base_dir = self._report_root_dir or self._current_dir
         report_cache = self._report_full_cache or self._report_cache or {}
         source_path = actual_path or norm_path
@@ -3961,7 +3985,7 @@ class FileListPanel(QWidget):
             self._thumb_list_model.clear_all_pixmaps()
             self._update_thumb_display()
             self._schedule_visible_thumbnail_update()
-        if self._all_files:
+        if self._all_files and self._use_preview_cache:
             self._schedule_persistent_thumb_cache_build(self._all_files)
         else:
             self._update_persistent_thumb_progress_widget()
@@ -3976,7 +4000,7 @@ class FileListPanel(QWidget):
                 self._thumb_list_model.clear_all_pixmaps()
                 self._update_thumb_display()
                 self._schedule_visible_thumbnail_update()
-            if self._all_files:
+            if self._all_files and self._use_preview_cache:
                 self._schedule_persistent_thumb_cache_build(self._all_files)
             else:
                 self._update_persistent_thumb_progress_widget()
@@ -4058,7 +4082,7 @@ class FileListPanel(QWidget):
                 float(cache_stats.get("bytes", 0)) / (1024.0 * 1024.0),
             )
 
-        preview_base_dir = self._report_root_dir or self._current_dir
+        preview_base_dir = (self._report_root_dir or self._current_dir) if self._use_preview_cache else ""
         self._thumb_request_token += 1
         loader = ThumbnailLoader(
             self._thumb_size,
@@ -4305,6 +4329,13 @@ class FileListPanel(QWidget):
         self._persistent_thumb_progress.show()
 
     def _schedule_persistent_thumb_cache_build(self, paths: list[str] | None) -> None:
+        if not self._use_preview_cache:
+            self._persistent_thumb_cache_pending_paths = []
+            self._persistent_thumb_cache_base_dir = ""
+            self._persistent_thumb_cache_total = 0
+            self._persistent_thumb_cache_done = 0
+            self._update_persistent_thumb_progress_widget()
+            return
         base_dir = self._report_root_dir or self._current_dir
         pending_paths = ThumbnailLoader._normalize_unique_paths(paths or [])
         self._persistent_thumb_cache_pending_paths = pending_paths
@@ -5226,6 +5257,9 @@ class FileListPanel(QWidget):
         )
 
     def _delete_report_rows_for_paths(self, paths: list[str]) -> int:
+        if not self._use_report_db:
+            _log.info("[_delete_report_rows_for_paths] skip reason=report_db_disabled")
+            return 0
         filenames = self._collect_report_filenames_for_paths(paths)
         if not filenames:
             _log.info("[_delete_report_rows_for_paths] skip reason=no_filenames")

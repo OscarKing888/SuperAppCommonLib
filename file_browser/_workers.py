@@ -15,6 +15,7 @@ class DirectoryScanWorker(QThread):
         recursive: bool,
         report_root: str | None = None,
         report_cache_full: dict | None = None,
+        use_report_db: bool = True,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -22,20 +23,24 @@ class DirectoryScanWorker(QThread):
         self._recursive = recursive
         self._report_root = report_root
         self._report_cache_full = report_cache_full
+        self._use_report_db = bool(use_report_db)
 
     def run(self) -> None:
         _log.info(
-            "[DirectoryScanWorker.run] START path=%r recursive=%s report_root=%r has_cached_full_report=%s",
+            "[DirectoryScanWorker.run] START path=%r recursive=%s report_root=%r use_report_db=%s has_cached_full_report=%s",
             self._path,
             self._recursive,
             self._report_root,
+            self._use_report_db,
             self._report_cache_full is not None,
         )
         report_cache: dict = {}
-        full_report_cache: dict | None = self._report_cache_full
-        report_source_available = self._report_cache_full is not None
+        full_report_cache: dict | None = self._report_cache_full if self._use_report_db else None
+        report_source_available = self._use_report_db and self._report_cache_full is not None
         try:
-            if self._report_cache_full is not None:
+            if not self._use_report_db:
+                _log.info("[DirectoryScanWorker.run] report load disabled")
+            elif self._report_cache_full is not None:
                 report_cache = self._report_cache_full
                 _log.info("[DirectoryScanWorker.run] reuse cached full report_cache %s entries", len(report_cache))
             else:
