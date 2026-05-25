@@ -2,8 +2,14 @@
 跨平台文件/目录隐藏工具
 """
 import os
+import shutil
 import subprocess
 import sys
+
+SUPERPICKY_DIRNAME = ".superpicky"
+SUPERPICKY_TRASH_DIRNAME = "deleted"
+SUPERPICKY_TRASH_ENV_VAR = "SUPERPICKY_TRASH_ENABLED"
+MOVE_TO_SUPERPICKY_TRASH_BY_DEFAULT = True
 
 
 def hide_path(path):
@@ -98,8 +104,125 @@ def unhide_path(path):
     return True
 
 
-def move_to_trash(path):
+def _path_key(path):
+    try:
+        return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+    except Exception:
+        return ""
+
+
+def _is_same_or_child_path(parent, child):
+    parent_key = _path_key(parent)
+    child_key = _path_key(child)
+    if not parent_key or not child_key:
+        return False
+    try:
+        return os.path.commonpath([parent_key, child_key]) == parent_key
+    except Exception:
+        return False
+
+
+def _superpicky_trash_enabled(use_superpicky_trash):
+    if use_superpicky_trash is not None:
+        return bool(use_superpicky_trash)
+    env_value = os.environ.get(SUPERPICKY_TRASH_ENV_VAR, "")
+    if env_value.strip():
+        return env_value.strip().lower() not in {"0", "false", "no", "off"}
+    return MOVE_TO_SUPERPICKY_TRASH_BY_DEFAULT
+
+
+def _find_superpicky_dir_for_path(path):
+    if not path:
+        return ""
+    try:
+        target = os.path.normpath(os.path.abspath(path))
+    except Exception:
+        return ""
+    candidate = target if os.path.isdir(target) else os.path.dirname(target)
+    if os.path.basename(candidate) == SUPERPICKY_DIRNAME and os.path.isdir(candidate):
+        return candidate
+    while candidate:
+        superpicky_dir = os.path.join(candidate, SUPERPICKY_DIRNAME)
+        if os.path.isdir(superpicky_dir):
+            return os.path.normpath(superpicky_dir)
+        parent = os.path.dirname(candidate)
+        if parent == candidate:
+            break
+        candidate = parent
+    return ""
+
+
+def _unique_destination_path(dest_path, source_is_dir=False):
+    if not os.path.lexists(dest_path):
+        return dest_path
+    parent = os.path.dirname(dest_path)
+    name = os.path.basename(dest_path)
+    if source_is_dir:
+        stem = name
+        suffix = ""
+    else:
+        stem, suffix = os.path.splitext(name)
+    for index in range(1, 10000):
+        candidate = os.path.join(parent, f"{stem} ({index}){suffix}")
+        if not os.path.lexists(candidate):
+            return candidate
+    return ""
+
+
+def _superpicky_trash_destination_for_path(path):
+    try:
+        source_abs = os.path.normpath(os.path.abspath(path))
+    except Exception:
+        return ""
+    superpicky_dir = _find_superpicky_dir_for_path(source_abs)
+    if not superpicky_dir:
+        return ""
+
+    superpicky_abs = os.path.normpath(os.path.abspath(superpicky_dir))
+    root_abs = os.path.dirname(superpicky_abs)
+    if _is_same_or_child_path(superpicky_abs, source_abs):
+        return ""
+    if _is_same_or_child_path(source_abs, superpicky_abs):
+        return ""
+    if not _is_same_or_child_path(root_abs, source_abs):
+        return ""
+
+    try:
+        rel_path = os.path.relpath(source_abs, root_abs)
+    except Exception:
+        return ""
+    if (
+        not rel_path
+        or rel_path == os.curdir
+        or rel_path == os.pardir
+        or rel_path.startswith(os.pardir + os.sep)
+    ):
+        return ""
+
+    dest_path = os.path.join(superpicky_abs, SUPERPICKY_TRASH_DIRNAME, rel_path)
+    if _is_same_or_child_path(source_abs, dest_path):
+        return ""
+    return _unique_destination_path(dest_path, source_is_dir=os.path.isdir(source_abs))
+
+
+def _move_to_superpicky_trash(path):
+    dest_path = _superpicky_trash_destination_for_path(path)
+    if not dest_path:
+        return None
+    try:
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        moved_path = shutil.move(os.path.normpath(os.path.abspath(path)), dest_path)
+        return bool(moved_path and os.path.lexists(moved_path))
+    except Exception:
+        return False
+
+
+def move_to_trash(path, *, use_superpicky_trash=None):
     """
+    By default, first moves files under an existing .superpicky root to
+    .superpicky/deleted/<relative original path>. Pass use_superpicky_trash=False,
+    or set SUPERPICKY_TRASH_ENABLED=0, to use the previous system-trash behavior.
+
     将文件或目录移动到系统垃圾桶（回收站），可恢复。
 
     优先使用 Send2Trash；若未安装则在 macOS 回退到 osascript / Finder，
@@ -113,6 +236,10 @@ def move_to_trash(path):
     """
     if not path or not os.path.exists(path):
         return False
+    if _superpicky_trash_enabled(use_superpicky_trash):
+        superpicky_result = _move_to_superpicky_trash(path)
+        if superpicky_result is not None:
+            return bool(superpicky_result)
     try:
         import send2trash
         send2trash.send2trash(path)
@@ -186,7 +313,7 @@ def _dir_is_effectively_empty(dir_path: str) -> bool:
     return all(e.lower() in _IGNORABLE_NAMES for e in entries)
 
 
-def move_empty_dirs_to_trash(root_path, include_root=False):
+def move_empty_dirs_to_trash(root_path, include_root=False, *, use_superpicky_trash=None):
     """
     Move empty directories under ``root_path`` to the system trash.
 
@@ -227,7 +354,7 @@ def move_empty_dirs_to_trash(root_path, include_root=False):
             continue
         if not _dir_is_effectively_empty(current_abs):
             continue
-        if move_to_trash(current_abs):
+        if move_to_trash(current_abs, use_superpicky_trash=use_superpicky_trash):
             moved.append(current_abs)
         else:
             failed.append(current_abs)
