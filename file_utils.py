@@ -472,7 +472,13 @@ def reveal_in_file_manager(path):
             args = ["open", "-R", norm_path]
         elif os.name == "nt":
             if os.path.isfile(norm_path):
-                args = ["explorer.exe", f"/select,{norm_path}"]
+                # Explorer expects the path quoted after the comma:
+                #   explorer.exe /select,"C:\path with spaces\file.jpg"
+                # Passing ["/select,C:\path with spaces\file.jpg"] lets
+                # subprocess quote the whole argument, which Explorer can
+                # misparse and open the wrong location.
+                subprocess.Popen(f'explorer.exe /select,"{norm_path}"')
+                return True
             else:
                 args = ["explorer.exe", norm_path]
         else:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 
+from app_common.perf_probe import elapsed_ms, perf_counter, perf_log, perf_probes_enabled
 from app_common.file_browser._browser_core import *
 from app_common.file_browser._models import *
 from app_common.file_browser._thumbnail import *
@@ -120,7 +121,7 @@ class FileListPanel(QWidget):
         self._persistent_thumb_cache_total: int = 0
         self._persistent_thumb_cache_done: int = 0
         self._persistent_thumb_cache_current_path: str = ""
-        self._thumb_profile_enabled: bool = _THUMB_PROFILE_ENABLED
+        self._thumb_profile_enabled: bool = _thumb_profile_enabled()
         self._thumb_profile_last_report_at: float = 0.0
         self._thumb_profile_window_started_at: float = _time.perf_counter()
         self._thumb_profile_ready_received_at: dict[str, float] = {}
@@ -850,12 +851,22 @@ class FileListPanel(QWidget):
         self._schedule_persistent_thumb_cache_build(self._all_files)
 
     def _refresh_filter_scope(self) -> None:
+        probe_t0 = perf_counter()
         if not self._current_dir or not os.path.isdir(self._current_dir):
             self._apply_filter()
+            perf_log(_log, "[filter.scope] reason=no_current_dir elapsed_ms=%.1f", elapsed_ms(probe_t0))
             return
         target_recursive = self._has_any_filter()
         if target_recursive == self._loaded_directory_recursive:
             self._apply_filter()
+            perf_log(
+                _log,
+                "[filter.scope] reason=same_scope recursive=%s all=%s visible=%s elapsed_ms=%.1f",
+                target_recursive,
+                len(self._all_files),
+                len(self._filtered_files),
+                elapsed_ms(probe_t0),
+            )
             return
         # 从当前目录切换到递归范围时，先在现有数据集上即时过滤一版，随后异步补齐子目录结果。
         if target_recursive and not self._loaded_directory_recursive:
@@ -873,6 +884,15 @@ class FileListPanel(QWidget):
             force_reload=True,
             preserve_meta_cache=True,
             reuse_cached_listing=True,
+        )
+        perf_log(
+            _log,
+            "[filter.scope] reason=reload target_recursive=%s previous_recursive=%s selected=%s all=%s elapsed_ms=%.1f",
+            target_recursive,
+            self._loaded_directory_recursive,
+            len(selected_paths),
+            len(self._all_files),
+            elapsed_ms(probe_t0),
         )
 
     def load_directory(
@@ -2209,6 +2229,7 @@ class FileListPanel(QWidget):
         rating: int | None = None,
         pick: int | None = None,
     ) -> None:
+        probe_t0 = perf_counter()
         unique_paths = self._unique_norm_paths(paths)
         if not unique_paths:
             return
@@ -2234,10 +2255,16 @@ class FileListPanel(QWidget):
             else:
                 file_paths.append(path)
         updated_paths: list[str] = []
+        report_ms = 0.0
+        file_ms = 0.0
         if report_paths:
+            apply_t0 = perf_counter()
             updated_paths.extend(self._apply_rating_state_via_report_db(report_paths, rating=rating, pick=pick))
+            report_ms = elapsed_ms(apply_t0)
         if file_paths:
+            apply_t0 = perf_counter()
             updated_paths.extend(self._apply_rating_state_via_exif(file_paths, rating=rating, pick=pick))
+            file_ms = elapsed_ms(apply_t0)
         source_summary = ", ".join(
             f"{name}={count}" for name, count in source_counts.items() if count > 0
         ) or "none"
@@ -2249,8 +2276,21 @@ class FileListPanel(QWidget):
                 pick,
                 len(unique_paths),
             )
+            perf_log(
+                _log,
+                "[rating] updated=0 sources=%s selected=%s rating=%r pick=%r report_ms=%.1f file_ms=%.1f total_ms=%.1f",
+                source_summary,
+                len(unique_paths),
+                rating,
+                pick,
+                report_ms,
+                file_ms,
+                elapsed_ms(probe_t0),
+            )
             return
+        refresh_t0 = perf_counter()
         self._refresh_metadata_state_for_paths(updated_paths)
+        refresh_ms = elapsed_ms(refresh_t0)
         _log.info(
             "[_set_rating_state_for_paths] sources=%s rating=%r pick=%r selected=%s updated=%s",
             source_summary,
@@ -2258,6 +2298,19 @@ class FileListPanel(QWidget):
             pick,
             len(unique_paths),
             len(updated_paths),
+        )
+        perf_log(
+            _log,
+            "[rating] sources=%s selected=%s updated=%s rating=%r pick=%r report_ms=%.1f file_ms=%.1f refresh_ms=%.1f total_ms=%.1f",
+            source_summary,
+            len(unique_paths),
+            len(updated_paths),
+            rating,
+            pick,
+            report_ms,
+            file_ms,
+            refresh_ms,
+            elapsed_ms(probe_t0),
         )
 
     def _add_rating_menu_actions(self, menu: QMenu, paths: list[str]) -> None:
@@ -3316,8 +3369,11 @@ class FileListPanel(QWidget):
         fr = self._filter_min_rating
         ff = self._filter_focus_status
         t0 = _time.perf_counter()
+        probe_t0 = perf_counter()
         selected_paths, current_path = self._capture_selection_restore_state()
+        compute_t0 = perf_counter()
         filtered = self._compute_filtered_files()
+        compute_ms = elapsed_ms(compute_t0)
         old_filtered = list(self._filtered_files)
         self._filtered_files = filtered
         _log.info(
@@ -3339,18 +3395,51 @@ class FileListPanel(QWidget):
                 reason="apply_filter_unchanged",
             )
             _log.info("[_apply_filter] SKIP unchanged elapsed=%.3fs", _time.perf_counter() - t0)
+            perf_log(
+                _log,
+                "[filter.apply] unchanged=1 all=%s visible=%s text=%r pick=%s reject=%s rating=%s focus=%r compute_ms=%.1f total_ms=%.1f",
+                len(self._all_files),
+                len(filtered),
+                ft or "",
+                fp,
+                fx,
+                fr,
+                ff or "",
+                compute_ms,
+                elapsed_ms(probe_t0),
+            )
             return
+        rebuild_t0 = perf_counter()
         self._rebuild_views(stop_loaders=False)
+        rebuild_ms = elapsed_ms(rebuild_t0)
+        restore_t0 = perf_counter()
         self._restore_selection_after_view_change(
             selected_paths,
             current_path,
             reason="apply_filter",
         )
+        restore_ms = elapsed_ms(restore_t0)
         _log.info(
             "[_apply_filter] END visible=%s hidden=%s elapsed=%.3fs",
             len(filtered),
             max(0, len(self._all_files) - len(filtered)),
             _time.perf_counter() - t0,
+        )
+        perf_log(
+            _log,
+            "[filter.apply] unchanged=0 all=%s visible=%s hidden=%s text=%r pick=%s reject=%s rating=%s focus=%r compute_ms=%.1f rebuild_ms=%.1f restore_ms=%.1f total_ms=%.1f",
+            len(self._all_files),
+            len(filtered),
+            max(0, len(self._all_files) - len(filtered)),
+            ft or "",
+            fp,
+            fx,
+            fr,
+            ff or "",
+            compute_ms,
+            rebuild_ms,
+            restore_ms,
+            elapsed_ms(probe_t0),
         )
 
     def _on_filter_text_changed(self, _text: str) -> None:
@@ -4274,6 +4363,7 @@ class FileListPanel(QWidget):
         return True
 
     def apply_user_options(self) -> None:
+        self._thumb_profile_enabled = _thumb_profile_enabled()
         self._thumb_loader_workers = _thumbnail_loader_worker_count()
         self._set_key_navigation_fps(get_key_navigation_fps(), persist=False)
         self._invalidate_visible_thumbnail_signature()
@@ -4945,7 +5035,8 @@ class FileListPanel(QWidget):
         self._meta_progress.setMaximum(max(1, self._meta_apply_expected_total))
         self._meta_progress.setValue(0)
         self._meta_progress.show()
-        _log.info(
+        perf_log(
+            _log,
             "[STAT][_meta_apply] begin tree_items=%s list_items=%s expected_total=%s batch=%s",
             self._tree_source_row_count(),
             self._thumb_row_count(),
@@ -5040,7 +5131,8 @@ class FileListPanel(QWidget):
     def _flush_meta_filter_refresh(self) -> None:
         if not self._meta_apply_needs_filter:
             return
-        _log.info(
+        perf_log(
+            _log,
             "[STAT][_meta_apply] incremental filter refresh applied=%s queued=%s expected=%s",
             self._meta_apply_index,
             self._meta_apply_total,
@@ -5062,7 +5154,8 @@ class FileListPanel(QWidget):
         self._meta_progress.setMaximum(max(1, self._meta_apply_expected_total or self._meta_apply_total))
         self._meta_progress.setValue(min(self._meta_apply_index, self._meta_progress.maximum()))
         self._meta_progress.show()
-        _log.info(
+        perf_log(
+            _log,
             "[STAT][_meta_apply] enqueue batch=%s queued_total=%s applied=%s expected=%s",
             len(ordered_batch),
             self._meta_apply_total,
@@ -5077,7 +5170,7 @@ class FileListPanel(QWidget):
         if self._meta_filter_refresh_timer is not None and self._meta_filter_refresh_timer.isActive():
             self._meta_filter_refresh_timer.stop()
         sort_t0 = _time.perf_counter()
-        _log.info("[STAT][_meta_apply] enabling tree sorting")
+        perf_log(_log, "[STAT][_meta_apply] enabling tree sorting")
         self._set_tree_header_fast_mode(False)
         self._tree_widget.setSortingEnabled(True)
         self._apply_tree_sort(
@@ -5087,25 +5180,26 @@ class FileListPanel(QWidget):
         )
         self._refresh_tree_row_numbers()
         self._replay_selection_visibility_restore("finish_meta_apply.sort")
-        _log.info("[STAT][_meta_apply] tree sorting enabled elapsed=%.3fs", _time.perf_counter() - sort_t0)
+        perf_log(_log, "[STAT][_meta_apply] tree sorting enabled elapsed=%.3fs", _time.perf_counter() - sort_t0)
 
         if self._view_mode == self._MODE_THUMB:
             paint_t0 = _time.perf_counter()
             self._list_widget.viewport().update()
             self._invalidate_visible_thumbnail_signature()
             self._schedule_visible_thumbnail_update()
-            _log.info("[STAT][_meta_apply] list viewport updated elapsed=%.3fs", _time.perf_counter() - paint_t0)
+            perf_log(_log, "[STAT][_meta_apply] list viewport updated elapsed=%.3fs", _time.perf_counter() - paint_t0)
 
         if self._meta_apply_needs_filter:
             _log.info("[_meta_apply] final _apply_filter")
             filter_t0 = _time.perf_counter()
             self._apply_filter()
-            _log.info("[STAT][_meta_apply] _apply_filter elapsed=%.3fs", _time.perf_counter() - filter_t0)
+            perf_log(_log, "[STAT][_meta_apply] _apply_filter elapsed=%.3fs", _time.perf_counter() - filter_t0)
 
         self._meta_progress.setValue(self._meta_progress.maximum())
         QTimer.singleShot(400, self._meta_progress.hide)
         elapsed = (_time.perf_counter() - self._meta_apply_started_at) if self._meta_apply_started_at > 0 else 0.0
-        _log.info(
+        perf_log(
+            _log,
             "[STAT][_meta_apply] total elapsed=%.3fs applied=%s queued_total=%s expected=%s",
             elapsed,
             self._meta_apply_index,
@@ -5149,7 +5243,8 @@ class FileListPanel(QWidget):
         self._meta_apply_index = end
         self._meta_progress.setValue(min(end, self._meta_progress.maximum()))
         if end % 1000 == 0 or end >= total:
-            _log.info(
+            perf_log(
+                _log,
                 "[STAT][_meta_apply] apply_meta progress=%s/%s tree_hits=%s list_hits=%s expected=%s elapsed=%.3fs",
                 end,
                 total,
@@ -5160,7 +5255,8 @@ class FileListPanel(QWidget):
             )
 
         if end >= total:
-            _log.info(
+            perf_log(
+                _log,
                 "[STAT][_meta_apply] apply_meta drained tree_hits=%s list_hits=%s loader_finished=%s elapsed=%.3fs",
                 self._meta_apply_tree_hits,
                 self._meta_apply_list_hits,
@@ -5297,28 +5393,33 @@ class FileListPanel(QWidget):
         comment_cnt = 0
         tag_cnt = 0
         rating_pos_cnt = 0
-        for m in meta_dict.values():
-            try:
-                if _metadata_comment_from_meta(m):
-                    comment_cnt += 1
-                if _metadata_tags_from_meta(m):
-                    tag_cnt += 1
-                if int(float(str(m.get("rating", 0) or 0))) > 0:
-                    rating_pos_cnt += 1
-            except Exception:
-                pass
-        _log.info(
+        should_log_probe = perf_probes_enabled()
+        if should_log_probe:
+            for m in meta_dict.values():
+                try:
+                    if _metadata_comment_from_meta(m):
+                        comment_cnt += 1
+                    if _metadata_tags_from_meta(m):
+                        tag_cnt += 1
+                    if int(float(str(m.get("rating", 0) or 0))) > 0:
+                        rating_pos_cnt += 1
+                except Exception:
+                    pass
+        perf_log(
+            _log,
             "[STAT][_on_metadata_batch_ready] meta_cache updated entries=%s cache_size=%s elapsed=%.3fs",
             total,
             len(self._meta_cache),
             _time.perf_counter() - t0,
         )
-        _log.info(
-            "[STAT][_on_metadata_batch_ready] richness comment=%s tags=%s rating>0=%s",
-            comment_cnt,
-            tag_cnt,
-            rating_pos_cnt,
-        )
+        if should_log_probe:
+            perf_log(
+                _log,
+                "[STAT][_on_metadata_batch_ready] richness comment=%s tags=%s rating>0=%s",
+                comment_cnt,
+                tag_cnt,
+                rating_pos_cnt,
+            )
         self._enqueue_meta_apply(meta_dict)
 
     def _on_metadata_focus_cache_batch_ready(self, focus_dict: dict) -> None:
@@ -5348,6 +5449,7 @@ class FileListPanel(QWidget):
     def _emit_file_selected_for_path(self, path: str) -> None:
         """更新当前显示路径并发出 file_selected，供点击与键盘选择共用。"""
         t0 = _time.perf_counter()
+        probe_t0 = perf_counter()
         if not path:
             return
         self._selected_display_path = os.path.normpath(path)
@@ -5368,7 +5470,8 @@ class FileListPanel(QWidget):
         emit_t0 = _time.perf_counter()
         self.file_selected.emit(resolved_path or path)
         emit_ms = (_time.perf_counter() - emit_t0) * 1000.0
-        _log.info(
+        perf_log(
+            _log,
             "[PERF][image_switch][FileListPanel.emit_file_selected] source=%r resolved=%r status_ms=%.1f resolve_ms=%.1f emit_slots_ms=%.1f total_ms=%.1f",
             path,
             resolved_path or path,
@@ -5376,6 +5479,17 @@ class FileListPanel(QWidget):
             resolve_ms,
             emit_ms,
             (_time.perf_counter() - t0) * 1000.0,
+        )
+        perf_log(
+            _log,
+            "[image.select] source=%r resolved=%r exists=%s status_ms=%.1f resolve_ms=%.1f emit_slots_ms=%.1f total_ms=%.1f",
+            path,
+            resolved_path or path,
+            os.path.isfile(resolved_path) if resolved_path else False,
+            status_ms,
+            resolve_ms,
+            emit_ms,
+            elapsed_ms(probe_t0),
         )
 
     def _on_tree_item_clicked(self, index) -> None:

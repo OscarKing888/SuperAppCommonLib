@@ -42,6 +42,7 @@ import time as _time
 from typing import Callable
 
 from app_common.log import get_logger
+from app_common.perf_probe import perf_log
 
 try:
     from PyQt6.QtCore import QPointF, QRectF, Qt, pyqtSignal
@@ -516,7 +517,8 @@ class PreviewCanvas(QLabel):
             self._update_cursor()
             self.update()
             self._emit_display_scale_percent_changed(force=True)
-            _log.info(
+            perf_log(
+                _log,
                 "[PERF][image_switch][PreviewCanvas.set_source_pixmap] cleared size=%s view_ms=%.1f clear_ms=%.1f total_ms=%.1f",
                 source_size,
                 view_ms,
@@ -554,7 +556,8 @@ class PreviewCanvas(QLabel):
         self.update()
         self._emit_display_scale_percent_changed(force=True)
         layout_ms = (_time.perf_counter() - layout_t0) * 1000.0
-        _log.info(
+        perf_log(
+            _log,
             "[PERF][image_switch][PreviewCanvas.set_source_pixmap] size=%s reset=%s preserve_view=%s preserve_scale=%s view_ms=%.1f scale_ms=%.1f layout_ms=%.1f total_ms=%.1f",
             source_size,
             bool(reset_view),

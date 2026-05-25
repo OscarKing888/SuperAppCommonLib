@@ -217,7 +217,7 @@ class ThumbnailLoader(QThread):
         self._seq = 0                      # monotonic counter for stable FIFO within same priority
         self._queue_lock = threading.Lock()
         self._profile_lock = threading.Lock()
-        self._profile_enabled = _THUMB_PROFILE_ENABLED
+        self._profile_enabled = _thumb_profile_enabled()
         self._profile_started_at = _time.perf_counter()
         self._profile_enqueued_visible = 0
         self._profile_enqueued_prefetch = 0

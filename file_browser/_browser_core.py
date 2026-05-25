@@ -69,6 +69,7 @@ from app_common.focus_calc import (
     extract_focus_box_for_display,
     resolve_focus_camera_type_from_metadata,
 )
+from app_common.perf_probe import perf_probes_enabled
 from app_common.log import get_logger
 from app_common.file_utils import reveal_in_file_manager, move_to_trash, move_empty_dirs_to_trash
 from app_common.send_to_app import get_external_apps, send_files_to_app
@@ -339,7 +340,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 _DEBUG_FILE_LIST_LIMIT = max(0, _env_int("SuperViewer_DEBUG_FILE_LIST_LIMIT", 0))
 _DEBUG_FILE_LIST_MATCH = (os.environ.get("SuperViewer_DEBUG_FILE_LIST_MATCH", "") or "").strip().lower()
-_THUMB_PROFILE_ENABLED = _env_flag("SuperViewer_THUMB_PROFILE", True)
+_THUMB_PROFILE_ENABLED = _env_flag("SuperViewer_THUMB_PROFILE", False)
 _THUMB_PROFILE_VERBOSE = _env_flag("SuperViewer_THUMB_PROFILE_VERBOSE", False)
 _THUMB_PROFILE_REPORT_INTERVAL_S = max(0.25, _env_int("SuperViewer_THUMB_PROFILE_INTERVAL_MS", 1500) / 1000.0)
 _THUMB_BOTTLENECK_SAMPLE_LIMIT = max(256, _env_int("SuperViewer_THUMB_BOTTLENECK_SAMPLE_LIMIT", 50000))
@@ -362,8 +363,12 @@ _THUMB_BOTTLENECK_SAMPLES: dict[str, list[float]] = {
 }
 
 
+def _thumb_profile_enabled() -> bool:
+    return bool(_THUMB_PROFILE_ENABLED or perf_probes_enabled())
+
+
 def _record_thumb_bottleneck_sample(metric: str, value_ms: float) -> None:
-    if not _THUMB_PROFILE_ENABLED:
+    if not _thumb_profile_enabled():
         return
     try:
         sample = float(value_ms)
@@ -379,7 +384,7 @@ def _record_thumb_bottleneck_sample(metric: str, value_ms: float) -> None:
 
 
 def _log_thumb_bottleneck_summary() -> None:
-    if not _THUMB_PROFILE_ENABLED:
+    if not _thumb_profile_enabled():
         return
     with _THUMB_BOTTLENECK_LOCK:
         snapshot = {
