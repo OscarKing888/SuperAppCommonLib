@@ -27,6 +27,16 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+from .xmp_sidecar_edits import (
+    acquire_compact_lock,
+    delete_edit_files,
+    has_pending_edits,
+    load_pending_edits,
+    release_compact_lock,
+    sidecar_sha256,
+    write_edit_file,
+)
+
 
 # ---------------------------------------------------------------------------
 # Abstract base
@@ -288,6 +298,7 @@ class PhotoMetaDataXMP(PhotoMetaData):
         try:
             from .xmp_sidecar import read_xmp_sidecar
             rows = read_xmp_sidecar(path)
+            self._compact_pending_edits(path, self.sidecar_path_for(path))
             if not rows:
                 return {}
             rec: dict[str, Any] = {"SourceFile": path}
@@ -403,23 +414,17 @@ class PhotoMetaDataXMP(PhotoMetaData):
 
     def read_subjects(self, path: str) -> list[str]:
         """Read XMP ``dc:subject`` values as an ordered, de-duplicated list."""
-        sidecar_path = self.sidecar_path_for(path)
-        if not sidecar_path.is_file():
-            return []
         try:
-            root = ET.parse(sidecar_path).getroot()
+            from .xmp_sidecar import read_xmp_sidecar
+            rows = read_xmp_sidecar(path)
+            self._compact_pending_edits(path, self.sidecar_path_for(path))
         except Exception:
             return []
 
         values: list[str] = []
-        for desc in root.iter(_RDF_DESCRIPTION_TAG):
-            attr_value = desc.attrib.get(_XMP_DC_SUBJECT_TAG)
-            if attr_value:
-                values.extend(_normalise_subject_value(attr_value, split_strings=True))
-            for child in desc:
-                if child.tag != _XMP_DC_SUBJECT_TAG:
-                    continue
-                values.extend(self._subject_values_from_element(child))
+        for group, name, value in rows:
+            if group == "XMP-dc" and str(name).lower() == "subject":
+                values.extend(_normalise_subject_value(value, split_strings=True))
         return _normalise_text_values(values)
 
     def write_subjects(self, path: str, subjects: Iterable[Any]) -> bool:
@@ -429,40 +434,38 @@ class PhotoMetaDataXMP(PhotoMetaData):
         removes the ``dc:subject`` node while leaving the sidecar itself intact.
         """
         clean_subjects = _normalise_text_values(subjects)
-        sidecar_path = self.sidecar_path_for(path)
-        try:
-            tree = self._load_or_create_xmp_tree(sidecar_path)
-            if tree is None:
-                return False
-            root = tree.getroot()
-            desc = self._ensure_description(root)
-            self._replace_subject_node(desc, clean_subjects)
-            sidecar_path.parent.mkdir(parents=True, exist_ok=True)
-            ok = self._write_tree_atomic(tree, sidecar_path)
-            if ok:
-                self._invalidate_metadata_cache(path)
-            return ok
-        except Exception:
-            return False
+        return self._append_sidecar_edit(
+            path,
+            [{"field": "subject", "op": "set", "values": clean_subjects}],
+        )
+
+    def add_subjects(self, path: str, subjects: Iterable[Any]) -> bool:
+        """Append XMP ``dc:subject`` values without replacing concurrent tags."""
+        clean_subjects = _normalise_text_values(subjects)
+        if not clean_subjects:
+            return True
+        return self._append_sidecar_edit(
+            path,
+            [{"field": "subject", "op": "add", "values": clean_subjects}],
+        )
+
+    def remove_subjects(self, path: str, subjects: Iterable[Any]) -> bool:
+        """Remove XMP ``dc:subject`` values without replacing concurrent tags."""
+        clean_subjects = _normalise_text_values(subjects)
+        if not clean_subjects:
+            return True
+        return self._append_sidecar_edit(
+            path,
+            [{"field": "subject", "op": "remove", "values": clean_subjects}],
+        )
 
     def write_description(self, path: str, description: Any) -> bool:
         """Replace XMP ``dc:description`` text in the sidecar."""
         text = "" if description is None else str(description)
-        sidecar_path = self.sidecar_path_for(path)
-        try:
-            tree = self._load_or_create_xmp_tree(sidecar_path)
-            if tree is None:
-                return False
-            root = tree.getroot()
-            desc = self._ensure_description(root)
-            self._replace_simple_text_node(desc, _XMP_DC_DESCRIPTION_TAG, text)
-            sidecar_path.parent.mkdir(parents=True, exist_ok=True)
-            ok = self._write_tree_atomic(tree, sidecar_path)
-            if ok:
-                self._invalidate_metadata_cache(path)
-            return ok
-        except Exception:
-            return False
+        return self._append_sidecar_edit(
+            path,
+            [{"field": "description", "op": "set", "value": text}],
+        )
 
     def write_rating_pick(
         self,
@@ -472,34 +475,115 @@ class PhotoMetaDataXMP(PhotoMetaData):
         pick: int | None = None,
     ) -> bool:
         """Write Lightroom-style rating and Pick/Reject state into the sidecar."""
+        operations: list[dict[str, Any]] = []
+        if rating is not None:
+            operations.append({"field": "rating", "op": "set", "value": max(0, min(5, int(rating)))})
+        if pick is not None:
+            operations.append({"field": "pick", "op": "set", "value": max(-1, min(1, int(pick)))})
+        return self._append_sidecar_edit(path, operations)
+
+    def _append_sidecar_edit(self, path: str, operations: list[dict[str, Any]]) -> bool:
+        if not operations:
+            return True
         sidecar_path = self.sidecar_path_for(path)
         try:
-            tree = self._load_or_create_xmp_tree(sidecar_path)
-            if tree is None:
-                return False
-            root = tree.getroot()
-            desc = self._ensure_description(root)
-            if rating is not None:
-                self._replace_simple_text_node(
-                    desc,
-                    _XMP_RATING_TAG,
-                    str(max(0, min(5, int(rating)))),
-                )
-            if pick is not None:
-                pick_value = max(-1, min(1, int(pick)))
-                self._replace_simple_text_node(desc, _XMP_PICK_TAG, "")
-                self._replace_simple_text_node(
-                    desc,
-                    _XMP_DM_PICK_TAG,
-                    "" if pick_value == 0 else str(pick_value),
-                )
             sidecar_path.parent.mkdir(parents=True, exist_ok=True)
-            ok = self._write_tree_atomic(tree, sidecar_path)
-            if ok:
-                self._invalidate_metadata_cache(path)
-            return ok
         except Exception:
             return False
+        edit_path = write_edit_file(
+            sidecar_path,
+            path,
+            operations,
+            base_hash=sidecar_sha256(sidecar_path),
+        )
+        if edit_path is None:
+            return False
+        self._compact_pending_edits(path, sidecar_path)
+        self._invalidate_metadata_cache(path)
+        return True
+
+    def _compact_pending_edits(self, path: str, sidecar_path: Path | None = None) -> bool:
+        sidecar_path = sidecar_path or self.sidecar_path_for(path)
+        if not has_pending_edits(sidecar_path):
+            return True
+        lock_path = acquire_compact_lock(sidecar_path)
+        if lock_path is None:
+            return False
+        try:
+            for _ in range(2):
+                records = load_pending_edits(sidecar_path)
+                if not records:
+                    return True
+                expected_hash = sidecar_sha256(sidecar_path)
+                tree = self._load_or_create_xmp_tree(sidecar_path)
+                if tree is None:
+                    return False
+                self._apply_pending_edit_records_to_tree(tree, records)
+                sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+                if self._write_tree_atomic(tree, sidecar_path, expected_hash=expected_hash):
+                    delete_edit_files(records)
+                    self._invalidate_metadata_cache(path)
+                    return True
+            return False
+        finally:
+            release_compact_lock(lock_path)
+
+    @classmethod
+    def _apply_pending_edit_records_to_tree(
+        cls,
+        tree: ET.ElementTree,
+        records: list[tuple[Path, dict[str, Any]]],
+    ) -> None:
+        root = tree.getroot()
+        desc = cls._ensure_description(root)
+        for _, record in records:
+            ops = record.get("operations", record.get("ops", []))
+            if not isinstance(ops, list):
+                continue
+            for op in ops:
+                if not isinstance(op, dict):
+                    continue
+                field = str(op.get("field") or "").strip().lower()
+                op_name = str(op.get("op") or "set").strip().lower()
+                if field == "subject":
+                    cls._apply_subject_operation(desc, op_name, op.get("values", []))
+                elif field == "description":
+                    value = "" if op.get("value") is None else str(op.get("value"))
+                    cls._replace_simple_text_node(desc, _XMP_DC_DESCRIPTION_TAG, value)
+                elif field == "rating":
+                    cls._replace_simple_text_node(
+                        desc,
+                        _XMP_RATING_TAG,
+                        str(_normalise_rating_value(op.get("value"))),
+                    )
+                elif field == "pick":
+                    pick_value = _normalise_pick_value(op.get("value"))
+                    cls._replace_simple_text_node(desc, _XMP_PICK_TAG, "")
+                    cls._replace_simple_text_node(
+                        desc,
+                        _XMP_DM_PICK_TAG,
+                        "" if pick_value == 0 else str(pick_value),
+                    )
+
+    @classmethod
+    def _apply_subject_operation(cls, desc: ET.Element, op_name: str, values: Any) -> None:
+        current = cls._subject_values_from_description(desc)
+        incoming = _normalise_subject_value(values, split_strings=True)
+        if op_name == "set":
+            merged = incoming
+        elif op_name == "add":
+            merged = list(current)
+            seen = set(merged)
+            for value in incoming:
+                if value not in seen:
+                    seen.add(value)
+                    merged.append(value)
+        elif op_name == "remove":
+            remove = set(incoming)
+            merged = [value for value in current if value not in remove]
+        else:
+            return
+        cls._replace_subject_node(desc, merged)
 
     @staticmethod
     def _invalidate_metadata_cache(path: str) -> None:
@@ -571,6 +655,17 @@ class PhotoMetaDataXMP(PhotoMetaData):
         node = ET.SubElement(desc, tag)
         node.text = text
 
+    @classmethod
+    def _subject_values_from_description(cls, desc: ET.Element) -> list[str]:
+        values: list[str] = []
+        attr_value = desc.attrib.get(_XMP_DC_SUBJECT_TAG)
+        if attr_value:
+            values.extend(_normalise_subject_value(attr_value, split_strings=True))
+        for child in desc:
+            if child.tag == _XMP_DC_SUBJECT_TAG:
+                values.extend(cls._subject_values_from_element(child))
+        return _normalise_text_values(values)
+
     @staticmethod
     def _subject_values_from_element(element: ET.Element) -> list[str]:
         values: list[str] = []
@@ -588,7 +683,12 @@ class PhotoMetaDataXMP(PhotoMetaData):
         return []
 
     @staticmethod
-    def _write_tree_atomic(tree: ET.ElementTree, sidecar_path: Path) -> bool:
+    def _write_tree_atomic(
+        tree: ET.ElementTree,
+        sidecar_path: Path,
+        *,
+        expected_hash: str | None = None,
+    ) -> bool:
         if hasattr(ET, "indent"):
             ET.indent(tree, space="  ")
         fd, tmp_name = tempfile.mkstemp(
@@ -600,6 +700,8 @@ class PhotoMetaDataXMP(PhotoMetaData):
         tmp_path = Path(tmp_name)
         try:
             tree.write(tmp_path, encoding="utf-8", xml_declaration=True)
+            if expected_hash is not None and sidecar_sha256(sidecar_path) != expected_hash:
+                return False
             os.replace(tmp_path, sidecar_path)
             return True
         finally:

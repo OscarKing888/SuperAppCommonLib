@@ -467,6 +467,10 @@ def _apply_browser_metadata_aliases(rec: dict) -> None:
     description = first("XMP-dc:Description", "XMP-dc:description")
     if description is not None and not has_value(rec.get("XMP-dc:Description")):
         rec["XMP-dc:Description"] = description
+    if description is not None and not has_value(rec.get("XMP:Description")):
+        rec["XMP:Description"] = description
+    if description is not None and not has_value(rec.get("Description")):
+        rec["Description"] = description
 
     subject = first("XMP-dc:Subject", "XMP-dc:subject")
     if subject is not None and not has_value(rec.get("XMP-dc:Subject")):

@@ -920,9 +920,25 @@ def _thumb_disk_cache_dir() -> str:
     return os.path.join(base, "SuperViewer", "thumb_cache")
 
 
+def _thumb_disk_cache_dir_for_path(path: str) -> str:
+    if path:
+        try:
+            current_dir = os.path.dirname(os.path.normpath(os.path.abspath(path)))
+            superpicky_dir = _find_superpicky_dir(current_dir)
+        except Exception:
+            superpicky_dir = ""
+        if superpicky_dir:
+            return os.path.join(superpicky_dir, "thumb_cache")
+    return _thumb_disk_cache_dir()
+
+
 def _thumb_disk_cache_path(path: str, mtime: float, size: int) -> str:
     """Full path to cached thumbnail file; path must be absolute/normalized for stable key."""
-    cache_dir = _thumb_disk_cache_dir()
+    try:
+        size_dir = str(int(size))
+    except Exception:
+        size_dir = str(size)
+    cache_dir = os.path.join(_thumb_disk_cache_dir_for_path(path), size_dir)
     raw = f"{_path_key(path)}\0{mtime}\0{size}"
     name = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24] + ".jpg"
     return os.path.join(cache_dir, name)

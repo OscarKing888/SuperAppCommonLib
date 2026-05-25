@@ -178,12 +178,24 @@ def read_xmp_sidecar(image_path: str) -> list[tuple[str, str, str]]:
     """
     xmp_path = find_xmp_sidecar(image_path)
     if not xmp_path:
+        default_xmp_path = os.path.splitext(os.path.normpath(image_path))[0] + ".xmp"
+        try:
+            from app_common.exif_io.xmp_sidecar_edits import has_pending_edits, merge_xmp_rows_with_pending_edits
+            if has_pending_edits(default_xmp_path):
+                return merge_xmp_rows_with_pending_edits(default_xmp_path, [])
+        except Exception:
+            pass
         return []
 
     try:
         tree = ET.parse(xmp_path)
         root = tree.getroot()
     except Exception:
+        try:
+            from app_common.exif_io.xmp_sidecar_edits import merge_xmp_rows_with_pending_edits
+            return merge_xmp_rows_with_pending_edits(xmp_path, [])
+        except Exception:
+            pass
         return []
 
     results: list[tuple[str, str, str]] = []
@@ -219,4 +231,8 @@ def read_xmp_sidecar(image_path: str) -> list[tuple[str, str, str]]:
                 group = f"XMP-{prefix}"
                 results.append((group, local, value))
 
-    return results
+    try:
+        from app_common.exif_io.xmp_sidecar_edits import merge_xmp_rows_with_pending_edits
+        return merge_xmp_rows_with_pending_edits(xmp_path, results)
+    except Exception:
+        return results

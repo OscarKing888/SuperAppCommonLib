@@ -10,6 +10,7 @@ SUPERPICKY_DIRNAME = ".superpicky"
 SUPERPICKY_TRASH_DIRNAME = "deleted"
 SUPERPICKY_TRASH_ENV_VAR = "SUPERPICKY_TRASH_ENABLED"
 MOVE_TO_SUPERPICKY_TRASH_BY_DEFAULT = True
+_XMP_SIDECAR_SUFFIX_CANDIDATES = (".xmp", ".XMP", ".Xmp")
 
 
 def hide_path(path):
@@ -169,7 +170,7 @@ def _unique_destination_path(dest_path, source_is_dir=False):
     return ""
 
 
-def _superpicky_trash_destination_for_path(path):
+def _superpicky_trash_base_destination_for_path(path):
     try:
         source_abs = os.path.normpath(os.path.abspath(path))
     except Exception:
@@ -202,17 +203,105 @@ def _superpicky_trash_destination_for_path(path):
     dest_path = os.path.join(superpicky_abs, SUPERPICKY_TRASH_DIRNAME, rel_path)
     if _is_same_or_child_path(source_abs, dest_path):
         return ""
-    return _unique_destination_path(dest_path, source_is_dir=os.path.isdir(source_abs))
+    return dest_path
+
+
+def _superpicky_trash_destination_for_path(path):
+    dest_path = _superpicky_trash_base_destination_for_path(path)
+    if not dest_path:
+        return ""
+    return _unique_destination_path(dest_path, source_is_dir=os.path.isdir(path))
+
+
+def _find_sibling_xmp_sidecar_for_file(path):
+    if not path or not os.path.isfile(path):
+        return ""
+    try:
+        source_abs = os.path.normpath(os.path.abspath(path))
+    except Exception:
+        return ""
+    if os.path.splitext(source_abs)[1].lower() == ".xmp":
+        return ""
+    base_path, _ = os.path.splitext(source_abs)
+    for suffix in _XMP_SIDECAR_SUFFIX_CANDIDATES:
+        candidate = base_path + suffix
+        if os.path.isfile(candidate):
+            return os.path.normpath(candidate)
+
+    parent = os.path.dirname(source_abs)
+    target_name = os.path.basename(base_path).lower() + ".xmp"
+    try:
+        for entry in os.scandir(parent):
+            if entry.name.lower() == target_name and entry.is_file():
+                return os.path.normpath(entry.path)
+    except Exception:
+        return ""
+    return ""
+
+
+def _unique_file_and_sidecar_destinations(source_dest, sidecar_suffix):
+    parent = os.path.dirname(source_dest)
+    source_name = os.path.basename(source_dest)
+    source_stem, source_suffix = os.path.splitext(source_name)
+    sidecar_suffix = sidecar_suffix or ".xmp"
+    for index in range(0, 10000):
+        stem = source_stem if index == 0 else f"{source_stem} ({index})"
+        candidate_source = os.path.join(parent, f"{stem}{source_suffix}")
+        candidate_sidecar = os.path.join(parent, f"{stem}{sidecar_suffix}")
+        if (
+            _path_key(candidate_source) != _path_key(candidate_sidecar)
+            and not os.path.lexists(candidate_source)
+            and not os.path.lexists(candidate_sidecar)
+        ):
+            return candidate_source, candidate_sidecar
+    return "", ""
+
+
+def _move_path_pair(source_path, source_dest, sidecar_path="", sidecar_dest=""):
+    try:
+        os.makedirs(os.path.dirname(source_dest), exist_ok=True)
+        moved_sidecar = False
+        if sidecar_path and sidecar_dest:
+            os.makedirs(os.path.dirname(sidecar_dest), exist_ok=True)
+            moved_sidecar_path = shutil.move(sidecar_path, sidecar_dest)
+            moved_sidecar = bool(moved_sidecar_path and os.path.lexists(moved_sidecar_path))
+            if not moved_sidecar:
+                return False
+        moved_source_path = shutil.move(source_path, source_dest)
+        moved_source = bool(moved_source_path and os.path.lexists(moved_source_path))
+        if moved_source:
+            return True
+        if moved_sidecar:
+            try:
+                shutil.move(sidecar_dest, sidecar_path)
+            except Exception:
+                pass
+        return False
+    except Exception:
+        if sidecar_path and sidecar_dest and os.path.lexists(sidecar_dest) and not os.path.lexists(sidecar_path):
+            try:
+                shutil.move(sidecar_dest, sidecar_path)
+            except Exception:
+                pass
+        return False
 
 
 def _move_to_superpicky_trash(path):
-    dest_path = _superpicky_trash_destination_for_path(path)
+    dest_path = _superpicky_trash_base_destination_for_path(path)
     if not dest_path:
         return None
+    source_abs = os.path.normpath(os.path.abspath(path))
+    sidecar_path = _find_sibling_xmp_sidecar_for_file(source_abs)
+    if sidecar_path:
+        sidecar_suffix = os.path.splitext(sidecar_path)[1] or ".xmp"
+        dest_path, sidecar_dest = _unique_file_and_sidecar_destinations(dest_path, sidecar_suffix)
+    else:
+        dest_path = _unique_destination_path(dest_path, source_is_dir=os.path.isdir(source_abs))
+        sidecar_dest = ""
+    if not dest_path:
+        return False
     try:
-        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-        moved_path = shutil.move(os.path.normpath(os.path.abspath(path)), dest_path)
-        return bool(moved_path and os.path.lexists(moved_path))
+        return _move_path_pair(source_abs, dest_path, sidecar_path, sidecar_dest)
     except Exception:
         return False
 

@@ -238,7 +238,7 @@ class FileListPanel(QWidget):
             self._filter_bar_layout = filter_bar
 
             self._filter_edit = QLineEdit()
-            self._filter_edit.setPlaceholderText("过滤文件名…")
+            self._filter_edit.setPlaceholderText("过滤文件名/注释…")
             self._filter_edit.setClearButtonEnabled(True)
             self._filter_edit.setStyleSheet(
                 "QLineEdit { padding: 2px 4px; font-size: 12px; }"
@@ -720,6 +720,10 @@ class FileListPanel(QWidget):
             "rating",
             "pick",
             "comment",
+            "Description",
+            "XMP-dc:Description",
+            "XMP-dc:description",
+            "XMP:Description",
             "title",
             "color",
             "country",
@@ -1076,16 +1080,26 @@ class FileListPanel(QWidget):
         selected_display = os.path.normpath(self._selected_display_path) if self._selected_display_path else ""
         if selected_display and selected_display not in candidates:
             candidates.append(selected_display)
+        shallow_cached: dict | None = None
         for candidate in candidates:
             cached = self._meta_cache.get(candidate)
             if isinstance(cached, dict) and cached:
-                return dict(cached)
+                if not allow_slow_read or self._metadata_cache_has_browser_fields(cached):
+                    return dict(cached)
+                if shallow_cached is None:
+                    shallow_cached = dict(cached)
         if not allow_slow_read:
             return {}
         try:
             data = self._meta_proxy.read(norm_path)
         except Exception:
             return {}
+        if isinstance(data, dict) and isinstance(shallow_cached, dict):
+            merged = dict(data)
+            for key, value in shallow_cached.items():
+                if key not in merged:
+                    merged[key] = value
+            return merged
         return dict(data) if isinstance(data, dict) else {}
 
     def get_photo_exposure_settings_for_path(
@@ -2818,6 +2832,15 @@ class FileListPanel(QWidget):
 
     def _resolve_source_path_for_action(self, path: str) -> str:
         norm_path = os.path.normpath(path) if path else ""
+        if (
+            not self._use_report_db
+            and norm_path
+            and os.path.isfile(norm_path)
+            and Path(norm_path).suffix.lower() in IMAGE_EXTENSIONS
+        ):
+            _log.info("[_resolve_source_path_for_action] source=%r resolved=self=%r", path, norm_path)
+            return norm_path
+
         actual_path = self._get_actual_path_for_display(norm_path)
         if actual_path:
             _log.info("[_resolve_source_path_for_action] source=%r resolved=actual_cache=%r", path, actual_path)
@@ -2960,7 +2983,9 @@ class FileListPanel(QWidget):
             rating = int(meta.get("rating", 0) or 0)
         except Exception:
             rating = 0
-        if filter_text and filter_text not in name.lower():
+        comment = _metadata_comment_from_meta(meta)
+        filter_text = str(filter_text or "").strip().lower()
+        if filter_text and filter_text not in name.lower() and filter_text not in comment.lower():
             return False
         if filter_pick and pick != 1:
             return False
@@ -2989,7 +3014,14 @@ class FileListPanel(QWidget):
         缩略图模式下改星级/精选时，大多数情况只是 badge 变化，不应该因为过滤器
         正处于激活状态就整表 `_apply_filter()`，否则当前视图和选中项会跳动。
         """
-        if not (self._filter_pick or self._filter_reject or self._filter_min_rating > 0 or self._filter_focus_status):
+        filter_text = (self._filter_edit.text().strip().lower()) if self._filter_edit else ""
+        if not (
+            filter_text
+            or self._filter_pick
+            or self._filter_reject
+            or self._filter_min_rating > 0
+            or self._filter_focus_status
+        ):
             return False
         if not paths:
             return False
@@ -4901,7 +4933,8 @@ class FileListPanel(QWidget):
         self._meta_apply_tree_hits = 0
         self._meta_apply_list_hits = 0
         self._meta_apply_needs_filter = bool(
-            self._filter_pick
+            ((self._filter_edit.text().strip()) if self._filter_edit else "")
+            or self._filter_pick
             or self._filter_reject
             or self._filter_min_rating > 0
             or self._filter_focus_status

@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 
 from app_common.exif_io.photo_meta import PhotoMetaDataProxy
+from app_common.exif_io.writer import invalidate_metadata_cache, read_batch_metadata
 
 
 class _FakeExifMeta:
@@ -44,3 +45,16 @@ def test_proxy_writes_rating_pick_to_sidecar(tmp_path: Path) -> None:
     assert (tmp_path / "img001.xmp").is_file()
     assert PhotoMetaDataProxy().read(str(photo_path)).get("rating") == 5
     assert PhotoMetaDataProxy().read(str(photo_path)).get("pick") == 1
+
+
+def test_read_batch_metadata_exposes_sidecar_description_aliases(tmp_path: Path) -> None:
+    photo_path = tmp_path / "img001.jpg"
+    photo_path.write_bytes(b"not an image")
+
+    assert PhotoMetaDataProxy().write(str(photo_path), {"XMP-dc:Description": "sidecar note"})
+    invalidate_metadata_cache(str(photo_path))
+    meta = read_batch_metadata([str(photo_path)]).get(os.path.normpath(str(photo_path)), {})
+
+    assert meta.get("XMP-dc:Description") == "sidecar note"
+    assert meta.get("XMP:Description") == "sidecar note"
+    assert meta.get("Description") == "sidecar note"
