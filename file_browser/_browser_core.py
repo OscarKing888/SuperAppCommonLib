@@ -1008,7 +1008,7 @@ def _persistent_thumb_cache_worker_count() -> int:
 
 
 def _persistent_thumb_cache_dirname(size: int) -> str:
-    return f"thumb_preview_{int(size)}"
+    return str(int(size))
 
 
 def _find_superpicky_dir(current_dir: str, max_levels: int | None = None) -> str:
@@ -1071,7 +1071,7 @@ def _persistent_thumb_cache_dir(current_dir: str | None, size: int) -> str:
     superpicky_dir = _find_superpicky_dir(current_dir)
     if not superpicky_dir:
         return ""
-    return os.path.join(superpicky_dir, "cache", _persistent_thumb_cache_dirname(size))
+    return os.path.join(superpicky_dir, "thumb_cache", _persistent_thumb_cache_dirname(size))
 
 
 def _persistent_thumb_cache_filename_for_file(path: str, current_dir: str | None = None) -> str:
@@ -1101,12 +1101,25 @@ def _persistent_thumb_cache_filename_for_file(path: str, current_dir: str | None
     return f"{name}.thumb.jpg"
 
 
-def _legacy_persistent_thumb_cache_path_for_file(path: str, current_dir: str | None, size: int) -> str:
-    cache_dir = _persistent_thumb_cache_dir(current_dir, size)
-    if not cache_dir or not path:
-        return ""
+def _legacy_persistent_thumb_cache_paths_for_file(path: str, current_dir: str | None, size: int) -> list[str]:
+    if not current_dir or not path:
+        return []
+    superpicky_dir = _find_superpicky_dir(current_dir)
+    if not superpicky_dir:
+        return []
+    legacy_dir = os.path.join(superpicky_dir, "cache", f"thumb_cache_{int(size)}")
+    cache_root_dir = _superpicky_cache_root_dir(current_dir)
+    paths = [
+        os.path.join(legacy_dir, _persistent_thumb_cache_filename_for_file(path, cache_root_dir or current_dir))
+    ]
     digest = hashlib.sha1(_path_key(path).encode("utf-8")).hexdigest()
-    return os.path.join(cache_dir, digest[:2], f"{digest}.jpg")
+    paths.append(os.path.join(legacy_dir, digest[:2], f"{digest}.jpg"))
+    return paths
+
+
+def _legacy_persistent_thumb_cache_path_for_file(path: str, current_dir: str | None, size: int) -> str:
+    paths = _legacy_persistent_thumb_cache_paths_for_file(path, current_dir, size)
+    return paths[0] if paths else ""
 
 
 def _persistent_thumb_cache_path_for_file(path: str, current_dir: str | None, size: int) -> str:
@@ -1155,9 +1168,11 @@ def _existing_persistent_thumb_cache_path_for_exact_size(
 ) -> str:
     cache_path = _persistent_thumb_cache_path_for_file(path, current_dir, size)
     if not cache_path or not os.path.isfile(cache_path):
-        legacy_path = _legacy_persistent_thumb_cache_path_for_file(path, current_dir, size)
-        if legacy_path and os.path.isfile(legacy_path):
-            cache_path = _migrate_legacy_persistent_thumb_cache_path(cache_path, legacy_path)
+        for legacy_path in _legacy_persistent_thumb_cache_paths_for_file(path, current_dir, size):
+            if legacy_path and os.path.isfile(legacy_path):
+                cache_path = _migrate_legacy_persistent_thumb_cache_path(cache_path, legacy_path)
+                if cache_path and os.path.isfile(cache_path):
+                    break
         if not cache_path or not os.path.isfile(cache_path):
             return ""
     if source_stamp is None:
