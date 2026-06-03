@@ -25,9 +25,17 @@ from app_common.exif_io.writer import (
 )
 from app_common.exif_io.writer import _get_exiftool_tag_target  # 供 main 读路径使用
 from app_common.exif_io.xmp_sidecar import find_xmp_sidecar, read_xmp_sidecar
+from app_common.exif_io.json_sidecar import (
+    JSON_SIDECAR_SUFFIX,
+    find_json_sidecar,
+    json_sidecar_path_for,
+    json_sidecar_to_flat_dict,
+    read_json_sidecar,
+)
 from app_common.exif_io.photo_meta import (
     PhotoMetaData,
     PhotoMetaDataEXIFEmbeded,
+    PhotoMetaDataJSON,
     PhotoMetaDataXMP,
     PhotoMetaDataReportDB,
     PhotoMetaDataProxy,
@@ -48,6 +56,11 @@ __all__ = [
     "_get_exiftool_tag_target",
     "find_xmp_sidecar",
     "read_xmp_sidecar",
+    "JSON_SIDECAR_SUFFIX",
+    "find_json_sidecar",
+    "json_sidecar_path_for",
+    "json_sidecar_to_flat_dict",
+    "read_json_sidecar",
     "read_batch_metadata",
     "inject_metadata_cache",
     "DEFAULT_METADATA_TAGS",
@@ -58,6 +71,7 @@ __all__ = [
     # OOD metadata abstraction
     "PhotoMetaData",
     "PhotoMetaDataEXIFEmbeded",
+    "PhotoMetaDataJSON",
     "PhotoMetaDataXMP",
     "PhotoMetaDataReportDB",
     "PhotoMetaDataProxy",

@@ -14,6 +14,7 @@ from typing import Any
 from PIL import ExifTags, Image
 
 from app_common.exif_io.exiftool_path import get_exiftool_executable_path
+from app_common.exif_io.json_sidecar import json_sidecar_to_flat_dict, read_json_sidecar
 
 try:
     _PIL_IFD_ENUM = ExifTags.IFD
@@ -376,6 +377,12 @@ def extract_many_with_xmp_priority(
             if xmp_rows:
                 merged.update(_xmp_rows_to_flat_dict(resolved_path, xmp_rows))
                 _overlay_xmp_aliases(merged)
+        try:
+            json_payload = read_json_sidecar(str(resolved_path))
+        except Exception:
+            json_payload = {}
+        if json_payload:
+            merged.update(json_sidecar_to_flat_dict(str(resolved_path), json_payload))
         _overlay_generic_aliases(merged)
         out[resolved_path] = merged
     return out
@@ -411,6 +418,12 @@ def extract_metadata_with_xmp_priority(path: Path | str, mode: str = "auto") -> 
         if xmp_rows:
             merged.update(_xmp_rows_to_flat_dict(source, xmp_rows))
             _overlay_xmp_aliases(merged)
+        try:
+            json_payload = read_json_sidecar(str(source))
+        except Exception:
+            json_payload = {}
+        if json_payload:
+            merged.update(json_sidecar_to_flat_dict(str(source), json_payload))
     _overlay_generic_aliases(merged)
 
     return merged

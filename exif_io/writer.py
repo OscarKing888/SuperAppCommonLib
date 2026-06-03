@@ -14,6 +14,7 @@ import threading
 import piexif
 
 from app_common.exif_io.exiftool_path import get_exiftool_executable_path
+from app_common.exif_io.json_sidecar import json_sidecar_to_flat_dict, read_json_sidecar
 from app_common.log import get_logger
 
 _log = get_logger("exif_io")
@@ -592,6 +593,29 @@ def _batch_read_xmp_sidecar(paths: list) -> dict:
     return result
 
 
+def _batch_read_json_sidecar(paths: list) -> dict:
+    """
+    Read SuperViewer JSON sidecars and convert them to exiftool-style records.
+
+    Returns only paths that actually have JSON metadata so callers can merge it
+    with higher priority than embedded EXIF and legacy XMP sidecars.
+    """
+    result: dict = {}
+    for path in paths:
+        norm = os.path.normpath(path)
+        try:
+            payload = read_json_sidecar(path)
+        except Exception:
+            payload = {}
+        if not payload:
+            continue
+        rec = json_sidecar_to_flat_dict(path, payload)
+        if len(rec) > 1:
+            _apply_browser_metadata_aliases(rec)
+            result[norm] = rec
+    return result
+
+
 def _summarize_rec_for_log(rec: dict) -> str:
     """用于日志：从 flat_dict 提取标题、Rating、Pick 等简要信息。"""
     title = rec.get("XMP-dc:Title") or rec.get("XMP-dc:title") or rec.get("IFD0:XPTitle") or rec.get("IPTC:ObjectName") or ""
@@ -708,10 +732,20 @@ def read_batch_metadata(paths: list, tags: list | None = None, use_cache: bool =
             # 保证文件列表「标题」「对焦状态」能从 sidecar 显示：补全浏览器使用的键名
             _apply_browser_metadata_aliases(rec)
 
+    json_sidecar_result = _batch_read_json_sidecar(uncached)
+    if json_sidecar_result:
+        _log.debug("[read_batch_metadata] merge JSON sidecar paths=%s", list(json_sidecar_result.keys()))
+        for norm, json_rec in json_sidecar_result.items():
+            rec = new_result.setdefault(norm, {"SourceFile": norm})
+            rec.update(json_rec)
+            _apply_browser_metadata_aliases(rec)
+
     need_merge_norms = {os.path.normpath(p) for p in need_merge}
     for norm, rec in new_result.items():
         result[norm] = rec
-        if norm in exiftool_norms:
+        if norm in json_sidecar_result:
+            source = "JSON"
+        elif norm in exiftool_norms:
             source = "文件内+XMP合并" if norm in need_merge_norms else "文件内(exiftool)"
         else:
             source = "XMP"

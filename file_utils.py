@@ -6,6 +6,8 @@ import shutil
 import subprocess
 import sys
 
+from app_common.exif_io.json_sidecar import JSON_SIDECAR_SUFFIX
+
 SUPERPICKY_DIRNAME = ".superpicky"
 SUPERPICKY_TRASH_DIRNAME = "deleted"
 SUPERPICKY_TRASH_ENV_VAR = "SUPERPICKY_TRASH_ENABLED"
@@ -239,6 +241,48 @@ def _find_sibling_xmp_sidecar_for_file(path):
     return ""
 
 
+def _find_sibling_json_sidecar_for_file(path):
+    if not path or not os.path.isfile(path):
+        return ""
+    try:
+        source_abs = os.path.normpath(os.path.abspath(path))
+    except Exception:
+        return ""
+    candidate = source_abs + JSON_SIDECAR_SUFFIX
+    if os.path.isfile(candidate):
+        return os.path.normpath(candidate)
+    return ""
+
+
+def _find_sibling_metadata_sidecars_for_file(path):
+    sidecars = []
+    seen = set()
+    for candidate in (
+        _find_sibling_xmp_sidecar_for_file(path),
+        _find_sibling_json_sidecar_for_file(path),
+    ):
+        if not candidate:
+            continue
+        key = _path_key(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        sidecars.append(candidate)
+    return sidecars
+
+
+def _sidecar_destination_for_file_destination(source_path, source_dest, sidecar_path):
+    source_abs = os.path.normpath(os.path.abspath(source_path))
+    sidecar_abs = os.path.normpath(os.path.abspath(sidecar_path))
+    if _path_key(sidecar_abs) == _path_key(source_abs + JSON_SIDECAR_SUFFIX):
+        return source_dest + JSON_SIDECAR_SUFFIX
+    source_base, _source_suffix = os.path.splitext(source_abs)
+    if _path_key(sidecar_abs) == _path_key(source_base + ".xmp"):
+        dest_base, _dest_suffix = os.path.splitext(source_dest)
+        return dest_base + os.path.splitext(sidecar_abs)[1]
+    return os.path.join(os.path.dirname(source_dest), os.path.basename(sidecar_abs))
+
+
 def _unique_file_and_sidecar_destinations(source_dest, sidecar_suffix):
     parent = os.path.dirname(source_dest)
     source_name = os.path.basename(source_dest)
@@ -255,6 +299,30 @@ def _unique_file_and_sidecar_destinations(source_dest, sidecar_suffix):
         ):
             return candidate_source, candidate_sidecar
     return "", ""
+
+
+def _unique_file_and_metadata_sidecar_destinations(source_path, source_dest, sidecar_paths):
+    parent = os.path.dirname(source_dest)
+    source_name = os.path.basename(source_dest)
+    source_stem, source_suffix = os.path.splitext(source_name)
+    for index in range(0, 10000):
+        stem = source_stem if index == 0 else f"{source_stem} ({index})"
+        candidate_source = os.path.join(parent, f"{stem}{source_suffix}")
+        candidate_sidecars = [
+            _sidecar_destination_for_file_destination(source_path, candidate_source, sidecar_path)
+            for sidecar_path in sidecar_paths
+        ]
+        candidate_keys = {_path_key(candidate_source)}
+        valid = not os.path.lexists(candidate_source)
+        for candidate_sidecar in candidate_sidecars:
+            key = _path_key(candidate_sidecar)
+            if key in candidate_keys or os.path.lexists(candidate_sidecar):
+                valid = False
+                break
+            candidate_keys.add(key)
+        if valid:
+            return candidate_source, candidate_sidecars
+    return "", []
 
 
 def _move_path_pair(source_path, source_dest, sidecar_path="", sidecar_dest=""):
@@ -286,22 +354,51 @@ def _move_path_pair(source_path, source_dest, sidecar_path="", sidecar_dest=""):
         return False
 
 
+def _move_path_with_sidecars(source_path, source_dest, sidecar_pairs):
+    moved_sidecars = []
+    try:
+        os.makedirs(os.path.dirname(source_dest), exist_ok=True)
+        for sidecar_path, sidecar_dest in sidecar_pairs:
+            os.makedirs(os.path.dirname(sidecar_dest), exist_ok=True)
+            moved_sidecar_path = shutil.move(sidecar_path, sidecar_dest)
+            if not moved_sidecar_path or not os.path.lexists(moved_sidecar_path):
+                raise RuntimeError("sidecar move failed")
+            moved_sidecars.append((sidecar_path, sidecar_dest))
+        moved_source_path = shutil.move(source_path, source_dest)
+        moved_source = bool(moved_source_path and os.path.lexists(moved_source_path))
+        if moved_source:
+            return True
+        for sidecar_path, sidecar_dest in reversed(moved_sidecars):
+            if os.path.lexists(sidecar_dest) and not os.path.lexists(sidecar_path):
+                shutil.move(sidecar_dest, sidecar_path)
+        return False
+    except Exception:
+        for sidecar_path, sidecar_dest in reversed(moved_sidecars):
+            if os.path.lexists(sidecar_dest) and not os.path.lexists(sidecar_path):
+                try:
+                    shutil.move(sidecar_dest, sidecar_path)
+                except Exception:
+                    pass
+        return False
+
+
 def _move_to_superpicky_trash(path):
     dest_path = _superpicky_trash_base_destination_for_path(path)
     if not dest_path:
         return None
     source_abs = os.path.normpath(os.path.abspath(path))
-    sidecar_path = _find_sibling_xmp_sidecar_for_file(source_abs)
-    if sidecar_path:
-        sidecar_suffix = os.path.splitext(sidecar_path)[1] or ".xmp"
-        dest_path, sidecar_dest = _unique_file_and_sidecar_destinations(dest_path, sidecar_suffix)
+    sidecar_paths = _find_sibling_metadata_sidecars_for_file(source_abs)
+    if sidecar_paths:
+        dest_path, sidecar_dests = _unique_file_and_metadata_sidecar_destinations(source_abs, dest_path, sidecar_paths)
     else:
         dest_path = _unique_destination_path(dest_path, source_is_dir=os.path.isdir(source_abs))
-        sidecar_dest = ""
+        sidecar_dests = []
     if not dest_path:
         return False
     try:
-        return _move_path_pair(source_abs, dest_path, sidecar_path, sidecar_dest)
+        if sidecar_paths:
+            return _move_path_with_sidecars(source_abs, dest_path, list(zip(sidecar_paths, sidecar_dests)))
+        return _move_path_pair(source_abs, dest_path)
     except Exception:
         return False
 
@@ -329,9 +426,18 @@ def move_to_trash(path, *, use_superpicky_trash=None):
         superpicky_result = _move_to_superpicky_trash(path)
         if superpicky_result is not None:
             return bool(superpicky_result)
+    source_abs = os.path.normpath(os.path.abspath(path))
+    trash_paths = [source_abs]
+    if os.path.isfile(source_abs):
+        trash_paths.extend(_find_sibling_metadata_sidecars_for_file(source_abs))
+    trash_paths = [p for p in trash_paths if p and os.path.exists(p)]
     try:
         import send2trash
-        send2trash.send2trash(path)
+        try:
+            send2trash.send2trash(trash_paths if len(trash_paths) > 1 else source_abs)
+        except TypeError:
+            for trash_path in trash_paths:
+                send2trash.send2trash(trash_path)
         return True
     except ImportError:
         pass  # fall through to OS-native fallback
@@ -341,13 +447,16 @@ def move_to_trash(path, *, use_superpicky_trash=None):
     # ── OS-native fallback (no send2trash) ───────────────────────────────────
     try:
         if sys.platform == "darwin":
-            escaped = path.replace("\\", "\\\\").replace('"', '\\"')
-            result = subprocess.run(
-                ["osascript", "-e",
-                 f'tell application "Finder" to delete POSIX file "{escaped}"'],
-                capture_output=True,
-            )
-            return result.returncode == 0
+            for trash_path in trash_paths:
+                escaped = trash_path.replace("\\", "\\\\").replace('"', '\\"')
+                result = subprocess.run(
+                    ["osascript", "-e",
+                     f'tell application "Finder" to delete POSIX file "{escaped}"'],
+                    capture_output=True,
+                )
+                if result.returncode != 0:
+                    return False
+            return True
         elif sys.platform == "win32":
             import ctypes
             from ctypes import wintypes
@@ -366,7 +475,7 @@ def move_to_trash(path, *, use_superpicky_trash=None):
 
             op = _SHFILEOPSTRUCTW()
             op.wFunc  = 3            # FO_DELETE
-            op.pFrom  = path + "\0\0"
+            op.pFrom  = "\0".join(trash_paths) + "\0\0"
             op.fFlags = 0x0040 | 0x0010 | 0x0004  # ALLOWUNDO | NOCONFIRMATION | SILENT
             return ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op)) == 0
     except Exception:

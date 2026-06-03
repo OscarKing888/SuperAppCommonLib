@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 
+from app_common.exif_io.json_sidecar import JSON_SIDECAR_SUFFIX
 from app_common.perf_probe import elapsed_ms, perf_counter, perf_log, perf_probes_enabled
 from app_common.file_browser._browser_core import *
 from app_common.file_browser._models import *
@@ -6019,30 +6020,66 @@ class FileListPanel(QWidget):
                 continue
             seen.add(norm_key)
 
-            # 同步带上 sidecar（如 IMG_0001.CR3 -> IMG_0001.xmp）
-            xmp_path = self._resolve_sidecar_path(p)
-            xmp_exists = bool(xmp_path and os.path.isfile(xmp_path))
-            abs_xmp = ""
-            if xmp_exists:
-                abs_xmp = os.path.abspath(xmp_path)
-            entries.append({"source": abs_path, "sidecar": abs_xmp})
+            sidecars = self._metadata_sidecars_for_source_path(p, abs_path)
+            entries.append({"source": abs_path, "sidecar": sidecars[0] if sidecars else "", "sidecars": sidecars})
             _log.info(
-                "[_collect_file_clipboard_entries] source=%r resolved_source=%r source_exists=%s xmp_path=%r xmp_exists=%s",
+                "[_collect_file_clipboard_entries] source=%r resolved_source=%r source_exists=%s sidecars=%s",
                 p,
                 abs_path,
                 source_exists,
-                xmp_path,
-                xmp_exists,
+                sidecars,
             )
         return entries
+
+    def _metadata_sidecars_for_source_path(self, display_path: str, source_path: str) -> list[str]:
+        sidecars: list[str] = []
+        seen: set[str] = set()
+
+        def add(path: str | None) -> None:
+            if not path or not os.path.isfile(path):
+                return
+            abs_path = os.path.abspath(path)
+            key = os.path.normcase(os.path.normpath(abs_path))
+            if key in seen:
+                return
+            seen.add(key)
+            sidecars.append(abs_path)
+
+        add(self._resolve_sidecar_path(display_path))
+        if source_path:
+            add(os.path.abspath(source_path) + JSON_SIDECAR_SUFFIX)
+        return sidecars
+
+    @staticmethod
+    def _sidecar_paths_from_clipboard_entry(entry: dict) -> list[str]:
+        sidecars: list[str] = []
+        seen: set[str] = set()
+
+        def add(path) -> None:
+            path_text = str(path or "").strip()
+            if not path_text:
+                return
+            norm_key = os.path.normcase(os.path.normpath(path_text))
+            if norm_key in seen:
+                return
+            seen.add(norm_key)
+            sidecars.append(path_text)
+
+        raw_sidecars = (entry or {}).get("sidecars")
+        if isinstance(raw_sidecars, list):
+            for path in raw_sidecars:
+                add(path)
+        add((entry or {}).get("sidecar"))
+        return sidecars
 
     @staticmethod
     def _expanded_paths_from_clipboard_entries(entries: list[dict[str, str]]) -> list[str]:
         expanded_paths: list[str] = []
         seen: set[str] = set()
         for entry in entries or []:
-            for key in ("source", "sidecar"):
-                path = str((entry or {}).get(key) or "").strip()
+            paths = [str((entry or {}).get("source") or "").strip()]
+            paths.extend(FileListPanel._sidecar_paths_from_clipboard_entry(entry or {}))
+            for path in paths:
                 if not path:
                     continue
                 norm_key = os.path.normcase(os.path.normpath(path))
@@ -6137,9 +6174,13 @@ class FileListPanel(QWidget):
                         if not isinstance(item, dict):
                             continue
                         source = os.path.abspath(str(item.get("source") or ""))
-                        sidecar = os.path.abspath(str(item.get("sidecar") or "")) if item.get("sidecar") else ""
+                        sidecars = [
+                            os.path.abspath(path)
+                            for path in self._sidecar_paths_from_clipboard_entry(item)
+                            if path and os.path.isfile(path)
+                        ]
                         if source and os.path.isfile(source):
-                            entries.append({"source": source, "sidecar": sidecar if os.path.isfile(sidecar) else ""})
+                            entries.append({"source": source, "sidecar": sidecars[0] if sidecars else "", "sidecars": sidecars})
                     if entries:
                         return action, entries
         except Exception as exc:
@@ -6159,7 +6200,7 @@ class FileListPanel(QWidget):
 
     @staticmethod
     def _clipboard_entries_from_urls(paths: list[str]) -> list[dict[str, str]]:
-        """将外部文件 URL 尽量按主文件 + 同 stem .xmp 配对。"""
+        """将外部文件 URL 尽量按主文件 + metadata sidecars 配对。"""
         norm_paths: list[str] = []
         seen: set[str] = set()
         for path in paths or []:
@@ -6173,24 +6214,39 @@ class FileListPanel(QWidget):
             norm_paths.append(abs_path)
 
         xmp_by_stem: dict[tuple[str, str], str] = {}
+        json_by_source_name: dict[tuple[str, str], str] = {}
         for path in norm_paths:
+            parent_key = os.path.normcase(os.path.dirname(path))
+            name = os.path.basename(path)
             if Path(path).suffix.lower() == ".xmp":
-                xmp_by_stem[(os.path.normcase(os.path.dirname(path)), Path(path).stem)] = path
+                xmp_by_stem[(parent_key, Path(path).stem)] = path
+            elif name.lower().endswith(JSON_SIDECAR_SUFFIX.lower()):
+                source_name = name[: -len(JSON_SIDECAR_SUFFIX)]
+                if source_name:
+                    json_by_source_name[(parent_key, source_name)] = path
 
-        paired_xmps: set[str] = set()
+        paired_sidecars: set[str] = set()
         entries: list[dict[str, str]] = []
         for path in norm_paths:
-            if Path(path).suffix.lower() == ".xmp":
+            name = os.path.basename(path)
+            if Path(path).suffix.lower() == ".xmp" or name.lower().endswith(JSON_SIDECAR_SUFFIX.lower()):
                 continue
-            sidecar = xmp_by_stem.get((os.path.normcase(os.path.dirname(path)), Path(path).stem), "")
-            if sidecar:
-                paired_xmps.add(os.path.normcase(os.path.normpath(sidecar)))
-            entries.append({"source": path, "sidecar": sidecar})
+            parent_key = os.path.normcase(os.path.dirname(path))
+            sidecars = []
+            xmp_sidecar = xmp_by_stem.get((parent_key, Path(path).stem), "")
+            json_sidecar = json_by_source_name.get((parent_key, name), "")
+            for sidecar in (xmp_sidecar, json_sidecar):
+                if not sidecar:
+                    continue
+                paired_sidecars.add(os.path.normcase(os.path.normpath(sidecar)))
+                sidecars.append(sidecar)
+            entries.append({"source": path, "sidecar": sidecars[0] if sidecars else "", "sidecars": sidecars})
 
         for path in norm_paths:
             key = os.path.normcase(os.path.normpath(path))
-            if Path(path).suffix.lower() == ".xmp" and key not in paired_xmps:
-                entries.append({"source": path, "sidecar": ""})
+            is_sidecar = Path(path).suffix.lower() == ".xmp" or os.path.basename(path).lower().endswith(JSON_SIDECAR_SUFFIX.lower())
+            if is_sidecar and key not in paired_sidecars:
+                entries.append({"source": path, "sidecar": "", "sidecars": []})
         return entries
 
     def _can_paste_files_from_clipboard(self) -> bool:
@@ -6209,17 +6265,28 @@ class FileListPanel(QWidget):
         except Exception:
             return os.path.normcase(os.path.normpath(path_a)) == os.path.normcase(os.path.normpath(path_b))
 
-    def _unique_paste_destination_pair(
+    @staticmethod
+    def _sidecar_destination_for_paste(source_path: str, dest_source: str, sidecar_path: str) -> str:
+        source_abs = os.path.normpath(os.path.abspath(source_path))
+        sidecar_abs = os.path.normpath(os.path.abspath(sidecar_path))
+        if os.path.normcase(sidecar_abs) == os.path.normcase(source_abs + JSON_SIDECAR_SUFFIX):
+            return os.path.normpath(dest_source + JSON_SIDECAR_SUFFIX)
+        source_base, _source_suffix = os.path.splitext(source_abs)
+        if os.path.normcase(sidecar_abs) == os.path.normcase(source_base + ".xmp"):
+            dest_base, _dest_suffix = os.path.splitext(dest_source)
+            return os.path.normpath(dest_base + os.path.splitext(sidecar_abs)[1])
+        return os.path.normpath(os.path.join(os.path.dirname(dest_source), os.path.basename(sidecar_abs)))
+
+    def _unique_paste_destinations(
         self,
         source_path: str,
-        sidecar_path: str,
+        sidecar_paths: list[str],
         dest_dir: str,
         *,
         action: str,
-    ) -> tuple[str, str]:
-        """计算主文件和 sidecar 的目标路径，避免覆盖并保持 sidecar 同 stem。"""
+    ) -> tuple[str, list[str]]:
+        """计算主文件和 sidecar 的目标路径，避免覆盖并保持 sidecar 跟随主文件名。"""
         source = Path(source_path)
-        sidecar_suffix = Path(sidecar_path).suffix if sidecar_path else ".xmp"
         base_stem = source.stem
         suffix = source.suffix
 
@@ -6231,16 +6298,29 @@ class FileListPanel(QWidget):
             else:
                 stem = f"{base_stem} {i}"
             dest_source = os.path.normpath(os.path.join(dest_dir, f"{stem}{suffix}"))
-            dest_sidecar = os.path.normpath(os.path.join(dest_dir, f"{stem}{sidecar_suffix}")) if sidecar_path else ""
+            dest_sidecars = [
+                self._sidecar_destination_for_paste(source_path, dest_source, sidecar_path)
+                for sidecar_path in sidecar_paths
+            ]
 
             source_conflict = os.path.exists(dest_source) and not (
                 action == "cut" and self._same_file_path(source_path, dest_source)
             )
-            sidecar_conflict = bool(dest_sidecar) and os.path.exists(dest_sidecar) and not (
-                action == "cut" and self._same_file_path(sidecar_path, dest_sidecar)
-            )
+            sidecar_conflict = False
+            candidate_keys = {os.path.normcase(os.path.normpath(dest_source))}
+            for sidecar_path, dest_sidecar in zip(sidecar_paths, dest_sidecars):
+                key = os.path.normcase(os.path.normpath(dest_sidecar))
+                if key in candidate_keys:
+                    sidecar_conflict = True
+                    break
+                candidate_keys.add(key)
+                if os.path.exists(dest_sidecar) and not (
+                    action == "cut" and self._same_file_path(sidecar_path, dest_sidecar)
+                ):
+                    sidecar_conflict = True
+                    break
             if not source_conflict and not sidecar_conflict:
-                return dest_source, dest_sidecar
+                return dest_source, dest_sidecars
         raise RuntimeError(f"无法为 {source.name} 生成不冲突的目标文件名。")
 
     def _paste_clipboard_to_current_dir(self) -> None:
@@ -6259,14 +6339,18 @@ class FileListPanel(QWidget):
         failures: list[str] = []
         for entry in entries:
             source_path = os.path.abspath(str(entry.get("source") or ""))
-            sidecar_path = os.path.abspath(str(entry.get("sidecar") or "")) if entry.get("sidecar") else ""
+            sidecar_paths = [
+                os.path.abspath(path)
+                for path in self._sidecar_paths_from_clipboard_entry(entry)
+                if path and os.path.isfile(path)
+            ]
             if not source_path or not os.path.isfile(source_path):
                 failures.append(source_path or "(empty)")
                 continue
             try:
-                dest_source, dest_sidecar = self._unique_paste_destination_pair(
+                dest_source, dest_sidecars = self._unique_paste_destinations(
                     source_path,
-                    sidecar_path if sidecar_path and os.path.isfile(sidecar_path) else "",
+                    sidecar_paths,
                     dest_dir,
                     action=action,
                 )
@@ -6274,30 +6358,31 @@ class FileListPanel(QWidget):
                     if not self._same_file_path(source_path, dest_source):
                         shutil.move(source_path, dest_source)
                         touched_paths.extend([source_path, dest_source])
-                    if sidecar_path and os.path.isfile(sidecar_path) and dest_sidecar and not self._same_file_path(sidecar_path, dest_sidecar):
-                        shutil.move(sidecar_path, dest_sidecar)
-                        touched_paths.extend([sidecar_path, dest_sidecar])
+                    for sidecar_path, dest_sidecar in zip(sidecar_paths, dest_sidecars):
+                        if not self._same_file_path(sidecar_path, dest_sidecar):
+                            shutil.move(sidecar_path, dest_sidecar)
+                            touched_paths.extend([sidecar_path, dest_sidecar])
                 else:
                     shutil.copy2(source_path, dest_source)
                     touched_paths.extend([dest_source])
-                    if sidecar_path and os.path.isfile(sidecar_path) and dest_sidecar:
+                    for sidecar_path, dest_sidecar in zip(sidecar_paths, dest_sidecars):
                         shutil.copy2(sidecar_path, dest_sidecar)
                         touched_paths.extend([dest_sidecar])
                 pasted_sources.append(dest_source)
                 _log.info(
-                    "[_paste_clipboard_to_current_dir] action=%r source=%r sidecar=%r dest=%r dest_sidecar=%r",
+                    "[_paste_clipboard_to_current_dir] action=%r source=%r sidecars=%s dest=%r dest_sidecars=%s",
                     action,
                     source_path,
-                    sidecar_path,
+                    sidecar_paths,
                     dest_source,
-                    dest_sidecar,
+                    dest_sidecars,
                 )
             except Exception as exc:
                 _log.warning(
-                    "[_paste_clipboard_to_current_dir] action=%r source=%r sidecar=%r failed: %s",
+                    "[_paste_clipboard_to_current_dir] action=%r source=%r sidecars=%s failed: %s",
                     action,
                     source_path,
-                    sidecar_path,
+                    sidecar_paths,
                     exc,
                 )
                 failures.append(source_path)

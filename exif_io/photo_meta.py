@@ -27,6 +27,14 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+from .json_sidecar import (
+    empty_json_sidecar_payload,
+    json_sidecar_metadata,
+    json_sidecar_path_for,
+    json_sidecar_to_flat_dict,
+    read_json_sidecar,
+    write_json_sidecar,
+)
 from .xmp_sidecar_edits import (
     acquire_compact_lock,
     delete_edit_files,
@@ -716,6 +724,143 @@ class PhotoMetaDataXMP(PhotoMetaData):
 
 
 # ---------------------------------------------------------------------------
+# JSON Sidecar
+# ---------------------------------------------------------------------------
+
+class PhotoMetaDataJSON(PhotoMetaData):
+    """Reads and writes SuperViewer JSON sidecar files.
+
+    The JSON sidecar is the fast SuperViewer-native replacement for XMP
+    sidecar writes.  It keeps the same exiftool-style metadata keys used by the
+    rest of the browser and can optionally read XMP as a fallback for existing
+    libraries.
+    """
+
+    SUBJECT_KEYS = _XMP_SUBJECT_KEYS
+
+    def __init__(self, fallback: PhotoMetaData | None = None) -> None:
+        self._fallback = fallback
+
+    def sidecar_path_for(self, path: str) -> Path:
+        return json_sidecar_path_for(path)
+
+    def _load_payload(self, path: str) -> dict[str, Any]:
+        payload = read_json_sidecar(path)
+        if not payload:
+            payload = empty_json_sidecar_payload(path)
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, dict):
+            payload["metadata"] = {}
+        return payload
+
+    def read(self, path: str) -> dict[str, Any]:
+        payload = read_json_sidecar(path)
+        if payload:
+            return json_sidecar_to_flat_dict(path, payload)
+        if self._fallback is not None:
+            try:
+                return self._fallback.read(path)
+            except Exception:
+                return {}
+        return {}
+
+    def read_batch(self, paths: list[str]) -> dict[str, dict[str, Any]]:
+        return {os.path.normpath(p): self.read(p) for p in paths}
+
+    def write(self, path: str, fields: dict[str, Any]) -> bool:
+        if not fields:
+            return True
+        payload = self._load_payload(path)
+        metadata = json_sidecar_metadata(payload)
+        payload["metadata"] = metadata
+
+        for key, value in fields.items():
+            if _is_xmp_subject_key(key):
+                metadata["XMP-dc:Subject"] = _normalise_subject_value(value, split_strings=True)
+            elif _is_xmp_description_key(key):
+                metadata["XMP-dc:Description"] = "" if value is None else str(value)
+            elif _is_xmp_rating_key(key):
+                metadata["XMP-xmp:Rating"] = _normalise_rating_value(value)
+            elif _is_xmp_pick_key(key):
+                metadata["XMP-xmpDM:pick"] = _normalise_pick_value(value)
+            else:
+                metadata[str(key)] = value
+
+        if not write_json_sidecar(path, payload):
+            return False
+        self._invalidate_metadata_cache(path)
+        return True
+
+    def read_subjects(self, path: str) -> list[str]:
+        payload = read_json_sidecar(path)
+        metadata = json_sidecar_metadata(payload)
+        for key, value in metadata.items():
+            if _is_xmp_subject_key(str(key)):
+                return _normalise_subject_value(value, split_strings=True)
+        if payload:
+            return []
+        fallback = self._fallback
+        if fallback is not None and hasattr(fallback, "read_subjects"):
+            try:
+                return list(fallback.read_subjects(path))  # type: ignore[attr-defined]
+            except Exception:
+                return []
+        return []
+
+    def write_subjects(self, path: str, subjects: Iterable[Any]) -> bool:
+        clean_subjects = _normalise_text_values(subjects)
+        return self.write(path, {"XMP-dc:Subject": clean_subjects})
+
+    def add_subjects(self, path: str, subjects: Iterable[Any]) -> bool:
+        incoming = _normalise_text_values(subjects)
+        if not incoming:
+            return True
+        current = self.read_subjects(path)
+        seen = set(current)
+        merged = list(current)
+        for value in incoming:
+            if value not in seen:
+                seen.add(value)
+                merged.append(value)
+        return self.write_subjects(path, merged)
+
+    def remove_subjects(self, path: str, subjects: Iterable[Any]) -> bool:
+        remove = set(_normalise_text_values(subjects))
+        if not remove:
+            return True
+        kept = [value for value in self.read_subjects(path) if value not in remove]
+        return self.write_subjects(path, kept)
+
+    def write_description(self, path: str, description: Any) -> bool:
+        return self.write(path, {"XMP-dc:Description": "" if description is None else str(description)})
+
+    def write_rating_pick(
+        self,
+        path: str,
+        *,
+        rating: int | None = None,
+        pick: int | None = None,
+    ) -> bool:
+        fields: dict[str, Any] = {}
+        if rating is not None:
+            fields["XMP-xmp:Rating"] = rating
+        if pick is not None:
+            fields["XMP-xmpDM:pick"] = pick
+        return self.write(path, fields)
+
+    @staticmethod
+    def _invalidate_metadata_cache(path: str) -> None:
+        try:
+            from .writer import invalidate_metadata_cache
+            invalidate_metadata_cache(path)
+        except Exception:
+            pass
+
+    def supports_write(self) -> bool:
+        return True
+
+
+# ---------------------------------------------------------------------------
 # Camera exposure summary helpers
 # ---------------------------------------------------------------------------
 
@@ -1105,9 +1250,11 @@ class PhotoMetaDataProxy(PhotoMetaData):
         self,
         exif: PhotoMetaDataEXIFEmbeded | None = None,
         xmp: PhotoMetaDataXMP | None = None,
+        json_sidecar: PhotoMetaDataJSON | None = None,
     ) -> None:
         self._exif = exif or PhotoMetaDataEXIFEmbeded()
         self._xmp = xmp or PhotoMetaDataXMP()
+        self._json = json_sidecar or PhotoMetaDataJSON()
 
     # ------------------------------------------------------------------
     # Properties for direct access to sub-sources
@@ -1121,6 +1268,10 @@ class PhotoMetaDataProxy(PhotoMetaData):
     def xmp(self) -> PhotoMetaDataXMP:
         return self._xmp
 
+    @property
+    def json(self) -> PhotoMetaDataJSON:
+        return self._json
+
     # ------------------------------------------------------------------
     # PhotoMetaData interface
     # ------------------------------------------------------------------
@@ -1129,7 +1280,7 @@ class PhotoMetaDataProxy(PhotoMetaData):
         """Merge EXIF and sidecar metadata; sidecar keys overwrite embedded keys."""
         merged: dict[str, Any] = {"SourceFile": path}
         # Apply in ascending priority order so later sources win
-        for source in (self._exif, self._xmp):
+        for source in (self._exif, self._xmp, self._json):
             try:
                 data = source.read(path)
                 if data:
@@ -1165,6 +1316,15 @@ class PhotoMetaDataProxy(PhotoMetaData):
             except Exception:
                 pass
 
+        # 3. JSON per-file (highest priority)
+        for p, norm in zip(paths, norm_paths):
+            try:
+                data = self._json.read(p)
+                if data and norm in result:
+                    result[norm].update(data)
+            except Exception:
+                pass
+
         for rec in result.values():
             _normalise_rating_pick_aliases(rec)
         return result
@@ -1183,17 +1343,17 @@ class PhotoMetaDataProxy(PhotoMetaData):
                 or _is_xmp_description_key(key)
             )
 
-        xmp_fields = {k: v for k, v in fields.items() if is_sidecar_field(k)}
-        file_fields = {k: v for k, v in fields.items() if k not in xmp_fields}
+        sidecar_fields = {k: v for k, v in fields.items() if is_sidecar_field(k)}
+        file_fields = {k: v for k, v in fields.items() if k not in sidecar_fields}
 
         success = True
         if file_fields:
             success = self._exif.write(path, file_fields) and success
-        if xmp_fields:
-            success = self._xmp.write(path, xmp_fields) and success
-            # Also mirror XMP fields into the source when possible; sidecar is authoritative.
+        if sidecar_fields:
+            success = self._json.write(path, sidecar_fields) and success
+            # Also mirror sidecar fields into the source when possible; sidecar is authoritative.
             try:
-                self._exif.write(path, xmp_fields)
+                self._exif.write(path, sidecar_fields)
             except Exception:
                 pass
         return success
