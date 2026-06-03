@@ -221,6 +221,33 @@ class FileTableModel(QAbstractTableModel):
         self._row_by_path = {}
         self.endResetModel()
 
+    def append_paths(
+        self,
+        paths: list[str],
+        *,
+        meta_cache: dict,
+        tooltip_fn,
+        mismatch_fn,
+    ) -> int:
+        if not paths:
+            return 0
+        start_row = len(self._entries)
+        new_entries = [
+            self._build_entry(
+                path,
+                meta_cache=meta_cache,
+                tooltip_fn=tooltip_fn,
+                mismatch_fn=mismatch_fn,
+            )
+            for path in paths
+        ]
+        self.beginInsertRows(QModelIndex(), start_row, start_row + len(new_entries) - 1)
+        self._entries.extend(new_entries)
+        for offset, entry in enumerate(new_entries):
+            self._row_by_path[os.path.normpath(entry.path)] = start_row + offset
+        self.endInsertRows()
+        return len(new_entries)
+
     def rebuild(
         self,
         paths: list[str],

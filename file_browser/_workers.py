@@ -8,6 +8,7 @@ class DirectoryScanWorker(QThread):
     """在后台执行目录扫描与 report.db 加载，完成后通过信号回传结果。"""
 
     scan_finished = pyqtSignal(str, object, object, object)  # (path, files_list, selected_report_cache, full_report_cache_or_none)
+    scan_progress = pyqtSignal(str, int, int, str)  # (path, found_files, scanned_dirs, current_dir)
 
     def __init__(
         self,
@@ -65,6 +66,36 @@ class DirectoryScanWorker(QThread):
             _log.info("[DirectoryScanWorker.run] interrupted after report")
             return
         files: list = []
+        scanned_dirs = 0
+        last_progress_at = 0.0
+        last_progress_files = 0
+        last_progress_dirs = 0
+        last_worker_probe_at = 0.0
+
+        def maybe_emit_progress(current_dir: str = "", *, force: bool = False) -> None:
+            nonlocal last_progress_at, last_progress_files, last_progress_dirs, last_worker_probe_at
+            now = _time.perf_counter()
+            if not force and last_progress_at > 0.0 and (now - last_progress_at) < 0.25:
+                return
+            last_progress_at = now
+            last_progress_files = len(files)
+            last_progress_dirs = scanned_dirs
+            self.scan_progress.emit(
+                self._path,
+                len(files),
+                scanned_dirs,
+                os.path.normpath(current_dir) if current_dir else "",
+            )
+            if perf_probes_enabled() and (force or (now - last_worker_probe_at) >= 2.0):
+                last_worker_probe_at = now
+                _log.info(
+                    "[FILE_BROWSER_PROBE] event=scan_worker_progress path=%r found_files=%s scanned_dirs=%s current_dir=%r",
+                    self._path,
+                    len(files),
+                    scanned_dirs,
+                    os.path.normpath(current_dir) if current_dir else "",
+                )
+
         if report_source_available and self._report_root:
             # 当 report.db 有记录时，用 DB 中 current_path（相对选中目录）拼出完整路径，扩展名用 original_path 的（如 .ARW）
             selected_dir = os.path.normpath(self._path)
@@ -142,10 +173,12 @@ class DirectoryScanWorker(QThread):
                     for root, dirs, names in os.walk(self._path, topdown=True):
                         if self.isInterruptionRequested():
                             return
+                        scanned_dirs += 1
                         dirs[:] = [d for d in dirs if not d.startswith(".")]
                         for name in sorted(names, key=str.lower):
-                            if Path(name).suffix.lower() in IMAGE_EXTENSIONS:
+                            if name.lower().endswith(IMAGE_EXTENSIONS):
                                 files.append(os.path.join(root, name))
+                        maybe_emit_progress(root)
                 except (PermissionError, OSError) as e:
                     _log.warning("[DirectoryScanWorker.run] fallback scan error: %s", e)
         else:
@@ -155,18 +188,23 @@ class DirectoryScanWorker(QThread):
                         if self.isInterruptionRequested():
                             _log.info("[DirectoryScanWorker.run] interrupted during walk")
                             return
+                        scanned_dirs += 1
                         dirs[:] = [d for d in dirs if not d.startswith(".")]
                         for name in sorted(names, key=str.lower):
-                            if Path(name).suffix.lower() in IMAGE_EXTENSIONS:
+                            if name.lower().endswith(IMAGE_EXTENSIONS):
                                 files.append(os.path.join(root, name))
+                        maybe_emit_progress(root)
                 else:
                     for entry in sorted(os.scandir(self._path), key=lambda e: e.name.lower()):
                         if self.isInterruptionRequested():
                             return
-                        if entry.is_file() and Path(entry.name).suffix.lower() in IMAGE_EXTENSIONS:
+                        if entry.is_file() and entry.name.lower().endswith(IMAGE_EXTENSIONS):
                             files.append(entry.path)
+                    scanned_dirs = 1
+                    maybe_emit_progress(self._path, force=True)
             except (PermissionError, OSError) as e:
                 _log.warning("[DirectoryScanWorker.run] scan error: %s", e)
+        maybe_emit_progress(self._path, force=True)
         _log.info("[DirectoryScanWorker.run] 目录扫描完成：列出 %s 个图像文件，report_cache %s 条，即将通知主线程加载 EXIF", len(files), len(report_cache))
         _log.info("[DirectoryScanWorker.run] scan done files=%s", len(files))
         if not self.isInterruptionRequested():

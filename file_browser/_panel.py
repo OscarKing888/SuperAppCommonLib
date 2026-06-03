@@ -54,6 +54,7 @@ class FileListPanel(QWidget):
         self._thumbnail_loader: ThumbnailLoader | None = None
         self._metadata_loader:  MetadataLoader  | None = None
         self._directory_scan_worker: DirectoryScanWorker | None = None
+        self._pending_directory_listing_result: tuple | None = None
         self._file_table_model = FileTableModel(self)
         self._file_table_proxy = FileTableSortProxyModel(self)
         self._file_table_proxy.setSourceModel(self._file_table_model)
@@ -85,6 +86,10 @@ class FileListPanel(QWidget):
         self._tree_last_sort_column: int = _TREE_COL_NAME
         self._tree_last_sort_order = _AscendingOrder
         self._tree_view_dirty: bool = False
+        self._tree_model_populate_timer: QTimer | None = None
+        self._tree_model_pending_paths: list[str] = []
+        self._tree_model_pending_index: int = 0
+        self._tree_model_populate_started_at: float = 0.0
         self._copied_species_payload: dict | None = None
         self._pending_selection_paths: list | None = None  # 接收到的文件列表，目录加载完成后等同多选
         self._pending_selection_current_path: str = ""
@@ -121,11 +126,25 @@ class FileListPanel(QWidget):
         self._persistent_thumb_cache_total: int = 0
         self._persistent_thumb_cache_done: int = 0
         self._persistent_thumb_cache_current_path: str = ""
+        self._persistent_thumb_cache_status_text: str = ""
+        self._persistent_thumb_cache_focus_priority: int = 0
+        self._persistent_thumb_cache_pending_priority: int = 0
         self._thumb_profile_enabled: bool = _thumb_profile_enabled()
         self._thumb_profile_last_report_at: float = 0.0
         self._thumb_profile_window_started_at: float = _time.perf_counter()
         self._thumb_profile_ready_received_at: dict[str, float] = {}
         self._background_shutdown_started: bool = False
+        self._probe_phase: str = "init"
+        self._probe_phase_started_at: float = _time.perf_counter()
+        self._probe_heartbeat_timer: QTimer | None = None
+        self._probe_heartbeat_last_at: float = 0.0
+        self._probe_scan_last_log_at: float = 0.0
+        self._probe_scan_last_files: int = 0
+        self._probe_scan_last_dirs: int = 0
+        self._probe_tree_last_log_at: float = 0.0
+        self._probe_tree_last_rows: int = 0
+        self._probe_thumb_last_log_at: float = 0.0
+        self._probe_thumb_last_rows: int = 0
         self._selection_scroll_debug_events: deque[str] = deque(maxlen=120)
         self._selection_scroll_debug_total: int = 0
         self._selection_scroll_debug_flushed: bool = False
@@ -181,6 +200,7 @@ class FileListPanel(QWidget):
                 app.aboutToQuit.connect(self._shutdown_background_work)
             except Exception:
                 pass
+        self._sync_file_browser_probe_timer()
 
     # ── UI 初始化 ──────────────────────────────────────────────────────────────
     def _init_ui(self) -> None:
@@ -651,6 +671,109 @@ class FileListPanel(QWidget):
             parts.append("当前未选中")
         label.setText(" | ".join(parts))
 
+    def _show_meta_progress_status(
+        self,
+        text: str,
+        *,
+        busy: bool = False,
+        value: int = 0,
+        total: int = 0,
+    ) -> None:
+        if busy:
+            self._meta_progress.setRange(0, 0)
+            self._meta_progress.setFormat(text)
+        else:
+            bounded_total = max(1, int(total or 0))
+            bounded_value = min(max(0, int(value or 0)), bounded_total)
+            self._meta_progress.setRange(0, bounded_total)
+            self._meta_progress.setValue(bounded_value)
+            self._meta_progress.setFormat(f"{text} {bounded_value}/{bounded_total}")
+        self._meta_progress.show()
+
+    @staticmethod
+    def _probe_fields(**fields) -> str:
+        parts: list[str] = []
+        for key, value in fields.items():
+            if isinstance(value, float):
+                parts.append(f"{key}={value:.1f}")
+            else:
+                parts.append(f"{key}={value!r}")
+        return " ".join(parts)
+
+    def _probe_log(self, event: str, **fields) -> None:
+        if not perf_probes_enabled():
+            return
+        try:
+            phase_ms = elapsed_ms(self._probe_phase_started_at)
+            detail = self._probe_fields(**fields)
+            suffix = f" {detail}" if detail else ""
+            _log.info(
+                "[FILE_BROWSER_PROBE] event=%s phase=%s phase_ms=%.1f dir=%r all=%s filtered=%s%s",
+                event,
+                self._probe_phase,
+                phase_ms,
+                self._current_dir,
+                len(self._all_files),
+                len(self._filtered_files),
+                suffix,
+            )
+        except Exception:
+            pass
+
+    def _probe_set_phase(self, phase: str, **fields) -> None:
+        if not perf_probes_enabled():
+            return
+        previous = self._probe_phase
+        previous_ms = elapsed_ms(self._probe_phase_started_at)
+        self._probe_phase = str(phase or "")
+        self._probe_phase_started_at = perf_counter()
+        self._probe_log("phase", previous=previous, previous_ms=previous_ms, **fields)
+
+    def _sync_file_browser_probe_timer(self) -> None:
+        enabled = perf_probes_enabled()
+        if not enabled:
+            if self._probe_heartbeat_timer is not None and self._probe_heartbeat_timer.isActive():
+                self._probe_heartbeat_timer.stop()
+            self._probe_heartbeat_last_at = 0.0
+            return
+        if self._probe_heartbeat_timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(False)
+            timer.timeout.connect(self._on_file_browser_probe_heartbeat)
+            self._probe_heartbeat_timer = timer
+        self._probe_heartbeat_last_at = perf_counter()
+        if not self._probe_heartbeat_timer.isActive():
+            self._probe_heartbeat_timer.start(250)
+        self._probe_log("heartbeat_started")
+
+    def _on_file_browser_probe_heartbeat(self) -> None:
+        if not perf_probes_enabled():
+            self._sync_file_browser_probe_timer()
+            return
+        now = perf_counter()
+        last = self._probe_heartbeat_last_at or now
+        gap_ms = (now - last) * 1000.0
+        self._probe_heartbeat_last_at = now
+        if gap_ms < 750.0:
+            return
+        try:
+            _log.info(
+                "[UI_STALL] gap_ms=%.1f phase=%s phase_ms=%.1f dir=%r all=%s filtered=%s tree_rows=%s thumb_rows=%s scan_running=%s meta_running=%s thumb_loader_running=%s",
+                gap_ms,
+                self._probe_phase,
+                elapsed_ms(self._probe_phase_started_at),
+                self._current_dir,
+                len(self._all_files),
+                len(self._filtered_files),
+                self._tree_source_row_count(),
+                self._thumb_row_count(),
+                self._directory_scan_worker is not None,
+                self._metadata_loader is not None,
+                self._thumbnail_loader is not None and self._thumbnail_loader.isRunning(),
+            )
+        except Exception:
+            pass
+
     # ── 数据加载 ────────────────────────────────────────────────────────────────
     def _collect_image_files(self, dir_path: str, recursive: bool) -> list:
         """收集目录下支持的图像文件路径，委托给模块级函数（可被后台线程调用）。"""
@@ -752,15 +875,27 @@ class FileListPanel(QWidget):
         report_row_by_path: dict | None = None,
         from_cache: bool = False,
     ) -> None:
+        apply_t0 = perf_counter()
+        self._probe_set_phase(
+            "apply_listing",
+            path=path,
+            files=len(files),
+            report_entries=len(report_cache or {}),
+            from_cache=bool(from_cache),
+            recursive=bool(recursive),
+        )
         if path != self._current_dir:
             _log.info("[_apply_directory_listing_result] IGNORE stale path=%r current=%r", path, self._current_dir)
+            self._probe_set_phase("idle", reason="apply_listing_stale", elapsed_ms=elapsed_ms(apply_t0))
             return
+        step_t0 = perf_counter()
         if not self._use_report_db:
             report_cache = {}
             full_report_cache = None
             report_row_by_path = {}
             self._report_full_root_dir = None
             self._report_full_cache = None
+        self._probe_log("apply_listing.report_mode", elapsed_ms=elapsed_ms(step_t0), use_report_db=bool(self._use_report_db))
         if self._report_root_dir:
             self._report_full_root_dir = self._report_root_dir
             if full_report_cache is not None:
@@ -771,6 +906,7 @@ class FileListPanel(QWidget):
                 len(self._report_full_cache or {}),
             )
         if not from_cache and _DEBUG_FILE_LIST_LIMIT > 0 and len(files) > _DEBUG_FILE_LIST_LIMIT:
+            step_t0 = perf_counter()
             selected_files = files
             if _DEBUG_FILE_LIST_MATCH:
                 matched = [p for p in files if _DEBUG_FILE_LIST_MATCH in str(p).lower()]
@@ -798,6 +934,8 @@ class FileListPanel(QWidget):
                 len(report_cache),
             )
             files = limited_files
+            self._probe_log("apply_listing.debug_limit", elapsed_ms=elapsed_ms(step_t0), files=len(files))
+        step_t0 = perf_counter()
         self._report_cache = dict(report_cache or {})
         if report_row_by_path is None:
             report_row_by_path = {}
@@ -810,6 +948,8 @@ class FileListPanel(QWidget):
                 if isinstance(row, dict):
                     report_row_by_path[norm_p] = row
         self._report_row_by_path = dict(report_row_by_path or {})
+        self._probe_log("apply_listing.report_row_map", elapsed_ms=elapsed_ms(step_t0), rows=len(self._report_row_by_path))
+        step_t0 = perf_counter()
         self._all_files = list(files)
         self._loaded_directory_recursive = bool(recursive)
         self._store_directory_scope_cache(
@@ -818,6 +958,7 @@ class FileListPanel(QWidget):
             report_cache=self._report_cache,
             report_row_by_path=self._report_row_by_path,
         )
+        self._probe_log("apply_listing.store_scope", elapsed_ms=elapsed_ms(step_t0), files=len(self._all_files))
         _log.info(
             "[_apply_directory_listing_result] apply files=%s report_entries=%s recursive=%s from_cache=%s",
             len(self._all_files),
@@ -825,16 +966,30 @@ class FileListPanel(QWidget):
             recursive,
             from_cache,
         )
+        step_t0 = perf_counter()
         self._rebuild_views()
+        self._probe_log("apply_listing.rebuild_views", elapsed_ms=elapsed_ms(step_t0), mode=self._view_mode)
+        step_t0 = perf_counter()
         self.files_loaded.emit(self.get_display_file_paths())
+        self._probe_log("apply_listing.files_loaded_emit", elapsed_ms=elapsed_ms(step_t0), files=len(self._filtered_files))
+        step_t0 = perf_counter()
         if self._pending_selection_paths:
             self._apply_pending_selection()
-            if self._view_mode != self._MODE_THUMB or not self._thumb_model_dirty:
+            if not (
+                (self._view_mode == self._MODE_LIST and self._tree_view_dirty)
+                or (self._view_mode == self._MODE_THUMB and self._thumb_model_dirty)
+            ):
                 self._pending_selection_paths = None
                 self._pending_selection_current_path = ""
         else:
             self._select_first_file_if_needed(reason="directory_listing")
+        self._probe_log("apply_listing.selection", elapsed_ms=elapsed_ms(step_t0), pending=bool(self._pending_selection_paths))
+        step_t0 = perf_counter()
+        self._schedule_persistent_thumb_cache_build(self._all_files)
+        self._probe_log("apply_listing.schedule_persistent_thumbs", elapsed_ms=elapsed_ms(step_t0), files=len(self._all_files))
+        step_t0 = perf_counter()
         uncached_meta_paths = self._collect_uncached_metadata_paths(self._all_files)
+        self._probe_log("apply_listing.collect_uncached_meta", elapsed_ms=elapsed_ms(step_t0), uncached=len(uncached_meta_paths))
         if uncached_meta_paths:
             _log.info(
                 "[_apply_directory_listing_result] start metadata loader missing=%s cached=%s total=%s",
@@ -842,13 +997,15 @@ class FileListPanel(QWidget):
                 max(0, len(self._all_files) - len(uncached_meta_paths)),
                 len(self._all_files),
             )
+            step_t0 = perf_counter()
             self._start_metadata_loader(uncached_meta_paths)
+            self._probe_log("apply_listing.start_metadata_loader", elapsed_ms=elapsed_ms(step_t0), uncached=len(uncached_meta_paths))
         else:
             _log.info(
                 "[_apply_directory_listing_result] metadata already cached for all files total=%s",
                 len(self._all_files),
             )
-        self._schedule_persistent_thumb_cache_build(self._all_files)
+        self._probe_log("apply_listing.done", elapsed_ms=elapsed_ms(apply_t0), meta_uncached=len(uncached_meta_paths))
 
     def _refresh_filter_scope(self) -> None:
         probe_t0 = perf_counter()
@@ -856,7 +1013,7 @@ class FileListPanel(QWidget):
             self._apply_filter()
             perf_log(_log, "[filter.scope] reason=no_current_dir elapsed_ms=%.1f", elapsed_ms(probe_t0))
             return
-        target_recursive = self._has_any_filter()
+        target_recursive = True
         if target_recursive == self._loaded_directory_recursive:
             self._apply_filter()
             perf_log(
@@ -905,11 +1062,21 @@ class FileListPanel(QWidget):
     ) -> None:
         """
         扫描目录，加载支持的图像文件。扫描与 report 加载在后台线程执行，避免阻塞 UI。
-        当任意过滤条件开启（文本 / 🏆精选 / 星级 / 对焦）时，递归遍历该目录及所有子目录（不进入 . 开头目录）；
-        否则仅当前目录。过滤切换同目录 scope 时可复用当前内存中的文件列表和 metadata 缓存，避免重复全量读取。
+        递归遍历该目录及所有子目录（不进入 . 开头目录）。过滤切换同目录 scope 时可复用当前内存中的
+        文件列表和 metadata 缓存，避免重复全量读取。
         """
-        recursive = self._has_any_filter()
+        load_t0 = perf_counter()
+        recursive = True
         same_dir = path == self._current_dir
+        self._probe_set_phase(
+            "load_directory",
+            path=path,
+            force_reload=bool(force_reload),
+            same_dir=bool(same_dir),
+            recursive=bool(recursive),
+            preserve_meta_cache=bool(preserve_meta_cache),
+            reuse_cached_listing=bool(reuse_cached_listing),
+        )
         _log.info(
             "[load_directory] 选中目录，将扫描并列出图像文件、随后查询 EXIF path=%r force_reload=%s recursive=%s preserve_meta_cache=%s reuse_cached_listing=%s",
             path,
@@ -928,6 +1095,7 @@ class FileListPanel(QWidget):
         )
         if not force_reload and same_dir and recursive == self._loaded_directory_recursive:
             _log.info("[load_directory] SKIP same dir")
+            self._probe_set_phase("idle", reason="load_directory_skip_same_dir", elapsed_ms=elapsed_ms(load_t0))
             return
         self._current_dir = path
         if not same_dir:
@@ -965,9 +1133,13 @@ class FileListPanel(QWidget):
             len(self._report_full_cache or {}),
         )
         _log.info("[load_directory] _stop_all_loaders")
+        stop_t0 = perf_counter()
         self._stop_all_loaders()
+        self._probe_log("load_directory.stop_loaders", elapsed_ms=elapsed_ms(stop_t0))
         _log.info("[load_directory] _stop_directory_scan_worker")
         self._stop_directory_scan_worker()
+        self._pending_directory_listing_result = None
+        self._show_meta_progress_status("正在查找所有图像....", busy=True)
         if same_dir and reuse_cached_listing:
             cached_scope = self._get_cached_directory_scope(recursive)
             if cached_scope is not None:
@@ -978,6 +1150,7 @@ class FileListPanel(QWidget):
                     len(cached_scope["report_cache"]),
                 )
                 self._selected_display_path = ""
+                self._show_meta_progress_status("正在准备生成缩略图...", busy=True)
                 self._apply_directory_listing_result(
                     path,
                     cached_scope["files"],
@@ -988,6 +1161,7 @@ class FileListPanel(QWidget):
                     from_cache=True,
                 )
                 _log.info("[load_directory] END reused cached scope")
+                self._probe_set_phase("idle", reason="load_directory_reused_cache", elapsed_ms=elapsed_ms(load_t0))
                 return
         # Folder-level FIFO eviction: release QImages cached for any directory
         # other than the one we are about to enter.  This ensures that browsing
@@ -1006,7 +1180,9 @@ class FileListPanel(QWidget):
             self._selected_display_path = ""
             self._all_files = []
             _log.info("[load_directory] _rebuild_views (empty)")
+            empty_t0 = perf_counter()
             self._rebuild_views()
+            self._probe_log("load_directory.empty_rebuild", elapsed_ms=elapsed_ms(empty_t0))
         else:
             _log.info(
                 "[load_directory] preserve same-dir meta cache cache_size=%s loaded_recursive=%s target_recursive=%s",
@@ -1029,11 +1205,14 @@ class FileListPanel(QWidget):
             use_report_db=self._use_report_db,
             parent=self,
         )
+        self._directory_scan_worker.scan_progress.connect(self._on_directory_scan_progress)
         self._directory_scan_worker.scan_finished.connect(self._on_directory_scan_finished)
         self._directory_scan_worker.start()
+        self._probe_set_phase("directory_scan_running", path=path, elapsed_ms=elapsed_ms(load_t0))
         _log.info("[load_directory] END worker.started")
 
     def _stop_directory_scan_worker(self) -> None:
+        self._pending_directory_listing_result = None
         if self._directory_scan_worker is None:
             _log.debug("[_stop_directory_scan_worker] no worker")
             return
@@ -1042,8 +1221,37 @@ class FileListPanel(QWidget):
             self._directory_scan_worker.scan_finished.disconnect(self._on_directory_scan_finished)
         except Exception:
             pass
+        try:
+            self._directory_scan_worker.scan_progress.disconnect(self._on_directory_scan_progress)
+        except Exception:
+            pass
         self._directory_scan_worker.requestInterruption()
         self._directory_scan_worker = None
+
+    def _on_directory_scan_progress(self, path: str, found_files: int, scanned_dirs: int, current_dir: str) -> None:
+        if path != self._current_dir:
+            return
+        found_files = max(0, int(found_files))
+        scanned_dirs = max(0, int(scanned_dirs))
+        details = f"已找到 {max(0, int(found_files))} 张"
+        if scanned_dirs > 0:
+            details += f"，已扫描 {max(0, int(scanned_dirs))} 个目录"
+        self._show_meta_progress_status(f"正在查找所有图像.... {details}", busy=True)
+        now = perf_counter()
+        if (
+            found_files - self._probe_scan_last_files >= 1000
+            or scanned_dirs - self._probe_scan_last_dirs >= 250
+            or (now - self._probe_scan_last_log_at) >= 2.0
+        ):
+            self._probe_scan_last_log_at = now
+            self._probe_scan_last_files = found_files
+            self._probe_scan_last_dirs = scanned_dirs
+            self._probe_log(
+                "scan_progress",
+                found_files=found_files,
+                scanned_dirs=scanned_dirs,
+                current_dir=current_dir,
+            )
 
     def _on_directory_scan_finished(self, path: str, files: list, report_cache: dict, full_report_cache) -> None:
         _log.info("[_on_directory_scan_finished] 收到目录扫描结果 path=%r files=%s report_entries=%s，开始列出文件并查询 EXIF", path, len(files), len(report_cache))
@@ -1052,12 +1260,34 @@ class FileListPanel(QWidget):
             _log.info("[_on_directory_scan_finished] IGNORE stale path")
             return
         recursive = self._requested_directory_recursive
+        self._probe_set_phase(
+            "directory_scan_finished",
+            path=path,
+            files=len(files),
+            report_entries=len(report_cache),
+            recursive=bool(recursive),
+        )
         _log.info(
             "[_on_directory_scan_finished] apply scan result recursive=%s files=%s report_entries=%s",
             recursive,
             len(files),
             len(report_cache),
         )
+        self._show_meta_progress_status("正在准备生成缩略图...", busy=True)
+        self._directory_scan_worker = None
+        self._probe_set_phase("apply_listing_queued", files=len(files))
+        self._pending_directory_listing_result = (path, files, report_cache, full_report_cache, recursive)
+        QTimer.singleShot(0, self._apply_pending_directory_listing_result)
+        _log.info("[_on_directory_scan_finished] END")
+
+    def _apply_pending_directory_listing_result(self) -> None:
+        pending = self._pending_directory_listing_result
+        self._pending_directory_listing_result = None
+        if not pending:
+            self._probe_log("apply_listing_timer_fired_empty")
+            return
+        path, files, report_cache, full_report_cache, recursive = pending
+        self._probe_set_phase("apply_listing_timer_fired", path=path, files=len(files))
         self._apply_directory_listing_result(
             path,
             files,
@@ -1065,12 +1295,14 @@ class FileListPanel(QWidget):
             full_report_cache,
             recursive=recursive,
         )
-        self._directory_scan_worker = None
-        _log.info("[_on_directory_scan_finished] END")
 
     def get_current_dir(self) -> str:
         """返回当前选中的目录路径（与 load_directory 的 path 一致）。"""
         return self._current_dir or ""
+
+    def get_selected_display_path(self) -> str:
+        """返回文件列表中当前选中的显示路径。"""
+        return os.path.normpath(self._selected_display_path) if self._selected_display_path else ""
 
     def get_display_file_paths(self) -> list[str]:
         """返回当前文件列表的稳定快照，供后台预热类任务复用。"""
@@ -1248,7 +1480,10 @@ class FileListPanel(QWidget):
         ):
             self._pending_selection_paths = normalized
             self._apply_pending_selection()
-            if not self._thumb_model_dirty:
+            if not (
+                (self._view_mode == self._MODE_LIST and self._tree_view_dirty)
+                or (self._view_mode == self._MODE_THUMB and self._thumb_model_dirty)
+            ):
                 self._pending_selection_paths = None
                 self._pending_selection_current_path = ""
             return
@@ -3127,6 +3362,24 @@ class FileListPanel(QWidget):
     def _clear_tree_view_state(self) -> None:
         self._file_table_model.clear()
 
+    def _ensure_tree_model_populate_timer(self) -> None:
+        if self._tree_model_populate_timer is not None:
+            return
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(self._populate_tree_model_batch)
+        self._tree_model_populate_timer = timer
+
+    def _pause_tree_model_population(self) -> None:
+        if self._tree_model_populate_timer is not None and self._tree_model_populate_timer.isActive():
+            self._tree_model_populate_timer.stop()
+
+    def _cancel_tree_model_population(self) -> None:
+        self._pause_tree_model_population()
+        self._tree_model_pending_paths = []
+        self._tree_model_pending_index = 0
+        self._tree_model_populate_started_at = 0.0
+
     def _apply_tree_sort(self, column: int, order, *, sync_indicator: bool = False) -> None:
         """显式驱动 proxy 排序，避免依赖不同 Qt 版本对表头点击排序的隐式行为。"""
         hdr = self._tree_widget.header()
@@ -3146,33 +3399,137 @@ class FileListPanel(QWidget):
         self._tree_widget.sortByColumn(column, order)
 
     def _rebuild_tree_items(self) -> None:
-        self._tree_widget.setUpdatesEnabled(False)
-        try:
-            self._tree_widget.setSortingEnabled(False)
-            self._set_tree_header_fast_mode(True)
-            self._clear_tree_view_state()
-            ft = (self._filter_edit.text().strip().lower()) if self._filter_edit else ""
-            _log.info("[_rebuild_tree_items] filter_text=%r adding items", ft or "(none)")
-            self._file_table_model.rebuild(
-                self._filtered_files,
-                meta_cache=self._meta_cache,
-                tooltip_fn=self._build_list_path_tooltip,
-                mismatch_fn=self._has_path_mismatch,
+        self._probe_set_phase("tree_model_prepare", filtered=len(self._filtered_files))
+        self._cancel_tree_model_population()
+        prepare_t0 = perf_counter()
+        self._tree_widget.setSortingEnabled(False)
+        self._set_tree_header_fast_mode(True)
+        self._clear_tree_view_state()
+        ft = (self._filter_edit.text().strip().lower()) if self._filter_edit else ""
+        _log.info("[_rebuild_tree_items] filter_text=%r adding items", ft or "(none)")
+        self._probe_log("tree_model_prepare.done", elapsed_ms=elapsed_ms(prepare_t0), filter_text=ft)
+        self._start_tree_model_population()
+
+    def _start_tree_model_population(self, *, resume: bool = False) -> None:
+        if not resume:
+            self._tree_model_pending_paths = list(self._filtered_files)
+            self._tree_model_pending_index = 0
+            self._tree_model_populate_started_at = _time.perf_counter()
+            self._probe_tree_last_log_at = 0.0
+            self._probe_tree_last_rows = 0
+        elif not self._tree_model_pending_paths:
+            self._tree_model_pending_paths = list(self._filtered_files)
+        if not self._tree_model_pending_paths:
+            self._finish_tree_model_population(total=0)
+            return
+        if self._tree_model_populate_started_at <= 0:
+            self._tree_model_populate_started_at = _time.perf_counter()
+        self._tree_view_dirty = True
+        self._probe_set_phase("tree_model_populate", total=len(self._tree_model_pending_paths), resume=bool(resume))
+        self._ensure_tree_model_populate_timer()
+        self._populate_tree_model_batch()
+
+    def _populate_tree_model_batch(self) -> None:
+        if self._view_mode != self._MODE_LIST:
+            self._pause_tree_model_population()
+            return
+        total = len(self._tree_model_pending_paths)
+        start = self._tree_model_pending_index
+        if total <= 0 or start >= total:
+            self._finish_tree_model_population(total=total)
+            return
+        batch_t0 = perf_counter()
+        tick_t0 = _time.perf_counter()
+        end = start
+        min_batch = 24
+        max_batch = max(1, _THUMB_MODEL_APPEND_BATCH_SIZE)
+        while end < total:
+            end += 1
+            processed = end - start
+            if processed >= max_batch:
+                break
+            if processed >= min_batch and (_time.perf_counter() - tick_t0) >= _THUMB_MODEL_APPEND_BUDGET_S:
+                break
+        self._file_table_model.append_paths(
+            self._tree_model_pending_paths[start:end],
+            meta_cache=self._meta_cache,
+            tooltip_fn=self._build_list_path_tooltip,
+            mismatch_fn=self._has_path_mismatch,
+        )
+        batch_ms = elapsed_ms(batch_t0)
+        self._tree_model_pending_index = end
+        self._show_meta_progress_status("正在准备文件列表", value=end, total=total)
+        now = perf_counter()
+        if (
+            end >= total
+            or batch_ms >= 40.0
+            or end - self._probe_tree_last_rows >= 1000
+            or (now - self._probe_tree_last_log_at) >= 1.0
+        ):
+            self._probe_tree_last_log_at = now
+            self._probe_tree_last_rows = end
+            self._probe_log(
+                "tree_model_batch",
+                start=start,
+                end=end,
+                total=total,
+                batch=end - start,
+                batch_ms=batch_ms,
             )
-        finally:
-            self._tree_widget.setSortingEnabled(True)
-            self._set_tree_header_fast_mode(False)
-            if self._tree_row_count() > 0:
-                self._apply_tree_sort(
-                    self._tree_last_sort_column,
-                    self._tree_last_sort_order,
-                    sync_indicator=True,
-                )
-            self._tree_widget.setUpdatesEnabled(True)
-            self._refresh_tree_row_numbers()
+        if batch_ms >= 100.0:
+            _log.info(
+                "[UI_STALL_RISK] target=tree_model_batch batch_ms=%.1f start=%s end=%s total=%s",
+                batch_ms,
+                start,
+                end,
+                total,
+            )
+        if self._pending_selection_paths:
+            self._apply_pending_selection()
+        self._refresh_tree_row_numbers()
+        if end < total:
+            self._tree_view_dirty = True
+            if self._tree_model_populate_timer is not None:
+                self._tree_model_populate_timer.start(0)
+            return
+        self._finish_tree_model_population(total=total)
+
+    def _finish_tree_model_population(self, *, total: int) -> None:
+        self._pause_tree_model_population()
+        self._tree_model_pending_paths = []
+        self._tree_model_pending_index = 0
         self._tree_view_dirty = False
+        self._probe_set_phase("tree_model_sort", total=total)
+        sort_t0 = perf_counter()
+        self._tree_widget.setSortingEnabled(True)
+        self._set_tree_header_fast_mode(False)
+        if self._tree_row_count() > 0:
+            self._apply_tree_sort(
+                self._tree_last_sort_column,
+                self._tree_last_sort_order,
+                sync_indicator=True,
+            )
+        self._refresh_tree_row_numbers()
+        self._probe_log("tree_model_sort.done", elapsed_ms=elapsed_ms(sort_t0), rows=self._tree_row_count())
+        if self._pending_selection_paths:
+            self._apply_pending_selection()
+            if self._view_mode == self._MODE_LIST:
+                self._pending_selection_paths = None
+                self._pending_selection_current_path = ""
+        else:
+            self._select_first_file_if_needed(reason="tree_model_population_done")
+        elapsed = (
+            _time.perf_counter() - self._tree_model_populate_started_at
+            if self._tree_model_populate_started_at > 0
+            else 0.0
+        )
+        self._tree_model_populate_started_at = 0.0
+        self._show_meta_progress_status("正在准备文件列表", value=total, total=total)
+        self._probe_set_phase("idle", reason="tree_model_population_done", total=total, elapsed_ms=elapsed * 1000.0)
+        _log.info("[_populate_tree_model_batch] completed total=%s elapsed=%.3fs", total, elapsed)
 
     def _mark_tree_view_dirty(self) -> None:
+        self._cancel_tree_model_population()
         self._tree_view_dirty = True
         self._clear_tree_view_state()
 
@@ -3208,6 +3565,8 @@ class FileListPanel(QWidget):
             self._thumb_model_pending_paths = list(self._filtered_files)
             self._thumb_model_pending_index = 0
             self._thumb_model_populate_started_at = _time.perf_counter()
+            self._probe_thumb_last_log_at = 0.0
+            self._probe_thumb_last_rows = 0
             self._thumb_list_model.clear()
             self._invalidate_visible_thumbnail_signature()
         elif not self._thumb_model_pending_paths:
@@ -3218,6 +3577,7 @@ class FileListPanel(QWidget):
         if self._thumb_model_populate_started_at <= 0:
             self._thumb_model_populate_started_at = _time.perf_counter()
         self._thumb_model_dirty = True
+        self._probe_set_phase("thumb_model_populate", total=len(self._thumb_model_pending_paths), resume=bool(resume))
         self._ensure_thumb_model_populate_timer()
         self._populate_thumb_model_batch()
 
@@ -3229,6 +3589,7 @@ class FileListPanel(QWidget):
             self._thumb_model_pending_paths = []
             self._thumb_model_pending_index = 0
             return
+        batch_t0 = perf_counter()
         tick_t0 = _time.perf_counter()
         end = start
         min_batch = 24
@@ -3246,7 +3607,34 @@ class FileListPanel(QWidget):
             tooltip_fn=self._build_list_path_tooltip,
             mismatch_fn=self._has_path_mismatch,
         )
+        batch_ms = elapsed_ms(batch_t0)
         self._thumb_model_pending_index = end
+        now = perf_counter()
+        if (
+            end >= total
+            or batch_ms >= 40.0
+            or end - self._probe_thumb_last_rows >= 1000
+            or (now - self._probe_thumb_last_log_at) >= 1.0
+        ):
+            self._probe_thumb_last_log_at = now
+            self._probe_thumb_last_rows = end
+            self._probe_log(
+                "thumb_model_batch",
+                start=start,
+                end=end,
+                total=total,
+                batch=end - start,
+                appended=appended,
+                batch_ms=batch_ms,
+            )
+        if batch_ms >= 100.0:
+            _log.info(
+                "[UI_STALL_RISK] target=thumb_model_batch batch_ms=%.1f start=%s end=%s total=%s",
+                batch_ms,
+                start,
+                end,
+                total,
+            )
         if appended:
             self._invalidate_visible_thumbnail_signature()
             if self._pending_selection_paths:
@@ -3277,16 +3665,30 @@ class FileListPanel(QWidget):
             _time.perf_counter() - self._thumb_model_populate_started_at if self._thumb_model_populate_started_at > 0 else 0.0,
         )
         self._thumb_model_populate_started_at = 0.0
+        self._probe_set_phase("idle", reason="thumb_model_population_done", total=total)
 
     def _rebuild_views(self, stop_loaders: bool = True) -> None:
         """根据当前过滤结果重建列表/树视图与缩略图项。"""
+        rebuild_t0 = perf_counter()
+        self._probe_set_phase("rebuild_views", mode=self._view_mode, stop_loaders=bool(stop_loaders))
         self._thumb_selection_anchor_row = -1
         if stop_loaders:
+            stop_t0 = perf_counter()
             self._stop_all_loaders()
+            self._probe_log("rebuild_views.stop_all_loaders", elapsed_ms=elapsed_ms(stop_t0))
         else:
+            stop_t0 = perf_counter()
             self._stop_thumbnail_loader()
+            self._probe_log("rebuild_views.stop_thumbnail_loader", elapsed_ms=elapsed_ms(stop_t0))
         self._cancel_thumb_model_population()
+        filter_t0 = perf_counter()
         self._filtered_files = self._compute_filtered_files()
+        self._probe_log(
+            "rebuild_views.compute_filtered",
+            elapsed_ms=elapsed_ms(filter_t0),
+            all_files=len(self._all_files),
+            filtered=len(self._filtered_files),
+        )
         _log.info(
             "[_rebuild_views] START all_files=%s filtered_files=%s stop_loaders=%s",
             len(self._all_files),
@@ -3295,16 +3697,21 @@ class FileListPanel(QWidget):
         )
         _log.info("[_rebuild_views] added %s items", len(self._filtered_files))
         if self._view_mode == self._MODE_LIST:
+            branch_t0 = perf_counter()
             self._rebuild_tree_items()
+            self._probe_log("rebuild_views.start_tree_items", elapsed_ms=elapsed_ms(branch_t0))
             self._mark_thumb_model_dirty()
         else:
+            branch_t0 = perf_counter()
             self._mark_tree_view_dirty()
             self._update_thumb_display()
             self._start_thumb_model_population()
+            self._probe_log("rebuild_views.start_thumb_items", elapsed_ms=elapsed_ms(branch_t0))
         if self._view_mode == self._MODE_THUMB:
             _log.info("[_rebuild_views] thumb mode: update thumb display + schedule visible loader")
             self._schedule_visible_thumbnail_update()
         self._update_selection_status()
+        self._probe_log("rebuild_views.done", elapsed_ms=elapsed_ms(rebuild_t0), mode=self._view_mode)
         _log.info("[_rebuild_views] END")
         return
         self._tree_widget.setUpdatesEnabled(False)
@@ -4232,7 +4639,9 @@ class FileListPanel(QWidget):
             # Promote newly-visible items to the front of the queue so they
             # are processed before any pending prefetch.
             self._thumb_profile_add("loader_reprioritize", 1)
-            loader.replace_pending(missing_visible, prefetch_paths)
+            loader.promote(missing_visible)
+            loader.enqueue(prefetch_paths, priority=ThumbnailLoader.PRIORITY_PREFETCH)
+            loader.set_desired_paths(missing_visible, prefetch_paths)
         else:
             # ── No loader running: start fresh ───────────────────────────────
             if missing_visible or prefetch_paths:
@@ -4265,6 +4674,7 @@ class FileListPanel(QWidget):
         self._update_size_controls()
         self._invalidate_visible_thumbnail_signature()
         if mode == self._MODE_THUMB:
+            self._pause_tree_model_population()
             self._update_thumb_display()
             if self._thumb_model_dirty:
                 self._start_thumb_model_population(
@@ -4364,6 +4774,7 @@ class FileListPanel(QWidget):
 
     def apply_user_options(self) -> None:
         self._thumb_profile_enabled = _thumb_profile_enabled()
+        self._sync_file_browser_probe_timer()
         self._thumb_loader_workers = _thumbnail_loader_worker_count()
         self._set_key_navigation_fps(get_key_navigation_fps(), persist=False)
         self._invalidate_visible_thumbnail_signature()
@@ -4518,6 +4929,8 @@ class FileListPanel(QWidget):
         self._pending_loaders = [l for l in self._pending_loaders if l.isRunning()]
 
     def _start_metadata_loader(self, paths: list) -> None:
+        start_t0 = perf_counter()
+        self._probe_set_phase("metadata_loader_start", paths=len(paths))
         _log.info(
             "[_start_metadata_loader] START paths=%s report_cache=%s full_report_cache=%s",
             len(paths),
@@ -4543,6 +4956,7 @@ class FileListPanel(QWidget):
         loader.finished.connect(self._on_metadata_loader_finished)
         self._metadata_loader = loader
         loader.start()
+        self._probe_set_phase("metadata_loader_running", paths=len(paths), elapsed_ms=elapsed_ms(start_t0))
         _log.info("[_start_metadata_loader] MetadataLoader started via PhotoMetaDataProxy")
 
     def _stop_metadata_loader(self) -> None:
@@ -4738,7 +5152,13 @@ class FileListPanel(QWidget):
         self._persistent_thumb_cache_timer = timer
 
     def _hide_persistent_thumb_progress_if_idle(self) -> None:
-        if self._persistent_thumb_cache_worker is not None:
+        if (
+            self._persistent_thumb_cache_worker is not None
+            and (
+                self._persistent_thumb_cache_total <= 0
+                or self._persistent_thumb_cache_done < self._persistent_thumb_cache_total
+            )
+        ):
             return
         if self._persistent_thumb_cache_total > 0 and self._persistent_thumb_cache_done < self._persistent_thumb_cache_total:
             return
@@ -4751,9 +5171,14 @@ class FileListPanel(QWidget):
             self._persistent_thumb_progress.setToolTip("")
             return
         done = min(max(0, int(self._persistent_thumb_cache_done)), total)
-        self._persistent_thumb_progress.setMaximum(max(1, total))
-        self._persistent_thumb_progress.setValue(done)
-        self._persistent_thumb_progress.setFormat(f"小缩略图 {done}/{total}")
+        status_text = self._persistent_thumb_cache_status_text or "生成预览缩略图"
+        if status_text.startswith("正在"):
+            self._persistent_thumb_progress.setRange(0, 0)
+            self._persistent_thumb_progress.setFormat(status_text)
+        else:
+            self._persistent_thumb_progress.setRange(0, max(1, total))
+            self._persistent_thumb_progress.setValue(done)
+            self._persistent_thumb_progress.setFormat(f"{status_text} {done}/{total}")
         sizes = _effective_persistent_thumb_cache_sizes(self._thumb_size)
         cache_dirs = [
             _persistent_thumb_cache_dir(self._persistent_thumb_cache_base_dir, size)
@@ -4781,18 +5206,23 @@ class FileListPanel(QWidget):
             self._persistent_thumb_cache_base_dir = ""
             self._persistent_thumb_cache_total = 0
             self._persistent_thumb_cache_done = 0
+            self._persistent_thumb_cache_current_path = ""
+            self._persistent_thumb_cache_status_text = ""
             self._update_persistent_thumb_progress_widget()
             return
         base_dir = _superpicky_cache_root_dir(self._report_root_dir or self._current_dir)
         pending_paths = ThumbnailLoader._normalize_unique_paths(paths or [])
+        self._persistent_thumb_cache_focus_priority -= 1
         self._persistent_thumb_cache_pending_paths = pending_paths
         self._persistent_thumb_cache_base_dir = base_dir or ""
+        self._persistent_thumb_cache_pending_priority = self._persistent_thumb_cache_focus_priority
         self._persistent_thumb_cache_generated = 0
         self._persistent_thumb_cache_skipped = 0
         self._persistent_thumb_cache_failed = 0
         self._persistent_thumb_cache_total = len(pending_paths)
         self._persistent_thumb_cache_done = 0
         self._persistent_thumb_cache_current_path = ""
+        self._persistent_thumb_cache_status_text = "正在准备生成缩略图..."
         if not pending_paths or not self._persistent_thumb_cache_base_dir:
             if pending_paths:
                 _log.info(
@@ -4800,34 +5230,50 @@ class FileListPanel(QWidget):
                     self._current_dir,
                     self._report_root_dir,
                 )
+            self._persistent_thumb_cache_status_text = ""
             self._update_persistent_thumb_progress_widget()
             return
         self._update_persistent_thumb_progress_widget()
-        self._ensure_persistent_thumb_cache_timer()
-        self._persistent_thumb_cache_timer.start(_PERSISTENT_THUMB_CACHE_START_DELAY_MS)
+        self._start_persistent_thumb_cache_worker()
 
     def _start_persistent_thumb_cache_worker(self) -> None:
         if self._background_shutdown_started:
             return
-        if self._persistent_thumb_cache_worker is not None:
-            return
         if not self._persistent_thumb_cache_pending_paths or not self._persistent_thumb_cache_base_dir:
             self._update_persistent_thumb_progress_widget()
             return
-        loader = self._thumbnail_loader
-        if loader is not None and loader.isRunning():
-            snap = loader.profile_snapshot()
-            queue_size = int(snap.get("queue_size", 0))
-            inflight = max(
-                0,
-                int(snap.get("submitted", 0)) - int(snap.get("completed", 0)),
+        existing_worker = self._persistent_thumb_cache_worker
+        if existing_worker is not None and existing_worker.isRunning():
+            self._persistent_thumb_cache_status_text = "生成预览缩略图"
+            added = existing_worker.enqueue_paths(
+                self._persistent_thumb_cache_pending_paths,
+                self._persistent_thumb_cache_base_dir,
+                report_cache=self._report_full_cache or self._report_cache or {},
+                sizes=_effective_persistent_thumb_cache_sizes(self._thumb_size),
+                priority=self._persistent_thumb_cache_pending_priority,
+                replace_focus=True,
             )
-            if queue_size > 0 or inflight > 0:
-                self._persistent_thumb_cache_current_path = "(waiting for visible thumbs)"
-                self._update_persistent_thumb_progress_widget()
-                self._ensure_persistent_thumb_cache_timer()
-                self._persistent_thumb_cache_timer.start(_PERSISTENT_THUMB_CACHE_START_DELAY_MS)
-                return
+            _log.info(
+                "[_start_persistent_thumb_cache_worker] reprioritized existing worker dir=%r total=%s added=%s priority=%s",
+                self._persistent_thumb_cache_base_dir,
+                len(self._persistent_thumb_cache_pending_paths),
+                added,
+                self._persistent_thumb_cache_pending_priority,
+            )
+            self._persistent_thumb_cache_pending_paths = []
+            self._update_persistent_thumb_progress_widget()
+            return
+        if existing_worker is not None:
+            try:
+                existing_worker.progress_updated.disconnect(self._on_persistent_thumb_cache_progress)
+            except Exception:
+                pass
+            try:
+                existing_worker.finished_summary.disconnect(self._on_persistent_thumb_cache_finished)
+            except Exception:
+                pass
+            self._persistent_thumb_cache_worker = None
+        self._persistent_thumb_cache_status_text = "生成预览缩略图"
         worker = PersistentThumbCacheWorker(
             self._persistent_thumb_cache_pending_paths,
             self._persistent_thumb_cache_base_dir,
@@ -4847,6 +5293,7 @@ class FileListPanel(QWidget):
             _effective_persistent_thumb_cache_sizes(self._thumb_size),
             _persistent_thumb_cache_worker_count(),
         )
+        self._persistent_thumb_cache_pending_paths = []
 
     def _stop_persistent_thumb_cache_worker(self) -> None:
         if self._persistent_thumb_cache_timer is not None and self._persistent_thumb_cache_timer.isActive():
@@ -4871,6 +5318,7 @@ class FileListPanel(QWidget):
         self._persistent_thumb_cache_total = 0
         self._persistent_thumb_cache_done = 0
         self._persistent_thumb_cache_current_path = ""
+        self._persistent_thumb_cache_status_text = ""
         self._update_persistent_thumb_progress_widget()
 
     def _on_persistent_thumb_cache_progress(
@@ -4882,6 +5330,10 @@ class FileListPanel(QWidget):
         failed: int,
         current_path: str,
     ) -> None:
+        sender = self.sender()
+        if sender is not None and sender is not self._persistent_thumb_cache_worker:
+            return
+        self._persistent_thumb_cache_status_text = "生成预览缩略图"
         self._persistent_thumb_cache_done = max(0, int(done))
         self._persistent_thumb_cache_total = max(0, int(total))
         self._persistent_thumb_cache_generated = max(0, int(generated))
@@ -4889,6 +5341,8 @@ class FileListPanel(QWidget):
         self._persistent_thumb_cache_failed = max(0, int(failed))
         self._persistent_thumb_cache_current_path = os.path.normpath(current_path) if current_path else ""
         self._update_persistent_thumb_progress_widget()
+        if self._persistent_thumb_cache_total > 0 and self._persistent_thumb_cache_done >= self._persistent_thumb_cache_total:
+            QTimer.singleShot(1500, self._hide_persistent_thumb_progress_if_idle)
 
     def _on_persistent_thumb_cache_finished(
         self,
@@ -4898,13 +5352,22 @@ class FileListPanel(QWidget):
         skipped: int,
         failed: int,
     ) -> None:
+        sender = self.sender()
+        if sender is not None and sender is not self._persistent_thumb_cache_worker:
+            return
         self._persistent_thumb_cache_worker = None
+        self._persistent_thumb_cache_status_text = "生成预览缩略图"
         self._persistent_thumb_cache_done = max(0, int(done))
         self._persistent_thumb_cache_total = max(0, int(total))
         self._persistent_thumb_cache_generated = max(0, int(generated))
         self._persistent_thumb_cache_skipped = max(0, int(skipped))
         self._persistent_thumb_cache_failed = max(0, int(failed))
-        self._persistent_thumb_cache_pending_paths = []
+        if not (
+            self._persistent_thumb_cache_timer is not None
+            and self._persistent_thumb_cache_timer.isActive()
+            and self._persistent_thumb_cache_pending_paths
+        ):
+            self._persistent_thumb_cache_pending_paths = []
         self._update_persistent_thumb_progress_widget()
         QTimer.singleShot(1500, self._hide_persistent_thumb_progress_if_idle)
 
@@ -4943,7 +5406,6 @@ class FileListPanel(QWidget):
         self._stop_pending_meta_apply()
         self._stop_thumbnail_loader()
         self._stop_metadata_loader()
-        self._stop_persistent_thumb_cache_worker()
         self._stop_actual_path_lookup_workers()
 
     def _shutdown_background_work(self) -> None:
@@ -4967,7 +5429,9 @@ class FileListPanel(QWidget):
         active_threads.extend(self._pending_loaders)
 
         self._pause_thumb_model_population()
+        self._pause_tree_model_population()
         self._stop_all_loaders()
+        self._stop_persistent_thumb_cache_worker()
         self._stop_directory_scan_worker()
 
         wait_threads = []
@@ -5032,9 +5496,11 @@ class FileListPanel(QWidget):
         self._meta_apply_loader_finished = False
         self._set_tree_header_fast_mode(True)
         self._tree_widget.setSortingEnabled(False)
-        self._meta_progress.setMaximum(max(1, self._meta_apply_expected_total))
-        self._meta_progress.setValue(0)
-        self._meta_progress.show()
+        self._show_meta_progress_status(
+            "正在读取元数据",
+            value=0,
+            total=self._meta_apply_expected_total,
+        )
         perf_log(
             _log,
             "[STAT][_meta_apply] begin tree_items=%s list_items=%s expected_total=%s batch=%s",
@@ -5151,9 +5617,11 @@ class FileListPanel(QWidget):
             return
         self._meta_apply_items.extend(ordered_batch)
         self._meta_apply_total = len(self._meta_apply_items)
-        self._meta_progress.setMaximum(max(1, self._meta_apply_expected_total or self._meta_apply_total))
-        self._meta_progress.setValue(min(self._meta_apply_index, self._meta_progress.maximum()))
-        self._meta_progress.show()
+        self._show_meta_progress_status(
+            "正在读取元数据",
+            value=self._meta_apply_index,
+            total=self._meta_apply_expected_total or self._meta_apply_total,
+        )
         perf_log(
             _log,
             "[STAT][_meta_apply] enqueue batch=%s queued_total=%s applied=%s expected=%s",
@@ -5195,7 +5663,11 @@ class FileListPanel(QWidget):
             self._apply_filter()
             perf_log(_log, "[STAT][_meta_apply] _apply_filter elapsed=%.3fs", _time.perf_counter() - filter_t0)
 
-        self._meta_progress.setValue(self._meta_progress.maximum())
+        self._show_meta_progress_status(
+            "正在读取元数据",
+            value=self._meta_progress.maximum(),
+            total=self._meta_progress.maximum(),
+        )
         QTimer.singleShot(400, self._meta_progress.hide)
         elapsed = (_time.perf_counter() - self._meta_apply_started_at) if self._meta_apply_started_at > 0 else 0.0
         perf_log(
@@ -5241,7 +5713,11 @@ class FileListPanel(QWidget):
 
         end = i
         self._meta_apply_index = end
-        self._meta_progress.setValue(min(end, self._meta_progress.maximum()))
+        self._show_meta_progress_status(
+            "正在读取元数据",
+            value=end,
+            total=self._meta_progress.maximum(),
+        )
         if end % 1000 == 0 or end >= total:
             perf_log(
                 _log,
@@ -5374,8 +5850,11 @@ class FileListPanel(QWidget):
         if total <= 0:
             return
         self._meta_apply_expected_total = max(self._meta_apply_expected_total, int(total))
-        self._meta_progress.setMaximum(max(1, self._meta_apply_expected_total))
-        self._meta_progress.setValue(min(self._meta_apply_index, self._meta_progress.maximum()))
+        self._show_meta_progress_status(
+            "正在读取元数据",
+            value=self._meta_apply_index,
+            total=self._meta_apply_expected_total,
+        )
         _log.debug(
             "[_on_metadata_progress] loaded=%s/%s applied=%s queued=%s",
             current,
@@ -5437,6 +5916,12 @@ class FileListPanel(QWidget):
             return
         self._metadata_loader = None
         self._meta_apply_loader_finished = True
+        self._probe_log(
+            "metadata_loader_finished",
+            applied=self._meta_apply_index,
+            queued=self._meta_apply_total,
+            expected=self._meta_apply_expected_total,
+        )
         _log.info(
             "[_on_metadata_loader_finished] loader finished applied=%s queued_total=%s expected=%s",
             self._meta_apply_index,

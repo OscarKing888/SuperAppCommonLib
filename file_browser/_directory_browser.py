@@ -260,8 +260,17 @@ class DirectoryBrowserWidget(QWidget):
         按路径展开目录树并选中目标目录。
         返回是否成功定位到目标目录节点。
         """
+        probe_t0 = _time.perf_counter()
+        if perf_probes_enabled():
+            _log.info("[FILE_BROWSER_PROBE] event=directory_browser.select_directory.start path=%r emit_signal=%s", path, emit_signal)
         current = self._find_directory_item(path, expand_chain=True)
         if current is None:
+            if perf_probes_enabled():
+                _log.info(
+                    "[FILE_BROWSER_PROBE] event=directory_browser.select_directory.miss path=%r elapsed_ms=%.1f",
+                    path,
+                    (_time.perf_counter() - probe_t0) * 1000.0,
+                )
             return False
         target_path = current.data(0, _UserRole)
         if not target_path:
@@ -276,16 +285,38 @@ class DirectoryBrowserWidget(QWidget):
             pass
         if emit_signal:
             self.directory_selected.emit(target_path)
+        if perf_probes_enabled():
+            _log.info(
+                "[FILE_BROWSER_PROBE] event=directory_browser.select_directory.done path=%r elapsed_ms=%.1f emit_signal=%s",
+                target_path,
+                (_time.perf_counter() - probe_t0) * 1000.0,
+                emit_signal,
+            )
         return True
+
+    def select_file_parent_directory(self, file_path: str, emit_signal: bool = False) -> bool:
+        """展开并选中给定文件所在的目录。"""
+        if not file_path:
+            return False
+        try:
+            norm_path = os.path.normpath(os.path.abspath(file_path))
+        except Exception:
+            return False
+        target_dir = norm_path if os.path.isdir(norm_path) else os.path.dirname(norm_path)
+        if not target_dir or not os.path.isdir(target_dir):
+            return False
+        return self.select_directory(target_dir, emit_signal=emit_signal)
 
     def _on_expanded(self, item: QTreeWidgetItem) -> None:
         """懒加载：展开时填充子目录。"""
         if item.childCount() > 0 and item.child(0).text(0) != self._PLACEHOLDER:
             return
+        probe_t0 = _time.perf_counter()
         item.takeChildren()
         path = item.data(0, _UserRole)
         if not path:
             return
+        child_count = 0
         try:
             for entry in sorted(os.scandir(path), key=lambda e: e.name.lower()):
                 if not entry.is_dir() or entry.name.startswith("."):
@@ -294,12 +325,23 @@ class DirectoryBrowserWidget(QWidget):
                 child.setData(0, _UserRole, entry.path)
                 child.addChild(QTreeWidgetItem([self._PLACEHOLDER]))
                 item.addChild(child)
+                child_count += 1
         except (PermissionError, OSError):
             pass
+        elapsed = (_time.perf_counter() - probe_t0) * 1000.0
+        if perf_probes_enabled() or elapsed >= 250.0:
+            _log.info(
+                "[FILE_BROWSER_PROBE] event=directory_browser.expand path=%r children=%s elapsed_ms=%.1f",
+                path,
+                child_count,
+                elapsed,
+            )
 
     def _on_clicked(self, item: QTreeWidgetItem, column: int) -> None:
         path = item.data(0, _UserRole)
         if path and os.path.isdir(path):
+            if perf_probes_enabled():
+                _log.info("[FILE_BROWSER_PROBE] event=directory_browser.clicked path=%r", path)
             self.directory_selected.emit(path)
 
     def _refresh_dir_item_children(self, item: QTreeWidgetItem) -> None:
