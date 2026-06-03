@@ -18,13 +18,10 @@ import time as _time
 from pathlib import Path
 from typing import Callable, Generator
 
-# 扩展名集合，与 file_browser 一致，便于独立测试
-_JPEG_EXTENSIONS = frozenset({".jpg", ".jpeg"})
-_RAW_EXTENSIONS = frozenset({
-    ".cr2", ".cr3", ".crw", ".nef", ".nrw", ".arw", ".srf", ".sr2",
-    ".rw2", ".raw", ".orf", ".ori", ".raf", ".dng", ".pef", ".ptx",
-    ".x3f", ".rwl", ".3fr", ".dcr", ".kdc", ".mef", ".mrw", ".rwz",
-})
+from app_common.image_formats import (
+    JPEG_IMAGE_EXTENSIONS as _JPEG_EXTENSIONS,
+    RAW_IMAGE_EXTENSIONS as _RAW_EXTENSIONS,
+)
 
 THUMB_FAST_DEFAULT_SIZE = 64
 

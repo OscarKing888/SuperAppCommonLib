@@ -93,42 +93,9 @@ from app_common.superviewer_user_options import (
 )
 from app_common.ui_style.styles import COLORS
 from app_common import thumb_stream
+from app_common.image_formats import IMAGE_EXTENSIONS, RAW_EXTENSIONS
 
 _log = get_logger("file_browser")
-
-# ── 支持的图像扩展名 ───────────────────────────────────────────────────────────
-IMAGE_EXTENSIONS = (
-    ".jpg", ".jpeg", ".png", ".webp", ".tiff", ".tif",
-    ".heic", ".heif", ".hif",
-    # Canon
-    ".cr2", ".cr3", ".crw",
-    # Nikon
-    ".nef", ".nrw",
-    # Sony
-    ".arw", ".srf", ".sr2",
-    # Panasonic
-    ".rw2", ".raw",
-    # Olympus
-    ".orf", ".ori",
-    # Fujifilm
-    ".raf",
-    # Adobe / Leica 等
-    ".dng",
-    # Pentax
-    ".pef", ".ptx",
-    # Sigma
-    ".x3f",
-    # Leica
-    ".rwl",
-    # 其他常见 RAW
-    ".3fr", ".dcr", ".kdc", ".mef", ".mrw", ".rwz",
-)
-IMAGE_EXTENSIONS = tuple(dict.fromkeys(e.lower() for e in IMAGE_EXTENSIONS))
-RAW_EXTENSIONS = frozenset(
-    e for e in IMAGE_EXTENSIONS
-    if e not in (".jpg", ".jpeg", ".png", ".webp", ".tiff", ".tif",
-                 ".heic", ".heif", ".hif")
-)
 
 # ── Qt 兼容常量 ────────────────────────────────────────────────────────────────
 try:
