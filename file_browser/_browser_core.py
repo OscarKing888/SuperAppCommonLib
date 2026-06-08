@@ -94,6 +94,7 @@ from app_common.superviewer_user_options import (
 from app_common.ui_style.styles import COLORS
 from app_common import thumb_stream
 from app_common.image_formats import IMAGE_EXTENSIONS, RAW_EXTENSIONS
+from app_common.file_browser._permissions import superpicky_root_writable
 
 _log = get_logger("file_browser")
 
@@ -1103,6 +1104,8 @@ def _migrate_legacy_persistent_thumb_cache_path(target_path: str, legacy_path: s
         return ""
     if os.path.isfile(target_path):
         return target_path
+    if not superpicky_root_writable():
+        return legacy_path
     try:
         os.makedirs(os.path.dirname(target_path), exist_ok=True)
         os.replace(legacy_path, target_path)
@@ -1184,6 +1187,8 @@ def _write_persistent_thumb_cache_image(
 ) -> bool:
     if not target_path or qimg is None or qimg.isNull():
         return False
+    if not superpicky_root_writable():
+        return False
     tmp_path = f"{target_path}.tmp-{os.getpid()}-{threading.get_ident()}"
     try:
         os.makedirs(os.path.dirname(target_path), exist_ok=True)
@@ -1256,6 +1261,8 @@ def _read_thumb_from_disk_cache(path: str, mtime: float, size: int) -> "QImage |
 
 def _schedule_thumb_disk_cache_write(cache_path: str, qimg: "QImage") -> None:
     """Schedule async write of QImage to cache_path (JPEG). Pass a copy if caller keeps using qimg."""
+    if not superpicky_root_writable():
+        return
     img_copy = qimg.copy()
 
     def write():

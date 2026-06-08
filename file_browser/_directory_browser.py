@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 from app_common.file_browser._browser_core import *
+from app_common.file_browser._permissions import (
+    mark_write_action_disabled,
+    superpicky_path_write_disabled_tooltip,
+    superpicky_root_write_state_for_path,
+)
 
 class DirectoryBrowserWidget(QWidget):
     """
@@ -356,6 +361,14 @@ class DirectoryBrowserWidget(QWidget):
             self._tree.expandItem(item)
 
     def _trash_empty_subdirectories(self, path: str, item: QTreeWidgetItem) -> None:
+        _root, writable, _error = superpicky_root_write_state_for_path(path)
+        if not writable:
+            QMessageBox.warning(
+                self,
+                "删除空目录",
+                superpicky_path_write_disabled_tooltip(path, "删除空目录"),
+            )
+            return
         moved_paths, failed_paths = move_empty_dirs_to_trash(path, include_root=False)
         self._refresh_dir_item_children(item)
 
@@ -433,6 +446,13 @@ class DirectoryBrowserWidget(QWidget):
         act.triggered.connect(lambda: reveal_in_file_manager(path))
         menu.addSeparator()
         act_remove_empty = menu.addAction("删除所有空目录")
+        _root, writable, _error = superpicky_root_write_state_for_path(path)
+        act_remove_empty.setEnabled(writable)
+        if not writable:
+            mark_write_action_disabled(
+                act_remove_empty,
+                superpicky_path_write_disabled_tooltip(path, "删除空目录"),
+            )
         act_remove_empty.triggered.connect(
             lambda checked=False, p=path, it=item: self._trash_empty_subdirectories(p, it)
         )

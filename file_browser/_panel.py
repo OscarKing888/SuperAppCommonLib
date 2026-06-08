@@ -8,6 +8,13 @@ import shutil
 from app_common.exif_io.json_sidecar import JSON_SIDECAR_SUFFIX
 from app_common.perf_probe import elapsed_ms, perf_counter, perf_log, perf_probes_enabled
 from app_common.file_browser._browser_core import *
+from app_common.file_browser._permissions import (
+    mark_write_action_disabled,
+    refresh_superpicky_root_write_permission,
+    superpicky_root_writable,
+    superpicky_root_write_disabled_tooltip,
+    superpicky_root_write_state,
+)
 from app_common.file_browser._models import *
 from app_common.file_browser._thumbnail import *
 from app_common.file_browser._workers import *
@@ -536,6 +543,21 @@ class FileListPanel(QWidget):
         self._install_file_action_shortcut("`", "pick")
         self._install_file_action_shortcut("~", "pick")
 
+    def file_writes_allowed(self) -> bool:
+        return superpicky_root_writable()
+
+    def file_writes_disabled_tooltip(self, action: str = "写入操作") -> str:
+        return superpicky_root_write_disabled_tooltip(action)
+
+    def _file_writes_allowed(self, action: str = "写入操作", *, warn: bool = False) -> bool:
+        if self.file_writes_allowed():
+            return True
+        message = self.file_writes_disabled_tooltip(action)
+        _log.info("[file_write_permission] blocked action=%r message=%r", action, message)
+        if warn:
+            QMessageBox.warning(self, "目录只读", message)
+        return False
+
     def _copy_current_selection_to_clipboard(self) -> None:
         """将当前视图（列表/缩略图）中选中的文件路径复制到剪贴板。"""
         w = self._stack.currentWidget()
@@ -549,6 +571,8 @@ class FileListPanel(QWidget):
 
     def _cut_current_selection_to_clipboard(self) -> None:
         """将当前选中文件及其 sidecar 标记为剪切。"""
+        if not self._file_writes_allowed("剪切", warn=True):
+            return
         w = self._stack.currentWidget()
         if w is self._tree_widget:
             paths = self._tree_selected_paths()
@@ -1094,6 +1118,20 @@ class FileListPanel(QWidget):
             preserve_meta_cache,
             reuse_cached_listing,
         )
+        permission_changed = refresh_superpicky_root_write_permission(path)
+        if permission_changed:
+            root_path, writable, error = superpicky_root_write_state()
+            _log.info(
+                "[load_directory] write_permission root=%r writable=%s error=%r",
+                root_path,
+                writable,
+                error,
+            )
+        if not self.file_writes_allowed():
+            self._stop_persistent_thumb_cache_worker()
+        if permission_changed and same_dir and self._selected_display_path:
+            selected_path = self._resolve_source_path_for_action(self._selected_display_path)
+            self.file_selected.emit(selected_path or self._selected_display_path)
         if not force_reload and same_dir and recursive == self._loaded_directory_recursive:
             _log.info("[load_directory] SKIP same dir")
             self._probe_set_phase("idle", reason="load_directory_skip_same_dir", elapsed_ms=elapsed_ms(load_t0))
@@ -1398,6 +1436,8 @@ class FileListPanel(QWidget):
             if str(k) and v is not None
         }
         if not norm_path or (not report_fields and not meta_updates):
+            return False
+        if not self._file_writes_allowed("同步元数据"):
             return False
 
         filename = ""
@@ -1869,6 +1909,8 @@ class FileListPanel(QWidget):
         return "粘贴鸟种名称"
 
     def _paste_species_to_paths(self, paths: list[str]) -> None:
+        if not self._file_writes_allowed("粘贴鸟种名称", warn=True):
+            return
         payload = getattr(self, "_copied_species_payload", None)
         if not payload:
             _log.info("[_paste_species_to_paths] skip reason=no_copied_species")
@@ -2150,6 +2192,8 @@ class FileListPanel(QWidget):
     def _trigger_active_shortcut_action(self, action_kind: str, action_value: int = 0) -> None:
         if not self._keyboard_shortcut_focus_allows_file_action():
             return
+        if action_kind in {"rating", "pick", "reject"} and not self._file_writes_allowed("修改评级", warn=True):
+            return
         paths = self._paths_for_active_shortcut_action()
         if not paths:
             return
@@ -2180,6 +2224,8 @@ class FileListPanel(QWidget):
         else:
             return False
 
+        if not self._file_writes_allowed("修改评级", warn=True):
+            return True
         try:
             if event.isAutoRepeat():
                 return True
@@ -2207,6 +2253,8 @@ class FileListPanel(QWidget):
                 return True
         except Exception:
             pass
+        if not self._file_writes_allowed("删除文件", warn=True):
+            return True
         paths = self._paths_for_active_shortcut_action()
         if paths:
             self._move_paths_to_trash(paths)
@@ -2351,6 +2399,8 @@ class FileListPanel(QWidget):
         rating: int | None = None,
         pick: int | None = None,
     ) -> list[str]:
+        if not self._file_writes_allowed("修改评级"):
+            return []
         if not self._use_report_db:
             _log.info("[_apply_rating_state_via_report_db] skip reason=report_db_disabled")
             return []
@@ -2407,6 +2457,8 @@ class FileListPanel(QWidget):
         rating: int | None = None,
         pick: int | None = None,
     ) -> list[str]:
+        if not self._file_writes_allowed("修改评级"):
+            return []
         assignments = self._build_exif_rating_assignments(rating=rating, pick=pick)
         if not assignments:
             return []
@@ -2465,6 +2517,8 @@ class FileListPanel(QWidget):
         rating: int | None = None,
         pick: int | None = None,
     ) -> None:
+        if not self._file_writes_allowed("修改评级", warn=True):
+            return
         probe_t0 = perf_counter()
         unique_paths = self._unique_norm_paths(paths)
         if not unique_paths:
@@ -2553,7 +2607,14 @@ class FileListPanel(QWidget):
         unique_paths = self._unique_norm_paths(paths)
         if not unique_paths:
             return
+        writes_allowed = self._file_writes_allowed("修改评级")
         rating_menu = menu.addMenu("修改星级")
+        rating_menu.setEnabled(writes_allowed)
+        if not writes_allowed:
+            mark_write_action_disabled(
+                rating_menu.menuAction(),
+                self.file_writes_disabled_tooltip("修改评级"),
+            )
         clear_rating_action = rating_menu.addAction("取消星级")
         clear_rating_action.triggered.connect(
             lambda checked=False: self._set_rating_state_for_paths(unique_paths, rating=0)
@@ -2919,6 +2980,8 @@ class FileListPanel(QWidget):
                     self.file_selected.emit(resolved)
 
     def _sync_report_current_path_from_actual(self, source_path: str, actual_path: str, row: dict | None) -> None:
+        if not self._file_writes_allowed("修复 report.db 路径"):
+            return
         if not isinstance(row, dict):
             return
         root_dir = self._report_root_dir or self._current_dir
@@ -5117,6 +5180,8 @@ class FileListPanel(QWidget):
             return ""
         if os.path.isfile(cache_path):
             return cache_path
+        if not self._file_writes_allowed("生成预览缩略图"):
+            return ""
         try:
             os.makedirs(os.path.dirname(cache_path), exist_ok=True)
             if pixmap.save(cache_path, "JPEG", 85):
@@ -5212,6 +5277,9 @@ class FileListPanel(QWidget):
             self._persistent_thumb_cache_status_text = ""
             self._update_persistent_thumb_progress_widget()
             return
+        if not self._file_writes_allowed("生成预览缩略图"):
+            self._stop_persistent_thumb_cache_worker()
+            return
         base_dir = _superpicky_cache_root_dir(self._report_root_dir or self._current_dir)
         pending_paths = ThumbnailLoader._normalize_unique_paths(paths or [])
         self._persistent_thumb_cache_focus_priority -= 1
@@ -5240,6 +5308,9 @@ class FileListPanel(QWidget):
 
     def _start_persistent_thumb_cache_worker(self) -> None:
         if self._background_shutdown_started:
+            return
+        if not self._file_writes_allowed("生成预览缩略图"):
+            self._stop_persistent_thumb_cache_worker()
             return
         if not self._persistent_thumb_cache_pending_paths or not self._persistent_thumb_cache_base_dir:
             self._update_persistent_thumb_progress_widget()
@@ -6120,6 +6191,8 @@ class FileListPanel(QWidget):
 
     def _cut_paths_to_clipboard(self, paths: list) -> None:
         """将本地文件路径写入剪贴板并标记为剪切；sidecar 会跟随主文件。"""
+        if not self._file_writes_allowed("剪切", warn=True):
+            return
         entries = self._collect_file_clipboard_entries(paths)
         if not entries:
             _log.info("[_cut_paths_to_clipboard] nothing_to_cut input=%s", len(paths))
@@ -6254,6 +6327,8 @@ class FileListPanel(QWidget):
         dest_dir = self.get_current_dir()
         if not dest_dir or not os.path.isdir(dest_dir):
             return False
+        if not self._file_writes_allowed("粘贴"):
+            return False
         _action, entries = self._clipboard_file_payload()
         return bool(entries)
 
@@ -6326,6 +6401,8 @@ class FileListPanel(QWidget):
 
     def _paste_clipboard_to_current_dir(self) -> None:
         """将剪贴板中的文件粘贴到当前目录；内部剪切会移动，复制会复制。"""
+        if not self._file_writes_allowed("粘贴", warn=True):
+            return
         dest_dir = self.get_current_dir()
         if not dest_dir or not os.path.isdir(dest_dir):
             _log.info("[_paste_clipboard_to_current_dir] skip reason=no_current_dir dir=%r", dest_dir)
@@ -6417,21 +6494,35 @@ class FileListPanel(QWidget):
 
         act_cut = menu.addAction("剪切")
         _apply_context_menu_shortcut(act_cut, _platform_cut_key_sequence())
-        act_cut.setEnabled(bool(paths))
+        writes_allowed = self._file_writes_allowed("剪切")
+        act_cut.setEnabled(bool(paths) and writes_allowed)
+        if not writes_allowed:
+            mark_write_action_disabled(act_cut, self.file_writes_disabled_tooltip("剪切"))
         act_cut.triggered.connect(lambda checked=False, p=list(paths or []): self._cut_paths_to_clipboard(p))
 
         act_paste = menu.addAction("粘贴到当前目录")
         _apply_context_menu_shortcut(act_paste, _platform_paste_key_sequence())
-        act_paste.setEnabled(self._can_paste_files_from_clipboard())
+        can_paste = self._can_paste_files_from_clipboard()
+        act_paste.setEnabled(can_paste)
+        if not self.file_writes_allowed():
+            mark_write_action_disabled(act_paste, self.file_writes_disabled_tooltip("粘贴"))
         act_paste.triggered.connect(lambda checked=False: self._paste_clipboard_to_current_dir())
 
     def _show_empty_file_context_menu(self, viewport, pos) -> bool:
         """空目录/空白区域右键时，只要剪贴板可粘贴就显示粘贴菜单。"""
-        if not self._can_paste_files_from_clipboard():
+        dest_dir = self.get_current_dir()
+        if not dest_dir or not os.path.isdir(dest_dir):
+            return False
+        _action, entries = self._clipboard_file_payload()
+        if not entries:
             return False
         menu = QMenu(self)
         act_paste = menu.addAction("粘贴到当前目录")
         _apply_context_menu_shortcut(act_paste, _platform_paste_key_sequence())
+        writes_allowed = self._file_writes_allowed("粘贴")
+        act_paste.setEnabled(writes_allowed)
+        if not writes_allowed:
+            mark_write_action_disabled(act_paste, self.file_writes_disabled_tooltip("粘贴"))
         act_paste.triggered.connect(lambda checked=False: self._paste_clipboard_to_current_dir())
         _exec_menu(menu, viewport.mapToGlobal(pos))
         return True
@@ -6466,8 +6557,19 @@ class FileListPanel(QWidget):
             act_copy_species.triggered.connect(lambda: self._copy_species_from_path(source_path))
 
         act_paste_species = menu.addAction(self._get_paste_species_action_text())
-        can_paste = getattr(self, "_copied_species_payload", None) is not None and bool(paths) and bool(self._report_root_dir or self._current_dir)
+        writes_allowed = self._file_writes_allowed("粘贴鸟种名称")
+        can_paste = (
+            writes_allowed
+            and getattr(self, "_copied_species_payload", None) is not None
+            and bool(paths)
+            and bool(self._report_root_dir or self._current_dir)
+        )
         act_paste_species.setEnabled(can_paste)
+        if not writes_allowed:
+            mark_write_action_disabled(
+                act_paste_species,
+                self.file_writes_disabled_tooltip("粘贴鸟种名称"),
+            )
         if can_paste:
             act_paste_species.triggered.connect(lambda: self._paste_species_to_paths(paths))
 
@@ -6576,6 +6678,8 @@ class FileListPanel(QWidget):
         )
 
     def _delete_report_rows_for_paths(self, paths: list[str]) -> int:
+        if not self._file_writes_allowed("删除 report.db 记录"):
+            return 0
         if not self._use_report_db:
             _log.info("[_delete_report_rows_for_paths] skip reason=report_db_disabled")
             return 0
@@ -6664,6 +6768,8 @@ class FileListPanel(QWidget):
         return cache_paths
 
     def _delete_thumbnail_cache_paths(self, cache_paths: list[str]) -> int:
+        if not self._file_writes_allowed("删除缩略图缓存"):
+            return 0
         deleted = 0
         for cache_path in cache_paths or []:
             if not cache_path or not os.path.isfile(cache_path):
@@ -6678,6 +6784,8 @@ class FileListPanel(QWidget):
     def _move_paths_to_trash(self, paths: list) -> None:
         """将选中路径移动到垃圾桶，并同步删除 report.db 中对应记录。"""
         if not paths:
+            return
+        if not self._file_writes_allowed("删除文件", warn=True):
             return
         ok_count = 0
         deleted_thumb_cache_count = 0

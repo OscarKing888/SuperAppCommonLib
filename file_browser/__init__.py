@@ -23,10 +23,48 @@ from app_common.file_browser._browser import (
     IMAGE_EXTENSIONS,
     RAW_EXTENSIONS,
 )
+from app_common.file_browser import _permissions as _write_permissions
+from app_common.file_browser._permissions import (
+    READONLY_LABEL_SUFFIX,
+    clear_readonly_label,
+    find_nearest_superpicky_root,
+    mark_write_action_disabled,
+    readonly_label,
+    refresh_superpicky_root_write_permission,
+    set_superpicky_root_write_permission_state,
+    superpicky_root_writable,
+    superpicky_root_write_disabled_tooltip,
+    superpicky_root_write_state,
+    superpicky_root_write_state_for_path,
+)
 
 __all__ = [
     "DirectoryBrowserWidget",
     "FileListPanel",
     "IMAGE_EXTENSIONS",
     "RAW_EXTENSIONS",
+    "CURRENT_SUPERPICKY_ROOT_PATH",
+    "CURRENT_SUPERPICKY_ROOT_WRITABLE",
+    "CURRENT_SUPERPICKY_ROOT_WRITE_ERROR",
+    "READONLY_LABEL_SUFFIX",
+    "clear_readonly_label",
+    "find_nearest_superpicky_root",
+    "mark_write_action_disabled",
+    "readonly_label",
+    "refresh_superpicky_root_write_permission",
+    "set_superpicky_root_write_permission_state",
+    "superpicky_root_writable",
+    "superpicky_root_write_disabled_tooltip",
+    "superpicky_root_write_state",
+    "superpicky_root_write_state_for_path",
 ]
+
+
+def __getattr__(name: str):
+    if name in {
+        "CURRENT_SUPERPICKY_ROOT_PATH",
+        "CURRENT_SUPERPICKY_ROOT_WRITABLE",
+        "CURRENT_SUPERPICKY_ROOT_WRITE_ERROR",
+    }:
+        return getattr(_write_permissions, name)
+    raise AttributeError(name)
