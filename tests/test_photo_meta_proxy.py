@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 
+from app_common.exif_io.json_sidecar import JSON_SIDECAR_SUFFIX, json_sidecar_path_for
 from app_common.exif_io.photo_meta import PhotoMetaDataProxy
 from app_common.exif_io.writer import invalidate_metadata_cache, read_batch_metadata
 
@@ -42,9 +43,25 @@ def test_proxy_writes_rating_pick_to_sidecar(tmp_path: Path) -> None:
     photo_path.write_bytes(b"not an image")
 
     assert PhotoMetaDataProxy().write(str(photo_path), {"rating": 5, "pick": 1})
-    assert (tmp_path / "img001.xmp").is_file()
+    assert (tmp_path / f"img001.jpg{JSON_SIDECAR_SUFFIX}").is_file()
     assert PhotoMetaDataProxy().read(str(photo_path)).get("rating") == 5
     assert PhotoMetaDataProxy().read(str(photo_path)).get("pick") == 1
+
+
+def test_proxy_writes_rating_pick_to_central_superpicky_sidecar(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    photo_dir = root / "day1"
+    photo_dir.mkdir(parents=True)
+    (root / ".superpicky").mkdir()
+    photo_path = photo_dir / "img001.jpg"
+    photo_path.write_bytes(b"not an image")
+
+    assert PhotoMetaDataProxy().write(str(photo_path), {"rating": 5, "pick": 1})
+
+    expected = root / ".superpicky" / "metadata" / "day1" / f"img001.jpg{JSON_SIDECAR_SUFFIX}"
+    assert json_sidecar_path_for(str(photo_path)) == expected
+    assert expected.is_file()
+    assert PhotoMetaDataProxy().read(str(photo_path)).get("rating") == 5
 
 
 def test_read_batch_metadata_exposes_sidecar_description_aliases(tmp_path: Path) -> None:

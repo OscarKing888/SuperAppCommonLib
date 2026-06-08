@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from .json_sidecar import (
+    _remove_matching_metadata_aliases,
     empty_json_sidecar_payload,
     json_sidecar_metadata,
     json_sidecar_path_for,
@@ -776,12 +777,16 @@ class PhotoMetaDataJSON(PhotoMetaData):
 
         for key, value in fields.items():
             if _is_xmp_subject_key(key):
+                _remove_matching_metadata_aliases(metadata, _is_xmp_subject_key, "XMP-dc:Subject")
                 metadata["XMP-dc:Subject"] = _normalise_subject_value(value, split_strings=True)
             elif _is_xmp_description_key(key):
+                _remove_matching_metadata_aliases(metadata, _is_xmp_description_key, "XMP-dc:Description")
                 metadata["XMP-dc:Description"] = "" if value is None else str(value)
             elif _is_xmp_rating_key(key):
+                _remove_matching_metadata_aliases(metadata, _is_xmp_rating_key, "XMP-xmp:Rating")
                 metadata["XMP-xmp:Rating"] = _normalise_rating_value(value)
             elif _is_xmp_pick_key(key):
+                _remove_matching_metadata_aliases(metadata, _is_xmp_pick_key, "XMP-xmpDM:pick")
                 metadata["XMP-xmpDM:pick"] = _normalise_pick_value(value)
             else:
                 metadata[str(key)] = value

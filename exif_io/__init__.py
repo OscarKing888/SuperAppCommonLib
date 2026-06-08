@@ -26,11 +26,18 @@ from app_common.exif_io.writer import (
 from app_common.exif_io.writer import _get_exiftool_tag_target  # 供 main 读路径使用
 from app_common.exif_io.xmp_sidecar import find_xmp_sidecar, read_xmp_sidecar
 from app_common.exif_io.json_sidecar import (
+    DEFAULT_SUPERPICKY_SIDECAR_DIRNAME,
     JSON_SIDECAR_SUFFIX,
+    central_json_sidecar_path_for,
     find_json_sidecar,
+    find_nearest_superpicky_root,
+    json_sidecar_candidate_paths_for,
     json_sidecar_path_for,
     json_sidecar_to_flat_dict,
+    load_superpicky_sidecar_config,
     read_json_sidecar,
+    sibling_json_sidecar_path_for,
+    superpicky_sidecar_dir_for_root,
 )
 from app_common.exif_io.photo_meta import (
     PhotoMetaData,
@@ -57,10 +64,17 @@ __all__ = [
     "find_xmp_sidecar",
     "read_xmp_sidecar",
     "JSON_SIDECAR_SUFFIX",
+    "DEFAULT_SUPERPICKY_SIDECAR_DIRNAME",
+    "central_json_sidecar_path_for",
     "find_json_sidecar",
+    "find_nearest_superpicky_root",
+    "json_sidecar_candidate_paths_for",
     "json_sidecar_path_for",
     "json_sidecar_to_flat_dict",
+    "load_superpicky_sidecar_config",
     "read_json_sidecar",
+    "sibling_json_sidecar_path_for",
+    "superpicky_sidecar_dir_for_root",
     "read_batch_metadata",
     "inject_metadata_cache",
     "DEFAULT_METADATA_TAGS",

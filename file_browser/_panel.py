@@ -5,12 +5,17 @@ from __future__ import annotations
 import json
 import shutil
 
-from app_common.exif_io.json_sidecar import JSON_SIDECAR_SUFFIX
+from app_common.exif_io.json_sidecar import JSON_SIDECAR_SUFFIX, find_json_sidecar, json_sidecar_path_for
 from app_common.perf_probe import elapsed_ms, perf_counter, perf_log, perf_probes_enabled
 from app_common.file_browser._browser_core import *
 from app_common.file_browser._permissions import (
+    file_operation_paths_disabled_tooltip,
+    file_operation_paths_write_state,
     mark_write_action_disabled,
     refresh_superpicky_root_write_permission,
+    superpicky_sidecar_writable,
+    superpicky_sidecar_write_disabled_tooltip,
+    superpicky_sidecar_write_state,
     superpicky_root_writable,
     superpicky_root_write_disabled_tooltip,
     superpicky_root_write_state,
@@ -558,6 +563,90 @@ class FileListPanel(QWidget):
             QMessageBox.warning(self, "目录只读", message)
         return False
 
+    def _resolved_file_operation_paths(self, paths: list[str]) -> list[str]:
+        resolved_paths: list[str] = []
+        seen: set[str] = set()
+        for path in self._unique_norm_paths(paths or []):
+            resolved = self._resolve_source_path_for_action(path)
+            norm_path = os.path.normpath(os.path.abspath(resolved or path)) if (resolved or path) else ""
+            if not norm_path:
+                continue
+            key = _path_key(norm_path)
+            if key in seen:
+                continue
+            seen.add(key)
+            resolved_paths.append(norm_path)
+        return resolved_paths
+
+    def file_operation_paths_allowed(self, paths: list[str]) -> bool:
+        if not self.file_writes_allowed():
+            return False
+        writable, _error = file_operation_paths_write_state(self._resolved_file_operation_paths(paths))
+        return bool(writable)
+
+    def file_operation_paths_disabled_tooltip(
+        self,
+        paths: list[str],
+        action: str = "写入操作",
+    ) -> str:
+        if not self.file_writes_allowed():
+            return self.file_writes_disabled_tooltip(action)
+        return file_operation_paths_disabled_tooltip(self._resolved_file_operation_paths(paths), action)
+
+    def _file_operation_paths_allowed(
+        self,
+        paths: list[str],
+        action: str = "写入操作",
+        *,
+        warn: bool = False,
+    ) -> bool:
+        if not self._file_writes_allowed(action, warn=warn):
+            return False
+        resolved_paths = self._resolved_file_operation_paths(paths)
+        writable, error = file_operation_paths_write_state(resolved_paths)
+        if writable:
+            return True
+        message = file_operation_paths_disabled_tooltip(resolved_paths, action)
+        _log.info(
+            "[file_operation_permission] blocked action=%r paths=%s message=%r",
+            action,
+            len(resolved_paths),
+            message,
+        )
+        if warn:
+            QMessageBox.warning(self, "文件只读", message)
+        return False
+
+    def sidecar_writes_allowed(self) -> bool:
+        return superpicky_sidecar_writable()
+
+    def sidecar_writes_disabled_tooltip(self, action: str = "写入操作") -> str:
+        return superpicky_sidecar_write_disabled_tooltip(action)
+
+    def _sidecar_writes_allowed(self, action: str = "写入操作", *, warn: bool = False) -> bool:
+        if self.sidecar_writes_allowed():
+            return True
+        message = self.sidecar_writes_disabled_tooltip(action)
+        _log.info("[sidecar_write_permission] blocked action=%r message=%r", action, message)
+        if warn:
+            QMessageBox.warning(self, "sidecar 只读", message)
+        return False
+
+    def rating_writes_allowed(self) -> bool:
+        return self.file_writes_allowed()
+
+    def rating_writes_disabled_tooltip(self, action: str = "写入操作") -> str:
+        return self.file_writes_disabled_tooltip(action)
+
+    def _rating_writes_allowed(self, action: str = "写入操作", *, warn: bool = False) -> bool:
+        if self.rating_writes_allowed():
+            return True
+        message = self.rating_writes_disabled_tooltip(action)
+        _log.info("[rating_write_permission] blocked action=%r message=%r", action, message)
+        if warn:
+            QMessageBox.warning(self, "目录只读", message)
+        return False
+
     def _copy_current_selection_to_clipboard(self) -> None:
         """将当前视图（列表/缩略图）中选中的文件路径复制到剪贴板。"""
         w = self._stack.currentWidget()
@@ -571,8 +660,6 @@ class FileListPanel(QWidget):
 
     def _cut_current_selection_to_clipboard(self) -> None:
         """将当前选中文件及其 sidecar 标记为剪切。"""
-        if not self._file_writes_allowed("剪切", warn=True):
-            return
         w = self._stack.currentWidget()
         if w is self._tree_widget:
             paths = self._tree_selected_paths()
@@ -580,6 +667,10 @@ class FileListPanel(QWidget):
             paths = self._thumb_selected_paths()
         else:
             paths = []
+        if not paths:
+            return
+        if not self._file_operation_paths_allowed(paths, "剪切", warn=True):
+            return
         self._cut_paths_to_clipboard(paths)
 
     def _install_file_action_shortcut(self, sequence: str, action_kind: str) -> None:
@@ -1121,11 +1212,15 @@ class FileListPanel(QWidget):
         permission_changed = refresh_superpicky_root_write_permission(path)
         if permission_changed:
             root_path, writable, error = superpicky_root_write_state()
+            sidecar_dir, sidecar_writable, sidecar_error = superpicky_sidecar_write_state()
             _log.info(
-                "[load_directory] write_permission root=%r writable=%s error=%r",
+                "[load_directory] write_permission root=%r writable=%s error=%r sidecar_dir=%r sidecar_writable=%s sidecar_error=%r",
                 root_path,
                 writable,
                 error,
+                sidecar_dir,
+                sidecar_writable,
+                sidecar_error,
             )
         if not self.file_writes_allowed():
             self._stop_persistent_thumb_cache_worker()
@@ -2192,7 +2287,7 @@ class FileListPanel(QWidget):
     def _trigger_active_shortcut_action(self, action_kind: str, action_value: int = 0) -> None:
         if not self._keyboard_shortcut_focus_allows_file_action():
             return
-        if action_kind in {"rating", "pick", "reject"} and not self._file_writes_allowed("修改评级", warn=True):
+        if action_kind in {"rating", "pick", "reject"} and not self._rating_writes_allowed("修改评级", warn=True):
             return
         paths = self._paths_for_active_shortcut_action()
         if not paths:
@@ -2224,7 +2319,7 @@ class FileListPanel(QWidget):
         else:
             return False
 
-        if not self._file_writes_allowed("修改评级", warn=True):
+        if not self._rating_writes_allowed("修改评级", warn=True):
             return True
         try:
             if event.isAutoRepeat():
@@ -2253,9 +2348,9 @@ class FileListPanel(QWidget):
                 return True
         except Exception:
             pass
-        if not self._file_writes_allowed("删除文件", warn=True):
-            return True
         paths = self._paths_for_active_shortcut_action()
+        if paths and not self._file_operation_paths_allowed(paths, "删除文件", warn=True):
+            return True
         if paths:
             self._move_paths_to_trash(paths)
         return True
@@ -2399,7 +2494,7 @@ class FileListPanel(QWidget):
         rating: int | None = None,
         pick: int | None = None,
     ) -> list[str]:
-        if not self._file_writes_allowed("修改评级"):
+        if not self._rating_writes_allowed("修改评级"):
             return []
         if not self._use_report_db:
             _log.info("[_apply_rating_state_via_report_db] skip reason=report_db_disabled")
@@ -2457,7 +2552,7 @@ class FileListPanel(QWidget):
         rating: int | None = None,
         pick: int | None = None,
     ) -> list[str]:
-        if not self._file_writes_allowed("修改评级"):
+        if not self._rating_writes_allowed("修改评级"):
             return []
         assignments = self._build_exif_rating_assignments(rating=rating, pick=pick)
         if not assignments:
@@ -2517,7 +2612,7 @@ class FileListPanel(QWidget):
         rating: int | None = None,
         pick: int | None = None,
     ) -> None:
-        if not self._file_writes_allowed("修改评级", warn=True):
+        if not self._rating_writes_allowed("修改评级", warn=True):
             return
         probe_t0 = perf_counter()
         unique_paths = self._unique_norm_paths(paths)
@@ -2607,13 +2702,13 @@ class FileListPanel(QWidget):
         unique_paths = self._unique_norm_paths(paths)
         if not unique_paths:
             return
-        writes_allowed = self._file_writes_allowed("修改评级")
+        writes_allowed = self._rating_writes_allowed("修改评级")
         rating_menu = menu.addMenu("修改星级")
         rating_menu.setEnabled(writes_allowed)
         if not writes_allowed:
             mark_write_action_disabled(
                 rating_menu.menuAction(),
-                self.file_writes_disabled_tooltip("修改评级"),
+                self.rating_writes_disabled_tooltip("修改评级"),
             )
         clear_rating_action = rating_menu.addAction("取消星级")
         clear_rating_action.triggered.connect(
@@ -6119,7 +6214,7 @@ class FileListPanel(QWidget):
 
         add(self._resolve_sidecar_path(display_path))
         if source_path:
-            add(os.path.abspath(source_path) + JSON_SIDECAR_SUFFIX)
+            add(find_json_sidecar(source_path))
         return sidecars
 
     @staticmethod
@@ -6191,7 +6286,7 @@ class FileListPanel(QWidget):
 
     def _cut_paths_to_clipboard(self, paths: list) -> None:
         """将本地文件路径写入剪贴板并标记为剪切；sidecar 会跟随主文件。"""
-        if not self._file_writes_allowed("剪切", warn=True):
+        if not self._file_operation_paths_allowed(paths, "剪切", warn=True):
             return
         entries = self._collect_file_clipboard_entries(paths)
         if not entries:
@@ -6309,6 +6404,8 @@ class FileListPanel(QWidget):
             sidecars = []
             xmp_sidecar = xmp_by_stem.get((parent_key, Path(path).stem), "")
             json_sidecar = json_by_source_name.get((parent_key, name), "")
+            if not json_sidecar:
+                json_sidecar = find_json_sidecar(path) or ""
             for sidecar in (xmp_sidecar, json_sidecar):
                 if not sidecar:
                     continue
@@ -6329,7 +6426,11 @@ class FileListPanel(QWidget):
             return False
         if not self._file_writes_allowed("粘贴"):
             return False
-        _action, entries = self._clipboard_file_payload()
+        action, entries = self._clipboard_file_payload()
+        if action == "cut":
+            source_paths = [str(entry.get("source") or "") for entry in entries]
+            if source_paths and not self.file_operation_paths_allowed(source_paths):
+                return False
         return bool(entries)
 
     @staticmethod
@@ -6345,8 +6446,8 @@ class FileListPanel(QWidget):
     def _sidecar_destination_for_paste(source_path: str, dest_source: str, sidecar_path: str) -> str:
         source_abs = os.path.normpath(os.path.abspath(source_path))
         sidecar_abs = os.path.normpath(os.path.abspath(sidecar_path))
-        if os.path.normcase(sidecar_abs) == os.path.normcase(source_abs + JSON_SIDECAR_SUFFIX):
-            return os.path.normpath(dest_source + JSON_SIDECAR_SUFFIX)
+        if os.path.basename(sidecar_abs).lower().endswith(JSON_SIDECAR_SUFFIX.lower()):
+            return os.path.normpath(os.fspath(json_sidecar_path_for(dest_source)))
         source_base, _source_suffix = os.path.splitext(source_abs)
         if os.path.normcase(sidecar_abs) == os.path.normcase(source_base + ".xmp"):
             dest_base, _dest_suffix = os.path.splitext(dest_source)
@@ -6411,6 +6512,10 @@ class FileListPanel(QWidget):
         if not entries:
             _log.info("[_paste_clipboard_to_current_dir] skip reason=no_clipboard_files")
             return
+        if action == "cut":
+            source_paths = [str(entry.get("source") or "") for entry in entries]
+            if source_paths and not self._file_operation_paths_allowed(source_paths, "剪切粘贴", warn=True):
+                return
 
         pasted_sources: list[str] = []
         touched_paths: list[str] = []
@@ -6494,18 +6599,27 @@ class FileListPanel(QWidget):
 
         act_cut = menu.addAction("剪切")
         _apply_context_menu_shortcut(act_cut, _platform_cut_key_sequence())
-        writes_allowed = self._file_writes_allowed("剪切")
+        writes_allowed = self._file_operation_paths_allowed(paths, "剪切")
         act_cut.setEnabled(bool(paths) and writes_allowed)
         if not writes_allowed:
-            mark_write_action_disabled(act_cut, self.file_writes_disabled_tooltip("剪切"))
+            mark_write_action_disabled(act_cut, self.file_operation_paths_disabled_tooltip(paths, "剪切"))
         act_cut.triggered.connect(lambda checked=False, p=list(paths or []): self._cut_paths_to_clipboard(p))
 
         act_paste = menu.addAction("粘贴到当前目录")
         _apply_context_menu_shortcut(act_paste, _platform_paste_key_sequence())
+        paste_action, paste_entries = self._clipboard_file_payload()
         can_paste = self._can_paste_files_from_clipboard()
         act_paste.setEnabled(can_paste)
-        if not self.file_writes_allowed():
-            mark_write_action_disabled(act_paste, self.file_writes_disabled_tooltip("粘贴"))
+        if not can_paste and paste_entries:
+            if not self.file_writes_allowed():
+                mark_write_action_disabled(act_paste, self.file_writes_disabled_tooltip("粘贴"))
+            elif paste_action == "cut":
+                paste_sources = [str(entry.get("source") or "") for entry in paste_entries]
+                if not self.file_operation_paths_allowed(paste_sources):
+                    mark_write_action_disabled(
+                        act_paste,
+                        self.file_operation_paths_disabled_tooltip(paste_sources, "剪切粘贴"),
+                    )
         act_paste.triggered.connect(lambda checked=False: self._paste_clipboard_to_current_dir())
 
     def _show_empty_file_context_menu(self, viewport, pos) -> bool:
@@ -6513,16 +6627,26 @@ class FileListPanel(QWidget):
         dest_dir = self.get_current_dir()
         if not dest_dir or not os.path.isdir(dest_dir):
             return False
-        _action, entries = self._clipboard_file_payload()
+        action, entries = self._clipboard_file_payload()
         if not entries:
             return False
         menu = QMenu(self)
         act_paste = menu.addAction("粘贴到当前目录")
         _apply_context_menu_shortcut(act_paste, _platform_paste_key_sequence())
         writes_allowed = self._file_writes_allowed("粘贴")
+        if writes_allowed and action == "cut":
+            source_paths = [str(entry.get("source") or "") for entry in entries]
+            writes_allowed = self.file_operation_paths_allowed(source_paths)
         act_paste.setEnabled(writes_allowed)
         if not writes_allowed:
-            mark_write_action_disabled(act_paste, self.file_writes_disabled_tooltip("粘贴"))
+            if not self.file_writes_allowed():
+                tooltip = self.file_writes_disabled_tooltip("粘贴")
+            elif action == "cut":
+                source_paths = [str(entry.get("source") or "") for entry in entries]
+                tooltip = self.file_operation_paths_disabled_tooltip(source_paths, "剪切粘贴")
+            else:
+                tooltip = self.file_writes_disabled_tooltip("粘贴")
+            mark_write_action_disabled(act_paste, tooltip)
         act_paste.triggered.connect(lambda checked=False: self._paste_clipboard_to_current_dir())
         _exec_menu(menu, viewport.mapToGlobal(pos))
         return True
@@ -6785,7 +6909,7 @@ class FileListPanel(QWidget):
         """将选中路径移动到垃圾桶，并同步删除 report.db 中对应记录。"""
         if not paths:
             return
-        if not self._file_writes_allowed("删除文件", warn=True):
+        if not self._file_operation_paths_allowed(paths, "删除文件", warn=True):
             return
         ok_count = 0
         deleted_thumb_cache_count = 0

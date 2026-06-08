@@ -6,7 +6,7 @@ import shutil
 import subprocess
 import sys
 
-from app_common.exif_io.json_sidecar import JSON_SIDECAR_SUFFIX
+from app_common.exif_io.json_sidecar import JSON_SIDECAR_SUFFIX, find_json_sidecar, json_sidecar_path_for
 
 SUPERPICKY_DIRNAME = ".superpicky"
 SUPERPICKY_TRASH_DIRNAME = "deleted"
@@ -248,8 +248,8 @@ def _find_sibling_json_sidecar_for_file(path):
         source_abs = os.path.normpath(os.path.abspath(path))
     except Exception:
         return ""
-    candidate = source_abs + JSON_SIDECAR_SUFFIX
-    if os.path.isfile(candidate):
+    candidate = find_json_sidecar(source_abs)
+    if candidate and os.path.isfile(candidate):
         return os.path.normpath(candidate)
     return ""
 
@@ -274,8 +274,8 @@ def _find_sibling_metadata_sidecars_for_file(path):
 def _sidecar_destination_for_file_destination(source_path, source_dest, sidecar_path):
     source_abs = os.path.normpath(os.path.abspath(source_path))
     sidecar_abs = os.path.normpath(os.path.abspath(sidecar_path))
-    if _path_key(sidecar_abs) == _path_key(source_abs + JSON_SIDECAR_SUFFIX):
-        return source_dest + JSON_SIDECAR_SUFFIX
+    if os.path.basename(sidecar_abs).lower().endswith(JSON_SIDECAR_SUFFIX.lower()):
+        return os.path.normpath(os.fspath(json_sidecar_path_for(source_dest)))
     source_base, _source_suffix = os.path.splitext(source_abs)
     if _path_key(sidecar_abs) == _path_key(source_base + ".xmp"):
         dest_base, _dest_suffix = os.path.splitext(source_dest)
