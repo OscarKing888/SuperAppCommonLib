@@ -2581,11 +2581,12 @@ class FileListPanel(QWidget):
         reject_action.setText(f"{reject_label}\tQ")
 
     def _add_delete_menu_action(self, menu: QMenu, paths: list[str]) -> None:
-        unique_paths = self._unique_norm_paths(paths)
-        if not unique_paths:
-            return
-        act_delete = menu.addAction("删除\tDel")
-        act_delete.triggered.connect(lambda: self._move_paths_to_trash(unique_paths))
+        pass
+        #unique_paths = self._unique_norm_paths(paths)
+        #if not unique_paths:
+        #    return
+        #act_delete = menu.addAction("删除\tDel")
+        #act_delete.triggered.connect(lambda: self._move_paths_to_trash(unique_paths))
 
     def _get_actual_path_for_display(self, path: str) -> str | None:
         actual = _get_cached_actual_path(path)
@@ -6533,8 +6534,8 @@ class FileListPanel(QWidget):
             act_reveal = menu.addAction(label)
             act_reveal.triggered.connect(lambda: reveal_in_file_manager(reveal_path))
         # self._add_browse_preview_menu_action(menu, primary_path)
-        menu.addSeparator()
-        self._add_delete_menu_action(menu, paths)
+        # menu.addSeparator()
+        # self._add_delete_menu_action(menu, paths)
         _exec_menu(menu, self._tree_widget.viewport().mapToGlobal(pos))
 
     def _collect_report_filenames_for_paths(self, paths: list[str]) -> list[str]:
@@ -6748,6 +6749,6 @@ class FileListPanel(QWidget):
             act_reveal = menu.addAction(label)
             act_reveal.triggered.connect(lambda: reveal_in_file_manager(reveal_path))
         # self._add_browse_preview_menu_action(menu, primary_path)
-        menu.addSeparator()
-        self._add_delete_menu_action(menu, paths)
+        # menu.addSeparator()
+        # self._add_delete_menu_action(menu, paths)
         _exec_menu(menu, self._list_widget.viewport().mapToGlobal(pos))
