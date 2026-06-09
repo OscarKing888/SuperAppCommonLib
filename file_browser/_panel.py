@@ -2284,6 +2284,13 @@ class FileListPanel(QWidget):
         blocked_name_parts = ("LineEdit", "TextEdit", "PlainTextEdit", "SpinBox", "ComboBox")
         return not any(part in class_name for part in blocked_name_parts)
 
+    @staticmethod
+    def _event_is_auto_repeat(event) -> bool:
+        try:
+            return bool(event.isAutoRepeat())
+        except Exception:
+            return False
+
     def _trigger_active_shortcut_action(self, action_kind: str, action_value: int = 0) -> None:
         if not self._keyboard_shortcut_focus_allows_file_action():
             return
@@ -4422,9 +4429,11 @@ class FileListPanel(QWidget):
             if key in (_KeyUp, _KeyDown, _KeyLeft, _KeyRight):
                 if not self._accept_key_navigation_step(event):
                     return True
-                self._selection_key_nav_auto_repeat = True
-                self._selection_key_nav_hold_active = True
-                QTimer.singleShot(0, lambda: setattr(self, "_selection_key_nav_auto_repeat", False))
+                is_auto_repeat = self._event_is_auto_repeat(event)
+                self._selection_key_nav_auto_repeat = is_auto_repeat
+                self._selection_key_nav_hold_active = is_auto_repeat
+                if is_auto_repeat:
+                    QTimer.singleShot(0, lambda: setattr(self, "_selection_key_nav_auto_repeat", False))
         if (
             obj is tree_widget
             and event is not None
@@ -4468,8 +4477,8 @@ class FileListPanel(QWidget):
             elif key == _KeyRight and idx < count - 1:
                 new_idx = idx + 1
             if new_idx >= 0 and new_idx < count:
-                self._selection_key_nav_hold_active = True
-                fast_preview = True
+                fast_preview = self._event_is_auto_repeat(event)
+                self._selection_key_nav_hold_active = fast_preview
                 shift = _ShiftModifier and (event.modifiers() & _ShiftModifier)
                 new_index = self._thumb_index_for_row(new_idx)
                 if not new_index.isValid():
