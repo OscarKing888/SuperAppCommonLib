@@ -339,6 +339,13 @@ _BROWSER_METADATA_TAGS: list[str] = [
     "-DateCreated",
     "-MediaCreateDate",
     "-XMP-dc:Title", "-XMP-dc:title",  # 标题（sidecar 常用小写 dc:title）
+    "-XMP-dc:Description", "-XMP-dc:description",
+    "-IFD0:ImageDescription", "-EXIF:ImageDescription",
+    "-ExifIFD:UserComment", "-EXIF:UserComment",
+    "-IFD0:XPComment",
+    "-IPTC:Caption-Abstract",
+    "-XMP-dc:Subject", "-XMP-dc:subject",
+    "-IPTC:Keywords",
     "-XMP-xmp:Label",
     "-XMP-xmp:Rating",
     "-XMP-xmpDM:pick",        # 实际 XMP 结构 <xmpDM:pick>1</xmpDM:pick>（Dynamic Media）
@@ -434,15 +441,72 @@ def _apply_browser_metadata_aliases(rec: dict) -> None:
     当前重点：
     - 对焦状态：XMP-photoshop:Country / Country-PrimaryLocationName -> XMP:Country
     - 标题：XMP-dc:title -> XMP-dc:Title
+    - 注释：XMP-dc:description -> XMP-dc:Description
+    - 标签：XMP-dc:subject -> XMP-dc:Subject
     """
     if not isinstance(rec, dict):
         return
-    if rec.get("XMP-photoshop:Country") and not rec.get("XMP:Country"):
-        rec["XMP:Country"] = rec["XMP-photoshop:Country"]
-    if rec.get("XMP-photoshop:Country-PrimaryLocationName") and not rec.get("XMP:Country"):
-        rec["XMP:Country"] = rec["XMP-photoshop:Country-PrimaryLocationName"]
-    if rec.get("XMP-dc:title") and not rec.get("XMP-dc:Title"):
-        rec["XMP-dc:Title"] = rec["XMP-dc:title"]
+    def has_value(value) -> bool:
+        return value is not None and str(value).strip() != ""
+
+    def first(*keys: str):
+        for key in keys:
+            value = rec.get(key)
+            if has_value(value):
+                return value
+        return None
+
+    country = first("XMP:Country", "XMP-photoshop:Country", "XMP-photoshop:Country-PrimaryLocationName")
+    if country is not None and not has_value(rec.get("XMP:Country")):
+        rec["XMP:Country"] = country
+
+    title = first("XMP-dc:Title", "XMP-dc:title")
+    if title is not None and not has_value(rec.get("XMP-dc:Title")):
+        rec["XMP-dc:Title"] = title
+
+    description = first("XMP-dc:Description", "XMP-dc:description")
+    if description is not None and not has_value(rec.get("XMP-dc:Description")):
+        rec["XMP-dc:Description"] = description
+    if description is not None and not has_value(rec.get("XMP:Description")):
+        rec["XMP:Description"] = description
+    if description is not None and not has_value(rec.get("Description")):
+        rec["Description"] = description
+
+    subject = first("XMP-dc:Subject", "XMP-dc:subject")
+    if subject is not None and not has_value(rec.get("XMP-dc:Subject")):
+        rec["XMP-dc:Subject"] = subject
+
+    rating_raw = first("XMP-xmp:Rating", "XMP:Rating", "XMP-xmp:rating", "rating")
+    if rating_raw is not None:
+        if not has_value(rec.get("XMP-xmp:Rating")):
+            rec["XMP-xmp:Rating"] = rating_raw
+        try:
+            rec["rating"] = max(0, min(5, int(float(str(rating_raw)))))
+        except Exception:
+            rec["rating"] = 0
+
+    pick_raw = first(
+        "XMP-xmpDM:pick",
+        "XMP-xmpDM:Pick",
+        "XMP-xmp:Pick",
+        "XMP-xmp:PickLabel",
+        "XMP:Pick",
+        "XMP:PickLabel",
+        "pick",
+    )
+    if pick_raw is not None:
+        if not has_value(rec.get("XMP-xmpDM:pick")):
+            rec["XMP-xmpDM:pick"] = pick_raw
+        try:
+            text = str(pick_raw).strip().lower()
+            if text in ("true", "yes"):
+                rec["pick"] = 1
+            elif text in ("false", "no", ""):
+                rec["pick"] = 0
+            else:
+                rec["pick"] = max(-1, min(1, int(float(text))))
+        except Exception:
+            rec["pick"] = 0
 
 
 def _xmp_rows_to_flat_dict(path: str, xmp_rows: list) -> dict:
@@ -611,6 +675,8 @@ def read_batch_metadata(paths: list, tags: list | None = None, use_cache: bool =
     # 用于判断「是否需合并 XMP sidecar」；含标题、对焦状态等，缺一不可，勿删。
     _XMP_INDICATORS = (
         "XMP-dc:Title", "XMP-dc:title",   # 标题
+        "XMP-dc:Description", "XMP-dc:description",
+        "XMP-dc:Subject", "XMP-dc:subject",
         "XMP-xmp:Label", "XMP-xmp:Rating",
         "XMP-xmpDM:pick", "XMP-xmpDM:Pick",
         "XMP-xmp:Pick", "XMP-xmp:PickLabel", "XMP:Pick", "XMP:PickLabel",
@@ -676,3 +742,19 @@ def inject_metadata_cache(path: str, rec: dict) -> None:
             first = next(iter(_METADATA_CACHE))
             del _METADATA_CACHE[first]
         _METADATA_CACHE[norm] = rec.copy()
+
+
+def invalidate_metadata_cache(paths) -> None:
+    """Remove one or more paths from the batch metadata cache."""
+    if paths is None:
+        return
+    if isinstance(paths, (str, os.PathLike)):
+        iterable = [paths]
+    else:
+        iterable = list(paths)
+    norms = {os.path.normpath(os.fspath(p)) for p in iterable if p}
+    if not norms:
+        return
+    with _METADATA_CACHE_LOCK:
+        for norm in norms:
+            _METADATA_CACHE.pop(norm, None)

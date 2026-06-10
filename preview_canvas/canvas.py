@@ -38,7 +38,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import time as _time
 from typing import Callable
+
+from app_common.log import get_logger
+from app_common.perf_probe import perf_log
 
 try:
     from PyQt6.QtCore import QPointF, QRectF, Qt, pyqtSignal
@@ -88,6 +92,7 @@ _FOCUS_BOX_INNER_BLACK_WIDTH = 1
 _GRID_MODE_ALIASES: dict[str, str] = {
     "off": "none",
 }
+_log = get_logger("preview_canvas")
 
 
 def normalize_preview_composition_grid_mode(value: object) -> str:
@@ -487,12 +492,21 @@ class PreviewCanvas(QLabel):
         preserve_scale: bool = False,
     ) -> None:
         """Replace the displayed pixmap, optionally preserving the current view."""
+        t0 = _time.perf_counter()
+        source_size = (
+            (int(pixmap.width()), int(pixmap.height()))
+            if pixmap is not None and not pixmap.isNull()
+            else None
+        )
         old_pixmap = self._source_pixmap
+        view_t0 = _time.perf_counter()
         view_ratio = self._view_center_ratio() if preserve_view else None
         old_total_scale = self._fit_scale() * self._zoom
+        view_ms = (_time.perf_counter() - view_t0) * 1000.0
 
         self._source_pixmap = pixmap
         if self._source_pixmap is None or self._source_pixmap.isNull():
+            clear_t0 = _time.perf_counter()
             self._source_pixmap = None
             self._focus_box = None
             self._zoom = 1.0
@@ -503,8 +517,17 @@ class PreviewCanvas(QLabel):
             self._update_cursor()
             self.update()
             self._emit_display_scale_percent_changed(force=True)
+            perf_log(
+                _log,
+                "[PERF][image_switch][PreviewCanvas.set_source_pixmap] cleared size=%s view_ms=%.1f clear_ms=%.1f total_ms=%.1f",
+                source_size,
+                view_ms,
+                (_time.perf_counter() - clear_t0) * 1000.0,
+                (_time.perf_counter() - t0) * 1000.0,
+            )
             return
 
+        scale_t0 = _time.perf_counter()
         if preserve_scale and old_pixmap is not None and not old_pixmap.isNull():
             try:
                 ow = float(max(1, old_pixmap.width()))
@@ -520,6 +543,8 @@ class PreviewCanvas(QLabel):
             new_fit = self._fit_scale()
             if new_fit > 0:
                 self._zoom = max(self._min_zoom, min(self._max_zoom, old_total_scale / new_fit))
+        scale_ms = (_time.perf_counter() - scale_t0) * 1000.0
+        layout_t0 = _time.perf_counter()
         if reset_view:
             self._zoom = 1.0
             self._offset = QPointF(0.0, 0.0)
@@ -530,6 +555,19 @@ class PreviewCanvas(QLabel):
         self.setText("")
         self.update()
         self._emit_display_scale_percent_changed(force=True)
+        layout_ms = (_time.perf_counter() - layout_t0) * 1000.0
+        perf_log(
+            _log,
+            "[PERF][image_switch][PreviewCanvas.set_source_pixmap] size=%s reset=%s preserve_view=%s preserve_scale=%s view_ms=%.1f scale_ms=%.1f layout_ms=%.1f total_ms=%.1f",
+            source_size,
+            bool(reset_view),
+            bool(preserve_view),
+            bool(preserve_scale),
+            view_ms,
+            scale_ms,
+            layout_ms,
+            (_time.perf_counter() - t0) * 1000.0,
+        )
 
     # ------------------------------------------------------------------
     # Runtime overlay registration

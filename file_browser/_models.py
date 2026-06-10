@@ -4,6 +4,59 @@ from __future__ import annotations
 
 from app_common.file_browser._browser_core import *
 
+
+def _metadata_rating_value(meta: dict | None) -> int:
+    """从规范字段或原始 XMP 字段解析 0-5 星级。"""
+    if not isinstance(meta, dict):
+        return 0
+    raw = _first_non_empty(
+        meta.get("rating"),
+        meta.get("XMP-xmp:Rating"),
+        meta.get("XMP:Rating"),
+        meta.get("XMP-xmp:rating"),
+    )
+    try:
+        return max(0, min(5, int(float(str(raw or 0)))))
+    except Exception:
+        return 0
+
+
+def _metadata_pick_value(meta: dict | None) -> int:
+    """从规范字段或原始 XMP 字段解析 Pick/Reject：1/0/-1。"""
+    if not isinstance(meta, dict):
+        return 0
+    raw = _first_non_empty(
+        meta.get("pick"),
+        meta.get("XMP-xmpDM:pick"),
+        meta.get("XMP-xmpDM:Pick"),
+        meta.get("XMP-xmp:Pick"),
+        meta.get("XMP-xmp:PickLabel"),
+        meta.get("XMP:Pick"),
+        meta.get("XMP:PickLabel"),
+    )
+    if not str(raw or "").strip():
+        rating_raw = _first_non_empty(
+            meta.get("XMP-xmp:Rating"),
+            meta.get("XMP:Rating"),
+            meta.get("XMP-xmp:rating"),
+            meta.get("rating"),
+        )
+        try:
+            if int(float(str(rating_raw or 0))) < 0:
+                return -1
+        except Exception:
+            pass
+    try:
+        text = str(raw or "").strip().lower()
+        if text in ("true", "yes"):
+            return 1
+        if text in ("false", "no", ""):
+            return 0
+        return max(-1, min(1, int(float(text))))
+    except Exception:
+        return 0
+
+
 class SortableTreeItem(QTreeWidgetItem):
     """支持数值感知排序的 QTreeWidgetItem（通过 _SortRole 存储排序键）。"""
 
@@ -25,6 +78,9 @@ class FileTableEntry:
     name: str
     tooltip: str = ""
     mismatch: bool = False
+    comment: str = ""
+    tags: list[str] = field(default_factory=list)
+    tags_display: str = ""
     title: str = ""
     color: str = ""
     color_display: str = ""
@@ -74,17 +130,14 @@ class FileTableModel(QAbstractTableModel):
 
     def _apply_meta_to_entry(self, entry: FileTableEntry, meta: dict | None) -> None:
         meta = meta or {}
+        entry.comment = _metadata_comment_from_meta(meta)
+        entry.tags = _metadata_tags_from_meta(meta)
+        entry.tags_display = _FILE_TAG_DISPLAY_SEPARATOR.join(entry.tags)
         entry.title = str(meta.get("title", "") or "")
         entry.color = str(meta.get("color", "") or "")
         entry.color_display = _COLOR_LABEL_COLORS.get(entry.color, ("", ""))[1] or entry.color
-        try:
-            entry.rating = int(meta.get("rating", 0) or 0)
-        except Exception:
-            entry.rating = 0
-        try:
-            entry.pick = int(meta.get("pick", 0) or 0)
-        except Exception:
-            entry.pick = 0
+        entry.rating = _metadata_rating_value(meta)
+        entry.pick = _metadata_pick_value(meta)
         entry.city = str(meta.get("city", "") or "")
         entry.state = str(meta.get("state", "") or "")
         entry.country = str(meta.get("country", "") or "")
@@ -111,64 +164,33 @@ class FileTableModel(QAbstractTableModel):
         return entry
 
     def _sort_value(self, entry: FileTableEntry, column: int):
-        if column == _TREE_COL_SEQ:
-            return 0
         if column == _TREE_COL_NAME:
             return entry.name.lower()
-        if column == _TREE_COL_TITLE:
-            return entry.title.lower()
-        if column == _TREE_COL_COLOR:
-            return _COLOR_SORT_ORDER.get(entry.color, 99)
+        if column == _TREE_COL_COMMENT:
+            return entry.comment.lower()
         if column == _TREE_COL_STAR:
             if entry.pick == 1:
                 return 10
             if entry.pick == -1:
                 return -1
             return entry.rating
-        if column == _TREE_COL_SHARP:
-            return entry.city.lower()
-        if column == _TREE_COL_AESTHETIC:
-            return entry.state.lower()
-        if column == _TREE_COL_FOCUS:
-            return entry.country.lower()
-        if column == _TREE_COL_SHUTTER:
-            seconds = _parse_positive_fraction_or_float(entry.shutter)
-            return (0, seconds) if seconds is not None else (1, entry.shutter.lower())
-        if column == _TREE_COL_ISO:
-            iso_value = _parse_optional_int(entry.iso)
-            return (0, iso_value) if iso_value is not None else (1, entry.iso.lower())
-        if column == _TREE_COL_APERTURE:
-            aperture_value = _parse_positive_fraction_or_float(entry.aperture)
-            return (0, aperture_value) if aperture_value is not None else (1, entry.aperture.lower())
+        if column == _TREE_COL_TAGS:
+            return entry.tags_display.lower()
         return ""
 
     def _display_value(self, entry: FileTableEntry, row: int, column: int) -> str:
-        if column == _TREE_COL_SEQ:
-            return str(row + 1)
         if column == _TREE_COL_NAME:
             return entry.name
-        if column == _TREE_COL_TITLE:
-            return entry.title
-        if column == _TREE_COL_COLOR:
-            return entry.color_display
+        if column == _TREE_COL_COMMENT:
+            return entry.comment
         if column == _TREE_COL_STAR:
             if entry.pick == 1:
                 return "🏆"
             if entry.pick == -1:
                 return "🚫"
             return "★" * max(0, entry.rating)
-        if column == _TREE_COL_SHARP:
-            return entry.city
-        if column == _TREE_COL_AESTHETIC:
-            return entry.state
-        if column == _TREE_COL_FOCUS:
-            return entry.country
-        if column == _TREE_COL_SHUTTER:
-            return entry.shutter
-        if column == _TREE_COL_ISO:
-            return entry.iso
-        if column == _TREE_COL_APERTURE:
-            return entry.aperture
+        if column == _TREE_COL_TAGS:
+            return entry.tags_display
         return ""
 
     def data(self, index: QModelIndex, role: int = int(_DisplayRole)):
@@ -187,21 +209,10 @@ class FileTableModel(QAbstractTableModel):
             return entry.tooltip
         if role == _SortRole:
             return self._sort_value(entry, column)
-        if role == _TextAlignmentRole and column == _TREE_COL_SEQ:
-            return int(_AlignCenter)
         if role == _ForegroundRole:
             if column == _TREE_COL_NAME and entry.mismatch:
                 return QBrush(QColor("#c0392b"))
-            if column == _TREE_COL_COLOR and entry.color in _COLOR_LABEL_COLORS:
-                return QBrush(QColor("#333" if entry.color in ("Yellow", "White") else "#fff"))
-            if column == _TREE_COL_FOCUS:
-                focus_color = _FOCUS_STATUS_TEXT_COLORS.get(entry.country, "")
-                if focus_color:
-                    return QBrush(QColor(focus_color))
             return None
-        if role == _BackgroundRole and column == _TREE_COL_COLOR and entry.color in _COLOR_LABEL_COLORS:
-            hex_c, _label = _COLOR_LABEL_COLORS[entry.color]
-            return QBrush(QColor(hex_c))
         return None
 
     def clear(self) -> None:
@@ -209,6 +220,33 @@ class FileTableModel(QAbstractTableModel):
         self._entries = []
         self._row_by_path = {}
         self.endResetModel()
+
+    def append_paths(
+        self,
+        paths: list[str],
+        *,
+        meta_cache: dict,
+        tooltip_fn,
+        mismatch_fn,
+    ) -> int:
+        if not paths:
+            return 0
+        start_row = len(self._entries)
+        new_entries = [
+            self._build_entry(
+                path,
+                meta_cache=meta_cache,
+                tooltip_fn=tooltip_fn,
+                mismatch_fn=mismatch_fn,
+            )
+            for path in paths
+        ]
+        self.beginInsertRows(QModelIndex(), start_row, start_row + len(new_entries) - 1)
+        self._entries.extend(new_entries)
+        for offset, entry in enumerate(new_entries):
+            self._row_by_path[os.path.normpath(entry.path)] = start_row + offset
+        self.endInsertRows()
+        return len(new_entries)
 
     def rebuild(
         self,
@@ -266,7 +304,7 @@ class FileTableModel(QAbstractTableModel):
             return False
         entry = self._entries[row]
         self._apply_meta_to_entry(entry, meta)
-        left = self.index(row, _TREE_COL_TITLE)
+        left = self.index(row, _TREE_COL_COMMENT)
         right = self.index(row, self.columnCount() - 1)
         self.dataChanged.emit(left, right, [_DisplayRole, _SortRole, _ForegroundRole, _BackgroundRole])
         return True
@@ -303,8 +341,6 @@ class FileTableSortProxyModel(QSortFilterProxyModel):
             pass
 
     def data(self, index: QModelIndex, role: int = int(_DisplayRole)):
-        if role == _DisplayRole and index.isValid() and index.column() == _TREE_COL_SEQ:
-            return str(index.row() + 1)
         return super().data(index, role)
 
     def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:
@@ -437,7 +473,7 @@ class FileTableView(QTreeView):
             self._header_labels = []
 
 
-# ── 缩略图 delegate（颜色标签 + 星级徽章）─────────────────────────────────────
+# ── 缩略图 delegate（缩略图 + 星级徽章）───────────────────────────────────────
 
 @dataclass(frozen=True)
 class ThumbViewportEntry:
@@ -519,14 +555,8 @@ class ThumbnailListModel(QAbstractListModel):
     ) -> ThumbnailListEntry:
         norm = os.path.normpath(path)
         meta = meta_cache.get(norm, {}) if isinstance(meta_cache, dict) else {}
-        try:
-            rating = int(meta.get("rating", 0) or 0)
-        except Exception:
-            rating = 0
-        try:
-            pick = int(meta.get("pick", 0) or 0)
-        except Exception:
-            pick = 0
+        rating = _metadata_rating_value(meta)
+        pick = _metadata_pick_value(meta)
         return ThumbnailListEntry(
             path=path,
             name=Path(path).name,
@@ -642,17 +672,11 @@ class ThumbnailListModel(QAbstractListModel):
         if entry.color != new_color:
             entry.color = new_color
             changed_roles.append(_MetaColorRole)
-        try:
-            new_rating = int(meta.get("rating", 0) or 0)
-        except Exception:
-            new_rating = 0
+        new_rating = _metadata_rating_value(meta)
         if entry.rating != new_rating:
             entry.rating = new_rating
             changed_roles.append(_MetaRatingRole)
-        try:
-            new_pick = int(meta.get("pick", 0) or 0)
-        except Exception:
-            new_pick = 0
+        new_pick = _metadata_pick_value(meta)
         if entry.pick != new_pick:
             entry.pick = new_pick
             changed_roles.append(_MetaPickRole)
@@ -667,7 +691,7 @@ class ThumbnailListModel(QAbstractListModel):
         if not changed_roles:
             return False
         idx = self.index(row, 0)
-        self.dataChanged.emit(idx, idx, changed_roles)
+        self.dataChanged.emit(idx, idx, list(dict.fromkeys(changed_roles + [_DisplayRole])))
         return True
 
     def set_pixmap_for_path(self, path: str, pixmap: QPixmap | None, thumb_size: int) -> int | None:
@@ -813,11 +837,8 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
         selected = bool(opt.state & _StateSelected)
         hovered = bool(opt.state & _StateMouseOver)
         name = str(index.data() or "")
-        color_label = index.data(_MetaColorRole)
         rating = index.data(_MetaRatingRole)
         pick = index.data(_MetaPickRole)
-        focus_status = str(index.data(_MetaFocusRole) or "").strip()
-        species_cn = str(index.data(_MetaSpeciesCnRole) or "").strip()
         pixmap = index.data(_ThumbPixmapRole)
         if not isinstance(pixmap, QPixmap):
             pixmap = None
@@ -845,23 +866,6 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
             painter.setPen(QColor(70, 70, 70))
             painter.drawRoundedRect(thumb_rect, 6, 6)
 
-            if species_cn:
-                pad = 4
-                font_species = QFont(opt.font)
-                font_species.setPixelSize(max(9, min(11, thumb_rect.width() // 12)))
-                painter.setFont(font_species)
-                fm_s = painter.fontMetrics()
-                max_w = max(40, thumb_rect.width() - pad * 2)
-                elided_cn = fm_s.elidedText(species_cn, _ElideRight, max_w)
-                tw = min(max_w, fm_s.horizontalAdvance(elided_cn) if hasattr(fm_s, "horizontalAdvance") else fm_s.width(elided_cn)) + 8
-                th = fm_s.lineSpacing() + 4
-                badge_cn = QRect(thumb_rect.left() + pad, thumb_rect.top() + pad, tw, th)
-                painter.setBrush(QBrush(QColor(0, 0, 0, 160)))
-                painter.setPen(_NoPen)
-                painter.drawRoundedRect(badge_cn, 4, 4)
-                painter.setPen(QColor("#ffffff"))
-                painter.drawText(badge_cn.adjusted(4, 0, -4, 0), _AlignCenter, elided_cn)
-
             if pixmap is not None and not pixmap.isNull():
                 pw = max(1, pixmap.width())
                 ph = max(1, pixmap.height())
@@ -876,69 +880,42 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
                 )
                 painter.drawPixmap(draw_rect, pixmap)
 
-            has_color = bool(color_label and color_label in _COLOR_LABEL_COLORS)
-            if pick == 1:
-                right_badge_text = "🏆"
-                right_badge_bg = QColor(0, 0, 0, 160)
-                right_badge_fg = QColor(COLORS["star_gold"])
-            elif pick == -1:
-                right_badge_text = "🚫"
-                right_badge_bg = QColor(0, 0, 0, 160)
-                right_badge_fg = QColor("#ffffff")
-            elif isinstance(rating, int) and rating > 0:
-                right_badge_text = "★" * min(5, rating)
-                right_badge_bg = QColor(0, 0, 0, 140)
-                right_badge_fg = QColor(_STAR_SILVER_COLOR)
-            else:
-                right_badge_text = ""
-
-            if has_color:
-                hex_c, cn = _COLOR_LABEL_COLORS[color_label]
-                bw, bh = 30, 16
-                badge = QRect(draw_rect.left() + 2, draw_rect.bottom() - bh - 2, bw, bh)
-                painter.setBrush(QBrush(QColor(hex_c)))
-                painter.setPen(_NoPen)
-                painter.drawRoundedRect(badge, 4, 4)
-                painter.setPen(QColor("#333" if color_label in ("Yellow", "White") else "#fff"))
-                f = QFont(opt.font)
-                f.setPixelSize(9)
-                painter.setFont(f)
-                painter.drawText(badge, _AlignCenter, cn)
-
-            if right_badge_text:
+            def draw_badge(text: str, bg: QColor, fg: QColor, *, left: bool) -> None:
                 f2 = QFont(opt.font)
                 f2.setPixelSize(11)
                 painter.setFont(f2)
                 fm2 = painter.fontMetrics()
                 try:
-                    sw = fm2.horizontalAdvance(right_badge_text)
+                    sw = fm2.horizontalAdvance(text)
                 except AttributeError:
-                    sw = fm2.width(right_badge_text)
+                    sw = fm2.width(text)
                 bw2, bh2 = sw + 10, 16
-                badge2 = QRect(draw_rect.right() - bw2 - 2, draw_rect.top() + 2, bw2, bh2)
-                painter.setBrush(QBrush(right_badge_bg))
+                if left:
+                    badge2 = QRect(draw_rect.left() + 2, draw_rect.top() + 2, bw2, bh2)
+                else:
+                    badge2 = QRect(draw_rect.right() - bw2 - 2, draw_rect.top() + 2, bw2, bh2)
+                painter.setBrush(QBrush(bg))
                 painter.setPen(_NoPen)
                 painter.drawRoundedRect(badge2, 4, 4)
-                painter.setPen(right_badge_fg)
-                painter.drawText(badge2, _AlignCenter, right_badge_text)
+                painter.setPen(fg)
+                painter.drawText(badge2, _AlignCenter, text)
 
-            if focus_status:
-                focus_color = _FOCUS_STATUS_TEXT_COLORS.get(focus_status, COLORS["text_secondary"])
-                focus_font = QFont(opt.font)
-                focus_font.setPixelSize(max(10, opt.font.pixelSize() if opt.font.pixelSize() > 0 else 10))
-                painter.setFont(focus_font)
-                fm3 = painter.fontMetrics()
-                try:
-                    sw3 = fm3.horizontalAdvance(focus_status)
-                except AttributeError:
-                    sw3 = fm3.width(focus_status)
-                bw3, bh3 = sw3 + 10, 16
-                badge3 = QRect(draw_rect.right() - bw3 - 2, draw_rect.bottom() - bh3 - 2, bw3, bh3)
-                painter.setBrush(QBrush(QColor(0, 0, 0, 150)))
-                painter.setPen(_NoPen)
-                painter.drawRoundedRect(badge3, 4, 4)
-                painter.setPen(QColor(focus_color))
-                painter.drawText(badge3, _AlignCenter, focus_status)
+            if pick == 1:
+                draw_badge("🏆", QColor(0, 0, 0, 160), QColor(COLORS["star_gold"]), left=True)
+            elif pick == -1:
+                draw_badge("🚫", QColor(0, 0, 0, 160), QColor("#ffffff"), left=True)
+
+            try:
+                rating_value = int(rating or 0)
+            except Exception:
+                rating_value = 0
+            if rating_value > 0:
+                draw_badge(
+                    "★" * min(5, rating_value),
+                    QColor(0, 0, 0, 140),
+                    QColor(_STAR_SILVER_COLOR),
+                    left=False,
+                )
 
             text_rect = QRect(cell.left(), thumb_rect.bottom() + 4, cell.width(), name_height)
             text_color = opt.palette.highlightedText().color() if selected else opt.palette.text().color()

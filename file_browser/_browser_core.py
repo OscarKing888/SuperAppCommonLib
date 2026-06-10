@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import concurrent.futures as _futures
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import html
 import io as _io
@@ -69,13 +69,13 @@ from app_common.focus_calc import (
     extract_focus_box_for_display,
     resolve_focus_camera_type_from_metadata,
 )
+from app_common.perf_probe import perf_probes_enabled
 from app_common.log import get_logger
 from app_common.file_utils import reveal_in_file_manager, move_to_trash, move_empty_dirs_to_trash
 from app_common.send_to_app import get_external_apps, send_files_to_app
 from app_common.report_db import (
     ReportDB,
     report_row_to_exiftool_style,
-    EXIF_ONLY_FROM_REPORT_DB,
     get_preview_path_for_file,
     find_report_root,
 )
@@ -93,42 +93,9 @@ from app_common.superviewer_user_options import (
 )
 from app_common.ui_style.styles import COLORS
 from app_common import thumb_stream
+from app_common.image_formats import IMAGE_EXTENSIONS, RAW_EXTENSIONS
 
 _log = get_logger("file_browser")
-
-# ── 支持的图像扩展名 ───────────────────────────────────────────────────────────
-IMAGE_EXTENSIONS = (
-    ".jpg", ".jpeg", ".png", ".webp", ".tiff", ".tif",
-    ".heic", ".heif", ".hif",
-    # Canon
-    ".cr2", ".cr3", ".crw",
-    # Nikon
-    ".nef", ".nrw",
-    # Sony
-    ".arw", ".srf", ".sr2",
-    # Panasonic
-    ".rw2", ".raw",
-    # Olympus
-    ".orf", ".ori",
-    # Fujifilm
-    ".raf",
-    # Adobe / Leica 等
-    ".dng",
-    # Pentax
-    ".pef", ".ptx",
-    # Sigma
-    ".x3f",
-    # Leica
-    ".rwl",
-    # 其他常见 RAW
-    ".3fr", ".dcr", ".kdc", ".mef", ".mrw", ".rwz",
-)
-IMAGE_EXTENSIONS = tuple(dict.fromkeys(e.lower() for e in IMAGE_EXTENSIONS))
-RAW_EXTENSIONS = frozenset(
-    e for e in IMAGE_EXTENSIONS
-    if e not in (".jpg", ".jpeg", ".png", ".webp", ".tiff", ".tif",
-                 ".heic", ".heif", ".hif")
-)
 
 # ── Qt 兼容常量 ────────────────────────────────────────────────────────────────
 try:
@@ -263,18 +230,21 @@ _ThumbPixmapRole = int(_UserRole) + 20
 _ThumbSizeRole = int(_UserRole) + 21
 _MetaSpeciesCnRole = int(_UserRole) + 22
 
-_TREE_COL_SEQ = 0
-_TREE_COL_NAME = 1
-_TREE_COL_TITLE = 2
-_TREE_COL_COLOR = 3
-_TREE_COL_STAR = 4
-_TREE_COL_SHARP = 5
-_TREE_COL_AESTHETIC = 6
-_TREE_COL_FOCUS = 7
-_TREE_COL_SHUTTER = 8
-_TREE_COL_ISO = 9
-_TREE_COL_APERTURE = 10
-_FILE_TABLE_HEADERS = ["#", "文件名", "标题", "颜色", "星级", "锐度值", "美学评分", "对焦状态", "快门", "ISO", "光圈"]
+_TREE_COL_SEQ = -1
+_TREE_COL_NAME = 0
+_TREE_COL_COMMENT = 1
+_TREE_COL_STAR = 2
+_TREE_COL_TAGS = 3
+_TREE_COL_TITLE = _TREE_COL_COMMENT
+_TREE_COL_COLOR = _TREE_COL_TAGS
+_TREE_COL_SHARP = _TREE_COL_TAGS
+_TREE_COL_AESTHETIC = _TREE_COL_TAGS
+_TREE_COL_FOCUS = _TREE_COL_TAGS
+_TREE_COL_SHUTTER = _TREE_COL_TAGS
+_TREE_COL_ISO = _TREE_COL_TAGS
+_TREE_COL_APERTURE = _TREE_COL_TAGS
+_FILE_TABLE_HEADERS = ["文件名", "注释", "星级", "标签"]
+_FILE_TAG_DISPLAY_SEPARATOR = "、"
 _SUPERBIRDSTAMP_CAMERA_METADATA_TAGS = [
     "-ExifIFD:ExposureTime",
     "-EXIF:ExposureTime",
@@ -337,7 +307,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 _DEBUG_FILE_LIST_LIMIT = max(0, _env_int("SuperViewer_DEBUG_FILE_LIST_LIMIT", 0))
 _DEBUG_FILE_LIST_MATCH = (os.environ.get("SuperViewer_DEBUG_FILE_LIST_MATCH", "") or "").strip().lower()
-_THUMB_PROFILE_ENABLED = _env_flag("SuperViewer_THUMB_PROFILE", True)
+_THUMB_PROFILE_ENABLED = _env_flag("SuperViewer_THUMB_PROFILE", False)
 _THUMB_PROFILE_VERBOSE = _env_flag("SuperViewer_THUMB_PROFILE_VERBOSE", False)
 _THUMB_PROFILE_REPORT_INTERVAL_S = max(0.25, _env_int("SuperViewer_THUMB_PROFILE_INTERVAL_MS", 1500) / 1000.0)
 _THUMB_BOTTLENECK_SAMPLE_LIMIT = max(256, _env_int("SuperViewer_THUMB_BOTTLENECK_SAMPLE_LIMIT", 50000))
@@ -360,8 +330,12 @@ _THUMB_BOTTLENECK_SAMPLES: dict[str, list[float]] = {
 }
 
 
+def _thumb_profile_enabled() -> bool:
+    return bool(_THUMB_PROFILE_ENABLED or perf_probes_enabled())
+
+
 def _record_thumb_bottleneck_sample(metric: str, value_ms: float) -> None:
-    if not _THUMB_PROFILE_ENABLED:
+    if not _thumb_profile_enabled():
         return
     try:
         sample = float(value_ms)
@@ -377,7 +351,7 @@ def _record_thumb_bottleneck_sample(metric: str, value_ms: float) -> None:
 
 
 def _log_thumb_bottleneck_summary() -> None:
-    if not _THUMB_PROFILE_ENABLED:
+    if not _thumb_profile_enabled():
         return
     with _THUMB_BOTTLENECK_LOCK:
         snapshot = {
@@ -468,6 +442,79 @@ def _first_non_empty(*values):
         if str(value).strip():
             return value
     return ""
+
+
+def _normalise_metadata_tag_values(value) -> list[str]:
+    """将 XMP/IPTC tag/subject 值收敛为有序去重字符串列表。"""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set, frozenset)):
+        values = list(value)
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return []
+        values = text.split(";") if ";" in text else [text]
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        clean = str(item or "").strip()
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        result.append(clean)
+    return result
+
+
+def _metadata_tags_from_meta(meta: dict | None) -> list[str]:
+    if not isinstance(meta, dict):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for key in (
+        "tags",
+        "photo_tags",
+        "XMP-dc:Subject",
+        "XMP-dc:subject",
+        "XMP:Subject",
+        "Subject",
+        "subject",
+        "subjects",
+        "IPTC:Keywords",
+        "Keywords",
+    ):
+        for tag in _normalise_metadata_tag_values(meta.get(key)):
+            if tag in seen:
+                continue
+            seen.add(tag)
+            result.append(tag)
+    return result
+
+
+def _metadata_tags_display(meta: dict | None) -> str:
+    return _FILE_TAG_DISPLAY_SEPARATOR.join(_metadata_tags_from_meta(meta))
+
+
+def _metadata_comment_from_meta(meta: dict | None) -> str:
+    if not isinstance(meta, dict):
+        return ""
+    value = _first_non_empty(
+        meta.get("comment"),
+        meta.get("description"),
+        meta.get("Description"),
+        meta.get("XMP-dc:Description"),
+        meta.get("XMP-dc:description"),
+        meta.get("XMP:Description"),
+        meta.get("IFD0:ImageDescription"),
+        meta.get("EXIF:ImageDescription"),
+        meta.get("ExifIFD:UserComment"),
+        meta.get("EXIF:UserComment"),
+        meta.get("UserComment"),
+        meta.get("IFD0:XPComment"),
+        meta.get("IPTC:Caption-Abstract"),
+        meta.get("caption"),
+    )
+    return str(value or "").strip()
 
 
 def _parse_positive_fraction_or_float(raw) -> float | None:
@@ -597,6 +644,27 @@ def _filter_badge_stylesheet(
     )
 
 
+def apply_compact_filter_badge_menu(
+    inline_buttons,
+    menu_button,
+    compact: bool,
+    *,
+    menu_text: str,
+    menu_tooltip: str = "",
+) -> None:
+    """在空间不足时将一组过滤 badge 切换为单个下拉菜单按钮。"""
+    for button in inline_buttons or ():
+        if button is None:
+            continue
+        button.setVisible(not compact)
+    if menu_button is None:
+        return
+    menu_button.setVisible(bool(compact))
+    menu_button.setText(str(menu_text or ""))
+    if menu_tooltip:
+        menu_button.setToolTip(menu_tooltip)
+
+
 def _focus_filter_button_stylesheet(status: str) -> str:
     color = _FOCUS_STATUS_TEXT_COLORS.get(status, COLORS["text_secondary"])
     checked_fg = "#111111" if status in ("??", "??") else "#f5f5f5"
@@ -616,6 +684,7 @@ try:
     _EventKeyRelease = QEvent.Type.KeyRelease
     _EventToolTip = QEvent.Type.ToolTip
     _EventWheel = QEvent.Type.Wheel
+    _EventMouseButtonPress = QEvent.Type.MouseButtonPress
 except AttributeError:
     _EventResize = QEvent.Resize  # type: ignore[attr-defined]
     _EventShow = QEvent.Show  # type: ignore[attr-defined]
@@ -623,6 +692,7 @@ except AttributeError:
     _EventKeyRelease = QEvent.KeyRelease  # type: ignore[attr-defined]
     _EventToolTip = QEvent.ToolTip  # type: ignore[attr-defined]
     _EventWheel = QEvent.Wheel  # type: ignore[attr-defined]
+    _EventMouseButtonPress = QEvent.MouseButtonPress  # type: ignore[attr-defined]
 
 _KeyUp = getattr(Qt.Key, "Key_Up", None) or getattr(Qt, "Key_Up", None)
 _KeyDown = getattr(Qt.Key, "Key_Down", None) or getattr(Qt, "Key_Down", None)
@@ -662,6 +732,112 @@ try:
     _WindowShortcut = Qt.ShortcutContext.WindowShortcut
 except AttributeError:
     _WindowShortcut = Qt.WindowShortcut  # type: ignore[attr-defined]
+
+try:
+    _WidgetWithChildrenShortcut = Qt.ShortcutContext.WidgetWithChildrenShortcut
+except AttributeError:
+    _WidgetWithChildrenShortcut = Qt.WidgetWithChildrenShortcut  # type: ignore[attr-defined]
+
+
+def _platform_copy_key_sequence() -> "QKeySequence":
+    """Return the native Copy shortcut sequence for macOS / Windows."""
+    standard_key = None
+    standard_key_enum = getattr(QKeySequence, "StandardKey", None)
+    if standard_key_enum is not None:
+        standard_key = getattr(standard_key_enum, "Copy", None)
+    if standard_key is None:
+        standard_key = getattr(QKeySequence, "Copy", None)
+    if standard_key is not None:
+        try:
+            bindings = QKeySequence.keyBindings(standard_key)
+            if bindings:
+                return bindings[0]
+        except Exception:
+            pass
+        try:
+            return QKeySequence(standard_key)
+        except Exception:
+            pass
+    return QKeySequence("Ctrl+C")
+
+
+def _platform_cut_key_sequence() -> "QKeySequence":
+    """Return the native Cut shortcut sequence for macOS / Windows."""
+    standard_key = None
+    standard_key_enum = getattr(QKeySequence, "StandardKey", None)
+    if standard_key_enum is not None:
+        standard_key = getattr(standard_key_enum, "Cut", None)
+    if standard_key is None:
+        standard_key = getattr(QKeySequence, "Cut", None)
+    if standard_key is not None:
+        try:
+            bindings = QKeySequence.keyBindings(standard_key)
+            if bindings:
+                return bindings[0]
+        except Exception:
+            pass
+        try:
+            return QKeySequence(standard_key)
+        except Exception:
+            pass
+    return QKeySequence("Ctrl+X")
+
+
+def _platform_paste_key_sequence() -> "QKeySequence":
+    """Return the native Paste shortcut sequence for macOS / Windows."""
+    standard_key = None
+    standard_key_enum = getattr(QKeySequence, "StandardKey", None)
+    if standard_key_enum is not None:
+        standard_key = getattr(standard_key_enum, "Paste", None)
+    if standard_key is None:
+        standard_key = getattr(QKeySequence, "Paste", None)
+    if standard_key is not None:
+        try:
+            bindings = QKeySequence.keyBindings(standard_key)
+            if bindings:
+                return bindings[0]
+        except Exception:
+            pass
+        try:
+            return QKeySequence(standard_key)
+        except Exception:
+            pass
+    return QKeySequence("Ctrl+V")
+
+
+def _key_sequence_native_text(sequence: "QKeySequence") -> str:
+    try:
+        native_format = QKeySequence.SequenceFormat.NativeText
+    except AttributeError:
+        native_format = QKeySequence.NativeText  # type: ignore[attr-defined]
+    try:
+        text = sequence.toString(native_format)
+    except Exception:
+        text = sequence.toString()
+    if text:
+        return text
+    return "⌘C" if sys.platform == "darwin" else "Ctrl+C"
+
+
+def _apply_context_menu_shortcut(action, sequence: "QKeySequence") -> None:
+    """Attach a shortcut to a context-menu action and force it to be displayed."""
+    if action is None:
+        return
+    action.setShortcut(sequence)
+    try:
+        action.setShortcutContext(_WidgetWithChildrenShortcut)
+    except Exception:
+        pass
+    try:
+        action.setShortcutVisibleInContextMenu(True)
+        return
+    except Exception:
+        pass
+    text = str(action.text() or "")
+    if "\t" not in text:
+        shortcut_text = _key_sequence_native_text(sequence)
+        if shortcut_text:
+            action.setText(f"{text}\t{shortcut_text}")
 
 
 def _key_matches(value, key) -> bool:
@@ -716,9 +892,25 @@ def _thumb_disk_cache_dir() -> str:
     return os.path.join(base, "SuperViewer", "thumb_cache")
 
 
+def _thumb_disk_cache_dir_for_path(path: str) -> str:
+    if path:
+        try:
+            current_dir = os.path.dirname(os.path.normpath(os.path.abspath(path)))
+            superpicky_dir = _find_superpicky_dir(current_dir)
+        except Exception:
+            superpicky_dir = ""
+        if superpicky_dir:
+            return os.path.join(superpicky_dir, "thumb_cache")
+    return _thumb_disk_cache_dir()
+
+
 def _thumb_disk_cache_path(path: str, mtime: float, size: int) -> str:
     """Full path to cached thumbnail file; path must be absolute/normalized for stable key."""
-    cache_dir = _thumb_disk_cache_dir()
+    try:
+        size_dir = str(int(size))
+    except Exception:
+        size_dir = str(size)
+    cache_dir = os.path.join(_thumb_disk_cache_dir_for_path(path), size_dir)
     raw = f"{_path_key(path)}\0{mtime}\0{size}"
     name = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24] + ".jpg"
     return os.path.join(cache_dir, name)
@@ -783,14 +975,24 @@ def _persistent_thumb_cache_worker_count() -> int:
 
 
 def _persistent_thumb_cache_dirname(size: int) -> str:
-    return f"thumb_preview_{int(size)}"
+    return str(int(size))
 
 
-def _find_superpicky_dir(current_dir: str, max_levels: int = 4) -> str:
-    """Walk up from current_dir (up to max_levels) to find the nearest .superpicky directory.
-    Returns the .superpicky path if found, otherwise returns current_dir/.superpicky (may not exist yet)."""
+def _find_superpicky_dir(current_dir: str, max_levels: int | None = 6) -> str:
+    """向上查找最近的现有 .superpicky 目录；找不到时返回空字符串。
+
+    缓存写入方只应在用户已经有 .superpicky 的目录树内创建 cache 子目录，
+    不应为了缓存主动创建新的 .superpicky 根目录。
+    """
+    if not current_dir:
+        return ""
     candidate = os.path.normpath(current_dir)
-    for _ in range(max_levels + 1):
+    if os.path.basename(candidate) == ".superpicky" and os.path.isdir(candidate):
+        return candidate
+    depth = 0
+    while candidate:
+        if max_levels is not None and depth > max_levels:
+            break
         superpicky = os.path.join(candidate, ".superpicky")
         if os.path.isdir(superpicky):
             return superpicky
@@ -798,14 +1000,24 @@ def _find_superpicky_dir(current_dir: str, max_levels: int = 4) -> str:
         if parent == candidate:
             break
         candidate = parent
-    # Not found — default to creating one in the current dir
-    return os.path.join(os.path.normpath(current_dir), ".superpicky")
+        depth += 1
+    return ""
+
+
+def _superpicky_cache_root_dir(current_dir: str | None) -> str:
+    """返回持有 .superpicky 的 root 目录；找不到现有 .superpicky 时返回空。"""
+    superpicky_dir = _find_superpicky_dir(current_dir or "")
+    if not superpicky_dir:
+        return ""
+    return os.path.dirname(superpicky_dir)
 
 
 def _preview_cache_target_for_file(path: str, current_dir: str | None) -> str:
     if not path or not current_dir:
         return ""
     superpicky_dir = _find_superpicky_dir(current_dir)
+    if not superpicky_dir:
+        return ""
     preview_dir = os.path.join(superpicky_dir, "cache", "temp_preview")
     stem = os.path.splitext(os.path.basename(path))[0]
     if not stem:
@@ -824,7 +1036,9 @@ def _persistent_thumb_cache_dir(current_dir: str | None, size: int) -> str:
     if not current_dir:
         return ""
     superpicky_dir = _find_superpicky_dir(current_dir)
-    return os.path.join(superpicky_dir, "cache", _persistent_thumb_cache_dirname(size))
+    if not superpicky_dir:
+        return ""
+    return os.path.join(superpicky_dir, "thumb_cache", _persistent_thumb_cache_dirname(size))
 
 
 def _persistent_thumb_cache_filename_for_file(path: str, current_dir: str | None = None) -> str:
@@ -854,19 +1068,33 @@ def _persistent_thumb_cache_filename_for_file(path: str, current_dir: str | None
     return f"{name}.thumb.jpg"
 
 
-def _legacy_persistent_thumb_cache_path_for_file(path: str, current_dir: str | None, size: int) -> str:
-    cache_dir = _persistent_thumb_cache_dir(current_dir, size)
-    if not cache_dir or not path:
-        return ""
+def _legacy_persistent_thumb_cache_paths_for_file(path: str, current_dir: str | None, size: int) -> list[str]:
+    if not current_dir or not path:
+        return []
+    superpicky_dir = _find_superpicky_dir(current_dir)
+    if not superpicky_dir:
+        return []
+    legacy_dir = os.path.join(superpicky_dir, "cache", f"thumb_cache_{int(size)}")
+    cache_root_dir = _superpicky_cache_root_dir(current_dir)
+    paths = [
+        os.path.join(legacy_dir, _persistent_thumb_cache_filename_for_file(path, cache_root_dir or current_dir))
+    ]
     digest = hashlib.sha1(_path_key(path).encode("utf-8")).hexdigest()
-    return os.path.join(cache_dir, digest[:2], f"{digest}.jpg")
+    paths.append(os.path.join(legacy_dir, digest[:2], f"{digest}.jpg"))
+    return paths
+
+
+def _legacy_persistent_thumb_cache_path_for_file(path: str, current_dir: str | None, size: int) -> str:
+    paths = _legacy_persistent_thumb_cache_paths_for_file(path, current_dir, size)
+    return paths[0] if paths else ""
 
 
 def _persistent_thumb_cache_path_for_file(path: str, current_dir: str | None, size: int) -> str:
     cache_dir = _persistent_thumb_cache_dir(current_dir, size)
     if not cache_dir or not path:
         return ""
-    return os.path.join(cache_dir, _persistent_thumb_cache_filename_for_file(path, current_dir))
+    cache_root_dir = _superpicky_cache_root_dir(current_dir)
+    return os.path.join(cache_dir, _persistent_thumb_cache_filename_for_file(path, cache_root_dir or current_dir))
 
 
 def _migrate_legacy_persistent_thumb_cache_path(target_path: str, legacy_path: str) -> str:
@@ -907,9 +1135,11 @@ def _existing_persistent_thumb_cache_path_for_exact_size(
 ) -> str:
     cache_path = _persistent_thumb_cache_path_for_file(path, current_dir, size)
     if not cache_path or not os.path.isfile(cache_path):
-        legacy_path = _legacy_persistent_thumb_cache_path_for_file(path, current_dir, size)
-        if legacy_path and os.path.isfile(legacy_path):
-            cache_path = _migrate_legacy_persistent_thumb_cache_path(cache_path, legacy_path)
+        for legacy_path in _legacy_persistent_thumb_cache_paths_for_file(path, current_dir, size):
+            if legacy_path and os.path.isfile(legacy_path):
+                cache_path = _migrate_legacy_persistent_thumb_cache_path(cache_path, legacy_path)
+                if cache_path and os.path.isfile(cache_path):
+                    break
         if not cache_path or not os.path.isfile(cache_path):
             return ""
     if source_stamp is None:

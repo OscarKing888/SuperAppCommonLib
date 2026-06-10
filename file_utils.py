@@ -5,6 +5,8 @@ import os
 import subprocess
 import sys
 
+_XMP_SIDECAR_SUFFIX_CANDIDATES = (".xmp", ".XMP", ".Xmp")
+
 
 def hide_path(path):
     """
@@ -98,6 +100,32 @@ def unhide_path(path):
     return True
 
 
+def _find_sibling_xmp_sidecar_for_file(path):
+    if not path or not os.path.isfile(path):
+        return ""
+    try:
+        source_abs = os.path.normpath(os.path.abspath(path))
+    except Exception:
+        return ""
+    if os.path.splitext(source_abs)[1].lower() == ".xmp":
+        return ""
+    base_path, _ = os.path.splitext(source_abs)
+    for suffix in _XMP_SIDECAR_SUFFIX_CANDIDATES:
+        candidate = base_path + suffix
+        if os.path.isfile(candidate):
+            return os.path.normpath(candidate)
+
+    parent = os.path.dirname(source_abs)
+    target_name = os.path.basename(base_path).lower() + ".xmp"
+    try:
+        for entry in os.scandir(parent):
+            if entry.name.lower() == target_name and entry.is_file():
+                return os.path.normpath(entry.path)
+    except Exception:
+        return ""
+    return ""
+
+
 def move_to_trash(path):
     """
     将文件或目录移动到系统垃圾桶（回收站），可恢复。
@@ -113,9 +141,20 @@ def move_to_trash(path):
     """
     if not path or not os.path.exists(path):
         return False
+    source_abs = os.path.normpath(os.path.abspath(path))
+    trash_paths = [source_abs]
+    if os.path.isfile(source_abs):
+        xmp_sidecar = _find_sibling_xmp_sidecar_for_file(source_abs)
+        if xmp_sidecar:
+            trash_paths.append(xmp_sidecar)
+    trash_paths = [p for p in trash_paths if p and os.path.exists(p)]
     try:
         import send2trash
-        send2trash.send2trash(path)
+        try:
+            send2trash.send2trash(trash_paths if len(trash_paths) > 1 else source_abs)
+        except TypeError:
+            for trash_path in trash_paths:
+                send2trash.send2trash(trash_path)
         return True
     except ImportError:
         pass  # fall through to OS-native fallback
@@ -125,13 +164,16 @@ def move_to_trash(path):
     # ── OS-native fallback (no send2trash) ───────────────────────────────────
     try:
         if sys.platform == "darwin":
-            escaped = path.replace("\\", "\\\\").replace('"', '\\"')
-            result = subprocess.run(
-                ["osascript", "-e",
-                 f'tell application "Finder" to delete POSIX file "{escaped}"'],
-                capture_output=True,
-            )
-            return result.returncode == 0
+            for trash_path in trash_paths:
+                escaped = trash_path.replace("\\", "\\\\").replace('"', '\\"')
+                result = subprocess.run(
+                    ["osascript", "-e",
+                     f'tell application "Finder" to delete POSIX file "{escaped}"'],
+                    capture_output=True,
+                )
+                if result.returncode != 0:
+                    return False
+            return True
         elif sys.platform == "win32":
             import ctypes
             from ctypes import wintypes
@@ -150,7 +192,7 @@ def move_to_trash(path):
 
             op = _SHFILEOPSTRUCTW()
             op.wFunc  = 3            # FO_DELETE
-            op.pFrom  = path + "\0\0"
+            op.pFrom  = "\0".join(trash_paths) + "\0\0"
             op.fFlags = 0x0040 | 0x0010 | 0x0004  # ALLOWUNDO | NOCONFIRMATION | SILENT
             return ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op)) == 0
     except Exception:
@@ -256,7 +298,8 @@ def reveal_in_file_manager(path):
             args = ["open", "-R", norm_path]
         elif os.name == "nt":
             if os.path.isfile(norm_path):
-                args = ["explorer.exe", f"/select,{norm_path}"]
+                subprocess.Popen(f'explorer.exe /select,"{norm_path}"')
+                return True
             else:
                 args = ["explorer.exe", norm_path]
         else:

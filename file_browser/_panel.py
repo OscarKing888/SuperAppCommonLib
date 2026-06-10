@@ -2,22 +2,42 @@
 """File list panel implementation for app_common.file_browser."""
 from __future__ import annotations
 
+import json
+import shutil
+
+from app_common.perf_probe import elapsed_ms, perf_counter, perf_log, perf_probes_enabled
 from app_common.file_browser._browser_core import *
 from app_common.file_browser._models import *
 from app_common.file_browser._thumbnail import *
 from app_common.file_browser._workers import *
+
+_FILE_CLIPBOARD_ACTION_MIME = "application/x-superbirdtools-file-action"
+_FILE_CLIPBOARD_ENTRIES_MIME = "application/x-superbirdtools-file-entries"
+
+
+def mark_write_action_disabled(target, tooltip: str = "") -> None:
+    if target is not None and tooltip:
+        try:
+            target.setToolTip(tooltip)
+        except Exception:
+            pass
+
 
 class FileListPanel(QWidget):
     """
     图像文件列表面板。
 
     - 列表模式：含「文件名/标题/颜色/星级/城市/省区/国家」七列，可点击列头排序。
-    - 缩略图模式：图标网格，缩略图左下显示颜色标签、右下显示星级，
+    - 缩略图模式：图标网格，缩略图显示文件名与星级/Pick 标记，
       工具栏滑块可选 128/256/512/1024 px 四档大小。
     """
 
     # 子类可重载为 False 以不创建过滤栏（filter_bar）
     create_filter_bar = True
+    # report.db metadata 已停用；文件列表只读取 sidecar 和文件内 EXIF/XMP。
+    use_report_db = True
+    # 子类可重载为 False，避免使用 .superpicky/cache 下的派生预览图与持久缩略图。
+    use_preview_cache = True
 
     file_selected = pyqtSignal(str)
     file_fast_preview_requested = pyqtSignal(str)
@@ -27,6 +47,7 @@ class FileListPanel(QWidget):
     _MODE_THUMB = 1
     _WHEEL_SCROLL_ROWS = 3
     _WHEEL_ANGLE_STEP = 120
+    rating_filter_compact_width = 620
 
     def __init__(self, parent=None, *, create_filter_bar: bool | None = None) -> None:
         super().__init__(parent)
@@ -42,13 +63,14 @@ class FileListPanel(QWidget):
         self._thumbnail_loader: ThumbnailLoader | None = None
         self._metadata_loader:  MetadataLoader  | None = None
         self._directory_scan_worker: DirectoryScanWorker | None = None
+        self._pending_directory_listing_result: tuple | None = None
         self._file_table_model = FileTableModel(self)
         self._file_table_proxy = FileTableSortProxyModel(self)
         self._file_table_proxy.setSourceModel(self._file_table_model)
         self._thumb_list_model = ThumbnailListModel(self)
         self._meta_cache:    dict = {}   # norm_path → metadata dict
         self._directory_scope_cache: dict[bool, dict] = {}  # 当前目录 shallow/recursive 两个 scope 的文件列表缓存
-        self._report_cache:  dict = {}   # stem → report row (当前目录/子树筛出的 report 子集)
+        self._report_cache:  dict = {}   # legacy report row cache；sidecar/EXIF 模式下保持为空
         self._report_row_by_path: dict = {}
         self._loaded_directory_recursive: bool = False
         self._requested_directory_recursive: bool = False
@@ -67,10 +89,16 @@ class FileListPanel(QWidget):
         self._meta_apply_needs_filter: bool = False
         self._meta_apply_loader_finished: bool = True
         self._meta_filter_refresh_timer: QTimer | None = None
+        self._use_report_db = bool(getattr(type(self), "use_report_db", True))
+        self._use_preview_cache = bool(getattr(type(self), "use_preview_cache", True))
         self._tree_header_fast_mode: bool = False
         self._tree_last_sort_column: int = _TREE_COL_NAME
         self._tree_last_sort_order = _AscendingOrder
         self._tree_view_dirty: bool = False
+        self._tree_model_populate_timer: QTimer | None = None
+        self._tree_model_pending_paths: list[str] = []
+        self._tree_model_pending_index: int = 0
+        self._tree_model_populate_started_at: float = 0.0
         self._copied_species_payload: dict | None = None
         self._pending_selection_paths: list | None = None  # 接收到的文件列表，目录加载完成后等同多选
         self._pending_selection_current_path: str = ""
@@ -93,6 +121,7 @@ class FileListPanel(QWidget):
         self._deferred_file_selected_path: str = ""
         self._selection_key_nav_auto_repeat: bool = False
         self._selection_key_nav_hold_active: bool = False
+        self._thumb_selection_anchor_row: int = -1
         self._key_navigation_fps: int = get_key_navigation_fps()
         self._key_navigation_last_step_at: float = 0.0
         self._combo_key_navigation_fps: QComboBox | None = None
@@ -106,11 +135,25 @@ class FileListPanel(QWidget):
         self._persistent_thumb_cache_total: int = 0
         self._persistent_thumb_cache_done: int = 0
         self._persistent_thumb_cache_current_path: str = ""
-        self._thumb_profile_enabled: bool = _THUMB_PROFILE_ENABLED
+        self._persistent_thumb_cache_status_text: str = ""
+        self._persistent_thumb_cache_focus_priority: int = 0
+        self._persistent_thumb_cache_pending_priority: int = 0
+        self._thumb_profile_enabled: bool = _thumb_profile_enabled()
         self._thumb_profile_last_report_at: float = 0.0
         self._thumb_profile_window_started_at: float = _time.perf_counter()
         self._thumb_profile_ready_received_at: dict[str, float] = {}
         self._background_shutdown_started: bool = False
+        self._probe_phase: str = "init"
+        self._probe_phase_started_at: float = _time.perf_counter()
+        self._probe_heartbeat_timer: QTimer | None = None
+        self._probe_heartbeat_last_at: float = 0.0
+        self._probe_scan_last_log_at: float = 0.0
+        self._probe_scan_last_files: int = 0
+        self._probe_scan_last_dirs: int = 0
+        self._probe_tree_last_log_at: float = 0.0
+        self._probe_tree_last_rows: int = 0
+        self._probe_thumb_last_log_at: float = 0.0
+        self._probe_thumb_last_rows: int = 0
         self._selection_scroll_debug_events: deque[str] = deque(maxlen=120)
         self._selection_scroll_debug_total: int = 0
         self._selection_scroll_debug_flushed: bool = False
@@ -148,9 +191,13 @@ class FileListPanel(QWidget):
         }
         # 过滤状态
         self._filter_pick: bool = False   # 只显示精选(🏆)
-        self._filter_min_rating: int = 0  # 最低星级(0=不限)
+        self._filter_reject: bool = False  # 只显示排除(🚫)
+        self._filter_min_rating: int = 0  # 星级过滤(0=不限)
         self._filter_focus_status: str = ""
         self._star_btns: list = []
+        self._rating_filter_badge_buttons: list = []
+        self._btn_filter_rating_menu: QToolButton | None = None
+        self._rating_filter_compact: bool = False
         self._focus_filter_btns: dict[str, QToolButton] = {}
         if create_filter_bar is None:
             create_filter_bar = getattr(type(self), "create_filter_bar", True)
@@ -162,6 +209,7 @@ class FileListPanel(QWidget):
                 app.aboutToQuit.connect(self._shutdown_background_work)
             except Exception:
                 pass
+        self._sync_file_browser_probe_timer()
 
     # ── UI 初始化 ──────────────────────────────────────────────────────────────
     def _init_ui(self) -> None:
@@ -217,9 +265,10 @@ class FileListPanel(QWidget):
         if self._create_filter_bar:
             filter_bar = QHBoxLayout()
             filter_bar.setSpacing(3)
+            self._filter_bar_layout = filter_bar
 
             self._filter_edit = QLineEdit()
-            self._filter_edit.setPlaceholderText("过滤文件名…")
+            self._filter_edit.setPlaceholderText("过滤文件名/注释…")
             self._filter_edit.setClearButtonEnabled(True)
             self._filter_edit.setStyleSheet(
                 "QLineEdit { padding: 2px 4px; font-size: 12px; }"
@@ -241,14 +290,31 @@ class FileListPanel(QWidget):
                 )
             )
             self._btn_filter_pick.clicked.connect(self._on_pick_filter_toggled)
+            self._rating_filter_badge_buttons.append(self._btn_filter_pick)
             filter_bar.addWidget(self._btn_filter_pick)
+
+            self._btn_filter_reject = QToolButton()
+            self._btn_filter_reject.setText("🚫")
+            self._btn_filter_reject.setToolTip("只显示排除（Pick=-1）")
+            self._btn_filter_reject.setCheckable(True)
+            self._btn_filter_reject.setAutoRaise(False)
+            self._btn_filter_reject.setStyleSheet(
+                _filter_badge_stylesheet(
+                    "#d45d5d",
+                    min_width=34,
+                    checked_fg="#f5f5f5",
+                )
+            )
+            self._btn_filter_reject.clicked.connect(self._on_reject_filter_toggled)
+            self._rating_filter_badge_buttons.append(self._btn_filter_reject)
+            filter_bar.addWidget(self._btn_filter_reject)
 
             # 星级按钮（1～5，单选，点击已激活按钮则取消）
             star_widths = [22, 28, 34, 40, 46]
             for n in range(1, 6):
                 btn = QToolButton()
                 btn.setText("★" * n)
-                btn.setToolTip(f"只显示 ≥{n} 星")
+                btn.setToolTip(f"只显示 {n} 星")
                 btn.setCheckable(True)
                 btn.setAutoRaise(False)
                 btn.setStyleSheet(
@@ -262,7 +328,24 @@ class FileListPanel(QWidget):
                     lambda checked, rating=n: self._on_rating_filter_changed(rating)
                 )
                 self._star_btns.append(btn)
+                self._rating_filter_badge_buttons.append(btn)
                 filter_bar.addWidget(btn)
+
+            self._btn_filter_rating_menu = QToolButton()
+            self._btn_filter_rating_menu.setText("评级")
+            self._btn_filter_rating_menu.setToolTip("选择 Pick、排除或星级过滤")
+            self._btn_filter_rating_menu.setAutoRaise(False)
+            self._btn_filter_rating_menu.setStyleSheet(
+                _filter_badge_stylesheet(
+                    _STAR_SILVER_COLOR,
+                    min_width=46,
+                    checked_fg="#111111",
+                )
+            )
+            self._btn_filter_rating_menu.clicked.connect(
+                lambda checked=False: self._show_rating_filter_menu()
+            )
+            filter_bar.addWidget(self._btn_filter_rating_menu)
 
             for focus_status in _FOCUS_FILTER_OPTIONS:
                 btn = QToolButton()
@@ -275,7 +358,7 @@ class FileListPanel(QWidget):
                     lambda checked, status=focus_status: self._on_focus_filter_changed(status)
                 )
                 self._focus_filter_btns[focus_status] = btn
-                filter_bar.addWidget(btn)
+                # filter_bar.addWidget(btn)
 
             filter_bar.addSpacing(8)
             filter_bar.addWidget(QLabel("方向键:"))
@@ -288,9 +371,14 @@ class FileListPanel(QWidget):
             filter_bar.addWidget(self._combo_key_navigation_fps)
 
             layout.addLayout(filter_bar)
+            self._sync_rating_filter_compact_mode(force=True)
+            QTimer.singleShot(0, lambda: self._sync_rating_filter_compact_mode(force=True))
         else:
             self._filter_edit = None
             self._btn_filter_pick = None
+            self._btn_filter_reject = None
+            self._btn_filter_rating_menu = None
+            self._filter_bar_layout = None
             self._combo_key_navigation_fps = None
 
         # 视图堆叠
@@ -301,13 +389,6 @@ class FileListPanel(QWidget):
         self._tree_widget.setModel(self._file_table_proxy)
         self._tree_widget.setHeader(FileTableHeaderView(self._tree_widget))
 
-        # @Agents: 这个列名不要修改
-        # 城市 = 锐度值（越高越清晰）
-        # 省/直辖市/自治区 = 美学评分（越高越好看）
-        # 国家/地区 = 对焦状态（精焦/合焦/偏移/失焦）
-        # 🏆 奖杯 = Pick 精选旗标（双维度都出色）
-        # 🟢 绿色标签 = 飞鸟
-        # 🔴 红色标签 = 精焦（对焦点在鸟头）
         self._tree_widget.setHeaderLabels(_FILE_TABLE_HEADERS)
         self._tree_widget.setSortingEnabled(True)
         self._tree_widget.setRootIsDecorated(False)
@@ -330,17 +411,10 @@ class FileListPanel(QWidget):
         self._tree_widget.selectionModel().selectionChanged.connect(self._on_view_selection_changed)
         for col in range(len(_FILE_TABLE_HEADERS)):
             hdr.setSectionResizeMode(col, _ResizeInteractive)
-        self._tree_widget.setColumnWidth(_TREE_COL_SEQ, 44)
-        self._tree_widget.setColumnWidth(_TREE_COL_NAME, 190)
-        self._tree_widget.setColumnWidth(_TREE_COL_TITLE, 150)
-        self._tree_widget.setColumnWidth(_TREE_COL_COLOR, 86)
+        self._tree_widget.setColumnWidth(_TREE_COL_NAME, 240)
+        self._tree_widget.setColumnWidth(_TREE_COL_COMMENT, 280)
         self._tree_widget.setColumnWidth(_TREE_COL_STAR, 72)
-        self._tree_widget.setColumnWidth(_TREE_COL_SHARP, 96)
-        self._tree_widget.setColumnWidth(_TREE_COL_AESTHETIC, 96)
-        self._tree_widget.setColumnWidth(_TREE_COL_FOCUS, 108)
-        self._tree_widget.setColumnWidth(_TREE_COL_SHUTTER, 84)
-        self._tree_widget.setColumnWidth(_TREE_COL_ISO, 72)
-        self._tree_widget.setColumnWidth(_TREE_COL_APERTURE, 72)
+        self._tree_widget.setColumnWidth(_TREE_COL_TAGS, 240)
         self._apply_tree_sort(_TREE_COL_NAME, _AscendingOrder, sync_indicator=True)
         self._tree_widget.setContextMenuPolicy(_CustomContextMenu)
         self._tree_widget.customContextMenuRequested.connect(self._on_tree_context_menu)
@@ -439,18 +513,97 @@ class FileListPanel(QWidget):
         self._update_size_controls()
         self._update_selection_status()
 
-        # Cmd+C / Ctrl+C 复制选中文件到剪贴板
-        _copy_key = getattr(QKeySequence.StandardKey, "Copy", None) or getattr(QKeySequence, "Copy", QKeySequence("Ctrl+C"))
-        copy_shortcut = QShortcut(_copy_key, self)
+        self._file_action_shortcuts: list[QShortcut] = []
+
+        # macOS 使用 Cmd，Windows/Linux 使用 Ctrl；菜单显示也复用同一组快捷键。
+        copy_shortcut = QShortcut(_platform_copy_key_sequence(), self)
         try:
-            copy_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            copy_shortcut.setContext(_WidgetWithChildrenShortcut)
         except Exception:
             pass
         copy_shortcut.activated.connect(self._copy_current_selection_to_clipboard)
-        self._file_action_shortcuts: list[QShortcut] = []
+        self._file_action_shortcuts.append(copy_shortcut)
+
+        cut_shortcut = QShortcut(_platform_cut_key_sequence(), self)
+        try:
+            cut_shortcut.setContext(_WidgetWithChildrenShortcut)
+        except Exception:
+            pass
+        cut_shortcut.activated.connect(self._cut_current_selection_to_clipboard)
+        self._file_action_shortcuts.append(cut_shortcut)
+
+        paste_shortcut = QShortcut(_platform_paste_key_sequence(), self)
+        try:
+            paste_shortcut.setContext(_WidgetWithChildrenShortcut)
+        except Exception:
+            pass
+        paste_shortcut.activated.connect(self._paste_clipboard_to_current_dir)
+        self._file_action_shortcuts.append(paste_shortcut)
+
         self._install_file_action_shortcut("Q", "reject")
         self._install_file_action_shortcut("`", "pick")
         self._install_file_action_shortcut("~", "pick")
+
+    def file_writes_allowed(self) -> bool:
+        return True
+
+    def file_writes_disabled_tooltip(self, action: str = "写入操作") -> str:
+        return ""
+
+    def _file_writes_allowed(self, action: str = "写入操作", *, warn: bool = False) -> bool:
+        return True
+
+    def _resolved_file_operation_paths(self, paths: list[str]) -> list[str]:
+        resolved_paths: list[str] = []
+        seen: set[str] = set()
+        for path in self._unique_norm_paths(paths or []):
+            resolved = self._resolve_source_path_for_action(path)
+            norm_path = os.path.normpath(os.path.abspath(resolved or path)) if (resolved or path) else ""
+            if not norm_path:
+                continue
+            key = _path_key(norm_path)
+            if key in seen:
+                continue
+            seen.add(key)
+            resolved_paths.append(norm_path)
+        return resolved_paths
+
+    def file_operation_paths_allowed(self, paths: list[str]) -> bool:
+        return True
+
+    def file_operation_paths_disabled_tooltip(
+        self,
+        paths: list[str],
+        action: str = "写入操作",
+    ) -> str:
+        return ""
+
+    def _file_operation_paths_allowed(
+        self,
+        paths: list[str],
+        action: str = "写入操作",
+        *,
+        warn: bool = False,
+    ) -> bool:
+        return True
+
+    def sidecar_writes_allowed(self) -> bool:
+        return True
+
+    def sidecar_writes_disabled_tooltip(self, action: str = "写入操作") -> str:
+        return ""
+
+    def _sidecar_writes_allowed(self, action: str = "写入操作", *, warn: bool = False) -> bool:
+        return True
+
+    def rating_writes_allowed(self) -> bool:
+        return self.file_writes_allowed()
+
+    def rating_writes_disabled_tooltip(self, action: str = "写入操作") -> str:
+        return self.file_writes_disabled_tooltip(action)
+
+    def _rating_writes_allowed(self, action: str = "写入操作", *, warn: bool = False) -> bool:
+        return True
 
     def _copy_current_selection_to_clipboard(self) -> None:
         """将当前视图（列表/缩略图）中选中的文件路径复制到剪贴板。"""
@@ -462,6 +615,21 @@ class FileListPanel(QWidget):
         else:
             paths = []
         self._copy_paths_to_clipboard(paths)
+
+    def _cut_current_selection_to_clipboard(self) -> None:
+        """将当前选中文件及其 sidecar 标记为剪切。"""
+        w = self._stack.currentWidget()
+        if w is self._tree_widget:
+            paths = self._tree_selected_paths()
+        elif w is self._list_widget:
+            paths = self._thumb_selected_paths()
+        else:
+            paths = []
+        if not paths:
+            return
+        if not self._file_operation_paths_allowed(paths, "剪切", warn=True):
+            return
+        self._cut_paths_to_clipboard(paths)
 
     def _install_file_action_shortcut(self, sequence: str, action_kind: str) -> None:
         shortcut = QShortcut(QKeySequence(sequence), self)
@@ -577,6 +745,109 @@ class FileListPanel(QWidget):
             parts.append("当前未选中")
         label.setText(" | ".join(parts))
 
+    def _show_meta_progress_status(
+        self,
+        text: str,
+        *,
+        busy: bool = False,
+        value: int = 0,
+        total: int = 0,
+    ) -> None:
+        if busy:
+            self._meta_progress.setRange(0, 0)
+            self._meta_progress.setFormat(text)
+        else:
+            bounded_total = max(1, int(total or 0))
+            bounded_value = min(max(0, int(value or 0)), bounded_total)
+            self._meta_progress.setRange(0, bounded_total)
+            self._meta_progress.setValue(bounded_value)
+            self._meta_progress.setFormat(f"{text} {bounded_value}/{bounded_total}")
+        self._meta_progress.show()
+
+    @staticmethod
+    def _probe_fields(**fields) -> str:
+        parts: list[str] = []
+        for key, value in fields.items():
+            if isinstance(value, float):
+                parts.append(f"{key}={value:.1f}")
+            else:
+                parts.append(f"{key}={value!r}")
+        return " ".join(parts)
+
+    def _probe_log(self, event: str, **fields) -> None:
+        if not perf_probes_enabled():
+            return
+        try:
+            phase_ms = elapsed_ms(self._probe_phase_started_at)
+            detail = self._probe_fields(**fields)
+            suffix = f" {detail}" if detail else ""
+            _log.info(
+                "[FILE_BROWSER_PROBE] event=%s phase=%s phase_ms=%.1f dir=%r all=%s filtered=%s%s",
+                event,
+                self._probe_phase,
+                phase_ms,
+                self._current_dir,
+                len(self._all_files),
+                len(self._filtered_files),
+                suffix,
+            )
+        except Exception:
+            pass
+
+    def _probe_set_phase(self, phase: str, **fields) -> None:
+        if not perf_probes_enabled():
+            return
+        previous = self._probe_phase
+        previous_ms = elapsed_ms(self._probe_phase_started_at)
+        self._probe_phase = str(phase or "")
+        self._probe_phase_started_at = perf_counter()
+        self._probe_log("phase", previous=previous, previous_ms=previous_ms, **fields)
+
+    def _sync_file_browser_probe_timer(self) -> None:
+        enabled = perf_probes_enabled()
+        if not enabled:
+            if self._probe_heartbeat_timer is not None and self._probe_heartbeat_timer.isActive():
+                self._probe_heartbeat_timer.stop()
+            self._probe_heartbeat_last_at = 0.0
+            return
+        if self._probe_heartbeat_timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(False)
+            timer.timeout.connect(self._on_file_browser_probe_heartbeat)
+            self._probe_heartbeat_timer = timer
+        self._probe_heartbeat_last_at = perf_counter()
+        if not self._probe_heartbeat_timer.isActive():
+            self._probe_heartbeat_timer.start(250)
+        self._probe_log("heartbeat_started")
+
+    def _on_file_browser_probe_heartbeat(self) -> None:
+        if not perf_probes_enabled():
+            self._sync_file_browser_probe_timer()
+            return
+        now = perf_counter()
+        last = self._probe_heartbeat_last_at or now
+        gap_ms = (now - last) * 1000.0
+        self._probe_heartbeat_last_at = now
+        if gap_ms < 750.0:
+            return
+        try:
+            _log.info(
+                "[UI_STALL] gap_ms=%.1f phase=%s phase_ms=%.1f dir=%r all=%s filtered=%s tree_rows=%s thumb_rows=%s scan_running=%s meta_running=%s thumb_loader_running=%s",
+                gap_ms,
+                self._probe_phase,
+                elapsed_ms(self._probe_phase_started_at),
+                self._current_dir,
+                len(self._all_files),
+                len(self._filtered_files),
+                self._tree_source_row_count(),
+                self._thumb_row_count(),
+                self._directory_scan_worker is not None,
+                self._metadata_loader is not None,
+                self._thumbnail_loader is not None and self._thumbnail_loader.isRunning(),
+            )
+        except Exception:
+            pass
+
     # ── 数据加载 ────────────────────────────────────────────────────────────────
     def _collect_image_files(self, dir_path: str, recursive: bool) -> list:
         """收集目录下支持的图像文件路径，委托给模块级函数（可被后台线程调用）。"""
@@ -589,6 +860,7 @@ class FileListPanel(QWidget):
         return (
             bool(self._filter_edit.text().strip()) or
             self._filter_pick or
+            self._filter_reject or
             self._filter_min_rating > 0 or
             bool(self._filter_focus_status)
         )
@@ -628,9 +900,43 @@ class FileListPanel(QWidget):
             norm_path = os.path.normpath(path) if path else ""
             if not norm_path:
                 continue
-            if norm_path not in self._meta_cache:
+            if not self._metadata_cache_has_browser_fields(self._meta_cache.get(norm_path)):
                 uncached.append(path)
         return uncached
+
+    @staticmethod
+    def _metadata_cache_has_browser_fields(meta: dict | None) -> bool:
+        """
+        判断文件列表所需的 metadata 是否已加载。
+
+        SuperViewer 会先把自定义标签同步到 _meta_cache；仅有 tags 时不能视为
+        浏览器 metadata 已加载，否则会跳过 XMP 星级/Pick/注释读取。
+        """
+        if not isinstance(meta, dict) or not meta:
+            return False
+        for key in (
+            "rating",
+            "pick",
+            "comment",
+            "Description",
+            "XMP-dc:Description",
+            "XMP-dc:description",
+            "XMP:Description",
+            "title",
+            "color",
+            "country",
+            "shutter",
+            "iso",
+            "aperture",
+            "XMP-xmp:Rating",
+            "XMP-xmpDM:pick",
+            "XMP-xmpDM:Pick",
+            "XMP-xmp:Pick",
+            "XMP:Pick",
+        ):
+            if key in meta:
+                return True
+        return False
 
     def _apply_directory_listing_result(
         self,
@@ -643,9 +949,27 @@ class FileListPanel(QWidget):
         report_row_by_path: dict | None = None,
         from_cache: bool = False,
     ) -> None:
+        apply_t0 = perf_counter()
+        self._probe_set_phase(
+            "apply_listing",
+            path=path,
+            files=len(files),
+            report_entries=len(report_cache or {}),
+            from_cache=bool(from_cache),
+            recursive=bool(recursive),
+        )
         if path != self._current_dir:
             _log.info("[_apply_directory_listing_result] IGNORE stale path=%r current=%r", path, self._current_dir)
+            self._probe_set_phase("idle", reason="apply_listing_stale", elapsed_ms=elapsed_ms(apply_t0))
             return
+        step_t0 = perf_counter()
+        if not self._use_report_db:
+            report_cache = {}
+            full_report_cache = None
+            report_row_by_path = {}
+            self._report_full_root_dir = None
+            self._report_full_cache = None
+        self._probe_log("apply_listing.report_mode", elapsed_ms=elapsed_ms(step_t0), use_report_db=bool(self._use_report_db))
         if self._report_root_dir:
             self._report_full_root_dir = self._report_root_dir
             if full_report_cache is not None:
@@ -656,6 +980,7 @@ class FileListPanel(QWidget):
                 len(self._report_full_cache or {}),
             )
         if not from_cache and _DEBUG_FILE_LIST_LIMIT > 0 and len(files) > _DEBUG_FILE_LIST_LIMIT:
+            step_t0 = perf_counter()
             selected_files = files
             if _DEBUG_FILE_LIST_MATCH:
                 matched = [p for p in files if _DEBUG_FILE_LIST_MATCH in str(p).lower()]
@@ -683,8 +1008,9 @@ class FileListPanel(QWidget):
                 len(report_cache),
             )
             files = limited_files
+            self._probe_log("apply_listing.debug_limit", elapsed_ms=elapsed_ms(step_t0), files=len(files))
+        step_t0 = perf_counter()
         self._report_cache = dict(report_cache or {})
-        self._meta_proxy.report_db.update_cache(self._report_full_cache or self._report_cache)
         if report_row_by_path is None:
             report_row_by_path = {}
             row_cache_for_path_map = self._report_full_cache or self._report_cache or {}
@@ -696,6 +1022,8 @@ class FileListPanel(QWidget):
                 if isinstance(row, dict):
                     report_row_by_path[norm_p] = row
         self._report_row_by_path = dict(report_row_by_path or {})
+        self._probe_log("apply_listing.report_row_map", elapsed_ms=elapsed_ms(step_t0), rows=len(self._report_row_by_path))
+        step_t0 = perf_counter()
         self._all_files = list(files)
         self._loaded_directory_recursive = bool(recursive)
         self._store_directory_scope_cache(
@@ -704,6 +1032,7 @@ class FileListPanel(QWidget):
             report_cache=self._report_cache,
             report_row_by_path=self._report_row_by_path,
         )
+        self._probe_log("apply_listing.store_scope", elapsed_ms=elapsed_ms(step_t0), files=len(self._all_files))
         _log.info(
             "[_apply_directory_listing_result] apply files=%s report_entries=%s recursive=%s from_cache=%s",
             len(self._all_files),
@@ -711,14 +1040,30 @@ class FileListPanel(QWidget):
             recursive,
             from_cache,
         )
+        step_t0 = perf_counter()
         self._rebuild_views()
+        self._probe_log("apply_listing.rebuild_views", elapsed_ms=elapsed_ms(step_t0), mode=self._view_mode)
+        step_t0 = perf_counter()
         self.files_loaded.emit(self.get_display_file_paths())
+        self._probe_log("apply_listing.files_loaded_emit", elapsed_ms=elapsed_ms(step_t0), files=len(self._filtered_files))
+        step_t0 = perf_counter()
         if self._pending_selection_paths:
             self._apply_pending_selection()
-            if self._view_mode != self._MODE_THUMB or not self._thumb_model_dirty:
+            if not (
+                (self._view_mode == self._MODE_LIST and self._tree_view_dirty)
+                or (self._view_mode == self._MODE_THUMB and self._thumb_model_dirty)
+            ):
                 self._pending_selection_paths = None
                 self._pending_selection_current_path = ""
+        else:
+            self._select_first_file_if_needed(reason="directory_listing")
+        self._probe_log("apply_listing.selection", elapsed_ms=elapsed_ms(step_t0), pending=bool(self._pending_selection_paths))
+        step_t0 = perf_counter()
+        self._schedule_persistent_thumb_cache_build(self._all_files)
+        self._probe_log("apply_listing.schedule_persistent_thumbs", elapsed_ms=elapsed_ms(step_t0), files=len(self._all_files))
+        step_t0 = perf_counter()
         uncached_meta_paths = self._collect_uncached_metadata_paths(self._all_files)
+        self._probe_log("apply_listing.collect_uncached_meta", elapsed_ms=elapsed_ms(step_t0), uncached=len(uncached_meta_paths))
         if uncached_meta_paths:
             _log.info(
                 "[_apply_directory_listing_result] start metadata loader missing=%s cached=%s total=%s",
@@ -726,21 +1071,33 @@ class FileListPanel(QWidget):
                 max(0, len(self._all_files) - len(uncached_meta_paths)),
                 len(self._all_files),
             )
+            step_t0 = perf_counter()
             self._start_metadata_loader(uncached_meta_paths)
+            self._probe_log("apply_listing.start_metadata_loader", elapsed_ms=elapsed_ms(step_t0), uncached=len(uncached_meta_paths))
         else:
             _log.info(
                 "[_apply_directory_listing_result] metadata already cached for all files total=%s",
                 len(self._all_files),
             )
-        self._schedule_persistent_thumb_cache_build(self._all_files)
+        self._probe_log("apply_listing.done", elapsed_ms=elapsed_ms(apply_t0), meta_uncached=len(uncached_meta_paths))
 
     def _refresh_filter_scope(self) -> None:
+        probe_t0 = perf_counter()
         if not self._current_dir or not os.path.isdir(self._current_dir):
             self._apply_filter()
+            perf_log(_log, "[filter.scope] reason=no_current_dir elapsed_ms=%.1f", elapsed_ms(probe_t0))
             return
-        target_recursive = self._has_any_filter()
+        target_recursive = True
         if target_recursive == self._loaded_directory_recursive:
             self._apply_filter()
+            perf_log(
+                _log,
+                "[filter.scope] reason=same_scope recursive=%s all=%s visible=%s elapsed_ms=%.1f",
+                target_recursive,
+                len(self._all_files),
+                len(self._filtered_files),
+                elapsed_ms(probe_t0),
+            )
             return
         # 从当前目录切换到递归范围时，先在现有数据集上即时过滤一版，随后异步补齐子目录结果。
         if target_recursive and not self._loaded_directory_recursive:
@@ -759,6 +1116,15 @@ class FileListPanel(QWidget):
             preserve_meta_cache=True,
             reuse_cached_listing=True,
         )
+        perf_log(
+            _log,
+            "[filter.scope] reason=reload target_recursive=%s previous_recursive=%s selected=%s all=%s elapsed_ms=%.1f",
+            target_recursive,
+            self._loaded_directory_recursive,
+            len(selected_paths),
+            len(self._all_files),
+            elapsed_ms(probe_t0),
+        )
 
     def load_directory(
         self,
@@ -770,11 +1136,21 @@ class FileListPanel(QWidget):
     ) -> None:
         """
         扫描目录，加载支持的图像文件。扫描与 report 加载在后台线程执行，避免阻塞 UI。
-        当任意过滤条件开启（文本 / 🏆精选 / 星级 / 对焦）时，递归遍历该目录及所有子目录（不进入 . 开头目录）；
-        否则仅当前目录。过滤切换同目录 scope 时可复用当前内存中的文件列表和 metadata 缓存，避免重复全量读取。
+        递归遍历该目录及所有子目录（不进入 . 开头目录）。过滤切换同目录 scope 时可复用当前内存中的
+        文件列表和 metadata 缓存，避免重复全量读取。
         """
-        recursive = self._has_any_filter()
+        load_t0 = perf_counter()
+        recursive = True
         same_dir = path == self._current_dir
+        self._probe_set_phase(
+            "load_directory",
+            path=path,
+            force_reload=bool(force_reload),
+            same_dir=bool(same_dir),
+            recursive=bool(recursive),
+            preserve_meta_cache=bool(preserve_meta_cache),
+            reuse_cached_listing=bool(reuse_cached_listing),
+        )
         _log.info(
             "[load_directory] 选中目录，将扫描并列出图像文件、随后查询 EXIF path=%r force_reload=%s recursive=%s preserve_meta_cache=%s reuse_cached_listing=%s",
             path,
@@ -793,13 +1169,14 @@ class FileListPanel(QWidget):
         )
         if not force_reload and same_dir and recursive == self._loaded_directory_recursive:
             _log.info("[load_directory] SKIP same dir")
+            self._probe_set_phase("idle", reason="load_directory_skip_same_dir", elapsed_ms=elapsed_ms(load_t0))
             return
         self._current_dir = path
         if not same_dir:
             self._directory_scope_cache.clear()
             self._loaded_directory_recursive = False
-        # 选择目录后，向上最多查找 4 层最近的 report 根目录；子目录共用同一个 report.db
-        new_report_root_dir = find_report_root(path, max_levels=4)
+        # report.db metadata 已停用；保留旧字段清理，目录列表直接从文件系统扫描。
+        new_report_root_dir = find_report_root(path, max_levels=4) if self._use_report_db else None
         if new_report_root_dir != self._report_root_dir:
             _log.info(
                 "[load_directory] report_root_dir changed old=%r new=%r",
@@ -807,7 +1184,6 @@ class FileListPanel(QWidget):
                 new_report_root_dir,
             )
         self._report_root_dir = new_report_root_dir
-        self._meta_proxy.report_db.update_report_root(self._report_root_dir)
         if self._report_root_dir:
             if self._report_full_root_dir != self._report_root_dir:
                 _log.info(
@@ -831,9 +1207,13 @@ class FileListPanel(QWidget):
             len(self._report_full_cache or {}),
         )
         _log.info("[load_directory] _stop_all_loaders")
+        stop_t0 = perf_counter()
         self._stop_all_loaders()
+        self._probe_log("load_directory.stop_loaders", elapsed_ms=elapsed_ms(stop_t0))
         _log.info("[load_directory] _stop_directory_scan_worker")
         self._stop_directory_scan_worker()
+        self._pending_directory_listing_result = None
+        self._show_meta_progress_status("正在查找所有图像....", busy=True)
         if same_dir and reuse_cached_listing:
             cached_scope = self._get_cached_directory_scope(recursive)
             if cached_scope is not None:
@@ -844,6 +1224,7 @@ class FileListPanel(QWidget):
                     len(cached_scope["report_cache"]),
                 )
                 self._selected_display_path = ""
+                self._show_meta_progress_status("正在准备生成缩略图...", busy=True)
                 self._apply_directory_listing_result(
                     path,
                     cached_scope["files"],
@@ -854,6 +1235,7 @@ class FileListPanel(QWidget):
                     from_cache=True,
                 )
                 _log.info("[load_directory] END reused cached scope")
+                self._probe_set_phase("idle", reason="load_directory_reused_cache", elapsed_ms=elapsed_ms(load_t0))
                 return
         # Folder-level FIFO eviction: release QImages cached for any directory
         # other than the one we are about to enter.  This ensures that browsing
@@ -872,7 +1254,9 @@ class FileListPanel(QWidget):
             self._selected_display_path = ""
             self._all_files = []
             _log.info("[load_directory] _rebuild_views (empty)")
+            empty_t0 = perf_counter()
             self._rebuild_views()
+            self._probe_log("load_directory.empty_rebuild", elapsed_ms=elapsed_ms(empty_t0))
         else:
             _log.info(
                 "[load_directory] preserve same-dir meta cache cache_size=%s loaded_recursive=%s target_recursive=%s",
@@ -892,13 +1276,17 @@ class FileListPanel(QWidget):
             recursive,
             self._report_root_dir,
             self._report_full_cache if self._report_root_dir and self._report_full_root_dir == self._report_root_dir else None,
-            self,
+            use_report_db=self._use_report_db,
+            parent=self,
         )
+        self._directory_scan_worker.scan_progress.connect(self._on_directory_scan_progress)
         self._directory_scan_worker.scan_finished.connect(self._on_directory_scan_finished)
         self._directory_scan_worker.start()
+        self._probe_set_phase("directory_scan_running", path=path, elapsed_ms=elapsed_ms(load_t0))
         _log.info("[load_directory] END worker.started")
 
     def _stop_directory_scan_worker(self) -> None:
+        self._pending_directory_listing_result = None
         if self._directory_scan_worker is None:
             _log.debug("[_stop_directory_scan_worker] no worker")
             return
@@ -907,8 +1295,37 @@ class FileListPanel(QWidget):
             self._directory_scan_worker.scan_finished.disconnect(self._on_directory_scan_finished)
         except Exception:
             pass
+        try:
+            self._directory_scan_worker.scan_progress.disconnect(self._on_directory_scan_progress)
+        except Exception:
+            pass
         self._directory_scan_worker.requestInterruption()
         self._directory_scan_worker = None
+
+    def _on_directory_scan_progress(self, path: str, found_files: int, scanned_dirs: int, current_dir: str) -> None:
+        if path != self._current_dir:
+            return
+        found_files = max(0, int(found_files))
+        scanned_dirs = max(0, int(scanned_dirs))
+        details = f"已找到 {max(0, int(found_files))} 张"
+        if scanned_dirs > 0:
+            details += f"，已扫描 {max(0, int(scanned_dirs))} 个目录"
+        self._show_meta_progress_status(f"正在查找所有图像.... {details}", busy=True)
+        now = perf_counter()
+        if (
+            found_files - self._probe_scan_last_files >= 1000
+            or scanned_dirs - self._probe_scan_last_dirs >= 250
+            or (now - self._probe_scan_last_log_at) >= 2.0
+        ):
+            self._probe_scan_last_log_at = now
+            self._probe_scan_last_files = found_files
+            self._probe_scan_last_dirs = scanned_dirs
+            self._probe_log(
+                "scan_progress",
+                found_files=found_files,
+                scanned_dirs=scanned_dirs,
+                current_dir=current_dir,
+            )
 
     def _on_directory_scan_finished(self, path: str, files: list, report_cache: dict, full_report_cache) -> None:
         _log.info("[_on_directory_scan_finished] 收到目录扫描结果 path=%r files=%s report_entries=%s，开始列出文件并查询 EXIF", path, len(files), len(report_cache))
@@ -917,12 +1334,34 @@ class FileListPanel(QWidget):
             _log.info("[_on_directory_scan_finished] IGNORE stale path")
             return
         recursive = self._requested_directory_recursive
+        self._probe_set_phase(
+            "directory_scan_finished",
+            path=path,
+            files=len(files),
+            report_entries=len(report_cache),
+            recursive=bool(recursive),
+        )
         _log.info(
             "[_on_directory_scan_finished] apply scan result recursive=%s files=%s report_entries=%s",
             recursive,
             len(files),
             len(report_cache),
         )
+        self._show_meta_progress_status("正在准备生成缩略图...", busy=True)
+        self._directory_scan_worker = None
+        self._probe_set_phase("apply_listing_queued", files=len(files))
+        self._pending_directory_listing_result = (path, files, report_cache, full_report_cache, recursive)
+        QTimer.singleShot(0, self._apply_pending_directory_listing_result)
+        _log.info("[_on_directory_scan_finished] END")
+
+    def _apply_pending_directory_listing_result(self) -> None:
+        pending = self._pending_directory_listing_result
+        self._pending_directory_listing_result = None
+        if not pending:
+            self._probe_log("apply_listing_timer_fired_empty")
+            return
+        path, files, report_cache, full_report_cache, recursive = pending
+        self._probe_set_phase("apply_listing_timer_fired", path=path, files=len(files))
         self._apply_directory_listing_result(
             path,
             files,
@@ -930,12 +1369,14 @@ class FileListPanel(QWidget):
             full_report_cache,
             recursive=recursive,
         )
-        self._directory_scan_worker = None
-        _log.info("[_on_directory_scan_finished] END")
 
     def get_current_dir(self) -> str:
         """返回当前选中的目录路径（与 load_directory 的 path 一致）。"""
         return self._current_dir or ""
+
+    def get_selected_display_path(self) -> str:
+        """返回文件列表中当前选中的显示路径。"""
+        return os.path.normpath(self._selected_display_path) if self._selected_display_path else ""
 
     def get_display_file_paths(self) -> list[str]:
         """返回当前文件列表的稳定快照，供后台预热类任务复用。"""
@@ -965,23 +1406,26 @@ class FileListPanel(QWidget):
         selected_display = os.path.normpath(self._selected_display_path) if self._selected_display_path else ""
         if selected_display and selected_display not in candidates:
             candidates.append(selected_display)
+        shallow_cached: dict | None = None
         for candidate in candidates:
             cached = self._meta_cache.get(candidate)
             if isinstance(cached, dict) and cached:
-                return dict(cached)
-        for candidate in candidates:
-            try:
-                report_data = self._meta_proxy.report_db.read(candidate)
-            except Exception:
-                report_data = {}
-            if isinstance(report_data, dict) and report_data:
-                return dict(report_data)
+                if not allow_slow_read or self._metadata_cache_has_browser_fields(cached):
+                    return dict(cached)
+                if shallow_cached is None:
+                    shallow_cached = dict(cached)
         if not allow_slow_read:
             return {}
         try:
             data = self._meta_proxy.read(norm_path)
         except Exception:
             return {}
+        if isinstance(data, dict) and isinstance(shallow_cached, dict):
+            merged = dict(data)
+            for key, value in shallow_cached.items():
+                if key not in merged:
+                    merged[key] = value
+            return merged
         return dict(data) if isinstance(data, dict) else {}
 
     def get_photo_exposure_settings_for_path(
@@ -993,8 +1437,8 @@ class FileListPanel(QWidget):
         """
         Return display-ready ``(shutter, aperture, iso)`` using PhotoMetaDataProxy.
 
-        Cached browser metadata and report.db rows are used first; committed
-        selections may fall back to direct proxy reads.
+        Cached browser metadata is used first; committed selections may fall
+        back to direct sidecar / embedded metadata reads.
         """
         metadata = self.get_photo_metadata_for_path(path, allow_slow_read=False)
         exposure = extract_exposure_settings(metadata)
@@ -1028,6 +1472,8 @@ class FileListPanel(QWidget):
         }
         if not norm_path or (not report_fields and not meta_updates):
             return False
+        if not self._file_writes_allowed("同步元数据"):
+            return False
 
         filename = ""
         row = self._get_report_row_for_path(norm_path)
@@ -1037,7 +1483,7 @@ class FileListPanel(QWidget):
             filename = str(Path(norm_path).stem or "").strip()
 
         db_updated = False
-        if report_fields and filename:
+        if self._use_report_db and report_fields and filename:
             db_dir = self._report_root_dir or self._current_dir
             db = ReportDB.open_if_exists(db_dir) if db_dir else None
             if db is not None:
@@ -1110,7 +1556,10 @@ class FileListPanel(QWidget):
         ):
             self._pending_selection_paths = normalized
             self._apply_pending_selection()
-            if not self._thumb_model_dirty:
+            if not (
+                (self._view_mode == self._MODE_LIST and self._tree_view_dirty)
+                or (self._view_mode == self._MODE_THUMB and self._thumb_model_dirty)
+            ):
                 self._pending_selection_paths = None
                 self._pending_selection_current_path = ""
             return
@@ -1180,6 +1629,7 @@ class FileListPanel(QWidget):
             idx_first = self._thumb_index_for_path(current_target)
             if idx_first.isValid():
                 self._list_widget.setCurrentIndex(idx_first)
+                self._thumb_selection_anchor_row = idx_first.row()
                 self._record_selection_scroll_debug(
                     "apply_pending.thumb",
                     current_target,
@@ -1190,6 +1640,51 @@ class FileListPanel(QWidget):
             self._schedule_selection_visibility_restore(current_target, reason="apply_pending_selection")
             self._emit_file_selected_for_path(current_target)
         self._update_selection_status()
+
+    def _select_first_file_if_needed(self, *, reason: str = "") -> None:
+        """目录首次加载且没有外部指定选择时，默认选中当前列表第一张。"""
+        if self._pending_selection_paths or self._selected_display_path or not self._filtered_files:
+            return
+        if self._active_view_selected_paths():
+            return
+        target = os.path.normpath(self._filtered_files[0])
+        if not target:
+            return
+
+        if self._view_mode == self._MODE_LIST:
+            view = self._tree_widget
+            index = self._tree_index_for_path(target)
+        else:
+            view = self._list_widget
+            index = self._thumb_index_for_path(target)
+
+        if not index.isValid():
+            self.set_pending_selection([target], current_path=target, apply_immediately=False)
+            _log.info("[_select_first_file_if_needed] pending reason=%s target=%r", reason, target)
+            return
+
+        view_was_blocked = view.blockSignals(True)
+        sm = view.selectionModel()
+        sm_was_blocked = sm.blockSignals(True) if sm is not None else False
+        try:
+            view.clearSelection()
+            view.setCurrentIndex(index)
+            if sm is not None:
+                sm.select(index, _ClearAndSelect)
+        finally:
+            if sm is not None:
+                sm.blockSignals(sm_was_blocked)
+            view.blockSignals(view_was_blocked)
+
+        self._record_selection_scroll_debug(
+            "select_first",
+            target,
+            row=index.row(),
+            view_mode=self._view_mode,
+            reason=reason,
+        )
+        self._schedule_selection_visibility_restore(target, reason=f"select_first:{reason}")
+        self._emit_file_selected_for_path(target)
 
     def _record_selection_scroll_debug(self, event: str, path: str = "", **fields) -> None:
         """缓存选中/滚动诊断信息，退出时统一汇总输出，避免运行中刷屏。"""
@@ -1449,9 +1944,14 @@ class FileListPanel(QWidget):
         return "粘贴鸟种名称"
 
     def _paste_species_to_paths(self, paths: list[str]) -> None:
+        if not self._file_writes_allowed("粘贴鸟种名称", warn=True):
+            return
         payload = getattr(self, "_copied_species_payload", None)
         if not payload:
             _log.info("[_paste_species_to_paths] skip reason=no_copied_species")
+            return
+        if not self._use_report_db:
+            _log.info("[_paste_species_to_paths] skip reason=report_db_disabled")
             return
         db_dir = self._report_root_dir or self._current_dir
         db = ReportDB.open_if_exists(db_dir) if db_dir else None
@@ -1724,8 +2224,17 @@ class FileListPanel(QWidget):
         blocked_name_parts = ("LineEdit", "TextEdit", "PlainTextEdit", "SpinBox", "ComboBox")
         return not any(part in class_name for part in blocked_name_parts)
 
+    @staticmethod
+    def _event_is_auto_repeat(event) -> bool:
+        try:
+            return bool(event.isAutoRepeat())
+        except Exception:
+            return False
+
     def _trigger_active_shortcut_action(self, action_kind: str, action_value: int = 0) -> None:
         if not self._keyboard_shortcut_focus_allows_file_action():
+            return
+        if action_kind in {"rating", "pick", "reject"} and not self._rating_writes_allowed("修改评级", warn=True):
             return
         paths = self._paths_for_active_shortcut_action()
         if not paths:
@@ -1757,6 +2266,8 @@ class FileListPanel(QWidget):
         else:
             return False
 
+        if not self._rating_writes_allowed("修改评级", warn=True):
+            return True
         try:
             if event.isAutoRepeat():
                 return True
@@ -1785,6 +2296,8 @@ class FileListPanel(QWidget):
         except Exception:
             pass
         paths = self._paths_for_active_shortcut_action()
+        if paths and not self._file_operation_paths_allowed(paths, "删除文件", warn=True):
+            return True
         if paths:
             self._move_paths_to_trash(paths)
         return True
@@ -1795,16 +2308,7 @@ class FileListPanel(QWidget):
         *,
         report_db_available: bool,
     ) -> str:
-        if report_db_available:
-            row = self._get_report_row_for_path(path)
-            if isinstance(row, dict):
-                filename = str(row.get("filename") or Path(path).stem or "").strip()
-                if filename:
-                    return "report_db"
-        sidecar_path = self._resolve_sidecar_path(path)
-        if sidecar_path and os.path.isfile(sidecar_path):
-            return "xmp_sidecar"
-        return "source_exif"
+        return "xmp_sidecar"
 
     def _resolve_metadata_write_target(self, path: str) -> str:
         sidecar_path = self._resolve_sidecar_path(path)
@@ -1928,6 +2432,11 @@ class FileListPanel(QWidget):
         rating: int | None = None,
         pick: int | None = None,
     ) -> list[str]:
+        if not self._rating_writes_allowed("修改评级"):
+            return []
+        if not self._use_report_db:
+            _log.info("[_apply_rating_state_via_report_db] skip reason=report_db_disabled")
+            return []
         db_dir = self._report_root_dir or self._current_dir
         db = ReportDB.open_if_exists(db_dir) if db_dir else None
         if db is None:
@@ -1981,50 +2490,38 @@ class FileListPanel(QWidget):
         rating: int | None = None,
         pick: int | None = None,
     ) -> list[str]:
-        assignments = self._build_exif_rating_assignments(rating=rating, pick=pick)
-        if not assignments:
+        if not self._rating_writes_allowed("修改评级"):
+            return []
+        fields: dict[str, int] = {}
+        if rating is not None:
+            fields["rating"] = max(0, min(5, int(rating)))
+        if pick is not None:
+            fields["pick"] = max(-1, min(1, int(pick)))
+        if not fields:
             return []
         updated_paths: list[str] = []
-        target_groups: dict[str, dict[str, object]] = {}
         for path in self._unique_norm_paths(paths):
             target_path = self._resolve_metadata_write_target(path)
             if not target_path:
                 continue
-            target_key = os.path.normcase(os.path.normpath(target_path))
-            group = target_groups.get(target_key)
-            if not isinstance(group, dict):
-                target_groups[target_key] = {
-                    "target_path": target_path,
-                    "paths": [path],
-                }
-                continue
-            group_paths = group.get("paths")
-            if isinstance(group_paths, list):
-                group_paths.append(path)
-        for group in target_groups.values():
-            target_path = str(group.get("target_path") or "").strip()
-            source_paths = [os.path.normpath(p) for p in group.get("paths", []) if p]
-            if not target_path or not source_paths:
-                continue
             try:
-                fields = {}
-                for a in assignments:
-                    if a.startswith("-") and "=" in a:
-                        tag, _, val = a[1:].partition("=")
-                        fields[tag] = val
-                if not self._meta_proxy.exif.write(target_path, fields):
-                    raise RuntimeError("exif write returned False")
+                if not self._meta_proxy.write(target_path, fields):
+                    raise RuntimeError("xmp sidecar write returned False")
             except Exception as exc:
                 _log.warning(
-                    "[_apply_rating_state_via_exif] source=%r target=%r failed: %s",
-                    source_paths[0],
+                    "[_apply_rating_state_via_xmp] source=%r target=%r failed: %s",
+                    path,
                     target_path,
                     exc,
                 )
                 continue
-            for source_path in source_paths:
-                self._apply_rating_state_to_meta_cache(source_path, rating=rating, pick=pick)
-                updated_paths.append(source_path)
+            try:
+                from app_common.exif_io.writer import invalidate_metadata_cache
+                invalidate_metadata_cache([path, target_path])
+            except Exception:
+                pass
+            self._apply_rating_state_to_meta_cache(path, rating=rating, pick=pick)
+            updated_paths.append(path)
         return updated_paths
 
     def _set_rating_state_for_paths(
@@ -2034,12 +2531,15 @@ class FileListPanel(QWidget):
         rating: int | None = None,
         pick: int | None = None,
     ) -> None:
+        if not self._rating_writes_allowed("修改评级", warn=True):
+            return
+        probe_t0 = perf_counter()
         unique_paths = self._unique_norm_paths(paths)
         if not unique_paths:
             return
-        db_dir = self._report_root_dir or self._current_dir
         db_exists = False
-        if db_dir:
+        db_dir = self._report_root_dir or self._current_dir
+        if self._use_report_db and db_dir:
             db_probe = ReportDB.open_if_exists(db_dir)
             db_exists = db_probe is not None
             if db_probe is not None:
@@ -2059,10 +2559,16 @@ class FileListPanel(QWidget):
             else:
                 file_paths.append(path)
         updated_paths: list[str] = []
+        report_ms = 0.0
+        file_ms = 0.0
         if report_paths:
+            apply_t0 = perf_counter()
             updated_paths.extend(self._apply_rating_state_via_report_db(report_paths, rating=rating, pick=pick))
+            report_ms = elapsed_ms(apply_t0)
         if file_paths:
+            apply_t0 = perf_counter()
             updated_paths.extend(self._apply_rating_state_via_exif(file_paths, rating=rating, pick=pick))
+            file_ms = elapsed_ms(apply_t0)
         source_summary = ", ".join(
             f"{name}={count}" for name, count in source_counts.items() if count > 0
         ) or "none"
@@ -2074,8 +2580,21 @@ class FileListPanel(QWidget):
                 pick,
                 len(unique_paths),
             )
+            perf_log(
+                _log,
+                "[rating] updated=0 sources=%s selected=%s rating=%r pick=%r report_ms=%.1f file_ms=%.1f total_ms=%.1f",
+                source_summary,
+                len(unique_paths),
+                rating,
+                pick,
+                report_ms,
+                file_ms,
+                elapsed_ms(probe_t0),
+            )
             return
+        refresh_t0 = perf_counter()
         self._refresh_metadata_state_for_paths(updated_paths)
+        refresh_ms = elapsed_ms(refresh_t0)
         _log.info(
             "[_set_rating_state_for_paths] sources=%s rating=%r pick=%r selected=%s updated=%s",
             source_summary,
@@ -2084,12 +2603,32 @@ class FileListPanel(QWidget):
             len(unique_paths),
             len(updated_paths),
         )
+        perf_log(
+            _log,
+            "[rating] sources=%s selected=%s updated=%s rating=%r pick=%r report_ms=%.1f file_ms=%.1f refresh_ms=%.1f total_ms=%.1f",
+            source_summary,
+            len(unique_paths),
+            len(updated_paths),
+            rating,
+            pick,
+            report_ms,
+            file_ms,
+            refresh_ms,
+            elapsed_ms(probe_t0),
+        )
 
     def _add_rating_menu_actions(self, menu: QMenu, paths: list[str]) -> None:
         unique_paths = self._unique_norm_paths(paths)
         if not unique_paths:
             return
+        writes_allowed = self._rating_writes_allowed("修改评级")
         rating_menu = menu.addMenu("修改星级")
+        rating_menu.setEnabled(writes_allowed)
+        if not writes_allowed:
+            mark_write_action_disabled(
+                rating_menu.menuAction(),
+                self.rating_writes_disabled_tooltip("修改评级"),
+            )
         clear_rating_action = rating_menu.addAction("取消星级")
         clear_rating_action.triggered.connect(
             lambda checked=False: self._set_rating_state_for_paths(unique_paths, rating=0)
@@ -2117,11 +2656,12 @@ class FileListPanel(QWidget):
         reject_action.setText(f"{reject_label}\tQ")
 
     def _add_delete_menu_action(self, menu: QMenu, paths: list[str]) -> None:
-        unique_paths = self._unique_norm_paths(paths)
-        if not unique_paths:
-            return
-        act_delete = menu.addAction("删除\tDel")
-        act_delete.triggered.connect(lambda: self._move_paths_to_trash(unique_paths))
+        pass
+        #unique_paths = self._unique_norm_paths(paths)
+        #if not unique_paths:
+        #    return
+        #act_delete = menu.addAction("删除\tDel")
+        #act_delete.triggered.connect(lambda: self._move_paths_to_trash(unique_paths))
 
     def _get_actual_path_for_display(self, path: str) -> str | None:
         actual = _get_cached_actual_path(path)
@@ -2159,7 +2699,7 @@ class FileListPanel(QWidget):
 
     def _resolve_preview_path_for_tooltip(self, path: str) -> str:
         norm_path = os.path.normpath(path) if path else ""
-        if not norm_path:
+        if not norm_path or not self._use_preview_cache:
             return ""
         preview_base_dir = self._report_root_dir or self._current_dir
         report_cache = self._report_full_cache or self._report_cache or {}
@@ -2172,7 +2712,7 @@ class FileListPanel(QWidget):
 
     def _resolve_existing_sized_preview_image_path(self, path: str) -> str:
         norm_path = os.path.normpath(path) if path else ""
-        if not norm_path:
+        if not norm_path or not self._use_preview_cache:
             return ""
         preview_base_dir = self._report_root_dir or self._current_dir
         if not preview_base_dir:
@@ -2203,7 +2743,7 @@ class FileListPanel(QWidget):
 
     def _resolve_existing_selected_preview_image_path(self, path: str) -> str:
         norm_path = os.path.normpath(path) if path else ""
-        if not norm_path:
+        if not norm_path or not self._use_preview_cache:
             return ""
         preview_base_dir = self._report_root_dir or self._current_dir
         if not preview_base_dir:
@@ -2454,6 +2994,8 @@ class FileListPanel(QWidget):
                     self.file_selected.emit(resolved)
 
     def _sync_report_current_path_from_actual(self, source_path: str, actual_path: str, row: dict | None) -> None:
+        if not self._file_writes_allowed("修复 report.db 路径"):
+            return
         if not isinstance(row, dict):
             return
         root_dir = self._report_root_dir or self._current_dir
@@ -2537,6 +3079,8 @@ class FileListPanel(QWidget):
         if not norm_path:
             return path
         actual_path = self._get_actual_path_for_display(norm_path)
+        if not self._use_preview_cache:
+            return actual_path or norm_path
         preview_base_dir = self._report_root_dir or self._current_dir
         report_cache = self._report_full_cache or self._report_cache or {}
         source_path = actual_path or norm_path
@@ -2655,6 +3199,15 @@ class FileListPanel(QWidget):
 
     def _resolve_source_path_for_action(self, path: str) -> str:
         norm_path = os.path.normpath(path) if path else ""
+        if (
+            not self._use_report_db
+            and norm_path
+            and os.path.isfile(norm_path)
+            and Path(norm_path).suffix.lower() in IMAGE_EXTENSIONS
+        ):
+            _log.info("[_resolve_source_path_for_action] source=%r resolved=self=%r", path, norm_path)
+            return norm_path
+
         actual_path = self._get_actual_path_for_display(norm_path)
         if actual_path:
             _log.info("[_resolve_source_path_for_action] source=%r resolved=actual_cache=%r", path, actual_path)
@@ -2780,6 +3333,7 @@ class FileListPanel(QWidget):
         *,
         filter_text: str = "",
         filter_pick: bool = False,
+        filter_reject: bool = False,
         filter_min_rating: int = 0,
         filter_focus_status: str = "",
     ) -> bool:
@@ -2796,11 +3350,15 @@ class FileListPanel(QWidget):
             rating = int(meta.get("rating", 0) or 0)
         except Exception:
             rating = 0
-        if filter_text and filter_text not in name.lower():
+        comment = _metadata_comment_from_meta(meta)
+        filter_text = str(filter_text or "").strip().lower()
+        if filter_text and filter_text not in name.lower() and filter_text not in comment.lower():
             return False
         if filter_pick and pick != 1:
             return False
-        if rating < filter_min_rating:
+        if filter_reject and pick != -1:
+            return False
+        if filter_min_rating > 0 and rating != filter_min_rating:
             return False
         if filter_focus_status and _focus_status_to_display(meta.get("country", "")) != filter_focus_status:
             return False
@@ -2811,6 +3369,7 @@ class FileListPanel(QWidget):
             path,
             filter_text=(self._filter_edit.text().strip().lower()) if self._filter_edit else "",
             filter_pick=self._filter_pick,
+            filter_reject=self._filter_reject,
             filter_min_rating=self._filter_min_rating,
             filter_focus_status=self._filter_focus_status,
         )
@@ -2822,7 +3381,14 @@ class FileListPanel(QWidget):
         缩略图模式下改星级/精选时，大多数情况只是 badge 变化，不应该因为过滤器
         正处于激活状态就整表 `_apply_filter()`，否则当前视图和选中项会跳动。
         """
-        if not (self._filter_pick or self._filter_min_rating > 0 or self._filter_focus_status):
+        filter_text = (self._filter_edit.text().strip().lower()) if self._filter_edit else ""
+        if not (
+            filter_text
+            or self._filter_pick
+            or self._filter_reject
+            or self._filter_min_rating > 0
+            or self._filter_focus_status
+        ):
             return False
         if not paths:
             return False
@@ -2875,6 +3441,24 @@ class FileListPanel(QWidget):
     def _clear_tree_view_state(self) -> None:
         self._file_table_model.clear()
 
+    def _ensure_tree_model_populate_timer(self) -> None:
+        if self._tree_model_populate_timer is not None:
+            return
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(self._populate_tree_model_batch)
+        self._tree_model_populate_timer = timer
+
+    def _pause_tree_model_population(self) -> None:
+        if self._tree_model_populate_timer is not None and self._tree_model_populate_timer.isActive():
+            self._tree_model_populate_timer.stop()
+
+    def _cancel_tree_model_population(self) -> None:
+        self._pause_tree_model_population()
+        self._tree_model_pending_paths = []
+        self._tree_model_pending_index = 0
+        self._tree_model_populate_started_at = 0.0
+
     def _apply_tree_sort(self, column: int, order, *, sync_indicator: bool = False) -> None:
         """显式驱动 proxy 排序，避免依赖不同 Qt 版本对表头点击排序的隐式行为。"""
         hdr = self._tree_widget.header()
@@ -2894,33 +3478,137 @@ class FileListPanel(QWidget):
         self._tree_widget.sortByColumn(column, order)
 
     def _rebuild_tree_items(self) -> None:
-        self._tree_widget.setUpdatesEnabled(False)
-        try:
-            self._tree_widget.setSortingEnabled(False)
-            self._set_tree_header_fast_mode(True)
-            self._clear_tree_view_state()
-            ft = (self._filter_edit.text().strip().lower()) if self._filter_edit else ""
-            _log.info("[_rebuild_tree_items] filter_text=%r adding items", ft or "(none)")
-            self._file_table_model.rebuild(
-                self._filtered_files,
-                meta_cache=self._meta_cache,
-                tooltip_fn=self._build_list_path_tooltip,
-                mismatch_fn=self._has_path_mismatch,
+        self._probe_set_phase("tree_model_prepare", filtered=len(self._filtered_files))
+        self._cancel_tree_model_population()
+        prepare_t0 = perf_counter()
+        self._tree_widget.setSortingEnabled(False)
+        self._set_tree_header_fast_mode(True)
+        self._clear_tree_view_state()
+        ft = (self._filter_edit.text().strip().lower()) if self._filter_edit else ""
+        _log.info("[_rebuild_tree_items] filter_text=%r adding items", ft or "(none)")
+        self._probe_log("tree_model_prepare.done", elapsed_ms=elapsed_ms(prepare_t0), filter_text=ft)
+        self._start_tree_model_population()
+
+    def _start_tree_model_population(self, *, resume: bool = False) -> None:
+        if not resume:
+            self._tree_model_pending_paths = list(self._filtered_files)
+            self._tree_model_pending_index = 0
+            self._tree_model_populate_started_at = _time.perf_counter()
+            self._probe_tree_last_log_at = 0.0
+            self._probe_tree_last_rows = 0
+        elif not self._tree_model_pending_paths:
+            self._tree_model_pending_paths = list(self._filtered_files)
+        if not self._tree_model_pending_paths:
+            self._finish_tree_model_population(total=0)
+            return
+        if self._tree_model_populate_started_at <= 0:
+            self._tree_model_populate_started_at = _time.perf_counter()
+        self._tree_view_dirty = True
+        self._probe_set_phase("tree_model_populate", total=len(self._tree_model_pending_paths), resume=bool(resume))
+        self._ensure_tree_model_populate_timer()
+        self._populate_tree_model_batch()
+
+    def _populate_tree_model_batch(self) -> None:
+        if self._view_mode != self._MODE_LIST:
+            self._pause_tree_model_population()
+            return
+        total = len(self._tree_model_pending_paths)
+        start = self._tree_model_pending_index
+        if total <= 0 or start >= total:
+            self._finish_tree_model_population(total=total)
+            return
+        batch_t0 = perf_counter()
+        tick_t0 = _time.perf_counter()
+        end = start
+        min_batch = 24
+        max_batch = max(1, _THUMB_MODEL_APPEND_BATCH_SIZE)
+        while end < total:
+            end += 1
+            processed = end - start
+            if processed >= max_batch:
+                break
+            if processed >= min_batch and (_time.perf_counter() - tick_t0) >= _THUMB_MODEL_APPEND_BUDGET_S:
+                break
+        self._file_table_model.append_paths(
+            self._tree_model_pending_paths[start:end],
+            meta_cache=self._meta_cache,
+            tooltip_fn=self._build_list_path_tooltip,
+            mismatch_fn=self._has_path_mismatch,
+        )
+        batch_ms = elapsed_ms(batch_t0)
+        self._tree_model_pending_index = end
+        self._show_meta_progress_status("正在准备文件列表", value=end, total=total)
+        now = perf_counter()
+        if (
+            end >= total
+            or batch_ms >= 40.0
+            or end - self._probe_tree_last_rows >= 1000
+            or (now - self._probe_tree_last_log_at) >= 1.0
+        ):
+            self._probe_tree_last_log_at = now
+            self._probe_tree_last_rows = end
+            self._probe_log(
+                "tree_model_batch",
+                start=start,
+                end=end,
+                total=total,
+                batch=end - start,
+                batch_ms=batch_ms,
             )
-        finally:
-            self._tree_widget.setSortingEnabled(True)
-            self._set_tree_header_fast_mode(False)
-            if self._tree_row_count() > 0:
-                self._apply_tree_sort(
-                    self._tree_last_sort_column,
-                    self._tree_last_sort_order,
-                    sync_indicator=True,
-                )
-            self._tree_widget.setUpdatesEnabled(True)
-            self._refresh_tree_row_numbers()
+        if batch_ms >= 100.0:
+            _log.info(
+                "[UI_STALL_RISK] target=tree_model_batch batch_ms=%.1f start=%s end=%s total=%s",
+                batch_ms,
+                start,
+                end,
+                total,
+            )
+        if self._pending_selection_paths:
+            self._apply_pending_selection()
+        self._refresh_tree_row_numbers()
+        if end < total:
+            self._tree_view_dirty = True
+            if self._tree_model_populate_timer is not None:
+                self._tree_model_populate_timer.start(0)
+            return
+        self._finish_tree_model_population(total=total)
+
+    def _finish_tree_model_population(self, *, total: int) -> None:
+        self._pause_tree_model_population()
+        self._tree_model_pending_paths = []
+        self._tree_model_pending_index = 0
         self._tree_view_dirty = False
+        self._probe_set_phase("tree_model_sort", total=total)
+        sort_t0 = perf_counter()
+        self._tree_widget.setSortingEnabled(True)
+        self._set_tree_header_fast_mode(False)
+        if self._tree_row_count() > 0:
+            self._apply_tree_sort(
+                self._tree_last_sort_column,
+                self._tree_last_sort_order,
+                sync_indicator=True,
+            )
+        self._refresh_tree_row_numbers()
+        self._probe_log("tree_model_sort.done", elapsed_ms=elapsed_ms(sort_t0), rows=self._tree_row_count())
+        if self._pending_selection_paths:
+            self._apply_pending_selection()
+            if self._view_mode == self._MODE_LIST:
+                self._pending_selection_paths = None
+                self._pending_selection_current_path = ""
+        else:
+            self._select_first_file_if_needed(reason="tree_model_population_done")
+        elapsed = (
+            _time.perf_counter() - self._tree_model_populate_started_at
+            if self._tree_model_populate_started_at > 0
+            else 0.0
+        )
+        self._tree_model_populate_started_at = 0.0
+        self._show_meta_progress_status("正在准备文件列表", value=total, total=total)
+        self._probe_set_phase("idle", reason="tree_model_population_done", total=total, elapsed_ms=elapsed * 1000.0)
+        _log.info("[_populate_tree_model_batch] completed total=%s elapsed=%.3fs", total, elapsed)
 
     def _mark_tree_view_dirty(self) -> None:
+        self._cancel_tree_model_population()
         self._tree_view_dirty = True
         self._clear_tree_view_state()
 
@@ -2956,6 +3644,8 @@ class FileListPanel(QWidget):
             self._thumb_model_pending_paths = list(self._filtered_files)
             self._thumb_model_pending_index = 0
             self._thumb_model_populate_started_at = _time.perf_counter()
+            self._probe_thumb_last_log_at = 0.0
+            self._probe_thumb_last_rows = 0
             self._thumb_list_model.clear()
             self._invalidate_visible_thumbnail_signature()
         elif not self._thumb_model_pending_paths:
@@ -2966,6 +3656,7 @@ class FileListPanel(QWidget):
         if self._thumb_model_populate_started_at <= 0:
             self._thumb_model_populate_started_at = _time.perf_counter()
         self._thumb_model_dirty = True
+        self._probe_set_phase("thumb_model_populate", total=len(self._thumb_model_pending_paths), resume=bool(resume))
         self._ensure_thumb_model_populate_timer()
         self._populate_thumb_model_batch()
 
@@ -2977,6 +3668,7 @@ class FileListPanel(QWidget):
             self._thumb_model_pending_paths = []
             self._thumb_model_pending_index = 0
             return
+        batch_t0 = perf_counter()
         tick_t0 = _time.perf_counter()
         end = start
         min_batch = 24
@@ -2994,7 +3686,34 @@ class FileListPanel(QWidget):
             tooltip_fn=self._build_list_path_tooltip,
             mismatch_fn=self._has_path_mismatch,
         )
+        batch_ms = elapsed_ms(batch_t0)
         self._thumb_model_pending_index = end
+        now = perf_counter()
+        if (
+            end >= total
+            or batch_ms >= 40.0
+            or end - self._probe_thumb_last_rows >= 1000
+            or (now - self._probe_thumb_last_log_at) >= 1.0
+        ):
+            self._probe_thumb_last_log_at = now
+            self._probe_thumb_last_rows = end
+            self._probe_log(
+                "thumb_model_batch",
+                start=start,
+                end=end,
+                total=total,
+                batch=end - start,
+                appended=appended,
+                batch_ms=batch_ms,
+            )
+        if batch_ms >= 100.0:
+            _log.info(
+                "[UI_STALL_RISK] target=thumb_model_batch batch_ms=%.1f start=%s end=%s total=%s",
+                batch_ms,
+                start,
+                end,
+                total,
+            )
         if appended:
             self._invalidate_visible_thumbnail_signature()
             if self._pending_selection_paths:
@@ -3025,15 +3744,30 @@ class FileListPanel(QWidget):
             _time.perf_counter() - self._thumb_model_populate_started_at if self._thumb_model_populate_started_at > 0 else 0.0,
         )
         self._thumb_model_populate_started_at = 0.0
+        self._probe_set_phase("idle", reason="thumb_model_population_done", total=total)
 
     def _rebuild_views(self, stop_loaders: bool = True) -> None:
         """根据当前过滤结果重建列表/树视图与缩略图项。"""
+        rebuild_t0 = perf_counter()
+        self._probe_set_phase("rebuild_views", mode=self._view_mode, stop_loaders=bool(stop_loaders))
+        self._thumb_selection_anchor_row = -1
         if stop_loaders:
+            stop_t0 = perf_counter()
             self._stop_all_loaders()
+            self._probe_log("rebuild_views.stop_all_loaders", elapsed_ms=elapsed_ms(stop_t0))
         else:
+            stop_t0 = perf_counter()
             self._stop_thumbnail_loader()
+            self._probe_log("rebuild_views.stop_thumbnail_loader", elapsed_ms=elapsed_ms(stop_t0))
         self._cancel_thumb_model_population()
+        filter_t0 = perf_counter()
         self._filtered_files = self._compute_filtered_files()
+        self._probe_log(
+            "rebuild_views.compute_filtered",
+            elapsed_ms=elapsed_ms(filter_t0),
+            all_files=len(self._all_files),
+            filtered=len(self._filtered_files),
+        )
         _log.info(
             "[_rebuild_views] START all_files=%s filtered_files=%s stop_loaders=%s",
             len(self._all_files),
@@ -3042,16 +3776,21 @@ class FileListPanel(QWidget):
         )
         _log.info("[_rebuild_views] added %s items", len(self._filtered_files))
         if self._view_mode == self._MODE_LIST:
+            branch_t0 = perf_counter()
             self._rebuild_tree_items()
+            self._probe_log("rebuild_views.start_tree_items", elapsed_ms=elapsed_ms(branch_t0))
             self._mark_thumb_model_dirty()
         else:
+            branch_t0 = perf_counter()
             self._mark_tree_view_dirty()
             self._update_thumb_display()
             self._start_thumb_model_population()
+            self._probe_log("rebuild_views.start_thumb_items", elapsed_ms=elapsed_ms(branch_t0))
         if self._view_mode == self._MODE_THUMB:
             _log.info("[_rebuild_views] thumb mode: update thumb display + schedule visible loader")
             self._schedule_visible_thumbnail_update()
         self._update_selection_status()
+        self._probe_log("rebuild_views.done", elapsed_ms=elapsed_ms(rebuild_t0), mode=self._view_mode)
         _log.info("[_rebuild_views] END")
         return
         self._tree_widget.setUpdatesEnabled(False)
@@ -3063,15 +3802,13 @@ class FileListPanel(QWidget):
             ft = (self._filter_edit.text().strip().lower()) if self._filter_edit else ""
             _log.info("[_rebuild_views] filter_text=%r adding items", ft or "(none)")
 
-            for seq, path in enumerate(self._filtered_files, start=1):
+            for path in self._filtered_files:
                 name = Path(path).name
                 norm = os.path.normpath(path)
                 meta = self._meta_cache.get(norm, {})
 
-                ti = SortableTreeItem([str(seq), name, *([""] * (len(_FILE_TABLE_HEADERS) - 2))])
-                ti.setTextAlignment(_TREE_COL_SEQ, _AlignCenter)
+                ti = SortableTreeItem([name, *([""] * (len(_FILE_TABLE_HEADERS) - 1))])
                 ti.setData(0, _UserRole, path)
-                ti.setData(_TREE_COL_SEQ, _SortRole, 0)
                 ti.setData(_TREE_COL_NAME, _SortRole, name.lower())
                 self._set_tree_item_tooltip_all_columns(ti, self._build_list_path_tooltip(path))
                 if meta:
@@ -3114,18 +3851,23 @@ class FileListPanel(QWidget):
         """根据当前过滤条件（文件名、精选、星级、对焦）重算过滤结果并刷新视图。"""
         ft = (self._filter_edit.text().strip().lower()) if self._filter_edit else ""
         fp = self._filter_pick
+        fx = self._filter_reject
         fr = self._filter_min_rating
         ff = self._filter_focus_status
         t0 = _time.perf_counter()
+        probe_t0 = perf_counter()
         selected_paths, current_path = self._capture_selection_restore_state()
+        compute_t0 = perf_counter()
         filtered = self._compute_filtered_files()
+        compute_ms = elapsed_ms(compute_t0)
         old_filtered = list(self._filtered_files)
         self._filtered_files = filtered
         _log.info(
-            "[_apply_filter] START files=%s filtered=%s pick=%s min_rating=%s focus=%r text=%r",
+            "[_apply_filter] START files=%s filtered=%s pick=%s reject=%s min_rating=%s focus=%r text=%r",
             len(self._all_files),
             len(filtered),
             fp,
+            fx,
             fr,
             ff or "(none)",
             ft or "(none)",
@@ -3139,44 +3881,208 @@ class FileListPanel(QWidget):
                 reason="apply_filter_unchanged",
             )
             _log.info("[_apply_filter] SKIP unchanged elapsed=%.3fs", _time.perf_counter() - t0)
+            perf_log(
+                _log,
+                "[filter.apply] unchanged=1 all=%s visible=%s text=%r pick=%s reject=%s rating=%s focus=%r compute_ms=%.1f total_ms=%.1f",
+                len(self._all_files),
+                len(filtered),
+                ft or "",
+                fp,
+                fx,
+                fr,
+                ff or "",
+                compute_ms,
+                elapsed_ms(probe_t0),
+            )
             return
+        rebuild_t0 = perf_counter()
         self._rebuild_views(stop_loaders=False)
+        rebuild_ms = elapsed_ms(rebuild_t0)
+        restore_t0 = perf_counter()
         self._restore_selection_after_view_change(
             selected_paths,
             current_path,
             reason="apply_filter",
         )
+        restore_ms = elapsed_ms(restore_t0)
         _log.info(
             "[_apply_filter] END visible=%s hidden=%s elapsed=%.3fs",
             len(filtered),
             max(0, len(self._all_files) - len(filtered)),
             _time.perf_counter() - t0,
         )
+        perf_log(
+            _log,
+            "[filter.apply] unchanged=0 all=%s visible=%s hidden=%s text=%r pick=%s reject=%s rating=%s focus=%r compute_ms=%.1f rebuild_ms=%.1f restore_ms=%.1f total_ms=%.1f",
+            len(self._all_files),
+            len(filtered),
+            max(0, len(self._all_files) - len(filtered)),
+            ft or "",
+            fp,
+            fx,
+            fr,
+            ff or "",
+            compute_ms,
+            rebuild_ms,
+            restore_ms,
+            elapsed_ms(probe_t0),
+        )
 
     def _on_filter_text_changed(self, _text: str) -> None:
         self._refresh_filter_scope()
 
-    def _on_pick_filter_toggled(self) -> None:
-        """切换精选过滤：只显示 Pick=1 的文件；仅在目录 scope 发生变化时才重扫。"""
-        self._filter_pick = self._btn_filter_pick.isChecked()
-        if self._filter_min_rating != 0:
-            self._filter_min_rating = 0
-            for btn in self._star_btns:
-                btn.setChecked(False)
-        self._refresh_filter_scope()
+    def _rating_filter_menu_text(self) -> str:
+        if self._filter_pick:
+            return "🏆"
+        if self._filter_reject:
+            return "🚫"
+        if self._filter_min_rating > 0:
+            return f"{self._filter_min_rating}★"
+        return "评级"
 
-    def _on_rating_filter_changed(self, n: int) -> None:
-        """切换星级过滤：只显示 ≥n 星的文件；仅在目录 scope 发生变化时才重扫。"""
-        if self._filter_min_rating == n:
-            self._filter_min_rating = 0
-        else:
-            self._filter_min_rating = n
-            if self._filter_pick:
-                self._filter_pick = False
-                self._btn_filter_pick.setChecked(False)
+    def _rating_filter_menu_tooltip(self) -> str:
+        if self._filter_pick:
+            return "当前过滤：只显示精选。点击选择评级过滤。"
+        if self._filter_reject:
+            return "当前过滤：只显示排除。点击选择评级过滤。"
+        if self._filter_min_rating > 0:
+            return f"当前过滤：只显示 {self._filter_min_rating} 星。点击选择评级过滤。"
+        return "选择 Pick、排除或星级过滤"
+
+    def _rating_filter_should_compact(self) -> bool:
+        if not self._create_filter_bar:
+            return False
+        try:
+            threshold = int(getattr(type(self), "rating_filter_compact_width", 620))
+        except Exception:
+            threshold = 620
+        return threshold > 0 and self.width() > 0 and self.width() < threshold
+
+    def _sync_rating_filter_buttons(self) -> None:
+        if self._btn_filter_pick is not None:
+            self._btn_filter_pick.setChecked(bool(self._filter_pick))
+        if self._btn_filter_reject is not None:
+            self._btn_filter_reject.setChecked(bool(self._filter_reject))
         for i, btn in enumerate(self._star_btns):
             btn.setChecked(i + 1 == self._filter_min_rating)
-        self._refresh_filter_scope()
+        if self._btn_filter_rating_menu is not None:
+            self._btn_filter_rating_menu.setText(self._rating_filter_menu_text())
+            self._btn_filter_rating_menu.setToolTip(self._rating_filter_menu_tooltip())
+
+    def _sync_rating_filter_compact_mode(self, *, force: bool = False) -> None:
+        if not self._create_filter_bar:
+            return
+        compact = self._rating_filter_should_compact()
+        if force or compact != self._rating_filter_compact:
+            self._rating_filter_compact = compact
+        apply_compact_filter_badge_menu(
+            self._rating_filter_badge_buttons,
+            self._btn_filter_rating_menu,
+            compact,
+            menu_text=self._rating_filter_menu_text(),
+            menu_tooltip=self._rating_filter_menu_tooltip(),
+        )
+
+    def _set_rating_filter_state(
+        self,
+        *,
+        pick: bool = False,
+        reject: bool = False,
+        min_rating: int = 0,
+    ) -> None:
+        try:
+            rating = int(min_rating)
+        except Exception:
+            rating = 0
+        rating = max(0, min(5, rating))
+        pick = bool(pick)
+        reject = bool(reject)
+        if pick:
+            reject = False
+            rating = 0
+        elif reject:
+            pick = False
+            rating = 0
+        elif rating > 0:
+            pick = False
+            reject = False
+        changed = (
+            self._filter_pick != pick or
+            self._filter_reject != reject or
+            self._filter_min_rating != rating
+        )
+        self._filter_pick = pick
+        self._filter_reject = reject
+        self._filter_min_rating = rating
+        self._sync_rating_filter_buttons()
+        self._sync_rating_filter_compact_mode()
+        if changed:
+            self._refresh_filter_scope()
+
+    def _show_rating_filter_menu(self) -> None:
+        button = self._btn_filter_rating_menu
+        if button is None:
+            return
+        menu = QMenu(button)
+
+        def add_state_action(text: str, checked: bool, callback) -> None:
+            action = menu.addAction(text)
+            action.setCheckable(True)
+            action.setChecked(bool(checked))
+            action.triggered.connect(lambda _checked=False, cb=callback: cb())
+
+        has_rating_filter = (
+            self._filter_pick or
+            self._filter_reject or
+            self._filter_min_rating > 0
+        )
+        add_state_action(
+            "不限",
+            not has_rating_filter,
+            lambda: self._set_rating_filter_state(),
+        )
+        menu.addSeparator()
+        add_state_action(
+            "🏆 Pick",
+            self._filter_pick,
+            lambda: self._set_rating_filter_state(
+                pick=not self._filter_pick,
+            ),
+        )
+        add_state_action(
+            "🚫 排除",
+            self._filter_reject,
+            lambda: self._set_rating_filter_state(
+                reject=not self._filter_reject,
+            ),
+        )
+        menu.addSeparator()
+        for rating in range(1, 6):
+            add_state_action(
+                f"{rating} 星",
+                self._filter_min_rating == rating,
+                lambda r=rating: self._set_rating_filter_state(
+                    min_rating=0 if self._filter_min_rating == r else r,
+                ),
+            )
+
+        _exec_menu(menu, button.mapToGlobal(button.rect().bottomLeft()))
+        self._sync_rating_filter_buttons()
+
+    def _on_pick_filter_toggled(self) -> None:
+        """切换精选过滤：只显示 Pick=1 的文件；仅在目录 scope 发生变化时才重扫。"""
+        checked = bool(self._btn_filter_pick and self._btn_filter_pick.isChecked())
+        self._set_rating_filter_state(pick=checked)
+
+    def _on_reject_filter_toggled(self) -> None:
+        """切换排除过滤：只显示 Pick=-1 的文件；仅在目录 scope 发生变化时才重扫。"""
+        checked = bool(self._btn_filter_reject and self._btn_filter_reject.isChecked())
+        self._set_rating_filter_state(reject=checked)
+
+    def _on_rating_filter_changed(self, n: int) -> None:
+        """切换星级过滤：只显示 n 星的文件；仅在目录 scope 发生变化时才重扫。"""
+        rating = 0 if self._filter_min_rating == n else n
+        self._set_rating_filter_state(min_rating=rating)
 
     def _on_focus_filter_changed(self, status: str) -> None:
         if self._filter_focus_status == status:
@@ -3188,29 +4094,19 @@ class FileListPanel(QWidget):
         self._refresh_filter_scope()
 
     def _apply_meta_to_tree_item(self, item: SortableTreeItem, meta: dict) -> None:
-        title   = meta.get("title", "")
-        color   = meta.get("color", "")
-        rating  = meta.get("rating", 0)
-        pick    = meta.get("pick", 0)
-        city    = meta.get("city", "")
-        state   = meta.get("state", "")
-        country = meta.get("country", "")
-        shutter = str(meta.get("shutter", "") or "")
-        iso = str(meta.get("iso", "") or "")
-        aperture = str(meta.get("aperture", "") or "")
+        comment = _metadata_comment_from_meta(meta)
+        tags_display = _metadata_tags_display(meta)
+        try:
+            rating = int(meta.get("rating", 0) or 0)
+        except Exception:
+            rating = 0
+        try:
+            pick = int(meta.get("pick", 0) or 0)
+        except Exception:
+            pick = 0
 
-        item.setText(_TREE_COL_TITLE, title);  item.setData(_TREE_COL_TITLE, _SortRole, title.lower())
-        color_display = (_COLOR_LABEL_COLORS.get(color, ("", ""))[1] or color)
-        item.setText(_TREE_COL_COLOR, color_display);  item.setData(_TREE_COL_COLOR, _SortRole, _COLOR_SORT_ORDER.get(color, 99))
-        if color in _COLOR_LABEL_COLORS:
-            hex_c, _ = _COLOR_LABEL_COLORS[color]
-            item.setBackground(_TREE_COL_COLOR, QBrush(QColor(hex_c)))
-            item.setForeground(_TREE_COL_COLOR, QBrush(QColor(
-                "#333" if color in ("Yellow", "White") else "#fff"
-            )))
-
-        # 星级列：pick 旗标优先于星级显示
-        # 排序键：精选=10 > 5星=5 > ... > 未标=0 > 排除=-1
+        item.setText(_TREE_COL_COMMENT, comment)
+        item.setData(_TREE_COL_COMMENT, _SortRole, comment.lower())
         if pick == 1:
             star_text = "🏆"
             sort_val  = 10
@@ -3221,24 +4117,8 @@ class FileListPanel(QWidget):
             star_text = "★" * rating if rating > 0 else ""
             sort_val  = rating
         item.setText(_TREE_COL_STAR, star_text); item.setData(_TREE_COL_STAR, _SortRole, sort_val)
-
-        item.setText(_TREE_COL_SHARP, city);    item.setData(_TREE_COL_SHARP, _SortRole, city.lower())
-        item.setText(_TREE_COL_AESTHETIC, state);   item.setData(_TREE_COL_AESTHETIC, _SortRole, state.lower())
-        item.setText(_TREE_COL_FOCUS, country); item.setData(_TREE_COL_FOCUS, _SortRole, country.lower())
-        shutter_seconds = _parse_positive_fraction_or_float(shutter)
-        item.setText(_TREE_COL_SHUTTER, shutter)
-        item.setData(_TREE_COL_SHUTTER, _SortRole, (0, shutter_seconds) if shutter_seconds is not None else (1, shutter.lower()))
-        iso_value = _parse_optional_int(iso)
-        item.setText(_TREE_COL_ISO, iso)
-        item.setData(_TREE_COL_ISO, _SortRole, (0, iso_value) if iso_value is not None else (1, iso.lower()))
-        aperture_value = _parse_positive_fraction_or_float(aperture)
-        item.setText(_TREE_COL_APERTURE, aperture)
-        item.setData(_TREE_COL_APERTURE, _SortRole, (0, aperture_value) if aperture_value is not None else (1, aperture.lower()))
-        focus_color = _FOCUS_STATUS_TEXT_COLORS.get(country, "")
-        if focus_color:
-            item.setForeground(_TREE_COL_FOCUS, QBrush(QColor(focus_color)))
-        else:
-            item.setForeground(_TREE_COL_FOCUS, QBrush())
+        item.setText(_TREE_COL_TAGS, tags_display)
+        item.setData(_TREE_COL_TAGS, _SortRole, tags_display.lower())
 
     # ── 视图模式切换 ────────────────────────────────────────────────────────────
     def _view_uses_pixel_scroll(self, view) -> bool:
@@ -3344,6 +4224,10 @@ class FileListPanel(QWidget):
             pass
         return True
 
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._sync_rating_filter_compact_mode()
+
     def eventFilter(self, obj, event):
         tree_widget = getattr(self, "_tree_widget", None)
         tree_viewport = tree_widget.viewport() if tree_widget is not None else None
@@ -3383,6 +4267,14 @@ class FileListPanel(QWidget):
             if et in (_EventResize, _EventShow):
                 self._invalidate_visible_thumbnail_signature()
                 self._schedule_visible_thumbnail_update()
+            elif et == _EventMouseButtonPress and list_widget is not None:
+                try:
+                    has_shift = bool(_ShiftModifier and (event.modifiers() & _ShiftModifier))
+                except Exception:
+                    has_shift = False
+                if not has_shift:
+                    idx = list_widget.indexAt(event.pos())
+                    self._thumb_selection_anchor_row = idx.row() if idx.isValid() else -1
         if event is not None and event.type() == _EventWheel:
             if (
                 self._view_mode == self._MODE_LIST
@@ -3449,9 +4341,11 @@ class FileListPanel(QWidget):
             if key in (_KeyUp, _KeyDown, _KeyLeft, _KeyRight):
                 if not self._accept_key_navigation_step(event):
                     return True
-                self._selection_key_nav_auto_repeat = True
-                self._selection_key_nav_hold_active = True
-                QTimer.singleShot(0, lambda: setattr(self, "_selection_key_nav_auto_repeat", False))
+                is_auto_repeat = self._event_is_auto_repeat(event)
+                self._selection_key_nav_auto_repeat = is_auto_repeat
+                self._selection_key_nav_hold_active = is_auto_repeat
+                if is_auto_repeat:
+                    QTimer.singleShot(0, lambda: setattr(self, "_selection_key_nav_auto_repeat", False))
         if (
             obj is tree_widget
             and event is not None
@@ -3495,23 +4389,27 @@ class FileListPanel(QWidget):
             elif key == _KeyRight and idx < count - 1:
                 new_idx = idx + 1
             if new_idx >= 0 and new_idx < count:
-                self._selection_key_nav_hold_active = True
-                fast_preview = True
+                fast_preview = self._event_is_auto_repeat(event)
+                self._selection_key_nav_hold_active = fast_preview
                 shift = _ShiftModifier and (event.modifiers() & _ShiftModifier)
                 new_index = self._thumb_index_for_row(new_idx)
                 if not new_index.isValid():
                     return True
                 if shift:
                     sm = list_widget.selectionModel()
-                    anchor = sm.anchorIndex().row() if sm and sm.anchorIndex().isValid() else idx
+                    anchor = self._thumb_selection_anchor_row
+                    if anchor < 0 or anchor >= count:
+                        anchor = idx
+                    self._thumb_selection_anchor_row = anchor
                     lo, hi = min(anchor, new_idx), max(anchor, new_idx)
+                    list_widget.setCurrentIndex(new_index)
                     list_widget.clearSelection()
                     for i in range(lo, hi + 1):
                         it = self._thumb_index_for_row(i)
                         if it.isValid() and sm is not None:
                             sm.select(it, _Select)
-                    list_widget.setCurrentIndex(new_index)
                 else:
+                    self._thumb_selection_anchor_row = new_idx
                     list_widget.clearSelection()
                     list_widget.setCurrentIndex(new_index)
                     sm = list_widget.selectionModel()
@@ -3822,7 +4720,9 @@ class FileListPanel(QWidget):
             # Promote newly-visible items to the front of the queue so they
             # are processed before any pending prefetch.
             self._thumb_profile_add("loader_reprioritize", 1)
-            loader.replace_pending(missing_visible, prefetch_paths)
+            loader.promote(missing_visible)
+            loader.enqueue(prefetch_paths, priority=ThumbnailLoader.PRIORITY_PREFETCH)
+            loader.set_desired_paths(missing_visible, prefetch_paths)
         else:
             # ── No loader running: start fresh ───────────────────────────────
             if missing_visible or prefetch_paths:
@@ -3848,12 +4748,14 @@ class FileListPanel(QWidget):
             return
         selected_paths, current_path = self._capture_selection_restore_state()
         self._view_mode = mode
+        self._thumb_selection_anchor_row = -1
         self._btn_list.setChecked(mode == self._MODE_LIST)
         self._btn_thumb.setChecked(mode == self._MODE_THUMB)
         self._stack.setCurrentIndex(0 if mode == self._MODE_LIST else 1)
         self._update_size_controls()
         self._invalidate_visible_thumbnail_signature()
         if mode == self._MODE_THUMB:
+            self._pause_tree_model_population()
             self._update_thumb_display()
             if self._thumb_model_dirty:
                 self._start_thumb_model_population(
@@ -3952,6 +4854,8 @@ class FileListPanel(QWidget):
         return True
 
     def apply_user_options(self) -> None:
+        self._thumb_profile_enabled = _thumb_profile_enabled()
+        self._sync_file_browser_probe_timer()
         self._thumb_loader_workers = _thumbnail_loader_worker_count()
         self._set_key_navigation_fps(get_key_navigation_fps(), persist=False)
         self._invalidate_visible_thumbnail_signature()
@@ -3961,7 +4865,7 @@ class FileListPanel(QWidget):
             self._thumb_list_model.clear_all_pixmaps()
             self._update_thumb_display()
             self._schedule_visible_thumbnail_update()
-        if self._all_files:
+        if self._all_files and self._use_preview_cache:
             self._schedule_persistent_thumb_cache_build(self._all_files)
         else:
             self._update_persistent_thumb_progress_widget()
@@ -3976,7 +4880,7 @@ class FileListPanel(QWidget):
                 self._thumb_list_model.clear_all_pixmaps()
                 self._update_thumb_display()
                 self._schedule_visible_thumbnail_update()
-            if self._all_files:
+            if self._all_files and self._use_preview_cache:
                 self._schedule_persistent_thumb_cache_build(self._all_files)
             else:
                 self._update_persistent_thumb_progress_widget()
@@ -4058,7 +4962,11 @@ class FileListPanel(QWidget):
                 float(cache_stats.get("bytes", 0)) / (1024.0 * 1024.0),
             )
 
-        preview_base_dir = self._report_root_dir or self._current_dir
+        preview_base_dir = (
+            _superpicky_cache_root_dir(self._report_root_dir or self._current_dir)
+            if self._use_preview_cache
+            else ""
+        )
         self._thumb_request_token += 1
         loader = ThumbnailLoader(
             self._thumb_size,
@@ -4102,6 +5010,8 @@ class FileListPanel(QWidget):
         self._pending_loaders = [l for l in self._pending_loaders if l.isRunning()]
 
     def _start_metadata_loader(self, paths: list) -> None:
+        start_t0 = perf_counter()
+        self._probe_set_phase("metadata_loader_start", paths=len(paths))
         _log.info(
             "[_start_metadata_loader] START paths=%s report_cache=%s full_report_cache=%s",
             len(paths),
@@ -4127,6 +5037,7 @@ class FileListPanel(QWidget):
         loader.finished.connect(self._on_metadata_loader_finished)
         self._metadata_loader = loader
         loader.start()
+        self._probe_set_phase("metadata_loader_running", paths=len(paths), elapsed_ms=elapsed_ms(start_t0))
         _log.info("[_start_metadata_loader] MetadataLoader started via PhotoMetaDataProxy")
 
     def _stop_metadata_loader(self) -> None:
@@ -4234,9 +5145,66 @@ class FileListPanel(QWidget):
             return
         self._selected_display_path = os.path.normpath(path)
         resolved_path = self._resolve_source_path_for_action(path)
-        if not resolved_path or not os.path.isfile(resolved_path):
+        preview_path = self.resolve_preview_path(path, prefer_fast_preview=True)
+        if (
+            preview_path
+            and resolved_path
+            and _path_key(preview_path) == _path_key(resolved_path)
+        ):
+            preview_path = ""
+        if not preview_path or not os.path.isfile(preview_path):
+            preview_path = self._materialize_current_thumbnail_fast_preview(path)
+        if (not preview_path or not os.path.isfile(preview_path)) and (
+            not resolved_path or not os.path.isfile(resolved_path)
+        ):
             self._request_actual_path_lookup(path)
-        self.file_fast_preview_requested.emit(resolved_path or path)
+        self.file_fast_preview_requested.emit(preview_path or resolved_path or path)
+
+    def _materialize_current_thumbnail_fast_preview(self, path: str) -> str:
+        """把当前缩略图视图中已有的同尺寸缩略图落盘，供方向键快速预览复用。"""
+        norm_path = os.path.normpath(path) if path else ""
+        if not norm_path or self._view_mode != self._MODE_THUMB:
+            return ""
+        idx = self._thumb_index_for_path(norm_path)
+        if not idx.isValid():
+            return ""
+        pixmap = self._thumb_list_model.data(idx, _ThumbPixmapRole)
+        if not isinstance(pixmap, QPixmap) or pixmap.isNull():
+            return ""
+        try:
+            entry_size = int(self._thumb_list_model.data(idx, _ThumbSizeRole) or 0)
+        except Exception:
+            entry_size = 0
+        if entry_size != int(self._thumb_size):
+            return ""
+        source_path = self._get_actual_path_for_display(norm_path) or norm_path
+        preview_base_dir = self._report_root_dir or self._current_dir
+        report_cache = self._report_full_cache or self._report_cache or {}
+        load_target_path = _resolve_thumb_source_path(
+            source_path,
+            report_cache if self._use_preview_cache else {},
+            preview_base_dir,
+        )
+        if not load_target_path or not os.path.isfile(load_target_path):
+            load_target_path = source_path
+        try:
+            mtime = float(os.path.getmtime(load_target_path))
+        except Exception:
+            mtime = 0.0
+        cache_path = _thumb_disk_cache_path(load_target_path, mtime, self._thumb_size)
+        if not cache_path:
+            return ""
+        if os.path.isfile(cache_path):
+            return cache_path
+        if not self._file_writes_allowed("生成预览缩略图"):
+            return ""
+        try:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            if pixmap.save(cache_path, "JPEG", 85):
+                return cache_path
+        except Exception:
+            return ""
+        return ""
 
     def _handle_selection_preview_request(
         self,
@@ -4267,7 +5235,13 @@ class FileListPanel(QWidget):
         self._persistent_thumb_cache_timer = timer
 
     def _hide_persistent_thumb_progress_if_idle(self) -> None:
-        if self._persistent_thumb_cache_worker is not None:
+        if (
+            self._persistent_thumb_cache_worker is not None
+            and (
+                self._persistent_thumb_cache_total <= 0
+                or self._persistent_thumb_cache_done < self._persistent_thumb_cache_total
+            )
+        ):
             return
         if self._persistent_thumb_cache_total > 0 and self._persistent_thumb_cache_done < self._persistent_thumb_cache_total:
             return
@@ -4280,9 +5254,14 @@ class FileListPanel(QWidget):
             self._persistent_thumb_progress.setToolTip("")
             return
         done = min(max(0, int(self._persistent_thumb_cache_done)), total)
-        self._persistent_thumb_progress.setMaximum(max(1, total))
-        self._persistent_thumb_progress.setValue(done)
-        self._persistent_thumb_progress.setFormat(f"小缩略图 {done}/{total}")
+        status_text = self._persistent_thumb_cache_status_text or "生成预览缩略图"
+        if status_text.startswith("正在"):
+            self._persistent_thumb_progress.setRange(0, 0)
+            self._persistent_thumb_progress.setFormat(status_text)
+        else:
+            self._persistent_thumb_progress.setRange(0, max(1, total))
+            self._persistent_thumb_progress.setValue(done)
+            self._persistent_thumb_progress.setFormat(f"{status_text} {done}/{total}")
         sizes = _effective_persistent_thumb_cache_sizes(self._thumb_size)
         cache_dirs = [
             _persistent_thumb_cache_dir(self._persistent_thumb_cache_base_dir, size)
@@ -4305,45 +5284,85 @@ class FileListPanel(QWidget):
         self._persistent_thumb_progress.show()
 
     def _schedule_persistent_thumb_cache_build(self, paths: list[str] | None) -> None:
-        base_dir = self._report_root_dir or self._current_dir
+        if not self._use_preview_cache:
+            self._persistent_thumb_cache_pending_paths = []
+            self._persistent_thumb_cache_base_dir = ""
+            self._persistent_thumb_cache_total = 0
+            self._persistent_thumb_cache_done = 0
+            self._persistent_thumb_cache_current_path = ""
+            self._persistent_thumb_cache_status_text = ""
+            self._update_persistent_thumb_progress_widget()
+            return
+        if not self._file_writes_allowed("生成预览缩略图"):
+            self._stop_persistent_thumb_cache_worker()
+            return
+        base_dir = _superpicky_cache_root_dir(self._report_root_dir or self._current_dir)
         pending_paths = ThumbnailLoader._normalize_unique_paths(paths or [])
+        self._persistent_thumb_cache_focus_priority -= 1
         self._persistent_thumb_cache_pending_paths = pending_paths
         self._persistent_thumb_cache_base_dir = base_dir or ""
+        self._persistent_thumb_cache_pending_priority = self._persistent_thumb_cache_focus_priority
         self._persistent_thumb_cache_generated = 0
         self._persistent_thumb_cache_skipped = 0
         self._persistent_thumb_cache_failed = 0
         self._persistent_thumb_cache_total = len(pending_paths)
         self._persistent_thumb_cache_done = 0
         self._persistent_thumb_cache_current_path = ""
+        self._persistent_thumb_cache_status_text = "正在准备生成缩略图..."
         if not pending_paths or not self._persistent_thumb_cache_base_dir:
+            if pending_paths:
+                _log.info(
+                    "[_schedule_persistent_thumb_cache_build] skip persistent cache: no existing .superpicky root current_dir=%r report_root=%r",
+                    self._current_dir,
+                    self._report_root_dir,
+                )
+            self._persistent_thumb_cache_status_text = ""
             self._update_persistent_thumb_progress_widget()
             return
         self._update_persistent_thumb_progress_widget()
-        self._ensure_persistent_thumb_cache_timer()
-        self._persistent_thumb_cache_timer.start(_PERSISTENT_THUMB_CACHE_START_DELAY_MS)
+        self._start_persistent_thumb_cache_worker()
 
     def _start_persistent_thumb_cache_worker(self) -> None:
         if self._background_shutdown_started:
             return
-        if self._persistent_thumb_cache_worker is not None:
+        if not self._file_writes_allowed("生成预览缩略图"):
+            self._stop_persistent_thumb_cache_worker()
             return
         if not self._persistent_thumb_cache_pending_paths or not self._persistent_thumb_cache_base_dir:
             self._update_persistent_thumb_progress_widget()
             return
-        loader = self._thumbnail_loader
-        if loader is not None and loader.isRunning():
-            snap = loader.profile_snapshot()
-            queue_size = int(snap.get("queue_size", 0))
-            inflight = max(
-                0,
-                int(snap.get("submitted", 0)) - int(snap.get("completed", 0)),
+        existing_worker = self._persistent_thumb_cache_worker
+        if existing_worker is not None and existing_worker.isRunning():
+            self._persistent_thumb_cache_status_text = "生成预览缩略图"
+            added = existing_worker.enqueue_paths(
+                self._persistent_thumb_cache_pending_paths,
+                self._persistent_thumb_cache_base_dir,
+                report_cache=self._report_full_cache or self._report_cache or {},
+                sizes=_effective_persistent_thumb_cache_sizes(self._thumb_size),
+                priority=self._persistent_thumb_cache_pending_priority,
+                replace_focus=True,
             )
-            if queue_size > 0 or inflight > 0:
-                self._persistent_thumb_cache_current_path = "(waiting for visible thumbs)"
-                self._update_persistent_thumb_progress_widget()
-                self._ensure_persistent_thumb_cache_timer()
-                self._persistent_thumb_cache_timer.start(_PERSISTENT_THUMB_CACHE_START_DELAY_MS)
-                return
+            _log.info(
+                "[_start_persistent_thumb_cache_worker] reprioritized existing worker dir=%r total=%s added=%s priority=%s",
+                self._persistent_thumb_cache_base_dir,
+                len(self._persistent_thumb_cache_pending_paths),
+                added,
+                self._persistent_thumb_cache_pending_priority,
+            )
+            self._persistent_thumb_cache_pending_paths = []
+            self._update_persistent_thumb_progress_widget()
+            return
+        if existing_worker is not None:
+            try:
+                existing_worker.progress_updated.disconnect(self._on_persistent_thumb_cache_progress)
+            except Exception:
+                pass
+            try:
+                existing_worker.finished_summary.disconnect(self._on_persistent_thumb_cache_finished)
+            except Exception:
+                pass
+            self._persistent_thumb_cache_worker = None
+        self._persistent_thumb_cache_status_text = "生成预览缩略图"
         worker = PersistentThumbCacheWorker(
             self._persistent_thumb_cache_pending_paths,
             self._persistent_thumb_cache_base_dir,
@@ -4363,6 +5382,7 @@ class FileListPanel(QWidget):
             _effective_persistent_thumb_cache_sizes(self._thumb_size),
             _persistent_thumb_cache_worker_count(),
         )
+        self._persistent_thumb_cache_pending_paths = []
 
     def _stop_persistent_thumb_cache_worker(self) -> None:
         if self._persistent_thumb_cache_timer is not None and self._persistent_thumb_cache_timer.isActive():
@@ -4387,6 +5407,7 @@ class FileListPanel(QWidget):
         self._persistent_thumb_cache_total = 0
         self._persistent_thumb_cache_done = 0
         self._persistent_thumb_cache_current_path = ""
+        self._persistent_thumb_cache_status_text = ""
         self._update_persistent_thumb_progress_widget()
 
     def _on_persistent_thumb_cache_progress(
@@ -4398,6 +5419,10 @@ class FileListPanel(QWidget):
         failed: int,
         current_path: str,
     ) -> None:
+        sender = self.sender()
+        if sender is not None and sender is not self._persistent_thumb_cache_worker:
+            return
+        self._persistent_thumb_cache_status_text = "生成预览缩略图"
         self._persistent_thumb_cache_done = max(0, int(done))
         self._persistent_thumb_cache_total = max(0, int(total))
         self._persistent_thumb_cache_generated = max(0, int(generated))
@@ -4405,6 +5430,8 @@ class FileListPanel(QWidget):
         self._persistent_thumb_cache_failed = max(0, int(failed))
         self._persistent_thumb_cache_current_path = os.path.normpath(current_path) if current_path else ""
         self._update_persistent_thumb_progress_widget()
+        if self._persistent_thumb_cache_total > 0 and self._persistent_thumb_cache_done >= self._persistent_thumb_cache_total:
+            QTimer.singleShot(1500, self._hide_persistent_thumb_progress_if_idle)
 
     def _on_persistent_thumb_cache_finished(
         self,
@@ -4414,13 +5441,22 @@ class FileListPanel(QWidget):
         skipped: int,
         failed: int,
     ) -> None:
+        sender = self.sender()
+        if sender is not None and sender is not self._persistent_thumb_cache_worker:
+            return
         self._persistent_thumb_cache_worker = None
+        self._persistent_thumb_cache_status_text = "生成预览缩略图"
         self._persistent_thumb_cache_done = max(0, int(done))
         self._persistent_thumb_cache_total = max(0, int(total))
         self._persistent_thumb_cache_generated = max(0, int(generated))
         self._persistent_thumb_cache_skipped = max(0, int(skipped))
         self._persistent_thumb_cache_failed = max(0, int(failed))
-        self._persistent_thumb_cache_pending_paths = []
+        if not (
+            self._persistent_thumb_cache_timer is not None
+            and self._persistent_thumb_cache_timer.isActive()
+            and self._persistent_thumb_cache_pending_paths
+        ):
+            self._persistent_thumb_cache_pending_paths = []
         self._update_persistent_thumb_progress_widget()
         QTimer.singleShot(1500, self._hide_persistent_thumb_progress_if_idle)
 
@@ -4459,7 +5495,6 @@ class FileListPanel(QWidget):
         self._stop_pending_meta_apply()
         self._stop_thumbnail_loader()
         self._stop_metadata_loader()
-        self._stop_persistent_thumb_cache_worker()
         self._stop_actual_path_lookup_workers()
 
     def _shutdown_background_work(self) -> None:
@@ -4483,7 +5518,9 @@ class FileListPanel(QWidget):
         active_threads.extend(self._pending_loaders)
 
         self._pause_thumb_model_population()
+        self._pause_tree_model_population()
         self._stop_all_loaders()
+        self._stop_persistent_thumb_cache_worker()
         self._stop_directory_scan_worker()
 
         wait_threads = []
@@ -4538,14 +5575,23 @@ class FileListPanel(QWidget):
         self._meta_apply_loop_started_at = self._meta_apply_started_at
         self._meta_apply_tree_hits = 0
         self._meta_apply_list_hits = 0
-        self._meta_apply_needs_filter = bool(self._filter_pick or self._filter_min_rating > 0 or self._filter_focus_status)
+        self._meta_apply_needs_filter = bool(
+            ((self._filter_edit.text().strip()) if self._filter_edit else "")
+            or self._filter_pick
+            or self._filter_reject
+            or self._filter_min_rating > 0
+            or self._filter_focus_status
+        )
         self._meta_apply_loader_finished = False
         self._set_tree_header_fast_mode(True)
         self._tree_widget.setSortingEnabled(False)
-        self._meta_progress.setMaximum(max(1, self._meta_apply_expected_total))
-        self._meta_progress.setValue(0)
-        self._meta_progress.show()
-        _log.info(
+        self._show_meta_progress_status(
+            "正在读取元数据",
+            value=0,
+            total=self._meta_apply_expected_total,
+        )
+        perf_log(
+            _log,
             "[STAT][_meta_apply] begin tree_items=%s list_items=%s expected_total=%s batch=%s",
             self._tree_source_row_count(),
             self._thumb_row_count(),
@@ -4586,24 +5632,9 @@ class FileListPanel(QWidget):
             return
         hdr = self._tree_widget.header()
         try:
-            if enabled:
-                for col in (
-                    _TREE_COL_TITLE,
-                    _TREE_COL_COLOR,
-                    _TREE_COL_STAR,
-                    _TREE_COL_SHARP,
-                    _TREE_COL_AESTHETIC,
-                    _TREE_COL_FOCUS,
-                    _TREE_COL_SHUTTER,
-                    _TREE_COL_ISO,
-                    _TREE_COL_APERTURE,
-                ):
-                    hdr.setSectionResizeMode(col, _ResizeInteractive)
-                self._tree_header_fast_mode = True
-            else:
-                for col in range(len(_FILE_TABLE_HEADERS)):
-                    hdr.setSectionResizeMode(col, _ResizeInteractive)
-                self._tree_header_fast_mode = False
+            for col in range(len(_FILE_TABLE_HEADERS)):
+                hdr.setSectionResizeMode(col, _ResizeInteractive)
+            self._tree_header_fast_mode = bool(enabled)
         except Exception:
             pass
 
@@ -4655,7 +5686,8 @@ class FileListPanel(QWidget):
     def _flush_meta_filter_refresh(self) -> None:
         if not self._meta_apply_needs_filter:
             return
-        _log.info(
+        perf_log(
+            _log,
             "[STAT][_meta_apply] incremental filter refresh applied=%s queued=%s expected=%s",
             self._meta_apply_index,
             self._meta_apply_total,
@@ -4674,10 +5706,13 @@ class FileListPanel(QWidget):
             return
         self._meta_apply_items.extend(ordered_batch)
         self._meta_apply_total = len(self._meta_apply_items)
-        self._meta_progress.setMaximum(max(1, self._meta_apply_expected_total or self._meta_apply_total))
-        self._meta_progress.setValue(min(self._meta_apply_index, self._meta_progress.maximum()))
-        self._meta_progress.show()
-        _log.info(
+        self._show_meta_progress_status(
+            "正在读取元数据",
+            value=self._meta_apply_index,
+            total=self._meta_apply_expected_total or self._meta_apply_total,
+        )
+        perf_log(
+            _log,
             "[STAT][_meta_apply] enqueue batch=%s queued_total=%s applied=%s expected=%s",
             len(ordered_batch),
             self._meta_apply_total,
@@ -4692,7 +5727,7 @@ class FileListPanel(QWidget):
         if self._meta_filter_refresh_timer is not None and self._meta_filter_refresh_timer.isActive():
             self._meta_filter_refresh_timer.stop()
         sort_t0 = _time.perf_counter()
-        _log.info("[STAT][_meta_apply] enabling tree sorting")
+        perf_log(_log, "[STAT][_meta_apply] enabling tree sorting")
         self._set_tree_header_fast_mode(False)
         self._tree_widget.setSortingEnabled(True)
         self._apply_tree_sort(
@@ -4702,25 +5737,30 @@ class FileListPanel(QWidget):
         )
         self._refresh_tree_row_numbers()
         self._replay_selection_visibility_restore("finish_meta_apply.sort")
-        _log.info("[STAT][_meta_apply] tree sorting enabled elapsed=%.3fs", _time.perf_counter() - sort_t0)
+        perf_log(_log, "[STAT][_meta_apply] tree sorting enabled elapsed=%.3fs", _time.perf_counter() - sort_t0)
 
         if self._view_mode == self._MODE_THUMB:
             paint_t0 = _time.perf_counter()
             self._list_widget.viewport().update()
             self._invalidate_visible_thumbnail_signature()
             self._schedule_visible_thumbnail_update()
-            _log.info("[STAT][_meta_apply] list viewport updated elapsed=%.3fs", _time.perf_counter() - paint_t0)
+            perf_log(_log, "[STAT][_meta_apply] list viewport updated elapsed=%.3fs", _time.perf_counter() - paint_t0)
 
         if self._meta_apply_needs_filter:
             _log.info("[_meta_apply] final _apply_filter")
             filter_t0 = _time.perf_counter()
             self._apply_filter()
-            _log.info("[STAT][_meta_apply] _apply_filter elapsed=%.3fs", _time.perf_counter() - filter_t0)
+            perf_log(_log, "[STAT][_meta_apply] _apply_filter elapsed=%.3fs", _time.perf_counter() - filter_t0)
 
-        self._meta_progress.setValue(self._meta_progress.maximum())
+        self._show_meta_progress_status(
+            "正在读取元数据",
+            value=self._meta_progress.maximum(),
+            total=self._meta_progress.maximum(),
+        )
         QTimer.singleShot(400, self._meta_progress.hide)
         elapsed = (_time.perf_counter() - self._meta_apply_started_at) if self._meta_apply_started_at > 0 else 0.0
-        _log.info(
+        perf_log(
+            _log,
             "[STAT][_meta_apply] total elapsed=%.3fs applied=%s queued_total=%s expected=%s",
             elapsed,
             self._meta_apply_index,
@@ -4762,9 +5802,14 @@ class FileListPanel(QWidget):
 
         end = i
         self._meta_apply_index = end
-        self._meta_progress.setValue(min(end, self._meta_progress.maximum()))
+        self._show_meta_progress_status(
+            "正在读取元数据",
+            value=end,
+            total=self._meta_progress.maximum(),
+        )
         if end % 1000 == 0 or end >= total:
-            _log.info(
+            perf_log(
+                _log,
                 "[STAT][_meta_apply] apply_meta progress=%s/%s tree_hits=%s list_hits=%s expected=%s elapsed=%.3fs",
                 end,
                 total,
@@ -4775,7 +5820,8 @@ class FileListPanel(QWidget):
             )
 
         if end >= total:
-            _log.info(
+            perf_log(
+                _log,
                 "[STAT][_meta_apply] apply_meta drained tree_hits=%s list_hits=%s loader_finished=%s elapsed=%.3fs",
                 self._meta_apply_tree_hits,
                 self._meta_apply_list_hits,
@@ -4893,8 +5939,11 @@ class FileListPanel(QWidget):
         if total <= 0:
             return
         self._meta_apply_expected_total = max(self._meta_apply_expected_total, int(total))
-        self._meta_progress.setMaximum(max(1, self._meta_apply_expected_total))
-        self._meta_progress.setValue(min(self._meta_apply_index, self._meta_progress.maximum()))
+        self._show_meta_progress_status(
+            "正在读取元数据",
+            value=self._meta_apply_index,
+            total=self._meta_apply_expected_total,
+        )
         _log.debug(
             "[_on_metadata_progress] loaded=%s/%s applied=%s queued=%s",
             current,
@@ -4909,43 +5958,36 @@ class FileListPanel(QWidget):
         t0 = _time.perf_counter()
         total = len(meta_dict)
         self._meta_cache.update(meta_dict)
-        title_cnt = 0
-        color_cnt = 0
+        comment_cnt = 0
+        tag_cnt = 0
         rating_pos_cnt = 0
-        city_cnt = 0
-        state_cnt = 0
-        country_cnt = 0
-        for m in meta_dict.values():
-            try:
-                if str(m.get("title", "")).strip():
-                    title_cnt += 1
-                if str(m.get("color", "")).strip():
-                    color_cnt += 1
-                if int(float(str(m.get("rating", 0) or 0))) > 0:
-                    rating_pos_cnt += 1
-                if str(m.get("city", "")).strip():
-                    city_cnt += 1
-                if str(m.get("state", "")).strip():
-                    state_cnt += 1
-                if str(m.get("country", "")).strip():
-                    country_cnt += 1
-            except Exception:
-                pass
-        _log.info(
+        should_log_probe = perf_probes_enabled()
+        if should_log_probe:
+            for m in meta_dict.values():
+                try:
+                    if _metadata_comment_from_meta(m):
+                        comment_cnt += 1
+                    if _metadata_tags_from_meta(m):
+                        tag_cnt += 1
+                    if int(float(str(m.get("rating", 0) or 0))) > 0:
+                        rating_pos_cnt += 1
+                except Exception:
+                    pass
+        perf_log(
+            _log,
             "[STAT][_on_metadata_batch_ready] meta_cache updated entries=%s cache_size=%s elapsed=%.3fs",
             total,
             len(self._meta_cache),
             _time.perf_counter() - t0,
         )
-        _log.info(
-            "[STAT][_on_metadata_batch_ready] richness title=%s color=%s rating>0=%s city=%s state=%s country=%s",
-            title_cnt,
-            color_cnt,
-            rating_pos_cnt,
-            city_cnt,
-            state_cnt,
-            country_cnt,
-        )
+        if should_log_probe:
+            perf_log(
+                _log,
+                "[STAT][_on_metadata_batch_ready] richness comment=%s tags=%s rating>0=%s",
+                comment_cnt,
+                tag_cnt,
+                rating_pos_cnt,
+            )
         self._enqueue_meta_apply(meta_dict)
 
     def _on_metadata_focus_cache_batch_ready(self, focus_dict: dict) -> None:
@@ -4963,6 +6005,12 @@ class FileListPanel(QWidget):
             return
         self._metadata_loader = None
         self._meta_apply_loader_finished = True
+        self._probe_log(
+            "metadata_loader_finished",
+            applied=self._meta_apply_index,
+            queued=self._meta_apply_total,
+            expected=self._meta_apply_expected_total,
+        )
         _log.info(
             "[_on_metadata_loader_finished] loader finished applied=%s queued_total=%s expected=%s",
             self._meta_apply_index,
@@ -4974,20 +6022,49 @@ class FileListPanel(QWidget):
 
     def _emit_file_selected_for_path(self, path: str) -> None:
         """更新当前显示路径并发出 file_selected，供点击与键盘选择共用。"""
+        t0 = _time.perf_counter()
+        probe_t0 = perf_counter()
         if not path:
             return
         self._selected_display_path = os.path.normpath(path)
+        status_t0 = _time.perf_counter()
         self._update_selection_status()
+        status_ms = (_time.perf_counter() - status_t0) * 1000.0
+        resolve_t0 = _time.perf_counter()
         resolved_path = self._resolve_source_path_for_action(path)
         if not resolved_path or not os.path.isfile(resolved_path):
             self._request_actual_path_lookup(path)
+        resolve_ms = (_time.perf_counter() - resolve_t0) * 1000.0
         _log.info(
             "[_emit_file_selected_for_path] source=%r resolved=%r exists=%s",
             path,
             resolved_path,
             os.path.isfile(resolved_path) if resolved_path else False,
         )
+        emit_t0 = _time.perf_counter()
         self.file_selected.emit(resolved_path or path)
+        emit_ms = (_time.perf_counter() - emit_t0) * 1000.0
+        perf_log(
+            _log,
+            "[PERF][image_switch][FileListPanel.emit_file_selected] source=%r resolved=%r status_ms=%.1f resolve_ms=%.1f emit_slots_ms=%.1f total_ms=%.1f",
+            path,
+            resolved_path or path,
+            status_ms,
+            resolve_ms,
+            emit_ms,
+            (_time.perf_counter() - t0) * 1000.0,
+        )
+        perf_log(
+            _log,
+            "[image.select] source=%r resolved=%r exists=%s status_ms=%.1f resolve_ms=%.1f emit_slots_ms=%.1f total_ms=%.1f",
+            path,
+            resolved_path or path,
+            os.path.isfile(resolved_path) if resolved_path else False,
+            status_ms,
+            resolve_ms,
+            emit_ms,
+            elapsed_ms(probe_t0),
+        )
 
     def _on_tree_item_clicked(self, index) -> None:
         path = self._tree_path_from_index(index)
@@ -5013,49 +6090,128 @@ class FileListPanel(QWidget):
         if path:
             self._handle_selection_preview_request(path)
 
-    def _copy_paths_to_clipboard(self, paths: list) -> None:
-        """将本地文件路径写入剪贴板；若存在同名 XMP sidecar 也一并复制。"""
-        expanded_paths: list[str] = []
+    def _collect_file_clipboard_entries(self, paths: list) -> list[dict[str, str]]:
+        """收集主文件与 sidecar 配对，供复制/剪切/粘贴复用。"""
+        entries: list[dict[str, str]] = []
         seen: set[str] = set()
-
         for p in paths:
             if not p:
                 continue
             abs_path = self._resolve_source_path_for_action(p)
             source_exists = bool(abs_path and os.path.isfile(abs_path))
-            if source_exists:
-                abs_path = os.path.abspath(abs_path)
-                norm_key = os.path.normcase(os.path.normpath(abs_path))
-                if norm_key not in seen:
-                    expanded_paths.append(abs_path)
-                    seen.add(norm_key)
+            if not source_exists:
+                _log.info("[_collect_file_clipboard_entries] source=%r resolved=%r reason=missing", p, abs_path)
+                continue
+            abs_path = os.path.abspath(abs_path)
+            norm_key = os.path.normcase(os.path.normpath(abs_path))
+            if norm_key in seen:
+                continue
+            seen.add(norm_key)
 
-            # 同步带上 sidecar（如 IMG_0001.CR3 -> IMG_0001.xmp）
-            xmp_path = self._resolve_sidecar_path(p)
-            xmp_exists = bool(xmp_path and os.path.isfile(xmp_path))
-            if xmp_exists:
-                abs_xmp = os.path.abspath(xmp_path)
-                xmp_key = os.path.normcase(os.path.normpath(abs_xmp))
-                if xmp_key not in seen:
-                    expanded_paths.append(abs_xmp)
-                    seen.add(xmp_key)
+            sidecars = self._metadata_sidecars_for_source_path(p, abs_path)
+            entries.append({"source": abs_path, "sidecar": sidecars[0] if sidecars else "", "sidecars": sidecars})
             _log.info(
-                "[_copy_paths_to_clipboard] source=%r resolved_source=%r source_exists=%s xmp_path=%r xmp_exists=%s",
+                "[_collect_file_clipboard_entries] source=%r resolved_source=%r source_exists=%s sidecars=%s",
                 p,
                 abs_path,
                 source_exists,
-                xmp_path,
-                xmp_exists,
+                sidecars,
             )
+        return entries
+
+    def _metadata_sidecars_for_source_path(self, display_path: str, source_path: str) -> list[str]:
+        sidecars: list[str] = []
+        seen: set[str] = set()
+
+        def add(path: str | None) -> None:
+            if not path or not os.path.isfile(path):
+                return
+            abs_path = os.path.abspath(path)
+            key = os.path.normcase(os.path.normpath(abs_path))
+            if key in seen:
+                return
+            seen.add(key)
+            sidecars.append(abs_path)
+
+        add(self._resolve_sidecar_path(display_path))
+        return sidecars
+
+    @staticmethod
+    def _sidecar_paths_from_clipboard_entry(entry: dict) -> list[str]:
+        sidecars: list[str] = []
+        seen: set[str] = set()
+
+        def add(path) -> None:
+            path_text = str(path or "").strip()
+            if not path_text:
+                return
+            norm_key = os.path.normcase(os.path.normpath(path_text))
+            if norm_key in seen:
+                return
+            seen.add(norm_key)
+            sidecars.append(path_text)
+
+        raw_sidecars = (entry or {}).get("sidecars")
+        if isinstance(raw_sidecars, list):
+            for path in raw_sidecars:
+                add(path)
+        add((entry or {}).get("sidecar"))
+        return sidecars
+
+    @staticmethod
+    def _expanded_paths_from_clipboard_entries(entries: list[dict[str, str]]) -> list[str]:
+        expanded_paths: list[str] = []
+        seen: set[str] = set()
+        for entry in entries or []:
+            paths = [str((entry or {}).get("source") or "").strip()]
+            paths.extend(FileListPanel._sidecar_paths_from_clipboard_entry(entry or {}))
+            for path in paths:
+                if not path:
+                    continue
+                norm_key = os.path.normcase(os.path.normpath(path))
+                if norm_key in seen:
+                    continue
+                seen.add(norm_key)
+                expanded_paths.append(path)
+        return expanded_paths
+
+    def _set_file_clipboard(self, entries: list[dict[str, str]], *, action: str) -> None:
+        expanded_paths = self._expanded_paths_from_clipboard_entries(entries)
 
         if not expanded_paths:
-            _log.info("[_copy_paths_to_clipboard] nothing_to_copy input=%s", len(paths))
+            _log.info("[_set_file_clipboard] nothing_to_clipboard action=%r entries=%s", action, len(entries or []))
             return
         mime = QMimeData()
         mime.setUrls([QUrl.fromLocalFile(p) for p in expanded_paths])
         mime.setText("\n".join(expanded_paths))
+        try:
+            mime.setData(_FILE_CLIPBOARD_ACTION_MIME, str(action or "copy").encode("utf-8"))
+            mime.setData(
+                _FILE_CLIPBOARD_ENTRIES_MIME,
+                json.dumps(entries, ensure_ascii=False).encode("utf-8"),
+            )
+        except Exception as exc:
+            _log.warning("[_set_file_clipboard] custom mime failed action=%r: %s", action, exc)
         QApplication.clipboard().setMimeData(mime)
-        _log.info("[_copy_paths_to_clipboard] platform=%r copied=%s", sys.platform, expanded_paths)
+        _log.info("[_set_file_clipboard] platform=%r action=%r paths=%s", sys.platform, action, expanded_paths)
+
+    def _copy_paths_to_clipboard(self, paths: list) -> None:
+        """将本地文件路径写入剪贴板；若存在同名 XMP sidecar 也一并复制。"""
+        entries = self._collect_file_clipboard_entries(paths)
+        if not entries:
+            _log.info("[_copy_paths_to_clipboard] nothing_to_copy input=%s", len(paths))
+            return
+        self._set_file_clipboard(entries, action="copy")
+
+    def _cut_paths_to_clipboard(self, paths: list) -> None:
+        """将本地文件路径写入剪贴板并标记为剪切；sidecar 会跟随主文件。"""
+        if not self._file_operation_paths_allowed(paths, "剪切", warn=True):
+            return
+        entries = self._collect_file_clipboard_entries(paths)
+        if not entries:
+            _log.info("[_cut_paths_to_clipboard] nothing_to_cut input=%s", len(paths))
+            return
+        self._set_file_clipboard(entries, action="cut")
 
     def _copy_filenames_to_clipboard(self, paths: list[str]) -> None:
         """Copy file full paths as plain text, one per line, without sidecars."""
@@ -5086,18 +6242,342 @@ class FileListPanel(QWidget):
         QApplication.clipboard().setText("\n".join(copied_paths))
         _log.info("[_copy_filenames_to_clipboard] platform=%r copied=%s", sys.platform, copied_paths)
 
+    def _clipboard_file_payload(self) -> tuple[str, list[dict[str, str]]]:
+        """读取剪贴板文件 payload；内部剪切/复制优先，外部 URL 作为复制处理。"""
+        mime = QApplication.clipboard().mimeData()
+        if mime is None:
+            return "copy", []
+        action = "copy"
+        entries: list[dict[str, str]] = []
+        try:
+            if mime.hasFormat(_FILE_CLIPBOARD_ACTION_MIME):
+                raw_action = bytes(mime.data(_FILE_CLIPBOARD_ACTION_MIME)).decode("utf-8", errors="replace").strip().lower()
+                if raw_action in ("copy", "cut"):
+                    action = raw_action
+            if mime.hasFormat(_FILE_CLIPBOARD_ENTRIES_MIME):
+                raw_entries = bytes(mime.data(_FILE_CLIPBOARD_ENTRIES_MIME)).decode("utf-8", errors="replace")
+                decoded = json.loads(raw_entries)
+                if isinstance(decoded, list):
+                    for item in decoded:
+                        if not isinstance(item, dict):
+                            continue
+                        source = os.path.abspath(str(item.get("source") or ""))
+                        sidecars = [
+                            os.path.abspath(path)
+                            for path in self._sidecar_paths_from_clipboard_entry(item)
+                            if path and os.path.isfile(path)
+                        ]
+                        if source and os.path.isfile(source):
+                            entries.append({"source": source, "sidecar": sidecars[0] if sidecars else "", "sidecars": sidecars})
+                    if entries:
+                        return action, entries
+        except Exception as exc:
+            _log.warning("[_clipboard_file_payload] custom payload parse failed: %s", exc)
+
+        url_paths: list[str] = []
+        try:
+            for url in mime.urls() if mime.hasUrls() else []:
+                if not url.isLocalFile():
+                    continue
+                path = os.path.abspath(url.toLocalFile())
+                if os.path.isfile(path):
+                    url_paths.append(path)
+        except Exception:
+            url_paths = []
+        return "copy", self._clipboard_entries_from_urls(url_paths)
+
+    @staticmethod
+    def _clipboard_entries_from_urls(paths: list[str]) -> list[dict[str, str]]:
+        """将外部文件 URL 尽量按主文件 + metadata sidecars 配对。"""
+        norm_paths: list[str] = []
+        seen: set[str] = set()
+        for path in paths or []:
+            if not path:
+                continue
+            abs_path = os.path.abspath(path)
+            key = os.path.normcase(os.path.normpath(abs_path))
+            if key in seen or not os.path.isfile(abs_path):
+                continue
+            seen.add(key)
+            norm_paths.append(abs_path)
+
+        xmp_by_stem: dict[tuple[str, str], str] = {}
+        for path in norm_paths:
+            parent_key = os.path.normcase(os.path.dirname(path))
+            if Path(path).suffix.lower() == ".xmp":
+                xmp_by_stem[(parent_key, Path(path).stem)] = path
+
+        paired_sidecars: set[str] = set()
+        entries: list[dict[str, str]] = []
+        for path in norm_paths:
+            if Path(path).suffix.lower() == ".xmp":
+                continue
+            parent_key = os.path.normcase(os.path.dirname(path))
+            sidecars = []
+            xmp_sidecar = xmp_by_stem.get((parent_key, Path(path).stem), "")
+            for sidecar in (xmp_sidecar,):
+                if not sidecar:
+                    continue
+                paired_sidecars.add(os.path.normcase(os.path.normpath(sidecar)))
+                sidecars.append(sidecar)
+            entries.append({"source": path, "sidecar": sidecars[0] if sidecars else "", "sidecars": sidecars})
+
+        for path in norm_paths:
+            key = os.path.normcase(os.path.normpath(path))
+            is_sidecar = Path(path).suffix.lower() == ".xmp"
+            if is_sidecar and key not in paired_sidecars:
+                entries.append({"source": path, "sidecar": "", "sidecars": []})
+        return entries
+
+    def _can_paste_files_from_clipboard(self) -> bool:
+        dest_dir = self.get_current_dir()
+        if not dest_dir or not os.path.isdir(dest_dir):
+            return False
+        if not self._file_writes_allowed("粘贴"):
+            return False
+        action, entries = self._clipboard_file_payload()
+        if action == "cut":
+            source_paths = [str(entry.get("source") or "") for entry in entries]
+            if source_paths and not self.file_operation_paths_allowed(source_paths):
+                return False
+        return bool(entries)
+
+    @staticmethod
+    def _same_file_path(path_a: str, path_b: str) -> bool:
+        if not path_a or not path_b:
+            return False
+        try:
+            return os.path.samefile(path_a, path_b)
+        except Exception:
+            return os.path.normcase(os.path.normpath(path_a)) == os.path.normcase(os.path.normpath(path_b))
+
+    @staticmethod
+    def _sidecar_destination_for_paste(source_path: str, dest_source: str, sidecar_path: str) -> str:
+        source_abs = os.path.normpath(os.path.abspath(source_path))
+        sidecar_abs = os.path.normpath(os.path.abspath(sidecar_path))
+        source_base, _source_suffix = os.path.splitext(source_abs)
+        if os.path.normcase(sidecar_abs) == os.path.normcase(source_base + ".xmp"):
+            dest_base, _dest_suffix = os.path.splitext(dest_source)
+            return os.path.normpath(dest_base + os.path.splitext(sidecar_abs)[1])
+        return os.path.normpath(os.path.join(os.path.dirname(dest_source), os.path.basename(sidecar_abs)))
+
+    def _unique_paste_destinations(
+        self,
+        source_path: str,
+        sidecar_paths: list[str],
+        dest_dir: str,
+        *,
+        action: str,
+    ) -> tuple[str, list[str]]:
+        """计算主文件和 sidecar 的目标路径，避免覆盖并保持 sidecar 跟随主文件名。"""
+        source = Path(source_path)
+        base_stem = source.stem
+        suffix = source.suffix
+
+        for i in range(0, 10000):
+            if i == 0:
+                stem = base_stem
+            elif action == "copy":
+                stem = f"{base_stem} copy" if i == 1 else f"{base_stem} copy {i}"
+            else:
+                stem = f"{base_stem} {i}"
+            dest_source = os.path.normpath(os.path.join(dest_dir, f"{stem}{suffix}"))
+            dest_sidecars = [
+                self._sidecar_destination_for_paste(source_path, dest_source, sidecar_path)
+                for sidecar_path in sidecar_paths
+            ]
+
+            source_conflict = os.path.exists(dest_source) and not (
+                action == "cut" and self._same_file_path(source_path, dest_source)
+            )
+            sidecar_conflict = False
+            candidate_keys = {os.path.normcase(os.path.normpath(dest_source))}
+            for sidecar_path, dest_sidecar in zip(sidecar_paths, dest_sidecars):
+                key = os.path.normcase(os.path.normpath(dest_sidecar))
+                if key in candidate_keys:
+                    sidecar_conflict = True
+                    break
+                candidate_keys.add(key)
+                if os.path.exists(dest_sidecar) and not (
+                    action == "cut" and self._same_file_path(sidecar_path, dest_sidecar)
+                ):
+                    sidecar_conflict = True
+                    break
+            if not source_conflict and not sidecar_conflict:
+                return dest_source, dest_sidecars
+        raise RuntimeError(f"无法为 {source.name} 生成不冲突的目标文件名。")
+
+    def _paste_clipboard_to_current_dir(self) -> None:
+        """将剪贴板中的文件粘贴到当前目录；内部剪切会移动，复制会复制。"""
+        if not self._file_writes_allowed("粘贴", warn=True):
+            return
+        dest_dir = self.get_current_dir()
+        if not dest_dir or not os.path.isdir(dest_dir):
+            _log.info("[_paste_clipboard_to_current_dir] skip reason=no_current_dir dir=%r", dest_dir)
+            return
+        action, entries = self._clipboard_file_payload()
+        if not entries:
+            _log.info("[_paste_clipboard_to_current_dir] skip reason=no_clipboard_files")
+            return
+        if action == "cut":
+            source_paths = [str(entry.get("source") or "") for entry in entries]
+            if source_paths and not self._file_operation_paths_allowed(source_paths, "剪切粘贴", warn=True):
+                return
+
+        pasted_sources: list[str] = []
+        touched_paths: list[str] = []
+        failures: list[str] = []
+        for entry in entries:
+            source_path = os.path.abspath(str(entry.get("source") or ""))
+            sidecar_paths = [
+                os.path.abspath(path)
+                for path in self._sidecar_paths_from_clipboard_entry(entry)
+                if path and os.path.isfile(path)
+            ]
+            if not source_path or not os.path.isfile(source_path):
+                failures.append(source_path or "(empty)")
+                continue
+            try:
+                dest_source, dest_sidecars = self._unique_paste_destinations(
+                    source_path,
+                    sidecar_paths,
+                    dest_dir,
+                    action=action,
+                )
+                if action == "cut":
+                    if not self._same_file_path(source_path, dest_source):
+                        shutil.move(source_path, dest_source)
+                        touched_paths.extend([source_path, dest_source])
+                    for sidecar_path, dest_sidecar in zip(sidecar_paths, dest_sidecars):
+                        if not self._same_file_path(sidecar_path, dest_sidecar):
+                            shutil.move(sidecar_path, dest_sidecar)
+                            touched_paths.extend([sidecar_path, dest_sidecar])
+                else:
+                    shutil.copy2(source_path, dest_source)
+                    touched_paths.extend([dest_source])
+                    for sidecar_path, dest_sidecar in zip(sidecar_paths, dest_sidecars):
+                        shutil.copy2(sidecar_path, dest_sidecar)
+                        touched_paths.extend([dest_sidecar])
+                pasted_sources.append(dest_source)
+                _log.info(
+                    "[_paste_clipboard_to_current_dir] action=%r source=%r sidecars=%s dest=%r dest_sidecars=%s",
+                    action,
+                    source_path,
+                    sidecar_paths,
+                    dest_source,
+                    dest_sidecars,
+                )
+            except Exception as exc:
+                _log.warning(
+                    "[_paste_clipboard_to_current_dir] action=%r source=%r sidecars=%s failed: %s",
+                    action,
+                    source_path,
+                    sidecar_paths,
+                    exc,
+                )
+                failures.append(source_path)
+
+        if touched_paths:
+            try:
+                from app_common.exif_io.writer import invalidate_metadata_cache
+                invalidate_metadata_cache(touched_paths)
+            except Exception:
+                pass
+        if action == "cut" and pasted_sources and not failures:
+            try:
+                QApplication.clipboard().clear()
+            except Exception:
+                pass
+        if pasted_sources:
+            self.load_directory(dest_dir, force_reload=True)
+            self.set_pending_selection(pasted_sources, current_path=pasted_sources[0], apply_immediately=True)
+        _log.info(
+            "[_paste_clipboard_to_current_dir] action=%r pasted=%s failed=%s dest_dir=%r",
+            action,
+            len(pasted_sources),
+            len(failures),
+            dest_dir,
+        )
+
+    def _add_file_clipboard_menu_actions(self, menu: QMenu, paths: list[str]) -> None:
+        act_copy = menu.addAction("复制")
+        _apply_context_menu_shortcut(act_copy, _platform_copy_key_sequence())
+        act_copy.triggered.connect(lambda checked=False, p=list(paths or []): self._copy_paths_to_clipboard(p))
+
+        act_cut = menu.addAction("剪切")
+        _apply_context_menu_shortcut(act_cut, _platform_cut_key_sequence())
+        writes_allowed = self._file_operation_paths_allowed(paths, "剪切")
+        act_cut.setEnabled(bool(paths) and writes_allowed)
+        if not writes_allowed:
+            mark_write_action_disabled(act_cut, self.file_operation_paths_disabled_tooltip(paths, "剪切"))
+        act_cut.triggered.connect(lambda checked=False, p=list(paths or []): self._cut_paths_to_clipboard(p))
+
+        act_paste = menu.addAction("粘贴到当前目录")
+        _apply_context_menu_shortcut(act_paste, _platform_paste_key_sequence())
+        paste_action, paste_entries = self._clipboard_file_payload()
+        can_paste = self._can_paste_files_from_clipboard()
+        act_paste.setEnabled(can_paste)
+        if not can_paste and paste_entries:
+            if not self.file_writes_allowed():
+                mark_write_action_disabled(act_paste, self.file_writes_disabled_tooltip("粘贴"))
+            elif paste_action == "cut":
+                paste_sources = [str(entry.get("source") or "") for entry in paste_entries]
+                if not self.file_operation_paths_allowed(paste_sources):
+                    mark_write_action_disabled(
+                        act_paste,
+                        self.file_operation_paths_disabled_tooltip(paste_sources, "剪切粘贴"),
+                    )
+        act_paste.triggered.connect(lambda checked=False: self._paste_clipboard_to_current_dir())
+
+    def _show_empty_file_context_menu(self, viewport, pos) -> bool:
+        """空目录/空白区域右键时，只要剪贴板可粘贴就显示粘贴菜单。"""
+        dest_dir = self.get_current_dir()
+        if not dest_dir or not os.path.isdir(dest_dir):
+            return False
+        action, entries = self._clipboard_file_payload()
+        if not entries:
+            return False
+        menu = QMenu(self)
+        act_paste = menu.addAction("粘贴到当前目录")
+        _apply_context_menu_shortcut(act_paste, _platform_paste_key_sequence())
+        writes_allowed = self._file_writes_allowed("粘贴")
+        if writes_allowed and action == "cut":
+            source_paths = [str(entry.get("source") or "") for entry in entries]
+            writes_allowed = self.file_operation_paths_allowed(source_paths)
+        act_paste.setEnabled(writes_allowed)
+        if not writes_allowed:
+            if not self.file_writes_allowed():
+                tooltip = self.file_writes_disabled_tooltip("粘贴")
+            elif action == "cut":
+                source_paths = [str(entry.get("source") or "") for entry in entries]
+                tooltip = self.file_operation_paths_disabled_tooltip(source_paths, "剪切粘贴")
+            else:
+                tooltip = self.file_writes_disabled_tooltip("粘贴")
+            mark_write_action_disabled(act_paste, tooltip)
+        act_paste.triggered.connect(lambda checked=False: self._paste_clipboard_to_current_dir())
+        _exec_menu(menu, viewport.mapToGlobal(pos))
+        return True
+
     def _add_send_to_external_app_actions(self, menu: QMenu, paths: list[str]) -> None:
-        """在右键菜单中平铺加入「发送到外部应用」各项，使用当前选中的文件列表。无配置时显示灰色提示项。"""
+        """在右键菜单中加入「发送到其它应用」子菜单，使用当前选中的文件列表。"""
+        send_menu = menu.addMenu("发送到其它应用")
         apps = get_external_apps()
         if not apps:
-            hint = menu.addAction("请在「文件 → 外部应用设置」中添加应用")
+            hint = send_menu.addAction("请在「文件 → 外部应用设置」中添加应用")
             hint.setEnabled(False)
             return
         base_dir = self.get_current_dir() or ""
+        selected_paths = list(paths or [])
         for app in apps:
-            name = f"发送到：{(app.get('name') or app.get('path') or '未命名').strip()}"
-            act = menu.addAction(name)
-            act.triggered.connect(lambda checked=False, a=app, p=paths: send_files_to_app(p, a, base_directory=base_dir))
+            name = (app.get("name") or app.get("path") or "未命名").strip()
+            act = send_menu.addAction(name)
+            act.triggered.connect(
+                lambda checked=False, a=app, p=selected_paths: send_files_to_app(
+                    p,
+                    a,
+                    base_directory=base_dir,
+                )
+            )
 
     def _add_species_menu_actions(self, menu: QMenu, primary_path: str | None, paths: list[str]) -> None:
         source_path = primary_path or (paths[0] if paths else "")
@@ -5108,8 +6588,19 @@ class FileListPanel(QWidget):
             act_copy_species.triggered.connect(lambda: self._copy_species_from_path(source_path))
 
         act_paste_species = menu.addAction(self._get_paste_species_action_text())
-        can_paste = getattr(self, "_copied_species_payload", None) is not None and bool(paths) and bool(self._report_root_dir or self._current_dir)
+        writes_allowed = self._file_writes_allowed("粘贴鸟种名称")
+        can_paste = (
+            writes_allowed
+            and getattr(self, "_copied_species_payload", None) is not None
+            and bool(paths)
+            and bool(self._report_root_dir or self._current_dir)
+        )
         act_paste_species.setEnabled(can_paste)
+        if not writes_allowed:
+            mark_write_action_disabled(
+                act_paste_species,
+                self.file_writes_disabled_tooltip("粘贴鸟种名称"),
+            )
         if can_paste:
             act_paste_species.triggered.connect(lambda: self._paste_species_to_paths(paths))
 
@@ -5126,7 +6617,7 @@ class FileListPanel(QWidget):
             act_preview.triggered.connect(lambda checked=False, p=sized_preview_path: reveal_in_file_manager(p))
 
         selected_preview_path = self._resolve_existing_selected_preview_image_path(source_path or "")
-        act_selected_preview = menu.addAction("浏览选鸟预览图像")
+        act_selected_preview = menu.addAction("浏览预览图像")
         act_selected_preview.setEnabled(bool(selected_preview_path))
         if selected_preview_path:
             _log.info(
@@ -5152,16 +6643,20 @@ class FileListPanel(QWidget):
             if p:
                 paths = [p]
         if not paths:
+            if self._show_empty_file_context_menu(self._tree_widget.viewport(), pos):
+                return
             return
         menu = QMenu(self)
-        act_copy = menu.addAction("复制")
-        act_copy.triggered.connect(lambda: self._copy_paths_to_clipboard(paths))
-        act_copy_filename = menu.addAction("复制文件名")
+        self._add_file_clipboard_menu_actions(menu, paths)
+        act_copy_filename = menu.addAction("复制文件全路径")
         act_copy_filename.triggered.connect(lambda: self._copy_filenames_to_clipboard(paths))
         self._add_rating_menu_actions(menu, paths)
         menu.addSeparator()
-        self._add_species_menu_actions(menu, self._tree_path_from_index(index) if index.isValid() else (paths[0] if paths else ""), paths)
+        #self._add_species_menu_actions(menu, self._tree_path_from_index(index) if index.isValid() else (paths[0] if paths else ""), paths)
+
+        self._add_photo_tag_menu_actions(menu, paths)
         menu.addSeparator()
+
         self._add_send_to_external_app_actions(menu, paths)
         menu.addSeparator()
         label = "在Finder中显示" if sys.platform == "darwin" else "在资源管理器中显示"
@@ -5171,9 +6666,9 @@ class FileListPanel(QWidget):
             _log.info("[_on_tree_context_menu] reveal_path=%r paths=%s", reveal_path, len(paths))
             act_reveal = menu.addAction(label)
             act_reveal.triggered.connect(lambda: reveal_in_file_manager(reveal_path))
-        self._add_browse_preview_menu_action(menu, primary_path)
-        menu.addSeparator()
-        self._add_delete_menu_action(menu, paths)
+        # self._add_browse_preview_menu_action(menu, primary_path)
+        # menu.addSeparator()
+        # self._add_delete_menu_action(menu, paths)
         _exec_menu(menu, self._tree_widget.viewport().mapToGlobal(pos))
 
     def _collect_report_filenames_for_paths(self, paths: list[str]) -> list[str]:
@@ -5205,7 +6700,6 @@ class FileListPanel(QWidget):
                 for path, row in self._report_row_by_path.items()
                 if str((row or {}).get("filename") or Path(path).stem or "").strip() not in filename_set
             }
-        self._meta_proxy.report_db.update_cache(self._report_full_cache or self._report_cache)
         _log.info(
             "[_remove_report_cache_entries_for_filenames] removed=%s full_cache=%s selected_cache=%s path_map=%s",
             len(filename_set),
@@ -5215,6 +6709,11 @@ class FileListPanel(QWidget):
         )
 
     def _delete_report_rows_for_paths(self, paths: list[str]) -> int:
+        if not self._file_writes_allowed("删除 report.db 记录"):
+            return 0
+        if not self._use_report_db:
+            _log.info("[_delete_report_rows_for_paths] skip reason=report_db_disabled")
+            return 0
         filenames = self._collect_report_filenames_for_paths(paths)
         if not filenames:
             _log.info("[_delete_report_rows_for_paths] skip reason=no_filenames")
@@ -5245,11 +6744,82 @@ class FileListPanel(QWidget):
         )
         return deleted
 
+    def _collect_thumbnail_cache_paths_for_source(self, source_path: str) -> list[str]:
+        """收集源文件对应的缩略图缓存路径；需在移动/删除源文件前调用。"""
+        source_path = os.path.normpath(source_path) if source_path else ""
+        if not source_path:
+            return []
+        preview_base_dir = (
+            _superpicky_cache_root_dir(self._report_root_dir or self._current_dir or os.path.dirname(source_path))
+            or self._report_root_dir
+            or self._current_dir
+            or os.path.dirname(source_path)
+        )
+        report_cache = self._report_full_cache or self._report_cache or {}
+        try:
+            thumb_source = _resolve_thumb_source_path(
+                source_path,
+                report_cache if self._use_preview_cache else {},
+                preview_base_dir,
+            )
+        except Exception:
+            thumb_source = ""
+        candidates = [source_path]
+        if thumb_source:
+            candidates.append(os.path.normpath(thumb_source))
+
+        cache_paths: list[str] = []
+        seen: set[str] = set()
+
+        def add_cache_path(cache_path: str) -> None:
+            if not cache_path:
+                return
+            norm = os.path.normpath(cache_path)
+            key = _path_key(norm)
+            if key in seen:
+                return
+            seen.add(key)
+            cache_paths.append(norm)
+
+        for candidate in candidates:
+            if not candidate:
+                continue
+            try:
+                mtime = float(os.path.getmtime(candidate))
+            except Exception:
+                mtime = 0.0
+            for size in _THUMB_SIZE_STEPS:
+                add_cache_path(_thumb_disk_cache_path(candidate, mtime, size))
+
+        # 持久小缩略图以原图路径命名；新版平铺和旧版 hash 分目录都清理。
+        if preview_base_dir:
+            for size in _THUMB_SIZE_STEPS:
+                add_cache_path(_persistent_thumb_cache_path_for_file(source_path, preview_base_dir, size))
+                add_cache_path(_legacy_persistent_thumb_cache_path_for_file(source_path, preview_base_dir, size))
+        return cache_paths
+
+    def _delete_thumbnail_cache_paths(self, cache_paths: list[str]) -> int:
+        if not self._file_writes_allowed("删除缩略图缓存"):
+            return 0
+        deleted = 0
+        for cache_path in cache_paths or []:
+            if not cache_path or not os.path.isfile(cache_path):
+                continue
+            try:
+                os.remove(cache_path)
+                deleted += 1
+            except Exception as exc:
+                _log.debug("[_delete_thumbnail_cache_paths] failed path=%r: %s", cache_path, exc)
+        return deleted
+
     def _move_paths_to_trash(self, paths: list) -> None:
         """将选中路径移动到垃圾桶，并同步删除 report.db 中对应记录。"""
         if not paths:
             return
+        if not self._file_operation_paths_allowed(paths, "删除文件", warn=True):
+            return
         ok_count = 0
+        deleted_thumb_cache_count = 0
         moved_display_paths: list[str] = []
         for p in paths:
             norm_path = os.path.normpath(p) if p else ""
@@ -5258,9 +6828,11 @@ class FileListPanel(QWidget):
             target_path = self._resolve_source_path_for_action(norm_path)
             target_path = os.path.normpath(target_path) if target_path else norm_path
             if target_path and os.path.exists(target_path):
+                thumb_cache_paths = self._collect_thumbnail_cache_paths_for_source(target_path)
                 if move_to_trash(target_path):
                     ok_count += 1
                     moved_display_paths.append(norm_path)
+                    deleted_thumb_cache_count += self._delete_thumbnail_cache_paths(thumb_cache_paths)
                     _log.info(
                         "[_move_paths_to_trash] moved source=%r target=%r",
                         norm_path,
@@ -5274,6 +6846,8 @@ class FileListPanel(QWidget):
                 )
         if moved_display_paths:
             self._delete_report_rows_for_paths(moved_display_paths)
+        if deleted_thumb_cache_count:
+            _log.info("[_move_paths_to_trash] deleted_thumb_cache=%s", deleted_thumb_cache_count)
         if ok_count and self._current_dir:
             self.load_directory(self._current_dir, force_reload=True)
 
@@ -5290,16 +6864,20 @@ class FileListPanel(QWidget):
             if p:
                 paths = [p]
         if not paths:
+            if self._show_empty_file_context_menu(self._list_widget.viewport(), pos):
+                return
             return
         menu = QMenu(self)
-        act_copy = menu.addAction("复制")
-        act_copy.triggered.connect(lambda: self._copy_paths_to_clipboard(paths))
-        act_copy_filename = menu.addAction("复制文件名")
+        self._add_file_clipboard_menu_actions(menu, paths)
+        act_copy_filename = menu.addAction("复制文件全路径")
         act_copy_filename.triggered.connect(lambda: self._copy_filenames_to_clipboard(paths))
         self._add_rating_menu_actions(menu, paths)
         menu.addSeparator()
-        self._add_species_menu_actions(menu, self._thumb_path_from_index(index) if index.isValid() else (paths[0] if paths else ""), paths)
+        #self._add_species_menu_actions(menu, self._thumb_path_from_index(index) if index.isValid() else (paths[0] if paths else ""), paths)
+
+        self._add_photo_tag_menu_actions(menu, paths)
         menu.addSeparator()
+
         self._add_send_to_external_app_actions(menu, paths)
         menu.addSeparator()
         label = "在Finder中显示" if sys.platform == "darwin" else "在资源管理器中显示"
@@ -5309,7 +6887,7 @@ class FileListPanel(QWidget):
             _log.info("[_on_list_context_menu] reveal_path=%r paths=%s", reveal_path, len(paths))
             act_reveal = menu.addAction(label)
             act_reveal.triggered.connect(lambda: reveal_in_file_manager(reveal_path))
-        self._add_browse_preview_menu_action(menu, primary_path)
-        menu.addSeparator()
-        self._add_delete_menu_action(menu, paths)
+        # self._add_browse_preview_menu_action(menu, primary_path)
+        # menu.addSeparator()
+        # self._add_delete_menu_action(menu, paths)
         _exec_menu(menu, self._list_widget.viewport().mapToGlobal(pos))

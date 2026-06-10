@@ -8,6 +8,7 @@ class DirectoryScanWorker(QThread):
     """在后台执行目录扫描与 report.db 加载，完成后通过信号回传结果。"""
 
     scan_finished = pyqtSignal(str, object, object, object)  # (path, files_list, selected_report_cache, full_report_cache_or_none)
+    scan_progress = pyqtSignal(str, int, int, str)  # (path, found_files, scanned_dirs, current_dir)
 
     def __init__(
         self,
@@ -15,6 +16,7 @@ class DirectoryScanWorker(QThread):
         recursive: bool,
         report_root: str | None = None,
         report_cache_full: dict | None = None,
+        use_report_db: bool = False,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -22,20 +24,24 @@ class DirectoryScanWorker(QThread):
         self._recursive = recursive
         self._report_root = report_root
         self._report_cache_full = report_cache_full
+        self._use_report_db = bool(use_report_db)
 
     def run(self) -> None:
         _log.info(
-            "[DirectoryScanWorker.run] START path=%r recursive=%s report_root=%r has_cached_full_report=%s",
+            "[DirectoryScanWorker.run] START path=%r recursive=%s report_root=%r use_report_db=%s has_cached_full_report=%s",
             self._path,
             self._recursive,
             self._report_root,
+            self._use_report_db,
             self._report_cache_full is not None,
         )
         report_cache: dict = {}
-        full_report_cache: dict | None = self._report_cache_full
-        report_source_available = self._report_cache_full is not None
+        full_report_cache: dict | None = self._report_cache_full if self._use_report_db else None
+        report_source_available = self._use_report_db and self._report_cache_full is not None
         try:
-            if self._report_cache_full is not None:
+            if not self._use_report_db:
+                _log.info("[DirectoryScanWorker.run] report load disabled")
+            elif self._report_cache_full is not None:
                 report_cache = self._report_cache_full
                 _log.info("[DirectoryScanWorker.run] reuse cached full report_cache %s entries", len(report_cache))
             else:
@@ -60,6 +66,36 @@ class DirectoryScanWorker(QThread):
             _log.info("[DirectoryScanWorker.run] interrupted after report")
             return
         files: list = []
+        scanned_dirs = 0
+        last_progress_at = 0.0
+        last_progress_files = 0
+        last_progress_dirs = 0
+        last_worker_probe_at = 0.0
+
+        def maybe_emit_progress(current_dir: str = "", *, force: bool = False) -> None:
+            nonlocal last_progress_at, last_progress_files, last_progress_dirs, last_worker_probe_at
+            now = _time.perf_counter()
+            if not force and last_progress_at > 0.0 and (now - last_progress_at) < 0.25:
+                return
+            last_progress_at = now
+            last_progress_files = len(files)
+            last_progress_dirs = scanned_dirs
+            self.scan_progress.emit(
+                self._path,
+                len(files),
+                scanned_dirs,
+                os.path.normpath(current_dir) if current_dir else "",
+            )
+            if perf_probes_enabled() and (force or (now - last_worker_probe_at) >= 2.0):
+                last_worker_probe_at = now
+                _log.info(
+                    "[FILE_BROWSER_PROBE] event=scan_worker_progress path=%r found_files=%s scanned_dirs=%s current_dir=%r",
+                    self._path,
+                    len(files),
+                    scanned_dirs,
+                    os.path.normpath(current_dir) if current_dir else "",
+                )
+
         if report_source_available and self._report_root:
             # 当 report.db 有记录时，用 DB 中 current_path（相对选中目录）拼出完整路径，扩展名用 original_path 的（如 .ARW）
             selected_dir = os.path.normpath(self._path)
@@ -137,10 +173,12 @@ class DirectoryScanWorker(QThread):
                     for root, dirs, names in os.walk(self._path, topdown=True):
                         if self.isInterruptionRequested():
                             return
+                        scanned_dirs += 1
                         dirs[:] = [d for d in dirs if not d.startswith(".")]
                         for name in sorted(names, key=str.lower):
-                            if Path(name).suffix.lower() in IMAGE_EXTENSIONS:
+                            if name.lower().endswith(IMAGE_EXTENSIONS):
                                 files.append(os.path.join(root, name))
+                        maybe_emit_progress(root)
                 except (PermissionError, OSError) as e:
                     _log.warning("[DirectoryScanWorker.run] fallback scan error: %s", e)
         else:
@@ -150,18 +188,23 @@ class DirectoryScanWorker(QThread):
                         if self.isInterruptionRequested():
                             _log.info("[DirectoryScanWorker.run] interrupted during walk")
                             return
+                        scanned_dirs += 1
                         dirs[:] = [d for d in dirs if not d.startswith(".")]
                         for name in sorted(names, key=str.lower):
-                            if Path(name).suffix.lower() in IMAGE_EXTENSIONS:
+                            if name.lower().endswith(IMAGE_EXTENSIONS):
                                 files.append(os.path.join(root, name))
+                        maybe_emit_progress(root)
                 else:
                     for entry in sorted(os.scandir(self._path), key=lambda e: e.name.lower()):
                         if self.isInterruptionRequested():
                             return
-                        if entry.is_file() and Path(entry.name).suffix.lower() in IMAGE_EXTENSIONS:
+                        if entry.is_file() and entry.name.lower().endswith(IMAGE_EXTENSIONS):
                             files.append(entry.path)
+                    scanned_dirs = 1
+                    maybe_emit_progress(self._path, force=True)
             except (PermissionError, OSError) as e:
                 _log.warning("[DirectoryScanWorker.run] scan error: %s", e)
+        maybe_emit_progress(self._path, force=True)
         _log.info("[DirectoryScanWorker.run] 目录扫描完成：列出 %s 个图像文件，report_cache %s 条，即将通知主线程加载 EXIF", len(files), len(report_cache))
         _log.info("[DirectoryScanWorker.run] scan done files=%s", len(files))
         if not self.isInterruptionRequested():
@@ -317,11 +360,6 @@ class MetadataLoader(QThread):
             _log.warning("[MetadataLoader.run] exception: %s", e)
         _log.info("[MetadataLoader.run] END")
 
-    def _uses_browser_metadata_tags(self) -> bool:
-        if not self._metadata_tags:
-            return False
-        return frozenset(self._metadata_tags) == _SUPERBIRDSTAMP_BROWSER_METADATA_TAGS_SET
-
     def _should_prefetch_focus_cache(self) -> bool:
         """
         文件列表 metadata 加载阶段不要再同步触发第二次 metadata 扫描。
@@ -331,84 +369,38 @@ class MetadataLoader(QThread):
         """
         return False
 
-    @staticmethod
-    def _has_report_backed_metadata(flat: dict | None) -> bool:
-        if not isinstance(flat, dict) or not flat:
-            return False
-        for key, value in flat.items():
-            if key == "SourceFile":
-                continue
-            if value is None:
-                continue
-            if isinstance(value, str) and not value.strip():
-                continue
-            return True
-        return False
-
-    def _read_report_metadata_batch(self, paths: list[str]) -> dict[str, dict]:
-        report_db = getattr(self._meta_proxy, "report_db", None)
-        if report_db is None:
-            return {}
-        try:
-            raw_batch = report_db.read_batch(paths) or {}
-        except Exception as exc:
-            _log.warning("[MetadataLoader._read_report_metadata_batch] report_db.read_batch failed: %s", exc)
-            return {}
-        result: dict[str, dict] = {}
-        for path, flat in raw_batch.items():
-            norm_path = os.path.normpath(path)
-            if isinstance(flat, dict) and flat:
-                result[norm_path] = flat
-        return result
-
     def _read_metadata_batch(self, paths: list[str]) -> dict[str, dict]:
         norm_paths = [os.path.normpath(p) for p in paths]
         result: dict[str, dict] = {norm: {"SourceFile": norm} for norm in norm_paths}
-        report_batch = self._read_report_metadata_batch(paths)
-        report_only_browser_mode = self._uses_browser_metadata_tags() and EXIF_ONLY_FROM_REPORT_DB
-        raw_paths = list(paths)
-        if report_only_browser_mode and report_batch:
-            raw_paths = []
-            report_hit_count = 0
-            for path, norm_path in zip(paths, norm_paths):
-                flat = report_batch.get(norm_path)
-                if self._has_report_backed_metadata(flat):
-                    result[norm_path].update(flat)
-                    report_hit_count += 1
-                    continue
-                raw_paths.append(path)
-            _log.info(
-                "[MetadataLoader._read_metadata_batch] browser metadata served from report.db hits=%s fallback=%s total=%s",
-                report_hit_count,
-                len(raw_paths),
-                len(paths),
+        try:
+            raw_batch = read_batch_metadata(
+                paths,
+                tags=self._metadata_tags or None,
+                use_cache=not bool(self._metadata_tags),
             )
-        if raw_paths:
-            try:
-                raw_batch = read_batch_metadata(
-                    raw_paths,
-                    tags=self._metadata_tags or None,
-                    use_cache=not bool(self._metadata_tags),
-                )
-                for norm_path, flat in raw_batch.items():
-                    if norm_path in result and flat:
-                        result[norm_path].update(flat)
-            except Exception as exc:
-                _log.warning("[MetadataLoader._read_metadata_batch] read_batch_metadata failed: %s", exc)
-        for norm_path, flat in report_batch.items():
-            if norm_path in result and flat:
-                result[norm_path].update(flat)
+            for norm_path, flat in raw_batch.items():
+                if norm_path in result and flat:
+                    result[norm_path].update(flat)
+        except Exception as exc:
+            _log.warning("[MetadataLoader._read_metadata_batch] read_batch_metadata failed: %s", exc)
         return result
 
     def _parse_rec(self, rec: dict) -> dict:
-        # 标题、对焦状态等支持 XMP sidecar（由 read_batch_metadata 合并），勿删以下键名
-        # 标题：XMP dc:title（sidecar 多为小写 tag）、IFD0/XPTitle、IPTC
+        # 注释、标签、星级等支持 XMP sidecar（由 read_batch_metadata 合并），勿删以下键名。
+        comment = _metadata_comment_from_meta(rec)
+        tags = _metadata_tags_from_meta(rec)
+        # 标题仍保留在 meta 里，供旧代码和缩略图兼容使用。
         title = (
             rec.get("XMP-dc:Title") or rec.get("XMP-dc:title")
             or rec.get("IFD0:XPTitle") or rec.get("IPTC:ObjectName") or ""
         )
         color = rec.get("XMP-xmp:Label") or ""
-        rating_raw = rec.get("XMP-xmp:Rating")
+        rating_raw = _first_non_empty(
+            rec.get("XMP-xmp:Rating"),
+            rec.get("XMP:Rating"),
+            rec.get("XMP-xmp:rating"),
+            rec.get("rating"),
+        )
         try:
             rating_num = int(float(str(rating_raw or 0)))
         except Exception:
@@ -422,6 +414,7 @@ class MetadataLoader(QThread):
             or rec.get("XMP-1.0:Pick") or rec.get("XMP-1.0:PickLabel")
             or rec.get("XMP-lr:Pick") or rec.get("XMP-lr:PickLabel")
             or rec.get("XMP:Pick") or rec.get("XMP:PickLabel")
+            or rec.get("pick")
             or ""
         )
         try:
@@ -482,6 +475,8 @@ class MetadataLoader(QThread):
 
         return {
             "title":   str(title).strip(),
+            "comment": comment,
+            "tags":    tags,
             "color":   str(color).strip(),
             "rating":  rating,
             "pick":    pick,

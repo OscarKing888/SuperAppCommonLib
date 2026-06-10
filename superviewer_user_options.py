@@ -7,8 +7,9 @@ import sys
 import threading
 
 USER_OPTIONS_FILENAME = "SuperViewerUser.cfg"
-PERSISTENT_THUMB_SIZE_LEVELS = (128, 256, 512)
-KEY_NAVIGATION_FPS_OPTIONS = (8, 10, 12, 13, 15, 20, 24, 25, 30, 40, 48, 50, 60, 120)
+PERSISTENT_THUMB_SIZE_LEVELS = (128, 256, 512, 1024)
+KEY_NAVIGATION_FPS_OPTIONS = (1, 2, 4, 8, 10, 12, 13, 15, 20, 24, 25, 30, 40, 45, 50, 60, 120)
+KEY_PERF_PROBES_ENABLED = "perf_probes_enabled"
 
 _OPTIONS_LOCK = threading.RLock()
 _DEFAULT_CPU_COUNT = max(1, os.cpu_count() or 1)
@@ -18,6 +19,7 @@ _DEFAULT_OPTIONS = {
     "persistent_thumb_max_size": 128,
     "key_navigation_fps": 24,
     "keep_view_on_switch": 1,
+    KEY_PERF_PROBES_ENABLED: 0,
 }
 _RUNTIME_OPTIONS = dict(_DEFAULT_OPTIONS)
 
@@ -73,6 +75,12 @@ def normalize_user_options(data: dict | None) -> dict[str, int]:
     except Exception:
         value = 1
     normalized["keep_view_on_switch"] = max(0, min(1, value))
+
+    try:
+        value = int(source.get(KEY_PERF_PROBES_ENABLED, normalized[KEY_PERF_PROBES_ENABLED]) or 0)
+    except Exception:
+        value = normalized[KEY_PERF_PROBES_ENABLED]
+    normalized[KEY_PERF_PROBES_ENABLED] = max(0, min(1, value))
 
     return normalized
 
@@ -137,6 +145,11 @@ def get_key_navigation_fps() -> int:
 def get_keep_view_on_switch() -> bool:
     with _OPTIONS_LOCK:
         return bool(_RUNTIME_OPTIONS.get("keep_view_on_switch", 1))
+
+
+def get_perf_probes_enabled() -> bool:
+    with _OPTIONS_LOCK:
+        return bool(_RUNTIME_OPTIONS.get(KEY_PERF_PROBES_ENABLED, 0))
 
 
 def get_persistent_thumb_sizes(max_size: int | None = None) -> list[int]:

@@ -217,7 +217,7 @@ class ThumbnailLoader(QThread):
         self._seq = 0                      # monotonic counter for stable FIFO within same priority
         self._queue_lock = threading.Lock()
         self._profile_lock = threading.Lock()
-        self._profile_enabled = _THUMB_PROFILE_ENABLED
+        self._profile_enabled = _thumb_profile_enabled()
         self._profile_started_at = _time.perf_counter()
         self._profile_enqueued_visible = 0
         self._profile_enqueued_prefetch = 0
@@ -687,8 +687,24 @@ class ThumbnailLoader(QThread):
             _log.debug("[ThumbnailLoader.run] END")
 
 
+@dataclass(frozen=True)
+class PersistentThumbCacheTask:
+    source_path: str
+    current_dir: str
+    report_cache: dict
+    sizes: tuple[int, ...]
+
+    @property
+    def key(self) -> tuple[str, str, tuple[int, ...]]:
+        return (
+            _path_key(self.source_path),
+            _path_key(self.current_dir),
+            tuple(int(size) for size in self.sizes),
+        )
+
+
 class PersistentThumbCacheWorker(QThread):
-    """Build restart-persistent small thumbnail JPEGs for the current directory."""
+    """Build restart-persistent preview thumbnails from an appendable priority queue."""
 
     progress_updated = pyqtSignal(int, int, int, int, int, str)
     finished_summary = pyqtSignal(int, int, int, int, int)
@@ -704,9 +720,36 @@ class PersistentThumbCacheWorker(QThread):
         parent=None,
     ) -> None:
         super().__init__(parent)
-        self._paths = [os.path.normpath(p) for p in paths if p]
-        self._current_dir = os.path.normpath(current_dir) if current_dir else ""
-        self._report_cache = report_cache or {}
+        self._task_queue: _queue.PriorityQueue = _queue.PriorityQueue()
+        self._queue_lock = threading.RLock()
+        self._wake_event = threading.Event()
+        self._seq = 0
+        self._inflight_keys: set[tuple[str, str, tuple[int, ...]]] = set()
+        self._completed_results: dict[tuple[str, str, tuple[int, ...]], tuple[int, int, int]] = {}
+        self._focus_keys: set[tuple[str, str, tuple[int, ...]]] = set()
+        self._focus_done_keys: set[tuple[str, str, tuple[int, ...]]] = set()
+        self._focus_generated = 0
+        self._focus_skipped = 0
+        self._focus_failed = 0
+        self._focus_current_path = ""
+        self._worker_count = max(1, int(worker_count or _persistent_thumb_cache_worker_count()))
+        self._stop_event = threading.Event()
+        self.enqueue_paths(
+            paths,
+            current_dir,
+            report_cache=report_cache,
+            sizes=sizes,
+            priority=0,
+            replace_focus=True,
+        )
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._wake_event.set()
+        self.requestInterruption()
+
+    @staticmethod
+    def _normalize_sizes(sizes: list[int] | tuple[int, ...] | None) -> tuple[int, ...]:
         normalized_sizes = sorted(
             {
                 int(size)
@@ -714,47 +757,139 @@ class PersistentThumbCacheWorker(QThread):
                 if int(size) in _THUMB_SIZE_STEPS
             }
         )
-        self._sizes = tuple(normalized_sizes or _persistent_thumb_cache_sizes())
-        self._worker_count = max(1, int(worker_count or _persistent_thumb_cache_worker_count()))
-        self._stop_event = threading.Event()
+        return tuple(normalized_sizes or _persistent_thumb_cache_sizes())
 
-    def stop(self) -> None:
-        self._stop_event.set()
-        self.requestInterruption()
+    @staticmethod
+    def _build_tasks(
+        paths: list[str] | None,
+        current_dir: str,
+        *,
+        report_cache: dict | None,
+        sizes: list[int] | tuple[int, ...] | None,
+    ) -> list[PersistentThumbCacheTask]:
+        current_dir_norm = os.path.normpath(current_dir) if current_dir else ""
+        sizes_tuple = PersistentThumbCacheWorker._normalize_sizes(sizes)
+        cache = report_cache or {}
+        result: list[PersistentThumbCacheTask] = []
+        seen: set[tuple[str, str, tuple[int, ...]]] = set()
+        for source_path in ThumbnailLoader._normalize_unique_paths(paths or []):
+            task = PersistentThumbCacheTask(
+                source_path=os.path.normpath(source_path),
+                current_dir=current_dir_norm,
+                report_cache=cache,
+                sizes=sizes_tuple,
+            )
+            if task.key in seen:
+                continue
+            seen.add(task.key)
+            result.append(task)
+        return result
 
-    def _process_path(self, source_path: str) -> tuple[str, int, int, int]:
-        if self._stop_event.is_set():
+    def enqueue_paths(
+        self,
+        paths: list[str] | None,
+        current_dir: str,
+        *,
+        report_cache: dict | None = None,
+        sizes: list[int] | tuple[int, ...] | None = None,
+        priority: int = 1,
+        replace_focus: bool = False,
+    ) -> int:
+        tasks = self._build_tasks(
+            paths,
+            current_dir,
+            report_cache=report_cache,
+            sizes=sizes,
+        )
+        with self._queue_lock:
+            if replace_focus:
+                self._focus_keys = {task.key for task in tasks}
+                self._rebuild_focus_counters_locked()
+            added = 0
+            for task in tasks:
+                if task.key in self._completed_results or task.key in self._inflight_keys:
+                    continue
+                self._seq += 1
+                self._task_queue.put_nowait((int(priority), self._seq, task))
+                added += 1
+            if added:
+                self._wake_event.set()
+            done, total, generated, skipped, failed, current_path = self._focus_snapshot_locked()
+        self.progress_updated.emit(done, total, generated, skipped, failed, current_path)
+        return added
+
+    def _rebuild_focus_counters_locked(self) -> None:
+        self._focus_done_keys = set()
+        self._focus_generated = 0
+        self._focus_skipped = 0
+        self._focus_failed = 0
+        self._focus_current_path = ""
+        for key in self._focus_keys:
+            result = self._completed_results.get(key)
+            if result is None:
+                continue
+            generated, skipped, failed = result
+            self._focus_done_keys.add(key)
+            self._focus_generated += int(generated)
+            self._focus_skipped += int(skipped)
+            self._focus_failed += int(failed)
+
+    def _focus_snapshot_locked(self) -> tuple[int, int, int, int, int, str]:
+        return (
+            len(self._focus_done_keys),
+            len(self._focus_keys),
+            self._focus_generated,
+            self._focus_skipped,
+            self._focus_failed,
+            self._focus_current_path,
+        )
+
+    def _pop_next_task_locked(self) -> PersistentThumbCacheTask | None:
+        while True:
+            try:
+                _priority, _seq, task = self._task_queue.get_nowait()
+            except _queue.Empty:
+                return None
+            if task.key in self._completed_results or task.key in self._inflight_keys:
+                continue
+            self._inflight_keys.add(task.key)
+            return task
+
+    @staticmethod
+    def _process_task(task: PersistentThumbCacheTask, stop_event: threading.Event) -> tuple[str, int, int, int]:
+        source_path = task.source_path
+        if stop_event.is_set():
             return source_path, 0, 0, 1
         load_target_path = _resolve_thumb_source_path(
             source_path,
-            self._report_cache,
-            self._current_dir,
+            task.report_cache,
+            task.current_dir,
         )
         source_stamp = _thumb_source_stamp(source_path, load_target_path)
         missing_sizes = [
             size
-            for size in self._sizes
+            for size in task.sizes
             if not _existing_persistent_thumb_cache_path_for_exact_size(
                 source_path,
-                self._current_dir,
+                task.current_dir,
                 size,
                 source_stamp=source_stamp,
             )
         ]
         if not missing_sizes:
             return source_path, 0, 1, 0
-        if self._stop_event.is_set():
+        if stop_event.is_set():
             return source_path, 0, 0, 1
         base_image = _load_thumbnail_image(load_target_path, max(missing_sizes))
         if base_image is None or base_image.isNull():
             return source_path, 0, 0, 1
         wrote_any = False
         for size in missing_sizes:
-            if self._stop_event.is_set():
+            if stop_event.is_set():
                 break
             target_path = _persistent_thumb_cache_path_for_file(
                 source_path,
-                self._current_dir,
+                task.current_dir,
                 size,
             )
             output_image = base_image if size >= max(missing_sizes) else _scale_qimage_for_thumb(base_image, size)
@@ -772,30 +907,44 @@ class PersistentThumbCacheWorker(QThread):
             return source_path, 1, 0, 0
         return source_path, 0, 0, 1
 
+    def _complete_task(
+        self,
+        task: PersistentThumbCacheTask,
+        generated: int,
+        skipped: int,
+        failed: int,
+        current_path: str,
+    ) -> tuple[int, int, int, int, int, str]:
+        with self._queue_lock:
+            self._inflight_keys.discard(task.key)
+            self._completed_results[task.key] = (int(generated), int(skipped), int(failed))
+            if task.key in self._focus_keys and task.key not in self._focus_done_keys:
+                self._focus_done_keys.add(task.key)
+                self._focus_generated += int(generated)
+                self._focus_skipped += int(skipped)
+                self._focus_failed += int(failed)
+                self._focus_current_path = os.path.normpath(current_path) if current_path else ""
+            return self._focus_snapshot_locked()
+
     def run(self) -> None:
-        total = len(self._paths)
-        processed = 0
-        generated = 0
-        skipped = 0
-        failed = 0
-        current_path = ""
         started_at = _time.perf_counter()
         last_emit_at = 0.0
 
-        def emit_progress(force: bool = False) -> None:
+        def emit_progress(snapshot: tuple[int, int, int, int, int, str], force: bool = False) -> None:
             nonlocal last_emit_at
             now = _time.perf_counter()
+            done, total, generated, skipped, failed, current_path = snapshot
             if (
                 not force
-                and processed < total
-                and processed != 1
-                and processed % 8 != 0
+                and done < total
+                and done != 1
+                and done % 8 != 0
                 and (now - last_emit_at) < 0.15
             ):
                 return
             last_emit_at = now
             self.progress_updated.emit(
-                processed,
+                done,
                 total,
                 generated,
                 skipped,
@@ -804,10 +953,8 @@ class PersistentThumbCacheWorker(QThread):
             )
 
         _log.info(
-            "[PersistentThumbCacheWorker.run] START dir=%r total=%s sizes=%s workers=%s",
-            self._current_dir,
-            total,
-            list(self._sizes),
+            "[PersistentThumbCacheWorker.run] START queued=%s workers=%s",
+            int(self._task_queue.qsize()),
             self._worker_count,
         )
         executor: _futures.ThreadPoolExecutor | None = None
@@ -816,25 +963,41 @@ class PersistentThumbCacheWorker(QThread):
                 max_workers=self._worker_count,
                 thread_name_prefix="thumb_preview",
             )
-            futures = {
-                executor.submit(self._process_path, source_path): source_path
-                for source_path in self._paths
-            }
-            for future in _futures.as_completed(futures):
-                current_path = futures.get(future, "") or current_path
-                try:
-                    _, generated_inc, skipped_inc, failed_inc = future.result()
-                except Exception:
-                    generated_inc = 0
-                    skipped_inc = 0
-                    failed_inc = 1
-                processed += 1
-                generated += generated_inc
-                skipped += skipped_inc
-                failed += failed_inc
-                emit_progress()
-                if self.isInterruptionRequested() or self._stop_event.is_set():
-                    break
+            while not self.isInterruptionRequested() and not self._stop_event.is_set():
+                batch: list[PersistentThumbCacheTask] = []
+                with self._queue_lock:
+                    while len(batch) < self._worker_count:
+                        task = self._pop_next_task_locked()
+                        if task is None:
+                            break
+                        batch.append(task)
+                if not batch:
+                    self._wake_event.wait(0.10)
+                    self._wake_event.clear()
+                    continue
+                futures = {
+                    executor.submit(self._process_task, task, self._stop_event): task
+                    for task in batch
+                }
+                for future in _futures.as_completed(futures):
+                    task = futures[future]
+                    try:
+                        current_path, generated_inc, skipped_inc, failed_inc = future.result()
+                    except Exception:
+                        current_path = task.source_path
+                        generated_inc = 0
+                        skipped_inc = 0
+                        failed_inc = 1
+                    snapshot = self._complete_task(
+                        task,
+                        generated_inc,
+                        skipped_inc,
+                        failed_inc,
+                        current_path,
+                    )
+                    emit_progress(snapshot)
+                    if self.isInterruptionRequested() or self._stop_event.is_set():
+                        break
         finally:
             self._stop_event.set()
             if executor is not None:
@@ -842,12 +1005,14 @@ class PersistentThumbCacheWorker(QThread):
                     executor.shutdown(wait=True, cancel_futures=True)
                 except Exception:
                     pass
-            emit_progress(force=True)
-            self.finished_summary.emit(processed, total, generated, skipped, failed)
+            with self._queue_lock:
+                snapshot = self._focus_snapshot_locked()
+            emit_progress(snapshot, force=True)
+            done, total, generated, skipped, failed, _current_path = snapshot
+            self.finished_summary.emit(done, total, generated, skipped, failed)
             _log.info(
-                "[PersistentThumbCacheWorker.run] END dir=%r processed=%s/%s generated=%s skipped=%s failed=%s elapsed=%.2fs",
-                self._current_dir,
-                processed,
+                "[PersistentThumbCacheWorker.run] END focus_processed=%s/%s generated=%s skipped=%s failed=%s elapsed=%.2fs",
+                done,
                 total,
                 generated,
                 skipped,

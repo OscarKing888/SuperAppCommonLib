@@ -129,9 +129,16 @@ class PhotoMetaDataEXIFEmbeded(PhotoMetaData):
 _XMP_META_NS = "adobe:ns:meta/"
 _RDF_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
 _DC_NS = "http://purl.org/dc/elements/1.1/"
+_XMP_NS = "http://ns.adobe.com/xap/1.0/"
+_XMP_DM_NS = "http://ns.adobe.com/xmp/1.0/DynamicMedia/"
 _XMP_DC_SUBJECT_TAG = f"{{{_DC_NS}}}subject"
+_XMP_DC_DESCRIPTION_TAG = f"{{{_DC_NS}}}description"
+_XMP_RATING_TAG = f"{{{_XMP_NS}}}Rating"
+_XMP_PICK_TAG = f"{{{_XMP_NS}}}Pick"
+_XMP_DM_PICK_TAG = f"{{{_XMP_DM_NS}}}pick"
 _RDF_DESCRIPTION_TAG = f"{{{_RDF_NS}}}Description"
 _RDF_BAG_TAG = f"{{{_RDF_NS}}}Bag"
+_RDF_ALT_TAG = f"{{{_RDF_NS}}}Alt"
 _RDF_LI_TAG = f"{{{_RDF_NS}}}li"
 _RDF_ABOUT_ATTR = f"{{{_RDF_NS}}}about"
 _RDF_RESOURCE_ATTR = f"{{{_RDF_NS}}}resource"
@@ -146,10 +153,84 @@ _XMP_SUBJECT_KEYS: frozenset[str] = frozenset({
     "keywords",
     "iptc:keywords",
 })
+_XMP_DESCRIPTION_KEYS: frozenset[str] = frozenset({
+    "xmp-dc:description",
+    "xmp:description",
+    "description",
+})
+_XMP_RATING_KEYS: frozenset[str] = frozenset({
+    "xmp-xmp:rating",
+    "xmp:rating",
+    "rating",
+})
+_XMP_PICK_KEYS: frozenset[str] = frozenset({
+    "xmp-xmpdm:pick",
+    "xmp-xmpdm:Pick".lower(),
+    "xmp-xmp:pick",
+    "xmp-xmp:picklabel",
+    "xmp:pick",
+    "xmp:picklabel",
+    "pick",
+})
 
 
 def _is_xmp_subject_key(key: str) -> bool:
     return str(key or "").strip().lower() in _XMP_SUBJECT_KEYS
+
+
+def _is_xmp_description_key(key: str) -> bool:
+    return str(key or "").strip().lower() in _XMP_DESCRIPTION_KEYS
+
+
+def _is_xmp_rating_key(key: str) -> bool:
+    return str(key or "").strip().lower() in _XMP_RATING_KEYS
+
+
+def _is_xmp_pick_key(key: str) -> bool:
+    return str(key or "").strip().lower() in _XMP_PICK_KEYS
+
+
+def _normalise_rating_value(value: Any) -> int:
+    try:
+        return max(0, min(5, int(float(str(value or 0)))))
+    except Exception:
+        return 0
+
+
+def _normalise_pick_value(value: Any) -> int:
+    try:
+        text = str(value if value is not None else "").strip().lower()
+        if text in ("true", "yes"):
+            return 1
+        if text in ("false", "no", ""):
+            return 0
+        if text == "reject":
+            return -1
+        return max(-1, min(1, int(float(text))))
+    except Exception:
+        return 0
+
+
+def _normalise_rating_pick_aliases(rec: dict[str, Any]) -> None:
+    if not isinstance(rec, dict):
+        return
+    raw_rating = None
+    pick_seen = False
+    for key, value in list(rec.items()):
+        if _is_xmp_rating_key(key):
+            raw_rating = value
+            rec.setdefault("XMP-xmp:Rating", value)
+            rec["rating"] = _normalise_rating_value(value)
+        elif _is_xmp_pick_key(key):
+            pick_seen = True
+            rec.setdefault("XMP-xmpDM:pick", value)
+            rec["pick"] = _normalise_pick_value(value)
+    if not pick_seen and raw_rating is not None:
+        try:
+            if int(float(str(raw_rating))) < 0:
+                rec["pick"] = -1
+        except Exception:
+            pass
 
 
 def _normalise_text_values(values: Iterable[Any], *, split_strings: bool = False) -> list[str]:
@@ -207,9 +288,19 @@ class PhotoMetaDataXMP(PhotoMetaData):
                 return {}
             rec: dict[str, Any] = {"SourceFile": path}
             for group, name, value in rows:
-                rec[f"{group}:{name}"] = value
+                key = f"{group}:{name}"
+                rec[key] = value
                 if group == "XMP-dc" and str(name).lower() == "subject":
                     rec["XMP-dc:Subject"] = value
+                elif group == "XMP-dc" and str(name).lower() == "description":
+                    rec["XMP-dc:Description"] = value
+                    rec["Description"] = value
+                elif _is_xmp_rating_key(key):
+                    rec["XMP-xmp:Rating"] = value
+                    rec["rating"] = _normalise_rating_value(value)
+                elif _is_xmp_pick_key(key):
+                    rec["XMP-xmpDM:pick"] = value
+                    rec["pick"] = _normalise_pick_value(value)
             return rec
         except Exception:
             return {}
@@ -221,17 +312,40 @@ class PhotoMetaDataXMP(PhotoMetaData):
 
         subject_seen = False
         subject_values: list[str] = []
+        description_seen = False
+        description_value = ""
+        rating_seen = False
+        rating_value = 0
+        pick_seen = False
+        pick_value = 0
         remaining_fields: dict[str, Any] = {}
         for key, value in fields.items():
             if _is_xmp_subject_key(key):
                 subject_seen = True
                 subject_values.extend(_normalise_subject_value(value, split_strings=True))
+            elif _is_xmp_description_key(key):
+                description_seen = True
+                description_value = "" if value is None else str(value)
+            elif _is_xmp_rating_key(key):
+                rating_seen = True
+                rating_value = _normalise_rating_value(value)
+            elif _is_xmp_pick_key(key):
+                pick_seen = True
+                pick_value = _normalise_pick_value(value)
             else:
                 remaining_fields[key] = value
 
         success = True
         if subject_seen:
             success = self.write_subjects(path, subject_values) and success
+        if description_seen:
+            success = self.write_description(path, description_value) and success
+        if rating_seen or pick_seen:
+            success = self.write_rating_pick(
+                path,
+                rating=rating_value if rating_seen else None,
+                pick=pick_value if pick_seen else None,
+            ) and success
         if not remaining_fields:
             return success
 
@@ -255,7 +369,10 @@ class PhotoMetaDataXMP(PhotoMetaData):
                     [et, "-@", argfile],
                     capture_output=True, check=False,
                 )
-                return cp.returncode == 0
+                ok = cp.returncode == 0
+                if ok:
+                    self._invalidate_metadata_cache(path)
+                return ok and success
             finally:
                 try:
                     os.unlink(argfile)
@@ -301,7 +418,77 @@ class PhotoMetaDataXMP(PhotoMetaData):
             desc = self._ensure_description(root)
             self._replace_subject_node(desc, clean_subjects)
             sidecar_path.parent.mkdir(parents=True, exist_ok=True)
-            return self._write_tree_atomic(tree, sidecar_path)
+            ok = self._write_tree_atomic(tree, sidecar_path)
+            if ok:
+                self._invalidate_metadata_cache(path)
+            return ok
+        except Exception:
+            return False
+
+    def add_subjects(self, path: str, subjects: Iterable[Any]) -> bool:
+        incoming = _normalise_text_values(subjects)
+        if not incoming:
+            return True
+        current = self.read_subjects(path)
+        seen = set(current)
+        merged = list(current)
+        for value in incoming:
+            if value in seen:
+                continue
+            seen.add(value)
+            merged.append(value)
+        return self.write_subjects(path, merged)
+
+    def remove_subjects(self, path: str, subjects: Iterable[Any]) -> bool:
+        remove = set(_normalise_text_values(subjects))
+        if not remove:
+            return True
+        kept = [value for value in self.read_subjects(path) if value not in remove]
+        return self.write_subjects(path, kept)
+
+    def write_description(self, path: str, description: Any) -> bool:
+        """Replace XMP ``dc:description`` text in the sidecar."""
+        text = "" if description is None else str(description)
+        sidecar_path = self.sidecar_path_for(path)
+        try:
+            tree = self._load_or_create_xmp_tree(sidecar_path)
+            if tree is None:
+                return False
+            desc = self._ensure_description(tree.getroot())
+            self._replace_alt_text_node(desc, _XMP_DC_DESCRIPTION_TAG, text)
+            sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+            ok = self._write_tree_atomic(tree, sidecar_path)
+            if ok:
+                self._invalidate_metadata_cache(path)
+            return ok
+        except Exception:
+            return False
+
+    def write_rating_pick(
+        self,
+        path: str,
+        *,
+        rating: int | None = None,
+        pick: int | None = None,
+    ) -> bool:
+        """Write Lightroom-style rating and Pick/Reject state into the sidecar."""
+        if rating is None and pick is None:
+            return True
+        sidecar_path = self.sidecar_path_for(path)
+        try:
+            tree = self._load_or_create_xmp_tree(sidecar_path)
+            if tree is None:
+                return False
+            desc = self._ensure_description(tree.getroot())
+            if rating is not None:
+                self._replace_text_node(desc, _XMP_RATING_TAG, str(_normalise_rating_value(rating)))
+            if pick is not None:
+                self._replace_text_node(desc, _XMP_DM_PICK_TAG, str(_normalise_pick_value(pick)))
+            sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+            ok = self._write_tree_atomic(tree, sidecar_path)
+            if ok:
+                self._invalidate_metadata_cache(path)
+            return ok
         except Exception:
             return False
 
@@ -310,6 +497,8 @@ class PhotoMetaDataXMP(PhotoMetaData):
         ET.register_namespace("x", _XMP_META_NS)
         ET.register_namespace("rdf", _RDF_NS)
         ET.register_namespace("dc", _DC_NS)
+        ET.register_namespace("xmp", _XMP_NS)
+        ET.register_namespace("xmpDM", _XMP_DM_NS)
         root = ET.Element(f"{{{_XMP_META_NS}}}xmpmeta")
         rdf = ET.SubElement(root, f"{{{_RDF_NS}}}RDF")
         ET.SubElement(rdf, _RDF_DESCRIPTION_TAG, {_RDF_ABOUT_ATTR: ""})
@@ -320,6 +509,8 @@ class PhotoMetaDataXMP(PhotoMetaData):
         ET.register_namespace("x", _XMP_META_NS)
         ET.register_namespace("rdf", _RDF_NS)
         ET.register_namespace("dc", _DC_NS)
+        ET.register_namespace("xmp", _XMP_NS)
+        ET.register_namespace("xmpDM", _XMP_DM_NS)
         if not sidecar_path.exists():
             return cls._new_xmp_tree()
         try:
@@ -351,6 +542,28 @@ class PhotoMetaDataXMP(PhotoMetaData):
         for value in subjects:
             item = ET.SubElement(bag, _RDF_LI_TAG)
             item.text = value
+
+    @staticmethod
+    def _replace_alt_text_node(desc: ET.Element, tag: str, text: str) -> None:
+        for child in list(desc):
+            if child.tag == tag:
+                desc.remove(child)
+        if not text:
+            return
+        element = ET.SubElement(desc, tag)
+        alt = ET.SubElement(element, _RDF_ALT_TAG)
+        item = ET.SubElement(alt, _RDF_LI_TAG)
+        item.text = text
+
+    @staticmethod
+    def _replace_text_node(desc: ET.Element, tag: str, text: str) -> None:
+        for child in list(desc):
+            if child.tag == tag:
+                desc.remove(child)
+        if text == "":
+            return
+        element = ET.SubElement(desc, tag)
+        element.text = text
 
     @staticmethod
     def _subject_values_from_element(element: ET.Element) -> list[str]:
@@ -389,6 +602,14 @@ class PhotoMetaDataXMP(PhotoMetaData):
                     tmp_path.unlink()
             except OSError:
                 pass
+
+    @staticmethod
+    def _invalidate_metadata_cache(path: str) -> None:
+        try:
+            from .writer import invalidate_metadata_cache
+            invalidate_metadata_cache(path)
+        except Exception:
+            pass
 
     def supports_write(self) -> bool:
         return True
@@ -840,6 +1061,7 @@ class PhotoMetaDataProxy(PhotoMetaData):
                     merged.update(data)
             except Exception:
                 pass
+        _normalise_rating_pick_aliases(merged)
         return merged
 
     def read_exposure_settings(self, path: str) -> tuple[str, str, str]:
@@ -877,6 +1099,8 @@ class PhotoMetaDataProxy(PhotoMetaData):
             except Exception:
                 pass
 
+        for rec in result.values():
+            _normalise_rating_pick_aliases(rec)
         return result
 
     def write(self, path: str, fields: dict[str, Any]) -> bool:
@@ -884,9 +1108,26 @@ class PhotoMetaDataProxy(PhotoMetaData):
         if not fields:
             return True
 
-        db_fields = {k: v for k, v in fields.items() if k in _REPORT_DB_ONLY_FIELDS}
-        file_fields = {k: v for k, v in fields.items() if k not in _REPORT_DB_ONLY_FIELDS}
-        xmp_fields = {k: v for k, v in file_fields.items() if k.upper().startswith("XMP")}
+        def is_xmp_field(key: str) -> bool:
+            return (
+                str(key).upper().startswith("XMP")
+                or _is_xmp_rating_key(key)
+                or _is_xmp_pick_key(key)
+                or _is_xmp_subject_key(key)
+                or _is_xmp_description_key(key)
+            )
+
+        xmp_fields = {k: v for k, v in fields.items() if is_xmp_field(k)}
+        db_fields = {
+            k: v
+            for k, v in fields.items()
+            if k in _REPORT_DB_ONLY_FIELDS and k not in xmp_fields
+        }
+        file_fields = {
+            k: v
+            for k, v in fields.items()
+            if k not in db_fields and k not in xmp_fields
+        }
 
         success = True
         if db_fields:
@@ -894,8 +1135,7 @@ class PhotoMetaDataProxy(PhotoMetaData):
         if file_fields:
             success = self._exif.write(path, file_fields) and success
         if xmp_fields:
-            # Also mirror XMP fields into the sidecar (best-effort, non-fatal)
-            self._xmp.write(path, xmp_fields)
+            success = self._xmp.write(path, xmp_fields) and success
         return success
 
     def supports_write(self) -> bool:
