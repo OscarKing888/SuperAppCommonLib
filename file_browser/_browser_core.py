@@ -229,12 +229,14 @@ _MetaFocusRole = int(_UserRole) + 4
 _ThumbPixmapRole = int(_UserRole) + 20
 _ThumbSizeRole = int(_UserRole) + 21
 _MetaSpeciesCnRole = int(_UserRole) + 22
+_MetaBurstTextRole = int(_UserRole) + 23
 
 _TREE_COL_SEQ = -1
 _TREE_COL_NAME = 0
-_TREE_COL_COMMENT = 1
-_TREE_COL_STAR = 2
-_TREE_COL_TAGS = 3
+_TREE_COL_BURST = 1
+_TREE_COL_COMMENT = 2
+_TREE_COL_STAR = 3
+_TREE_COL_TAGS = 4
 _TREE_COL_TITLE = _TREE_COL_COMMENT
 _TREE_COL_COLOR = _TREE_COL_TAGS
 _TREE_COL_SHARP = _TREE_COL_TAGS
@@ -243,7 +245,7 @@ _TREE_COL_FOCUS = _TREE_COL_TAGS
 _TREE_COL_SHUTTER = _TREE_COL_TAGS
 _TREE_COL_ISO = _TREE_COL_TAGS
 _TREE_COL_APERTURE = _TREE_COL_TAGS
-_FILE_TABLE_HEADERS = ["文件名", "注释", "星级", "标签"]
+_FILE_TABLE_HEADERS = ["文件名", "连拍", "注释", "星级", "标签"]
 _FILE_TAG_DISPLAY_SEPARATOR = "、"
 _SUPERBIRDSTAMP_CAMERA_METADATA_TAGS = [
     "-ExifIFD:ExposureTime",

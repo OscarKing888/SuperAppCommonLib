@@ -412,6 +412,7 @@ class FileListPanel(QWidget):
         for col in range(len(_FILE_TABLE_HEADERS)):
             hdr.setSectionResizeMode(col, _ResizeInteractive)
         self._tree_widget.setColumnWidth(_TREE_COL_NAME, 240)
+        self._tree_widget.setColumnWidth(_TREE_COL_BURST, 72)
         self._tree_widget.setColumnWidth(_TREE_COL_COMMENT, 280)
         self._tree_widget.setColumnWidth(_TREE_COL_STAR, 72)
         self._tree_widget.setColumnWidth(_TREE_COL_TAGS, 240)
@@ -928,6 +929,12 @@ class FileListPanel(QWidget):
             "shutter",
             "iso",
             "aperture",
+            "burst_id",
+            "burst_position",
+            "report.burst_id",
+            "report.burst_position",
+            "XMP-superpicky:burst_id",
+            "XMP-superpicky:burst_position",
             "XMP-xmp:Rating",
             "XMP-xmpDM:pick",
             "XMP-xmpDM:Pick",
@@ -3916,6 +3923,8 @@ class FileListPanel(QWidget):
     def _apply_meta_to_tree_item(self, item: SortableTreeItem, meta: dict) -> None:
         comment = _metadata_comment_from_meta(meta)
         tags_display = _metadata_tags_display(meta)
+        burst_position, burst_id = _metadata_burst_values(meta)
+        burst_text = _format_burst_text(burst_position, burst_id)
         try:
             rating = int(meta.get("rating", 0) or 0)
         except Exception:
@@ -3925,6 +3934,16 @@ class FileListPanel(QWidget):
         except Exception:
             pick = 0
 
+        item.setText(_TREE_COL_BURST, burst_text)
+        item.setData(
+            _TREE_COL_BURST,
+            _SortRole,
+            (
+                1 if burst_position is None and burst_id is None else 0,
+                burst_id if burst_id is not None else 10**12,
+                burst_position if burst_position is not None else 10**12,
+            ),
+        )
         item.setText(_TREE_COL_COMMENT, comment)
         item.setData(_TREE_COL_COMMENT, _SortRole, comment.lower())
         if pick == 1:

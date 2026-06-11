@@ -57,6 +57,56 @@ def _metadata_pick_value(meta: dict | None) -> int:
         return 0
 
 
+def _metadata_burst_int(meta: dict | None, key: str) -> int | None:
+    if not isinstance(meta, dict):
+        return None
+    raw = _first_non_empty(
+        meta.get(key),
+        meta.get(f"report.{key}"),
+        meta.get(f"XMP-superpicky:{key}"),
+    )
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        return int(float(text))
+    except Exception:
+        return None
+
+
+def _metadata_burst_values(meta: dict | None) -> tuple[int | None, int | None]:
+    return (
+        _metadata_burst_int(meta, "burst_position"),
+        _metadata_burst_int(meta, "burst_id"),
+    )
+
+
+def _format_burst_text(burst_position: int | None, burst_id: int | None) -> str:
+    if burst_position is None and burst_id is None:
+        return ""
+    position_text = str(burst_position) if burst_position is not None else "-"
+    id_text = str(burst_id) if burst_id is not None else "-"
+    return f"({position_text}/{id_text})"
+
+
+def _format_burst_name(name: str, burst_text: str) -> str:
+    return f"{burst_text} {name}" if burst_text else name
+
+
+def _append_burst_tooltip(tooltip: str, burst_text: str) -> str:
+    if not burst_text:
+        return tooltip
+    line = f"连拍: {burst_text}"
+    text = str(tooltip or "").strip()
+    if not text:
+        return line
+    if line in text.splitlines():
+        return text
+    return f"{text}\n{line}"
+
+
 class SortableTreeItem(QTreeWidgetItem):
     """支持数值感知排序的 QTreeWidgetItem（通过 _SortRole 存储排序键）。"""
 
@@ -76,6 +126,7 @@ class SortableTreeItem(QTreeWidgetItem):
 class FileTableEntry:
     path: str
     name: str
+    base_tooltip: str = ""
     tooltip: str = ""
     mismatch: bool = False
     comment: str = ""
@@ -92,6 +143,9 @@ class FileTableEntry:
     shutter: str = ""
     iso: str = ""
     aperture: str = ""
+    burst_position: int | None = None
+    burst_id: int | None = None
+    burst_text: str = ""
 
 
 class FileTableModel(QAbstractTableModel):
@@ -144,6 +198,8 @@ class FileTableModel(QAbstractTableModel):
         entry.shutter = str(meta.get("shutter", "") or "")
         entry.iso = str(meta.get("iso", "") or "")
         entry.aperture = str(meta.get("aperture", "") or "")
+        entry.burst_position, entry.burst_id = _metadata_burst_values(meta)
+        entry.burst_text = _format_burst_text(entry.burst_position, entry.burst_id)
 
     def _build_entry(
         self,
@@ -157,15 +213,24 @@ class FileTableModel(QAbstractTableModel):
         entry = FileTableEntry(
             path=path,
             name=Path(path).name,
-            tooltip=tooltip_fn(path),
+            base_tooltip=tooltip_fn(path),
             mismatch=bool(mismatch_fn(path)),
         )
         self._apply_meta_to_entry(entry, meta_cache.get(norm, {}) if isinstance(meta_cache, dict) else {})
+        entry.tooltip = _append_burst_tooltip(entry.base_tooltip, entry.burst_text)
         return entry
 
     def _sort_value(self, entry: FileTableEntry, column: int):
         if column == _TREE_COL_NAME:
             return entry.name.lower()
+        if column == _TREE_COL_BURST:
+            missing = entry.burst_position is None and entry.burst_id is None
+            return (
+                1 if missing else 0,
+                entry.burst_id if entry.burst_id is not None else 10**12,
+                entry.burst_position if entry.burst_position is not None else 10**12,
+                entry.name.lower(),
+            )
         if column == _TREE_COL_COMMENT:
             return entry.comment.lower()
         if column == _TREE_COL_STAR:
@@ -181,6 +246,8 @@ class FileTableModel(QAbstractTableModel):
     def _display_value(self, entry: FileTableEntry, row: int, column: int) -> str:
         if column == _TREE_COL_NAME:
             return entry.name
+        if column == _TREE_COL_BURST:
+            return entry.burst_text
         if column == _TREE_COL_COMMENT:
             return entry.comment
         if column == _TREE_COL_STAR:
@@ -304,16 +371,19 @@ class FileTableModel(QAbstractTableModel):
             return False
         entry = self._entries[row]
         self._apply_meta_to_entry(entry, meta)
-        left = self.index(row, _TREE_COL_COMMENT)
+        entry.tooltip = _append_burst_tooltip(entry.base_tooltip, entry.burst_text)
+        left = self.index(row, _TREE_COL_BURST)
         right = self.index(row, self.columnCount() - 1)
-        self.dataChanged.emit(left, right, [_DisplayRole, _SortRole, _ForegroundRole, _BackgroundRole])
+        self.dataChanged.emit(left, right, [_DisplayRole, _SortRole, _ForegroundRole, _BackgroundRole, _ToolTipRole])
         return True
 
     def set_tooltip_for_path(self, path: str, tooltip: str) -> bool:
         row = self.row_for_path(path)
         if row is None:
             return False
-        self._entries[row].tooltip = tooltip
+        entry = self._entries[row]
+        entry.base_tooltip = tooltip
+        entry.tooltip = _append_burst_tooltip(entry.base_tooltip, entry.burst_text)
         left = self.index(row, 0)
         right = self.index(row, self.columnCount() - 1)
         self.dataChanged.emit(left, right, [_ToolTipRole])
@@ -485,6 +555,7 @@ class ThumbViewportEntry:
 class ThumbnailListEntry:
     path: str
     name: str
+    base_tooltip: str = ""
     tooltip: str = ""
     mismatch: bool = False
     color: str = ""
@@ -492,6 +563,9 @@ class ThumbnailListEntry:
     pick: int = 0
     focus_status: str = ""
     species_cn: str = ""
+    burst_position: int | None = None
+    burst_id: int | None = None
+    burst_text: str = ""
     pixmap: QPixmap | None = None
     thumb_size: int = 0
 
@@ -539,6 +613,8 @@ class ThumbnailListModel(QAbstractListModel):
             return entry.focus_status
         if role == _MetaSpeciesCnRole:
             return entry.species_cn
+        if role == _MetaBurstTextRole:
+            return entry.burst_text
         if role == _ThumbPixmapRole:
             return entry.pixmap
         if role == _ThumbSizeRole:
@@ -557,16 +633,23 @@ class ThumbnailListModel(QAbstractListModel):
         meta = meta_cache.get(norm, {}) if isinstance(meta_cache, dict) else {}
         rating = _metadata_rating_value(meta)
         pick = _metadata_pick_value(meta)
+        burst_position, burst_id = _metadata_burst_values(meta)
+        burst_text = _format_burst_text(burst_position, burst_id)
+        base_tooltip = tooltip_fn(path)
         return ThumbnailListEntry(
             path=path,
             name=Path(path).name,
-            tooltip=tooltip_fn(path),
+            base_tooltip=base_tooltip,
+            tooltip=_append_burst_tooltip(base_tooltip, burst_text),
             mismatch=bool(mismatch_fn(path)),
             color=str(meta.get("color", "")),
             rating=rating,
             pick=pick,
             focus_status=str(meta.get("country", "")),
             species_cn=str(meta.get("bird_species_cn", "")),
+            burst_position=burst_position,
+            burst_id=burst_id,
+            burst_text=burst_text,
         )
 
     def clear(self) -> None:
@@ -688,6 +771,18 @@ class ThumbnailListModel(QAbstractListModel):
         if entry.species_cn != new_species_cn:
             entry.species_cn = new_species_cn
             changed_roles.append(_MetaSpeciesCnRole)
+        new_burst_position, new_burst_id = _metadata_burst_values(meta)
+        new_burst_text = _format_burst_text(new_burst_position, new_burst_id)
+        if (
+            entry.burst_position != new_burst_position
+            or entry.burst_id != new_burst_id
+            or entry.burst_text != new_burst_text
+        ):
+            entry.burst_position = new_burst_position
+            entry.burst_id = new_burst_id
+            entry.burst_text = new_burst_text
+            entry.tooltip = _append_burst_tooltip(entry.base_tooltip, new_burst_text)
+            changed_roles.extend([_MetaBurstTextRole, _ToolTipRole])
         if not changed_roles:
             return False
         idx = self.index(row, 0)
@@ -782,7 +877,9 @@ class ThumbnailListModel(QAbstractListModel):
         row = self.row_for_path(path)
         if row is None:
             return False
-        self._entries[row].tooltip = tooltip
+        entry = self._entries[row]
+        entry.base_tooltip = tooltip
+        entry.tooltip = _append_burst_tooltip(entry.base_tooltip, entry.burst_text)
         idx = self.index(row, 0)
         self.dataChanged.emit(idx, idx, [_ToolTipRole])
         return True
@@ -837,6 +934,7 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
         selected = bool(opt.state & _StateSelected)
         hovered = bool(opt.state & _StateMouseOver)
         name = str(index.data() or "")
+        burst_text = str(index.data(_MetaBurstTextRole) or "")
         rating = index.data(_MetaRatingRole)
         pick = index.data(_MetaPickRole)
         pixmap = index.data(_ThumbPixmapRole)
@@ -921,7 +1019,7 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
             text_color = opt.palette.highlightedText().color() if selected else opt.palette.text().color()
             painter.setPen(text_color)
             painter.setFont(opt.font)
-            elided = fm.elidedText(name, _ElideRight, text_rect.width())
+            elided = fm.elidedText(_format_burst_name(name, burst_text), _ElideRight, text_rect.width())
             painter.drawText(text_rect, _AlignCenter, elided)
         finally:
             painter.restore()
