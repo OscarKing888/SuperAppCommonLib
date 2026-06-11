@@ -176,7 +176,10 @@ class DirectoryScanWorker(QThread):
                         scanned_dirs += 1
                         dirs[:] = [d for d in dirs if not d.startswith(".")]
                         for name in sorted(names, key=str.lower):
-                            if name.lower().endswith(IMAGE_EXTENSIONS):
+                            if (
+                                not is_apple_double_metadata_file(name)
+                                and name.lower().endswith(IMAGE_EXTENSIONS)
+                            ):
                                 files.append(os.path.join(root, name))
                         maybe_emit_progress(root)
                 except (PermissionError, OSError) as e:
@@ -191,14 +194,21 @@ class DirectoryScanWorker(QThread):
                         scanned_dirs += 1
                         dirs[:] = [d for d in dirs if not d.startswith(".")]
                         for name in sorted(names, key=str.lower):
-                            if name.lower().endswith(IMAGE_EXTENSIONS):
+                            if (
+                                not is_apple_double_metadata_file(name)
+                                and name.lower().endswith(IMAGE_EXTENSIONS)
+                            ):
                                 files.append(os.path.join(root, name))
                         maybe_emit_progress(root)
                 else:
                     for entry in sorted(os.scandir(self._path), key=lambda e: e.name.lower()):
                         if self.isInterruptionRequested():
                             return
-                        if entry.is_file() and entry.name.lower().endswith(IMAGE_EXTENSIONS):
+                        if (
+                            entry.is_file()
+                            and not is_apple_double_metadata_file(entry.name)
+                            and entry.name.lower().endswith(IMAGE_EXTENSIONS)
+                        ):
                             files.append(entry.path)
                     scanned_dirs = 1
                     maybe_emit_progress(self._path, force=True)

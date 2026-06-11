@@ -2,7 +2,13 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 
-from app_common.file_utils import move_to_trash
+from app_common.file_utils import is_apple_double_metadata_file, move_to_trash
+
+
+def test_is_apple_double_metadata_file_matches_basename_cross_platform() -> None:
+    assert is_apple_double_metadata_file("/tmp/photos/._DSC06705.jpg")
+    assert is_apple_double_metadata_file(r"C:\photos\._DSC06705.jpg")
+    assert not is_apple_double_metadata_file("/tmp/photos/DSC06705.jpg")
 
 
 def test_move_to_trash_sends_sibling_xmp_sidecar_to_system_trash(monkeypatch, tmp_path: Path) -> None:

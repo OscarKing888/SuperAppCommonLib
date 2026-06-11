@@ -15,6 +15,7 @@ import inspect
 from collections.abc import Iterable
 from typing import Any, Callable
 
+from app_common.file_utils import is_apple_double_metadata_file
 from app_common.log import get_logger
 
 # 协议：客户端发送一行 JSON：{"files": ["path1", "path2", ...]}，UTF-8
@@ -108,6 +109,8 @@ def normalize_file_paths(paths: Iterable[str | os.PathLike[str]] | None) -> list
             path_text = str(raw_path)
         path_text = path_text.strip()
         if not path_text:
+            continue
+        if is_apple_double_metadata_file(path_text):
             continue
         full_path = os.path.abspath(os.path.normpath(os.path.expanduser(path_text)))
         if full_path in seen:

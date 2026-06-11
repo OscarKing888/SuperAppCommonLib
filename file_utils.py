@@ -6,6 +6,20 @@ import subprocess
 import sys
 
 _XMP_SIDECAR_SUFFIX_CANDIDATES = (".xmp", ".XMP", ".Xmp")
+_APPLE_DOUBLE_METADATA_PREFIX = "._"
+
+
+def is_apple_double_metadata_file(path) -> bool:
+    """Return True for macOS AppleDouble metadata files such as ``._IMG_0001.JPG``."""
+    try:
+        path_text = os.fspath(path)
+    except TypeError:
+        path_text = str(path)
+    path_text = path_text.strip()
+    if not path_text:
+        return False
+    name = path_text.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    return name.startswith(_APPLE_DOUBLE_METADATA_PREFIX)
 
 
 def hide_path(path):
@@ -225,7 +239,10 @@ def _dir_is_effectively_empty(dir_path: str) -> bool:
         return False  # already gone
     except Exception:
         return False
-    return all(e.lower() in _IGNORABLE_NAMES for e in entries)
+    return all(
+        e.lower() in _IGNORABLE_NAMES or is_apple_double_metadata_file(e)
+        for e in entries
+    )
 
 
 def move_empty_dirs_to_trash(root_path, include_root=False):

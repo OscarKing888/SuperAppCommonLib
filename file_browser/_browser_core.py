@@ -71,7 +71,12 @@ from app_common.focus_calc import (
 )
 from app_common.perf_probe import perf_probes_enabled
 from app_common.log import get_logger
-from app_common.file_utils import reveal_in_file_manager, move_to_trash, move_empty_dirs_to_trash
+from app_common.file_utils import (
+    is_apple_double_metadata_file,
+    reveal_in_file_manager,
+    move_to_trash,
+    move_empty_dirs_to_trash,
+)
 from app_common.send_to_app import get_external_apps, send_files_to_app
 from app_common.report_db import (
     ReportDB,
@@ -1778,6 +1783,8 @@ def _select_report_scope_files(
         full_path = _resolve_report_full_path(row, report_root, selected_dir)
         if not full_path:
             continue
+        if is_apple_double_metadata_file(full_path):
+            continue
         if not _is_same_or_child_path(selected_dir, full_path):
             continue
         files.append(full_path)
@@ -1860,11 +1867,18 @@ def _collect_image_files_impl(dir_path: str, recursive: bool) -> list:
             for root, dirs, names in os.walk(dir_path, topdown=True):
                 dirs[:] = [d for d in dirs if not d.startswith(".")]
                 for name in sorted(names, key=str.lower):
-                    if Path(name).suffix.lower() in IMAGE_EXTENSIONS:
+                    if (
+                        not is_apple_double_metadata_file(name)
+                        and Path(name).suffix.lower() in IMAGE_EXTENSIONS
+                    ):
                         files.append(os.path.join(root, name))
         else:
             for entry in sorted(os.scandir(dir_path), key=lambda e: e.name.lower()):
-                if entry.is_file() and Path(entry.name).suffix.lower() in IMAGE_EXTENSIONS:
+                if (
+                    entry.is_file()
+                    and not is_apple_double_metadata_file(entry.name)
+                    and Path(entry.name).suffix.lower() in IMAGE_EXTENSIONS
+                ):
                     files.append(entry.path)
     except (PermissionError, OSError):
         pass

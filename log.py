@@ -102,7 +102,8 @@ class _Logger:
             pass
 
     def debug(self, msg: str, *args: Any) -> None:
-        self._write("DEBUG", msg, *args)
+        pass
+        # self._write("DEBUG", msg, *args)
 
     def info(self, msg: str, *args: Any) -> None:
         self._write("INFO", msg, *args)

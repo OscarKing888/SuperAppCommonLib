@@ -1989,6 +1989,15 @@ class FileListPanel(QWidget):
             return f"粘贴鸟名（{label}）"
         return "粘贴鸟名"
 
+    @staticmethod
+    def _get_copy_species_action_text(payload: dict | None) -> str:
+        label = ""
+        if isinstance(payload, dict):
+            label = str(payload.get("bird_species_cn") or payload.get("filename") or "").strip()
+        if label:
+            return f"复制鸟名（{label}）"
+        return "复制鸟名"
+
     def _paste_species_to_paths(self, paths: list[str]) -> None:
         if not self._file_writes_allowed("粘贴鸟名", warn=True):
             return
@@ -2637,13 +2646,12 @@ class FileListPanel(QWidget):
         )
         reject_action.setText(f"{reject_label}\tQ")
 
-    def _add_delete_menu_action(self, menu: QMenu, paths: list[str]) -> None:
-        pass
-        #unique_paths = self._unique_norm_paths(paths)
-        #if not unique_paths:
-        #    return
-        #act_delete = menu.addAction("删除\tDel")
-        #act_delete.triggered.connect(lambda: self._move_paths_to_trash(unique_paths))
+    def _add_delete_menu_action(self, menu: QMenu, paths: list[str]) -> None:        
+        unique_paths = self._unique_norm_paths(paths)
+        if not unique_paths:
+            return
+        act_delete = menu.addAction("删除\tDel")
+        act_delete.triggered.connect(lambda: self._move_paths_to_trash(unique_paths))
 
     def _get_actual_path_for_display(self, path: str) -> str | None:
         actual = _get_cached_actual_path(path)
@@ -2768,6 +2776,16 @@ class FileListPanel(QWidget):
     def _tree_path_from_index(self, index: QModelIndex) -> str:
         if not index.isValid():
             return ""
+        model = index.model()
+        if model is self._file_table_model:
+            return self._file_table_model.path_for_index(index) or ""
+        if model is not self._file_table_proxy:
+            try:
+                raw_path = index.data(_UserRole)
+                if raw_path:
+                    return str(raw_path)
+            except Exception:
+                return ""
         source_index = self._file_table_proxy.mapToSource(index)
         return self._file_table_model.path_for_index(source_index) or ""
 
@@ -2776,11 +2794,25 @@ class FileListPanel(QWidget):
         if sm is None:
             return []
         indexes = [idx for idx in sm.selectedRows(0) if idx.isValid()]
+        if not indexes:
+            seen_rows: set[int] = set()
+            for idx in sm.selectedIndexes():
+                if not idx.isValid() or idx.row() in seen_rows:
+                    continue
+                seen_rows.add(idx.row())
+                row_index = self._file_table_proxy.index(idx.row(), 0)
+                if row_index.isValid():
+                    indexes.append(row_index)
         indexes.sort(key=lambda idx: idx.row())
         return indexes
 
     def _tree_selected_paths(self) -> list[str]:
-        return [self._tree_path_from_index(idx) for idx in self._tree_selected_indexes() if self._tree_path_from_index(idx)]
+        paths: list[str] = []
+        for idx in self._tree_selected_indexes():
+            path = self._tree_path_from_index(idx)
+            if path:
+                paths.append(path)
+        return paths
 
     def _thumb_row_count(self) -> int:
         return self._thumb_list_model.rowCount()
@@ -6524,10 +6556,14 @@ class FileListPanel(QWidget):
                 )
             )
 
+    def _add_photo_tag_menu_actions(self, menu: QMenu, paths: list[str]) -> None:
+        """Hook for SuperViewer tag-aware file lists."""
+        return
+
     def _add_species_menu_actions(self, menu: QMenu, primary_path: str | None, paths: list[str]) -> None:
         source_path = primary_path or (paths[0] if paths else "")
         copy_payload = self._get_species_payload_for_path(source_path) if source_path else None
-        act_copy_species = menu.addAction("复制鸟名")
+        act_copy_species = menu.addAction(self._get_copy_species_action_text(copy_payload))
         act_copy_species.setEnabled(copy_payload is not None)
         if copy_payload is not None:
             act_copy_species.triggered.connect(lambda: self._copy_species_from_path(source_path))
@@ -6562,11 +6598,11 @@ class FileListPanel(QWidget):
             act_preview.triggered.connect(lambda checked=False, p=sized_preview_path: reveal_in_file_manager(p))
 
         selected_preview_path = self._resolve_existing_selected_preview_image_path(source_path or "")
-        act_selected_preview = menu.addAction("浏览预览图像")
+        act_selected_preview = menu.addAction("浏览原图像")
         act_selected_preview.setEnabled(bool(selected_preview_path))
         if selected_preview_path:
             _log.info(
-                "[_add_browse_preview_menu_action] source=%r selected_preview=%r",
+                "[_add_browse_preview_menu_action] source=%r selected_src=%r",
                 source_path,
                 selected_preview_path,
             )
@@ -6574,47 +6610,72 @@ class FileListPanel(QWidget):
                 lambda checked=False, p=selected_preview_path: reveal_in_file_manager(p)
             )
 
+    def _show_file_context_menu(
+        self,
+        viewport,
+        pos,
+        *,
+        paths: list[str],
+        primary_path: str | None,
+        log_prefix: str,
+    ) -> None:
+        menu_paths = self._unique_norm_paths(paths)
+        if primary_path:
+            primary_norm = os.path.normpath(primary_path)
+            if primary_norm and primary_norm not in menu_paths:
+                menu_paths.insert(0, primary_norm)
+        if not menu_paths:
+            if self._show_empty_file_context_menu(viewport, pos):
+                return
+            return
+
+        primary = os.path.normpath(primary_path) if primary_path else menu_paths[0]
+        menu = QMenu(self)
+        self._add_file_clipboard_menu_actions(menu, menu_paths)
+        act_copy_filename = menu.addAction("复制文件全路径")
+        act_copy_filename.triggered.connect(
+            lambda checked=False, p=list(menu_paths): self._copy_filenames_to_clipboard(p)
+        )
+        self._add_species_menu_actions(menu, primary, menu_paths)
+        menu.addSeparator()
+
+        self._add_rating_menu_actions(menu, menu_paths)
+        self._add_photo_tag_menu_actions(menu, menu_paths)
+        menu.addSeparator()
+
+        self._add_send_to_external_app_actions(menu, menu_paths)
+        menu.addSeparator()
+        label = "在Finder中显示" if sys.platform == "darwin" else "在资源管理器中显示"
+        reveal_path = self._resolve_reveal_path(primary)
+        if reveal_path:
+            _log.info("[%s] reveal_path=%r paths=%s", log_prefix, reveal_path, len(menu_paths))
+            act_reveal = menu.addAction(label)
+            act_reveal.triggered.connect(lambda checked=False, p=reveal_path: reveal_in_file_manager(p))
+        self._add_browse_preview_menu_action(menu, primary)
+        menu.addSeparator()
+        self._add_delete_menu_action(menu, menu_paths)
+        _exec_menu(menu, viewport.mapToGlobal(pos))
+
     def _on_tree_context_menu(self, pos) -> None:
         index = self._tree_widget.indexAt(pos)
-        if index.isValid() and not self._tree_widget.selectionModel().isSelected(index):
+        sm = self._tree_widget.selectionModel()
+        if index.isValid() and sm is not None and not sm.isSelected(index):
             self._tree_widget.clearSelection()
             self._tree_widget.setCurrentIndex(index)
-            sm = self._tree_widget.selectionModel()
-            if sm is not None:
-                sm.select(index, _SelectCurrent)
+            sm.select(index, _SelectCurrent)
         paths = self._tree_selected_paths()
         if not paths and index.isValid():
             p = self._tree_path_from_index(index)
             if p:
                 paths = [p]
-        if not paths:
-            if self._show_empty_file_context_menu(self._tree_widget.viewport(), pos):
-                return
-            return
-        menu = QMenu(self)
-        self._add_file_clipboard_menu_actions(menu, paths)
-        act_copy_filename = menu.addAction("复制文件全路径")
-        act_copy_filename.triggered.connect(lambda: self._copy_filenames_to_clipboard(paths))
-        self._add_rating_menu_actions(menu, paths)
-        menu.addSeparator()
-        self._add_species_menu_actions(menu, self._tree_path_from_index(index) if index.isValid() else (paths[0] if paths else ""), paths)
-
-        self._add_photo_tag_menu_actions(menu, paths)
-        menu.addSeparator()
-
-        self._add_send_to_external_app_actions(menu, paths)
-        menu.addSeparator()
-        label = "在Finder中显示" if sys.platform == "darwin" else "在资源管理器中显示"
         primary_path = self._tree_path_from_index(index) if index.isValid() else (paths[0] if paths else None)
-        reveal_path = self._resolve_reveal_path(primary_path)
-        if reveal_path:
-            _log.info("[_on_tree_context_menu] reveal_path=%r paths=%s", reveal_path, len(paths))
-            act_reveal = menu.addAction(label)
-            act_reveal.triggered.connect(lambda: reveal_in_file_manager(reveal_path))
-        # self._add_browse_preview_menu_action(menu, primary_path)
-        # menu.addSeparator()
-        # self._add_delete_menu_action(menu, paths)
-        _exec_menu(menu, self._tree_widget.viewport().mapToGlobal(pos))
+        self._show_file_context_menu(
+            self._tree_widget.viewport(),
+            pos,
+            paths=paths,
+            primary_path=primary_path,
+            log_prefix="_on_tree_context_menu",
+        )
 
     def _collect_report_filenames_for_paths(self, paths: list[str]) -> list[str]:
         filenames: list[str] = []
@@ -6808,31 +6869,11 @@ class FileListPanel(QWidget):
             p = self._thumb_path_from_index(index)
             if p:
                 paths = [p]
-        if not paths:
-            if self._show_empty_file_context_menu(self._list_widget.viewport(), pos):
-                return
-            return
-        menu = QMenu(self)
-        self._add_file_clipboard_menu_actions(menu, paths)
-        act_copy_filename = menu.addAction("复制文件全路径")
-        act_copy_filename.triggered.connect(lambda: self._copy_filenames_to_clipboard(paths))
-        self._add_rating_menu_actions(menu, paths)
-        menu.addSeparator()
-        self._add_species_menu_actions(menu, self._thumb_path_from_index(index) if index.isValid() else (paths[0] if paths else ""), paths)
-
-        self._add_photo_tag_menu_actions(menu, paths)
-        menu.addSeparator()
-
-        self._add_send_to_external_app_actions(menu, paths)
-        menu.addSeparator()
-        label = "在Finder中显示" if sys.platform == "darwin" else "在资源管理器中显示"
         primary_path = self._thumb_path_from_index(index) if index.isValid() else (paths[0] if paths else None)
-        reveal_path = self._resolve_reveal_path(primary_path)
-        if reveal_path:
-            _log.info("[_on_list_context_menu] reveal_path=%r paths=%s", reveal_path, len(paths))
-            act_reveal = menu.addAction(label)
-            act_reveal.triggered.connect(lambda: reveal_in_file_manager(reveal_path))
-        # self._add_browse_preview_menu_action(menu, primary_path)
-        # menu.addSeparator()
-        # self._add_delete_menu_action(menu, paths)
-        _exec_menu(menu, self._list_widget.viewport().mapToGlobal(pos))
+        self._show_file_context_menu(
+            self._list_widget.viewport(),
+            pos,
+            paths=paths,
+            primary_path=primary_path,
+            log_prefix="_on_list_context_menu",
+        )
