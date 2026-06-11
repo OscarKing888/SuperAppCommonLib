@@ -10,8 +10,8 @@ PhotoMetaData (ABC)
 └── PhotoMetaDataReportDB      – SuperPicky report.db (SQLite)
 
 PhotoMetaDataProxy             – composite; merges all three with priority
-                                 ReportDB > XMP > EXIF (for reads)
-                                 routes writes to appropriate backend(s)
+                                 XMP > ReportDB > EXIF (for reads)
+                                 routes writes to XMP sidecar
 
 All `read()` methods return an **exiftool-G1-style flat dict** so callers do
 not need to care about the underlying source.  Existing functions in
@@ -107,14 +107,11 @@ class PhotoMetaDataEXIFEmbeded(PhotoMetaData):
             return super().read_batch(paths)
 
     def write(self, path: str, fields: dict[str, Any]) -> bool:
-        """Write arbitrary exiftool-style tag assignments to the embedded EXIF."""
+        """Compatibility entry point; writes are redirected to XMP sidecar."""
         if not fields:
             return True
-        assignments = [f"-{k}={v}" for k, v in fields.items()]
         try:
-            from .writer import run_exiftool_assignments
-            run_exiftool_assignments(path, assignments)
-            return True
+            return PhotoMetaDataXMP().write(path, fields)
         except Exception:
             return False
 
@@ -131,11 +128,18 @@ _RDF_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
 _DC_NS = "http://purl.org/dc/elements/1.1/"
 _XMP_NS = "http://ns.adobe.com/xap/1.0/"
 _XMP_DM_NS = "http://ns.adobe.com/xmp/1.0/DynamicMedia/"
+_EXIF_NS = "http://ns.adobe.com/exif/1.0/"
+_TIFF_NS = "http://ns.adobe.com/tiff/1.0/"
+_AUX_NS = "http://ns.adobe.com/exif/1.0/aux/"
+_PHOTOSHOP_NS = "http://ns.adobe.com/photoshop/1.0/"
+_SUPERPICKY_NS = "https://superbirdtools.local/xmp/superpicky/1.0/"
 _XMP_DC_SUBJECT_TAG = f"{{{_DC_NS}}}subject"
+_XMP_DC_TITLE_TAG = f"{{{_DC_NS}}}title"
 _XMP_DC_DESCRIPTION_TAG = f"{{{_DC_NS}}}description"
 _XMP_RATING_TAG = f"{{{_XMP_NS}}}Rating"
 _XMP_PICK_TAG = f"{{{_XMP_NS}}}Pick"
 _XMP_DM_PICK_TAG = f"{{{_XMP_DM_NS}}}pick"
+_XMP_SUPERPICKY_BIRD_SPECIES_CN_TAG = f"{{{_SUPERPICKY_NS}}}bird_species_cn"
 _RDF_DESCRIPTION_TAG = f"{{{_RDF_NS}}}Description"
 _RDF_BAG_TAG = f"{{{_RDF_NS}}}Bag"
 _RDF_ALT_TAG = f"{{{_RDF_NS}}}Alt"
@@ -152,6 +156,11 @@ _XMP_SUBJECT_KEYS: frozenset[str] = frozenset({
     "subjects",
     "keywords",
     "iptc:keywords",
+})
+_XMP_TITLE_KEYS: frozenset[str] = frozenset({
+    "xmp-dc:title",
+    "xmp:title",
+    "title",
 })
 _XMP_DESCRIPTION_KEYS: frozenset[str] = frozenset({
     "xmp-dc:description",
@@ -173,9 +182,102 @@ _XMP_PICK_KEYS: frozenset[str] = frozenset({
     "pick",
 })
 
+_XMP_SIDECAR_WRITE_KEY_ALIASES: dict[str, str] = {
+    "ifd0:documentname": "XMP-dc:Title",
+    "ifd0:xptitle": "XMP-dc:Title",
+    "iptc:objectname": "XMP-dc:Title",
+    "ifd0:xpcomment": "XMP-dc:Description",
+    "ifd0:imagedescription": "XMP-dc:Description",
+    "exif:imagedescription": "XMP-dc:Description",
+    "exif:usercomment": "XMP-dc:Description",
+    "iptc:caption-abstract": "XMP-dc:Description",
+    "xmp:city": "XMP-photoshop:City",
+    "xmp:state": "XMP-photoshop:State",
+    "xmp:country": "XMP-photoshop:Country",
+    "ifd0:make": "XMP-tiff:Make",
+    "exif:make": "XMP-tiff:Make",
+    "ifd0:model": "XMP-tiff:Model",
+    "exif:model": "XMP-tiff:Model",
+    "exif:datetimeoriginal": "XMP-exif:DateTimeOriginal",
+    "exififd:datetimeoriginal": "XMP-exif:DateTimeOriginal",
+    "exif:createdate": "XMP-xmp:CreateDate",
+    "exififd:createdate": "XMP-xmp:CreateDate",
+    "exif:fnumber": "XMP-exif:FNumber",
+    "exififd:fnumber": "XMP-exif:FNumber",
+    "exif:aperturevalue": "XMP-exif:ApertureValue",
+    "exififd:aperturevalue": "XMP-exif:ApertureValue",
+    "exif:exposuretime": "XMP-exif:ExposureTime",
+    "exififd:exposuretime": "XMP-exif:ExposureTime",
+    "exif:iso": "XMP-exif:PhotographicSensitivity",
+    "exififd:iso": "XMP-exif:PhotographicSensitivity",
+    "exif:isospeedratings": "XMP-exif:ISOSpeedRatings",
+    "exififd:isospeedratings": "XMP-exif:ISOSpeedRatings",
+    "exif:photographicsensitivity": "XMP-exif:PhotographicSensitivity",
+    "exififd:photographicsensitivity": "XMP-exif:PhotographicSensitivity",
+    "exif:focallength": "XMP-exif:FocalLength",
+    "exififd:focallength": "XMP-exif:FocalLength",
+    "exif:focallengthin35mmformat": "XMP-exif:FocalLengthIn35mmFormat",
+    "exififd:focallengthin35mmformat": "XMP-exif:FocalLengthIn35mmFormat",
+    "exif:lensmodel": "XMP-aux:LensModel",
+    "exififd:lensmodel": "XMP-aux:LensModel",
+    "composite:lensmodel": "XMP-aux:LensModel",
+    "composite:shutterspeed": "XMP-exif:ExposureTime",
+    "composite:aperture": "XMP-exif:FNumber",
+    "composite:focallength": "XMP-exif:FocalLength",
+    "composite:focallength35efl": "XMP-exif:FocalLengthIn35mmFormat",
+    "gps:gpslatitude": "XMP-exif:GPSLatitude",
+    "gps:gpslongitude": "XMP-exif:GPSLongitude",
+    "gps:gpsaltitude": "XMP-exif:GPSAltitude",
+    "exif:gpslatitude": "XMP-exif:GPSLatitude",
+    "exif:gpslongitude": "XMP-exif:GPSLongitude",
+    "exif:gpsaltitude": "XMP-exif:GPSAltitude",
+    "composite:gpslatitude": "XMP-exif:GPSLatitude",
+    "composite:gpslongitude": "XMP-exif:GPSLongitude",
+    "composite:gpsaltitude": "XMP-exif:GPSAltitude",
+}
+
+
+def _xmp_sidecar_write_key(key: str) -> str:
+    text = str(key or "").strip()
+    if not text:
+        return ""
+    return _XMP_SIDECAR_WRITE_KEY_ALIASES.get(text.lower(), text)
+
+
+def _xmp_group_tag_to_xml_tag(key: str) -> str:
+    text = _xmp_sidecar_write_key(key)
+    if ":" not in text:
+        return ""
+    group, tag_name = text.split(":", 1)
+    if not group or not tag_name:
+        return ""
+    group_norm = group.strip().lower()
+    ns_map = {
+        "xmp-dc": _DC_NS,
+        "xmp-xmp": _XMP_NS,
+        "xmp-xmpdm": _XMP_DM_NS,
+        "xmp-exif": _EXIF_NS,
+        "xmp-tiff": _TIFF_NS,
+        "xmp-aux": _AUX_NS,
+        "xmp-photoshop": _PHOTOSHOP_NS,
+        "xmp-superpicky": _SUPERPICKY_NS,
+    }
+    ns = ns_map.get(group_norm)
+    if not ns:
+        return ""
+    return f"{{{ns}}}{tag_name.strip()}"
+
+
+def _metadata_value_has_content(value: Any) -> bool:
+    return value is not None and (not isinstance(value, str) or bool(value.strip()))
+
 
 def _is_xmp_subject_key(key: str) -> bool:
     return str(key or "").strip().lower() in _XMP_SUBJECT_KEYS
+
+
+def _is_xmp_title_key(key: str) -> bool:
+    return str(key or "").strip().lower() in _XMP_TITLE_KEYS
 
 
 def _is_xmp_description_key(key: str) -> bool:
@@ -214,18 +316,31 @@ def _normalise_pick_value(value: Any) -> int:
 def _normalise_rating_pick_aliases(rec: dict[str, Any]) -> None:
     if not isinstance(rec, dict):
         return
-    raw_rating = None
-    pick_seen = False
+    xmp_rating = None
+    generic_rating = None
+    xmp_pick = None
+    generic_pick = None
     for key, value in list(rec.items()):
+        key_norm = str(key or "").strip().lower()
         if _is_xmp_rating_key(key):
-            raw_rating = value
-            rec.setdefault("XMP-xmp:Rating", value)
-            rec["rating"] = _normalise_rating_value(value)
+            if key_norm == "rating":
+                generic_rating = value
+            else:
+                xmp_rating = value
+                rec["XMP-xmp:Rating"] = value
         elif _is_xmp_pick_key(key):
-            pick_seen = True
-            rec.setdefault("XMP-xmpDM:pick", value)
-            rec["pick"] = _normalise_pick_value(value)
-    if not pick_seen and raw_rating is not None:
+            if key_norm == "pick":
+                generic_pick = value
+            else:
+                xmp_pick = value
+                rec["XMP-xmpDM:pick"] = value
+    raw_rating = xmp_rating if xmp_rating is not None else generic_rating
+    if raw_rating is not None:
+        rec["rating"] = _normalise_rating_value(raw_rating)
+    raw_pick = xmp_pick if xmp_pick is not None else generic_pick
+    if raw_pick is not None:
+        rec["pick"] = _normalise_pick_value(raw_pick)
+    if raw_pick is None and raw_rating is not None:
         try:
             if int(float(str(raw_rating))) < 0:
                 rec["pick"] = -1
@@ -290,8 +405,14 @@ class PhotoMetaDataXMP(PhotoMetaData):
             for group, name, value in rows:
                 key = f"{group}:{name}"
                 rec[key] = value
-                if group == "XMP-dc" and str(name).lower() == "subject":
+                if group == "XMP-superpicky":
+                    rec[str(name)] = value
+                    rec[f"report.{name}"] = value
+                elif group == "XMP-dc" and str(name).lower() == "subject":
                     rec["XMP-dc:Subject"] = value
+                elif group == "XMP-dc" and str(name).lower() == "title":
+                    rec["XMP-dc:Title"] = value
+                    rec["Title"] = value
                 elif group == "XMP-dc" and str(name).lower() == "description":
                     rec["XMP-dc:Description"] = value
                     rec["Description"] = value
@@ -310,8 +431,11 @@ class PhotoMetaDataXMP(PhotoMetaData):
         if not fields:
             return True
 
+        protected_report_fields = self._protected_report_fields_from_write_fields(fields)
         subject_seen = False
         subject_values: list[str] = []
+        title_seen = False
+        title_value = ""
         description_seen = False
         description_value = ""
         rating_seen = False
@@ -320,31 +444,52 @@ class PhotoMetaDataXMP(PhotoMetaData):
         pick_value = 0
         remaining_fields: dict[str, Any] = {}
         for key, value in fields.items():
-            if _is_xmp_subject_key(key):
+            write_key = _xmp_sidecar_write_key(key)
+            if not write_key:
+                continue
+            if _is_xmp_subject_key(write_key):
                 subject_seen = True
                 subject_values.extend(_normalise_subject_value(value, split_strings=True))
-            elif _is_xmp_description_key(key):
+            elif _is_xmp_title_key(write_key):
+                title_seen = True
+                title_value = "" if value is None else str(value)
+            elif _is_xmp_description_key(write_key):
                 description_seen = True
                 description_value = "" if value is None else str(value)
-            elif _is_xmp_rating_key(key):
+            elif _is_xmp_rating_key(write_key):
                 rating_seen = True
                 rating_value = _normalise_rating_value(value)
-            elif _is_xmp_pick_key(key):
+            elif _is_xmp_pick_key(write_key):
                 pick_seen = True
                 pick_value = _normalise_pick_value(value)
             else:
-                remaining_fields[key] = value
+                remaining_fields[write_key] = value
 
         success = True
         if subject_seen:
-            success = self.write_subjects(path, subject_values) and success
+            success = self.write_subjects(
+                path,
+                subject_values,
+                _protected_report_fields=protected_report_fields,
+            ) and success
+        if title_seen:
+            success = self.write_title(
+                path,
+                title_value,
+                _protected_report_fields=protected_report_fields,
+            ) and success
         if description_seen:
-            success = self.write_description(path, description_value) and success
+            success = self.write_description(
+                path,
+                description_value,
+                _protected_report_fields=protected_report_fields,
+            ) and success
         if rating_seen or pick_seen:
             success = self.write_rating_pick(
                 path,
                 rating=rating_value if rating_seen else None,
                 pick=pick_value if pick_seen else None,
+                _protected_report_fields=protected_report_fields,
             ) and success
         if not remaining_fields:
             return success
@@ -359,7 +504,7 @@ class PhotoMetaDataXMP(PhotoMetaData):
             assignments = [f"-{k}={v}" for k, v in remaining_fields.items()]
             # We write to the sidecar by passing the image path and using -o
             import subprocess
-            all_args = assignments + [f"-o={xmp_path}", os.path.normpath(path)]
+            all_args = ["-overwrite_original", *assignments, f"-o={xmp_path}", os.path.normpath(path)]
             fd, argfile = tempfile.mkstemp(suffix=".args", prefix="et_xmp_")
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -371,6 +516,10 @@ class PhotoMetaDataXMP(PhotoMetaData):
                 )
                 ok = cp.returncode == 0
                 if ok:
+                    self._hydrate_report_db_sidecar_if_needed(
+                        path,
+                        protected_report_fields=protected_report_fields,
+                    )
                     self._invalidate_metadata_cache(path)
                 return ok and success
             finally:
@@ -402,7 +551,13 @@ class PhotoMetaDataXMP(PhotoMetaData):
                 values.extend(self._subject_values_from_element(child))
         return _normalise_text_values(values)
 
-    def write_subjects(self, path: str, subjects: Iterable[Any]) -> bool:
+    def write_subjects(
+        self,
+        path: str,
+        subjects: Iterable[Any],
+        *,
+        _protected_report_fields: dict[str, Any] | None = None,
+    ) -> bool:
         """Replace XMP ``dc:subject`` values in the sidecar.
 
         Existing non-subject XMP properties are preserved.  Empty ``subjects``
@@ -418,7 +573,12 @@ class PhotoMetaDataXMP(PhotoMetaData):
             desc = self._ensure_description(root)
             self._replace_subject_node(desc, clean_subjects)
             sidecar_path.parent.mkdir(parents=True, exist_ok=True)
-            ok = self._write_tree_atomic(tree, sidecar_path)
+            ok = self._write_tree_with_report_hydration(
+                path,
+                tree,
+                sidecar_path,
+                protected_report_fields=_protected_report_fields,
+            )
             if ok:
                 self._invalidate_metadata_cache(path)
             return ok
@@ -446,7 +606,13 @@ class PhotoMetaDataXMP(PhotoMetaData):
         kept = [value for value in self.read_subjects(path) if value not in remove]
         return self.write_subjects(path, kept)
 
-    def write_description(self, path: str, description: Any) -> bool:
+    def write_description(
+        self,
+        path: str,
+        description: Any,
+        *,
+        _protected_report_fields: dict[str, Any] | None = None,
+    ) -> bool:
         """Replace XMP ``dc:description`` text in the sidecar."""
         text = "" if description is None else str(description)
         sidecar_path = self.sidecar_path_for(path)
@@ -457,7 +623,46 @@ class PhotoMetaDataXMP(PhotoMetaData):
             desc = self._ensure_description(tree.getroot())
             self._replace_alt_text_node(desc, _XMP_DC_DESCRIPTION_TAG, text)
             sidecar_path.parent.mkdir(parents=True, exist_ok=True)
-            ok = self._write_tree_atomic(tree, sidecar_path)
+            protected = dict(_protected_report_fields or {})
+            protected.setdefault("caption", text)
+            ok = self._write_tree_with_report_hydration(
+                path,
+                tree,
+                sidecar_path,
+                protected_report_fields=protected,
+            )
+            if ok:
+                self._invalidate_metadata_cache(path)
+            return ok
+        except Exception:
+            return False
+
+    def write_title(
+        self,
+        path: str,
+        title: Any,
+        *,
+        _protected_report_fields: dict[str, Any] | None = None,
+    ) -> bool:
+        """Replace XMP ``dc:title`` text in the sidecar."""
+        text = "" if title is None else str(title)
+        sidecar_path = self.sidecar_path_for(path)
+        try:
+            tree = self._load_or_create_xmp_tree(sidecar_path)
+            if tree is None:
+                return False
+            desc = self._ensure_description(tree.getroot())
+            self._replace_alt_text_node(desc, _XMP_DC_TITLE_TAG, text)
+            sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+            protected = dict(_protected_report_fields or {})
+            protected.setdefault("title", text)
+            protected.setdefault("bird_species_cn", text)
+            ok = self._write_tree_with_report_hydration(
+                path,
+                tree,
+                sidecar_path,
+                protected_report_fields=protected,
+            )
             if ok:
                 self._invalidate_metadata_cache(path)
             return ok
@@ -470,6 +675,7 @@ class PhotoMetaDataXMP(PhotoMetaData):
         *,
         rating: int | None = None,
         pick: int | None = None,
+        _protected_report_fields: dict[str, Any] | None = None,
     ) -> bool:
         """Write Lightroom-style rating and Pick/Reject state into the sidecar."""
         if rating is None and pick is None:
@@ -485,12 +691,240 @@ class PhotoMetaDataXMP(PhotoMetaData):
             if pick is not None:
                 self._replace_text_node(desc, _XMP_DM_PICK_TAG, str(_normalise_pick_value(pick)))
             sidecar_path.parent.mkdir(parents=True, exist_ok=True)
-            ok = self._write_tree_atomic(tree, sidecar_path)
+            protected = dict(_protected_report_fields or {})
+            if rating is not None:
+                protected.setdefault("rating", _normalise_rating_value(rating))
+            if pick is not None:
+                protected.setdefault("pick", _normalise_pick_value(pick))
+            ok = self._write_tree_with_report_hydration(
+                path,
+                tree,
+                sidecar_path,
+                protected_report_fields=protected,
+            )
             if ok:
                 self._invalidate_metadata_cache(path)
             return ok
         except Exception:
             return False
+
+    def _write_tree_with_report_hydration(
+        self,
+        path: str,
+        tree: ET.ElementTree,
+        sidecar_path: Path,
+        *,
+        protected_report_fields: dict[str, Any] | None = None,
+    ) -> bool:
+        self._hydrate_report_db_fields_if_needed(
+            path,
+            tree,
+            protected_report_fields=protected_report_fields,
+        )
+        return self._write_tree_atomic(tree, sidecar_path)
+
+    def _hydrate_report_db_sidecar_if_needed(
+        self,
+        path: str,
+        *,
+        protected_report_fields: dict[str, Any] | None = None,
+    ) -> bool:
+        sidecar_path = self.sidecar_path_for(path)
+        try:
+            tree = self._load_or_create_xmp_tree(sidecar_path)
+            if tree is None:
+                return False
+            changed = self._hydrate_report_db_fields_if_needed(
+                path,
+                tree,
+                protected_report_fields=protected_report_fields,
+            )
+            if not changed:
+                return True
+            sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+            return self._write_tree_atomic(tree, sidecar_path)
+        except Exception:
+            return False
+
+    def _hydrate_report_db_fields_if_needed(
+        self,
+        path: str,
+        tree: ET.ElementTree,
+        *,
+        protected_report_fields: dict[str, Any] | None = None,
+    ) -> bool:
+        try:
+            root = tree.getroot()
+            for existing_desc in root.iter(_RDF_DESCRIPTION_TAG):
+                if self._has_bird_species_marker(existing_desc):
+                    return False
+            row = PhotoMetaDataReportDB()._row_for(path)
+            if not isinstance(row, dict) or not row:
+                return False
+            desc = self._ensure_description(root)
+            changed = self._apply_report_row_to_sidecar_desc(
+                desc,
+                row,
+                path,
+                protected_report_fields=protected_report_fields,
+            )
+            return changed
+        except Exception:
+            return False
+
+    @classmethod
+    def _apply_report_row_to_sidecar_desc(
+        cls,
+        desc: ET.Element,
+        row: dict[str, Any],
+        path: str,
+        *,
+        protected_report_fields: dict[str, Any] | None = None,
+    ) -> bool:
+        changed = False
+        protected = protected_report_fields or {}
+        try:
+            from app_common.report_db import PHOTO_COLUMNS, report_row_to_exiftool_style
+        except Exception:
+            PHOTO_COLUMNS = []
+            report_row_to_exiftool_style = None
+
+        for column_name, _type_def, _default in PHOTO_COLUMNS:
+            value = protected.get(column_name, row.get(column_name))
+            if not _metadata_value_has_content(value):
+                continue
+            tag = f"{{{_SUPERPICKY_NS}}}{column_name}"
+            changed = cls._set_text_node_if_missing(desc, tag, str(value)) or changed
+
+        if callable(report_row_to_exiftool_style):
+            try:
+                compatible = report_row_to_exiftool_style(row, path)
+            except Exception:
+                compatible = {}
+            for key, value in compatible.items():
+                if key == "SourceFile" or not _metadata_value_has_content(value):
+                    continue
+                changed = cls._set_xmp_field_if_missing(desc, key, value) or changed
+        return changed
+
+    @classmethod
+    def _set_xmp_field_if_missing(cls, desc: ET.Element, key: str, value: Any) -> bool:
+        write_key = _xmp_sidecar_write_key(key)
+        if _is_xmp_title_key(write_key):
+            return cls._set_alt_text_node_if_missing(desc, _XMP_DC_TITLE_TAG, str(value))
+        if _is_xmp_description_key(write_key):
+            return cls._set_alt_text_node_if_missing(desc, _XMP_DC_DESCRIPTION_TAG, str(value))
+        tag = _xmp_group_tag_to_xml_tag(write_key)
+        if not tag:
+            return False
+        return cls._set_text_node_if_missing(desc, tag, str(value))
+
+    @classmethod
+    def _protected_report_fields_from_write_fields(cls, fields: dict[str, Any]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in (fields or {}).items():
+            for column_name in cls._report_columns_for_write_key(key):
+                result[column_name] = value
+        return result
+
+    @staticmethod
+    def _report_columns_for_write_key(key: str) -> tuple[str, ...]:
+        write_key = _xmp_sidecar_write_key(key)
+        key_norm = str(write_key or "").strip().lower()
+        mapping = {
+            "xmp-dc:title": ("title", "bird_species_cn"),
+            "title": ("title", "bird_species_cn"),
+            "xmp-dc:description": ("caption",),
+            "description": ("caption",),
+            "xmp-xmp:rating": ("rating",),
+            "rating": ("rating",),
+            "xmp-xmpdm:pick": ("pick",),
+            "pick": ("pick",),
+            "xmp-tiff:model": ("camera_model",),
+            "xmp-aux:lensmodel": ("lens_model",),
+            "xmp-exif:photographicsensitivity": ("iso",),
+            "xmp-exif:isospeedratings": ("iso",),
+            "xmp-exif:exposuretime": ("shutter_speed",),
+            "xmp-exif:fnumber": ("aperture",),
+            "xmp-exif:focallength": ("focal_length",),
+            "xmp-exif:focallengthin35mmformat": ("focal_length_35mm",),
+            "xmp-exif:gpslatitude": ("gps_latitude",),
+            "xmp-exif:gpslongitude": ("gps_longitude",),
+            "xmp-exif:gpsaltitude": ("gps_altitude",),
+            "xmp-photoshop:city": ("city", "adj_sharpness"),
+            "xmp-photoshop:state": ("state_province", "adj_topiq"),
+            "xmp-photoshop:country": ("country", "focus_status"),
+        }
+        if key_norm.startswith("xmp-superpicky:"):
+            return (key_norm.split(":", 1)[1],)
+        return mapping.get(key_norm, ())
+
+    @classmethod
+    def _has_bird_species_marker(cls, desc: ET.Element) -> bool:
+        if cls._element_or_attr_has_text(desc, _XMP_SUPERPICKY_BIRD_SPECIES_CN_TAG):
+            return True
+        if cls._element_or_attr_has_text(desc, _XMP_DC_TITLE_TAG):
+            return True
+        for attr_key, attr_value in desc.attrib.items():
+            local_name = str(attr_key or "").split("}", 1)[-1]
+            if local_name == "bird_species_cn" and isinstance(attr_value, str) and attr_value.strip():
+                return True
+        for child in desc:
+            if child.tag.split("}", 1)[-1] == "bird_species_cn" and cls._element_has_text(child):
+                return True
+        return False
+
+    @classmethod
+    def _element_or_attr_has_text(cls, desc: ET.Element, tag: str) -> bool:
+        attr_value = desc.attrib.get(tag)
+        if isinstance(attr_value, str) and attr_value.strip():
+            return True
+        for child in desc:
+            if child.tag == tag and cls._element_has_text(child):
+                return True
+        return False
+
+    @classmethod
+    def _element_has_text(cls, element: ET.Element) -> bool:
+        if element.text and element.text.strip():
+            return True
+        for item in element.iter(_RDF_LI_TAG):
+            text = item.text or item.attrib.get(_RDF_RESOURCE_ATTR) or item.attrib.get("resource")
+            if isinstance(text, str) and text.strip():
+                return True
+        return False
+
+    @classmethod
+    def _set_text_node_if_missing(cls, desc: ET.Element, tag: str, text: str) -> bool:
+        attr_value = desc.attrib.get(tag)
+        if isinstance(attr_value, str) and attr_value.strip():
+            return False
+        for child in desc:
+            if child.tag == tag:
+                if cls._element_has_text(child):
+                    return False
+                child.text = text
+                return True
+        element = ET.SubElement(desc, tag)
+        element.text = text
+        return True
+
+    @classmethod
+    def _set_alt_text_node_if_missing(cls, desc: ET.Element, tag: str, text: str) -> bool:
+        attr_value = desc.attrib.get(tag)
+        if isinstance(attr_value, str) and attr_value.strip():
+            return False
+        for child in desc:
+            if child.tag == tag:
+                if cls._element_has_text(child):
+                    return False
+                desc.remove(child)
+                break
+        element = ET.SubElement(desc, tag)
+        alt = ET.SubElement(element, _RDF_ALT_TAG)
+        item = ET.SubElement(alt, _RDF_LI_TAG)
+        item.text = text
+        return True
 
     @staticmethod
     def _new_xmp_tree() -> ET.ElementTree:
@@ -499,6 +933,11 @@ class PhotoMetaDataXMP(PhotoMetaData):
         ET.register_namespace("dc", _DC_NS)
         ET.register_namespace("xmp", _XMP_NS)
         ET.register_namespace("xmpDM", _XMP_DM_NS)
+        ET.register_namespace("exif", _EXIF_NS)
+        ET.register_namespace("tiff", _TIFF_NS)
+        ET.register_namespace("aux", _AUX_NS)
+        ET.register_namespace("photoshop", _PHOTOSHOP_NS)
+        ET.register_namespace("superpicky", _SUPERPICKY_NS)
         root = ET.Element(f"{{{_XMP_META_NS}}}xmpmeta")
         rdf = ET.SubElement(root, f"{{{_RDF_NS}}}RDF")
         ET.SubElement(rdf, _RDF_DESCRIPTION_TAG, {_RDF_ABOUT_ATTR: ""})
@@ -511,6 +950,11 @@ class PhotoMetaDataXMP(PhotoMetaData):
         ET.register_namespace("dc", _DC_NS)
         ET.register_namespace("xmp", _XMP_NS)
         ET.register_namespace("xmpDM", _XMP_DM_NS)
+        ET.register_namespace("exif", _EXIF_NS)
+        ET.register_namespace("tiff", _TIFF_NS)
+        ET.register_namespace("aux", _AUX_NS)
+        ET.register_namespace("photoshop", _PHOTOSHOP_NS)
+        ET.register_namespace("superpicky", _SUPERPICKY_NS)
         if not sidecar_path.exists():
             return cls._new_xmp_tree()
         try:
@@ -929,41 +1373,11 @@ class PhotoMetaDataReportDB(PhotoMetaData):
         return {os.path.normpath(p): self.read(p) for p in paths}
 
     def write(self, path: str, fields: dict[str, Any]) -> bool:
-        """Insert-or-update the DB row for this file's stem with ``fields``."""
-        if not fields:
-            return True
-        filename = self._filename_for_path(path)
-        root = self._report_root
-        if not root:
-            try:
-                from app_common.report_db import find_report_root
-                root = find_report_root(os.path.dirname(path), max_levels=4)
-            except Exception:
-                return False
-        if not root:
-            return False
-        try:
-            from app_common.report_db import ReportDB
-            db = ReportDB.open_if_exists(root)
-            if db is None:
-                return False
-            try:
-                if not db.update_photo(filename, fields):
-                    db.insert_photo({"filename": filename, **fields})
-            finally:
-                db.close()
-            # Keep in-memory cache in sync
-            if self._cache is not None:
-                row = dict(self._cache.get(filename) or {})
-                row["filename"] = filename
-                row.update(fields)
-                self._cache[filename] = row
-            return True
-        except Exception:
-            return False
+        """ReportDB is a legacy read fallback; metadata writes go to XMP sidecar."""
+        return True if not fields else False
 
     def supports_write(self) -> bool:
-        return True
+        return False
 
     # ------------------------------------------------------------------
     # State update helpers (call when active directory changes)
@@ -982,8 +1396,8 @@ class PhotoMetaDataReportDB(PhotoMetaData):
 # Proxy (composite)
 # ---------------------------------------------------------------------------
 
-# Fields that belong exclusively to report.db (not embedded in the image file).
-# When the proxy routes a write, these go to ReportDB; everything else to EXIF/XMP.
+# Legacy report.db-only fields. The proxy keeps these readable from report.db,
+# but write routing no longer targets report.db.
 _REPORT_DB_ONLY_FIELDS: frozenset[str] = frozenset({
     "rating", "pick",
     "has_bird", "confidence",
@@ -1002,15 +1416,14 @@ class PhotoMetaDataProxy(PhotoMetaData):
 
     Read priority (highest → lowest)
     ---------------------------------
-    1. **ReportDB** – curated ratings, species, focus, AI scores
-    2. **XMP sidecar** – Lightroom-compatible tags (Title, Rating, Label …)
-    3. **EXIF embedded** – camera-original (ISO, shutter, GPS …)
+    1. **XMP sidecar** - user-edited metadata
+    2. **ReportDB** - legacy curated ratings, species, focus, AI scores
+    3. **EXIF embedded** - camera-original metadata
 
     Write routing
     -------------
-    * ``_REPORT_DB_ONLY_FIELDS`` → :class:`PhotoMetaDataReportDB`
-    * All other fields → :class:`PhotoMetaDataEXIFEmbeded`
-      (XMP-prefixed keys also written to :class:`PhotoMetaDataXMP` sidecar)
+    * All metadata edits are written to :class:`PhotoMetaDataXMP` sidecar.
+      Embedded originals and report.db are never mutated by the proxy.
 
     Parameters
     ----------
@@ -1054,14 +1467,15 @@ class PhotoMetaDataProxy(PhotoMetaData):
         """Merge all three sources; higher-priority keys overwrite lower ones."""
         merged: dict[str, Any] = {"SourceFile": path}
         # Apply in ascending priority order so later sources win
-        for source in (self._exif, self._xmp, self._report_db):
+        for source in (self._exif, self._report_db, self._xmp):
             try:
                 data = source.read(path)
                 if data:
+                    data = dict(data)
+                    _normalise_rating_pick_aliases(data)
                     merged.update(data)
             except Exception:
                 pass
-        _normalise_rating_pick_aliases(merged)
         return merged
 
     def read_exposure_settings(self, path: str) -> tuple[str, str, str]:
@@ -1077,66 +1491,41 @@ class PhotoMetaDataProxy(PhotoMetaData):
         try:
             for norm, data in self._exif.read_batch(paths).items():
                 if norm in result and data:
+                    data = dict(data)
+                    _normalise_rating_pick_aliases(data)
                     result[norm].update(data)
         except Exception:
             pass
 
-        # 2. XMP per-file
-        for p, norm in zip(paths, norm_paths):
-            try:
-                data = self._xmp.read(p)
-                if data and norm in result:
-                    result[norm].update(data)
-            except Exception:
-                pass
-
-        # 3. ReportDB (O(1) per file if cache loaded)
+        # 2. ReportDB (legacy fallback)
         for p, norm in zip(paths, norm_paths):
             try:
                 data = self._report_db.read(p)
                 if data and norm in result:
+                    data = dict(data)
+                    _normalise_rating_pick_aliases(data)
                     result[norm].update(data)
             except Exception:
                 pass
 
-        for rec in result.values():
-            _normalise_rating_pick_aliases(rec)
+        # 3. XMP per-file (highest priority for editable metadata)
+        for p, norm in zip(paths, norm_paths):
+            try:
+                data = self._xmp.read(p)
+                if data and norm in result:
+                    data = dict(data)
+                    _normalise_rating_pick_aliases(data)
+                    result[norm].update(data)
+            except Exception:
+                pass
+
         return result
 
     def write(self, path: str, fields: dict[str, Any]) -> bool:
-        """Route fields to appropriate backends and return overall success."""
+        """Write every metadata edit to the XMP sidecar only."""
         if not fields:
             return True
-
-        def is_xmp_field(key: str) -> bool:
-            return (
-                str(key).upper().startswith("XMP")
-                or _is_xmp_rating_key(key)
-                or _is_xmp_pick_key(key)
-                or _is_xmp_subject_key(key)
-                or _is_xmp_description_key(key)
-            )
-
-        xmp_fields = {k: v for k, v in fields.items() if is_xmp_field(k)}
-        db_fields = {
-            k: v
-            for k, v in fields.items()
-            if k in _REPORT_DB_ONLY_FIELDS and k not in xmp_fields
-        }
-        file_fields = {
-            k: v
-            for k, v in fields.items()
-            if k not in db_fields and k not in xmp_fields
-        }
-
-        success = True
-        if db_fields:
-            success = self._report_db.write(path, db_fields) and success
-        if file_fields:
-            success = self._exif.write(path, file_fields) and success
-        if xmp_fields:
-            success = self._xmp.write(path, xmp_fields) and success
-        return success
+        return self._xmp.write(path, fields)
 
     def supports_write(self) -> bool:
         return True

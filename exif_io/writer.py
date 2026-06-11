@@ -185,7 +185,24 @@ def run_exiftool_assignments(path: str, assignments: list[str]) -> None:
             "或将 exiftool 加入系统 PATH。"
         )
     path_norm = os.path.normpath(path)
-    args = ["-overwrite_original", "-charset", "filename=UTF8", *assignments, path_norm]
+    target_norm = path_norm
+    if os.path.splitext(path_norm)[1].lower() == ".xmp":
+        args = ["-overwrite_original", "-charset", "filename=UTF8", *assignments, path_norm]
+    else:
+        try:
+            from app_common.exif_io.xmp_sidecar import find_xmp_sidecar
+            found = find_xmp_sidecar(path_norm)
+        except Exception:
+            found = None
+        target_norm = os.path.normpath(found or os.path.splitext(path_norm)[0] + ".xmp")
+        args = [
+            "-overwrite_original",
+            "-charset",
+            "filename=UTF8",
+            *assignments,
+            f"-o={target_norm}",
+            path_norm,
+        ]
 
     def _invoke(*, ignore_minor: bool) -> subprocess.CompletedProcess:
         fd, argfile_path = tempfile.mkstemp(suffix=".args", prefix="exiftool_")
@@ -219,7 +236,7 @@ def run_exiftool_assignments(path: str, assignments: list[str]) -> None:
 
     detail = _format_process_message(cp.stdout or "", cp.stderr or "")
     if _is_hidden_data_minor_copy_error(detail):
-        _cleanup_exiftool_temp_output(path_norm)
+        _cleanup_exiftool_temp_output(target_norm)
         cp_retry = _invoke(ignore_minor=True)
         if cp_retry.returncode == 0:
             return
@@ -230,39 +247,38 @@ def run_exiftool_assignments(path: str, assignments: list[str]) -> None:
 
 
 def write_exif_with_exiftool(path: str, ifd_name: str, tag_id: int, new_val: str, raw_value) -> None:
-    """使用 exiftool 写入单个标签。"""
+    """Compatibility wrapper: write one edited tag to the XMP sidecar."""
     tag_target = _get_exiftool_tag_target(ifd_name, tag_id)
     if not tag_target:
         raise RuntimeError(f"不支持写入该标签：{ifd_name}:{tag_id}")
     value = _convert_value_for_exiftool(new_val, raw_value)
-    run_exiftool_assignments(path, [f"-{tag_target}={value}"])
+    from app_common.exif_io.photo_meta import PhotoMetaDataXMP
+    if not PhotoMetaDataXMP().write(path, {tag_target: value}):
+        raise RuntimeError("XMP sidecar write failed")
 
 
 def write_exif_with_exiftool_by_key(path: str, tag_key: str, value: str) -> None:
-    """使用 exiftool 按 Group:Tag 键写入单个标签。"""
+    """Compatibility wrapper: write one edited tag to the XMP sidecar."""
     value = _ensure_utf8_for_exiftool(_sanitize(str(value or "")))
-    run_exiftool_assignments(path, [f"-{tag_key}={value}"])
+    from app_common.exif_io.photo_meta import PhotoMetaDataXMP
+    if not PhotoMetaDataXMP().write(path, {tag_key: value}):
+        raise RuntimeError("XMP sidecar write failed")
 
 
 def write_meta_with_exiftool(path: str, meta_tag_id: str, value: str) -> None:
-    """使用 exiftool 写入标题/描述元数据。"""
+    """Compatibility wrapper: write title/description to the XMP sidecar."""
     value = _ensure_utf8_for_exiftool(_sanitize(str(value or "")))
+    from app_common.exif_io.photo_meta import PhotoMetaDataXMP
+    xmp = PhotoMetaDataXMP()
     if meta_tag_id == META_TITLE_TAG_ID:
-        assignments = [
-            f"-XMP-dc:Title={value}",
-            f"-IFD0:XPTitle={value}",
-            f"-IFD0:DocumentName={value}",
-        ]
-    elif meta_tag_id == META_DESCRIPTION_TAG_ID:
-        assignments = [
-            f"-XMP-dc:Description={value}",
-            f"-IFD0:XPComment={value}",
-            f"-IFD0:ImageDescription={value}",
-            f"-EXIF:UserComment={value}",
-        ]
-    else:
-        raise RuntimeError(f"未知元数据标签：{meta_tag_id}")
-    run_exiftool_assignments(path, assignments)
+        if not xmp.write_title(path, value):
+            raise RuntimeError("XMP sidecar write failed")
+        return
+    if meta_tag_id == META_DESCRIPTION_TAG_ID:
+        if not xmp.write_description(path, value):
+            raise RuntimeError("XMP sidecar write failed")
+        return
+    raise RuntimeError(f"未知元数据标签：{meta_tag_id}")
 
 
 def _encode_xp_text_value(text: str) -> bytes:
@@ -281,37 +297,8 @@ def _set_or_clear_exif_tag(ifd_data: dict, tag_id: int, value) -> None:
 
 
 def write_meta_with_piexif(path: str, meta_tag_id: str, value: str) -> None:
-    """使用 piexif 写入标题/描述元数据。"""
-    data = piexif.load(path)
-    ifd0 = data.get("0th")
-    if not isinstance(ifd0, dict):
-        ifd0 = {}
-        data["0th"] = ifd0
-    exif_ifd = data.get("Exif")
-    if not isinstance(exif_ifd, dict):
-        exif_ifd = {}
-        data["Exif"] = exif_ifd
-    if meta_tag_id == META_TITLE_TAG_ID:
-        _set_or_clear_exif_tag(ifd0, 40091, _encode_xp_text_value(value) if value else None)
-        _set_or_clear_exif_tag(ifd0, 269, value.encode("utf-8") if value else None)
-    elif meta_tag_id == META_DESCRIPTION_TAG_ID:
-        _set_or_clear_exif_tag(ifd0, 40092, _encode_xp_text_value(value) if value else None)
-        _set_or_clear_exif_tag(ifd0, 270, value.encode("utf-8") if value else None)
-        _set_or_clear_exif_tag(
-            exif_ifd,
-            37510,
-            (b"ASCII\x00\x00\x00" + value.encode("utf-8")) if value else None,
-        )
-    else:
-        raise RuntimeError(f"未知元数据标签：{meta_tag_id}")
-    try:
-        exif_bytes = piexif.dump(data)
-        piexif.insert(exif_bytes, path)
-    except Exception as e:
-        if type(e).__name__ == "InvalidImageDataError" and get_exiftool_executable_path():
-            write_meta_with_exiftool(path, meta_tag_id, value)
-        else:
-            raise
+    """Compatibility wrapper: write title/description to the XMP sidecar."""
+    write_meta_with_exiftool(path, meta_tag_id, value)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

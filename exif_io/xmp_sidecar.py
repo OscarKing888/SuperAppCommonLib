@@ -31,6 +31,7 @@ _NS_PREFIXES: dict[str, str] = {
     "http://ns.useplus.org/ldf/xmp/1.0/": "plus",
     "http://ns.adobe.com/exif/1.0/aux/": "aux",
     "http://purl.org/dc/terms/": "dcterms",
+    "https://superbirdtools.local/xmp/superpicky/1.0/": "superpicky",
 }
 
 _RDF_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"

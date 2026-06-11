@@ -1460,68 +1460,26 @@ class FileListPanel(QWidget):
         meta_updates: dict | None = None,
     ) -> bool:
         norm_path = os.path.normpath(path) if path else ""
-        report_fields = {
-            str(k): v
-            for k, v in (report_fields or {}).items()
-            if str(k) in {"title", "caption"} and v is not None
-        }
+        # report.db is a read-only fallback source.  Ignore legacy
+        # report_fields writes and only refresh in-memory XMP metadata state.
+        _ = report_fields
         meta_updates = {
             str(k): v
             for k, v in (meta_updates or {}).items()
             if str(k) and v is not None
         }
-        if not norm_path or (not report_fields and not meta_updates):
+        if not norm_path or not meta_updates:
             return False
         if not self._file_writes_allowed("同步元数据"):
             return False
 
-        filename = ""
-        row = self._get_report_row_for_path(norm_path)
-        if isinstance(row, dict):
-            filename = str(row.get("filename") or "").strip()
-        if not filename:
-            filename = str(Path(norm_path).stem or "").strip()
-
-        db_updated = False
-        if self._use_report_db and report_fields and filename:
-            db_dir = self._report_root_dir or self._current_dir
-            db = ReportDB.open_if_exists(db_dir) if db_dir else None
-            if db is not None:
-                try:
-                    if isinstance(row, dict) or db.get_photo(filename):
-                        db_updated = bool(db.update_photo(filename, report_fields))
-                finally:
-                    db.close()
-
-        refresh_paths: list[str] = []
-        if filename:
-            for cache in (self._report_full_cache, self._report_cache):
-                cache_row = cache.get(filename) if isinstance(cache, dict) else None
-                if isinstance(cache_row, dict):
-                    cache_row.update(report_fields)
-            for mapped_path, mapped_row in list((self._report_row_by_path or {}).items()):
-                mapped_filename = str((mapped_row or {}).get("filename") or Path(mapped_path).stem or "").strip()
-                if mapped_filename != filename:
-                    continue
-                if isinstance(mapped_row, dict):
-                    mapped_row.update(report_fields)
-                refresh_paths.append(os.path.normpath(mapped_path))
-
-        if norm_path not in refresh_paths:
-            refresh_paths.append(norm_path)
-
-        if meta_updates:
-            for refresh_path in refresh_paths:
-                meta = self._meta_cache.get(refresh_path)
-                if not isinstance(meta, dict):
-                    meta = {}
-                    self._meta_cache[refresh_path] = meta
-                meta.update(meta_updates)
-
-        if meta_updates:
-            self._refresh_metadata_state_for_paths(refresh_paths)
-
-        return db_updated or bool(meta_updates)
+        meta = self._meta_cache.get(norm_path)
+        if not isinstance(meta, dict):
+            meta = {}
+            self._meta_cache[norm_path] = meta
+        meta.update(meta_updates)
+        self._refresh_metadata_state_for_paths([norm_path])
+        return True
 
     def set_pending_selection(
         self,
@@ -1950,58 +1908,46 @@ class FileListPanel(QWidget):
         if not payload:
             _log.info("[_paste_species_to_paths] skip reason=no_copied_species")
             return
-        if not self._use_report_db:
-            _log.info("[_paste_species_to_paths] skip reason=report_db_disabled")
-            return
-        db_dir = self._report_root_dir or self._current_dir
-        db = ReportDB.open_if_exists(db_dir) if db_dir else None
-        if db is None:
-            _log.info("[_paste_species_to_paths] skip db_dir=%r reason=no_report_db", db_dir)
-            return
 
         cn = str(payload.get("bird_species_cn") or "").strip()
         en = str(payload.get("bird_species_en") or "").strip()
-        data = {
-            "bird_species_cn": cn,
-            "bird_species_en": en,
-        }
+        title = cn or en
+        if not title:
+            _log.info("[_paste_species_to_paths] skip reason=empty_species")
+            return
+
         updated = 0
         attempted = 0
-        updated_stems: set[str] = set()
-        try:
-            for path in paths:
-                row = self._get_report_row_for_path(path)
-                filename = str((row or {}).get("filename") or Path(path).stem or "").strip()
-                if not filename or filename in updated_stems:
-                    continue
-                attempted += 1
-                if not db.update_photo(filename, data):
-                    continue
-                updated_stems.add(filename)
-                updated += 1
-                if isinstance(row, dict):
-                    row["bird_species_cn"] = cn
-                    row["bird_species_en"] = en
-                if self._report_full_cache and filename in self._report_full_cache:
-                    self._report_full_cache[filename]["bird_species_cn"] = cn
-                    self._report_full_cache[filename]["bird_species_en"] = en
-                if filename in self._report_cache:
-                    self._report_cache[filename]["bird_species_cn"] = cn
-                    self._report_cache[filename]["bird_species_en"] = en
-                norm_path = os.path.normpath(path) if path else ""
-                if norm_path:
-                    meta = self._meta_cache.setdefault(norm_path, {})
-                    if isinstance(meta, dict):
-                        meta["bird_species_cn"] = cn
-                        meta["bird_species_en"] = en
-                        fallback_title = str((row or {}).get("title") or meta.get("title") or "").strip()
-                        meta["title"] = cn or fallback_title
-                        self._file_table_model.set_meta_for_path(norm_path, meta)
-        finally:
-            db.close()
+        updated_paths: list[str] = []
+        for path in self._unique_norm_paths(paths):
+            target_path = self._resolve_source_path_for_action(path) or path
+            if not target_path:
+                continue
+            attempted += 1
+            try:
+                ok = self._meta_proxy.write(target_path, {"XMP-dc:Title": title})
+            except Exception as exc:
+                _log.warning("[_paste_species_to_paths] source=%r failed: %s", path, exc)
+                continue
+            if not ok:
+                _log.warning("[_paste_species_to_paths] source=%r write returned False", path)
+                continue
+            norm_path = os.path.normpath(path) if path else ""
+            if norm_path:
+                meta = self._meta_cache.setdefault(norm_path, {})
+                if isinstance(meta, dict):
+                    meta["bird_species_cn"] = cn
+                    meta["bird_species_en"] = en
+                    meta["title"] = title
+                    meta["Title"] = title
+                    meta["XMP-dc:Title"] = title
+                    self._file_table_model.set_meta_for_path(norm_path, meta)
+                updated_paths.append(norm_path)
+            updated += 1
 
+        if updated_paths:
+            self._refresh_metadata_state_for_paths(updated_paths)
         self._tree_widget.viewport().update()
-
         _log.info(
             "[_paste_species_to_paths] source_filename=%r bird_species_cn=%r bird_species_en=%r attempted=%s updated=%s",
             payload.get("filename"),
@@ -2015,11 +1961,6 @@ class FileListPanel(QWidget):
             path_keys = {os.path.normcase(os.path.normpath(p)) for p in paths if p}
             if os.path.normcase(selected_norm) in path_keys:
                 refreshed_path = self._resolve_source_path_for_action(selected_norm)
-                _log.info(
-                    "[_paste_species_to_paths] refresh_selected source=%r refreshed=%r",
-                    selected_norm,
-                    refreshed_path,
-                )
                 self.file_selected.emit(refreshed_path or selected_norm)
 
     def _unique_norm_paths(self, paths: list[str]) -> list[str]:
@@ -2432,56 +2373,8 @@ class FileListPanel(QWidget):
         rating: int | None = None,
         pick: int | None = None,
     ) -> list[str]:
-        if not self._rating_writes_allowed("修改评级"):
-            return []
-        if not self._use_report_db:
-            _log.info("[_apply_rating_state_via_report_db] skip reason=report_db_disabled")
-            return []
-        db_dir = self._report_root_dir or self._current_dir
-        db = ReportDB.open_if_exists(db_dir) if db_dir else None
-        if db is None:
-            _log.warning("[_apply_rating_state_via_report_db] db_dir=%r open failed", db_dir)
-            return []
-        updated_paths: list[str] = []
-        try:
-            for path in self._unique_norm_paths(paths):
-                row = self._get_report_row_for_path(path)
-                if not isinstance(row, dict):
-                    continue
-                filename = str(row.get("filename") or Path(path).stem or "").strip()
-                if not filename:
-                    continue
-                data: dict[str, int] = {}
-                if rating is not None:
-                    data["rating"] = max(0, min(5, int(rating)))
-                if pick is not None:
-                    data["pick"] = max(-1, min(1, int(pick)))
-                if not data:
-                    continue
-                try:
-                    ok = db.update_photo(filename, data)
-                    if not ok:
-                        db.insert_photo({"filename": filename, **data})
-                        ok = True
-                except Exception as exc:
-                    _log.warning(
-                        "[_apply_rating_state_via_report_db] source=%r filename=%r write failed: %s",
-                        path,
-                        filename,
-                        exc,
-                    )
-                    continue
-                if not ok:
-                    _log.warning("[_apply_rating_state_via_report_db] source=%r filename=%r write failed", path, filename)
-                    continue
-                cache_row = self._ensure_report_cache_row(path, filename)
-                for key, value in data.items():
-                    cache_row[key] = value
-                self._apply_rating_state_to_meta_cache(path, rating=rating, pick=pick)
-                updated_paths.append(path)
-        finally:
-            db.close()
-        return updated_paths
+        _log.info("[_apply_rating_state_via_report_db] skip reason=report_db_write_disabled")
+        return []
 
     def _apply_rating_state_via_exif(
         self,
@@ -2994,83 +2887,10 @@ class FileListPanel(QWidget):
                     self.file_selected.emit(resolved)
 
     def _sync_report_current_path_from_actual(self, source_path: str, actual_path: str, row: dict | None) -> None:
-        if not self._file_writes_allowed("修复 report.db 路径"):
-            return
-        if not isinstance(row, dict):
-            return
-        root_dir = self._report_root_dir or self._current_dir
-        if not root_dir or not os.path.isdir(root_dir):
-            _log.info("[_sync_report_current_path_from_actual] skip source=%r actual=%r reason=no_root", source_path, actual_path)
-            return
-        if not _is_same_or_child_path(root_dir, actual_path):
-            _log.info(
-                "[_sync_report_current_path_from_actual] skip source=%r actual=%r root=%r reason=outside_root",
-                source_path,
-                actual_path,
-                root_dir,
-            )
-            return
-        filename = str(row.get("filename") or Path(source_path).stem or "").strip()
-        if not filename:
-            _log.info("[_sync_report_current_path_from_actual] skip source=%r actual=%r reason=no_filename", source_path, actual_path)
-            return
-        try:
-            rel_current_path = os.path.normpath(os.path.relpath(actual_path, root_dir))
-        except Exception as e:
-            _log.warning(
-                "[_sync_report_current_path_from_actual] skip source=%r actual=%r root=%r relpath_failed=%s",
-                source_path,
-                actual_path,
-                root_dir,
-                e,
-            )
-            return
-        current_path_old = str(row.get("current_path") or "").strip()
-        if current_path_old and os.path.normcase(os.path.normpath(current_path_old)) == os.path.normcase(rel_current_path):
-            _log.info(
-                "[_sync_report_current_path_from_actual] skip source=%r filename=%r current_path already=%r",
-                source_path,
-                filename,
-                rel_current_path,
-            )
-            return
-        db = ReportDB.open_if_exists(root_dir)
-        if db is None:
-            _log.info(
-                "[_sync_report_current_path_from_actual] skip source=%r filename=%r root=%r reason=no_report_db",
-                source_path,
-                filename,
-                root_dir,
-            )
-            return
-        updated = False
-        try:
-            updated = db.update_photo(filename, {"current_path": rel_current_path})
-        finally:
-            db.close()
-        if not updated:
-            _log.info(
-                "[_sync_report_current_path_from_actual] update_failed source=%r filename=%r current_path=%r",
-                source_path,
-                filename,
-                rel_current_path,
-            )
-            return
-        row["current_path"] = rel_current_path
-        row["_current_path_report_raw"] = rel_current_path
-        if self._report_full_cache and filename in self._report_full_cache:
-            self._report_full_cache[filename]["current_path"] = rel_current_path
-            self._report_full_cache[filename]["_current_path_report_raw"] = rel_current_path
-        if filename in self._report_cache:
-            self._report_cache[filename]["current_path"] = rel_current_path
-            self._report_cache[filename]["_current_path_report_raw"] = rel_current_path
         _log.info(
-            "[_sync_report_current_path_from_actual] updated source=%r actual=%r filename=%r old_current_path=%r new_current_path=%r",
+            "[_sync_report_current_path_from_actual] skip source=%r actual=%r reason=report_db_write_disabled",
             source_path,
             actual_path,
-            filename,
-            current_path_old,
-            rel_current_path,
         )
 
     def resolve_preview_path(self, path: str, prefer_fast_preview: bool = False) -> str:
