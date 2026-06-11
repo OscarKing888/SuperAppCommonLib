@@ -237,17 +237,48 @@ _TREE_COL_BURST = 1
 _TREE_COL_COMMENT = 2
 _TREE_COL_STAR = 3
 _TREE_COL_TAGS = 4
+_TREE_COL_SHUTTER = 5
+_TREE_COL_APERTURE = 6
+_TREE_COL_ISO = 7
+_TREE_COL_FOCAL = 8
+_TREE_COL_CAMERA = 9
+_TREE_COL_LENS = 10
+_TREE_COL_CAPTURE_TIME = 11
+_TREE_COL_SHARP = 12
+_TREE_COL_AESTHETIC = 13
+_TREE_COL_FOCUS = 14
 _TREE_COL_TITLE = _TREE_COL_COMMENT
 _TREE_COL_COLOR = _TREE_COL_TAGS
-_TREE_COL_SHARP = _TREE_COL_TAGS
-_TREE_COL_AESTHETIC = _TREE_COL_TAGS
-_TREE_COL_FOCUS = _TREE_COL_TAGS
-_TREE_COL_SHUTTER = _TREE_COL_TAGS
-_TREE_COL_ISO = _TREE_COL_TAGS
-_TREE_COL_APERTURE = _TREE_COL_TAGS
-_FILE_TABLE_HEADERS = ["文件名", "连拍", "注释", "星级", "标签"]
+_TREE_COL_STATE = _TREE_COL_AESTHETIC
+_TREE_COL_COUNTRY = _TREE_COL_FOCUS
+_FILE_TABLE_HEADERS = [
+    "文件名",
+    "连拍",
+    "注释",
+    "星级",
+    "标签",
+    "快门",
+    "光圈",
+    "ISO",
+    "焦距",
+    "相机",
+    "镜头",
+    "拍摄时间",
+    "锐度",
+    "美学",
+    "对焦",
+]
 _FILE_TAG_DISPLAY_SEPARATOR = "、"
 _SUPERBIRDSTAMP_CAMERA_METADATA_TAGS = [
+    "-IFD0:Model",
+    "-EXIF:Model",
+    "-XMP-tiff:Model",
+    "-CameraModelName",
+    "-Model",
+    "-ExifIFD:DateTimeOriginal",
+    "-EXIF:DateTimeOriginal",
+    "-XMP-exif:DateTimeOriginal",
+    "-DateTimeOriginal",
     "-ExifIFD:ExposureTime",
     "-EXIF:ExposureTime",
     "-XMP-exif:ExposureTime",
@@ -260,6 +291,22 @@ _SUPERBIRDSTAMP_CAMERA_METADATA_TAGS = [
     "-EXIF:FNumber",
     "-XMP-exif:FNumber",
     "-Composite:Aperture",
+    "-ExifIFD:FocalLength",
+    "-EXIF:FocalLength",
+    "-XMP-exif:FocalLength",
+    "-Composite:FocalLength",
+    "-ExifIFD:FocalLengthIn35mmFormat",
+    "-EXIF:FocalLengthIn35mmFormat",
+    "-XMP-exif:FocalLengthIn35mmFormat",
+    "-Composite:FocalLength35efl",
+    "-ExifIFD:LensModel",
+    "-EXIF:LensModel",
+    "-Composite:LensModel",
+    "-XMP-aux:LensModel",
+    "-XMP-aux:Lens",
+    "-XMP-exifEX:LensModel",
+    "-LensModel",
+    "-Lens",
 ]
 
 
@@ -519,6 +566,43 @@ def _metadata_comment_from_meta(meta: dict | None) -> str:
     return str(value or "").strip()
 
 
+def _metadata_value_from_candidates(meta: dict | None, *keys: str):
+    """Return first non-empty metadata value, including report/superpicky aliases."""
+    if not isinstance(meta, dict):
+        return ""
+    values = []
+    seen: set[str] = set()
+    for key in keys:
+        text = str(key or "").strip()
+        if not text or text in seen:
+            continue
+        if ":" not in text and not text.startswith("report."):
+            superpicky_key = f"XMP-superpicky:{text}"
+            if superpicky_key not in seen:
+                seen.add(superpicky_key)
+                values.append(meta.get(superpicky_key))
+        seen.add(text)
+        values.append(meta.get(text))
+        if ":" not in text and not text.startswith("report."):
+            report_key = f"report.{text}"
+            if report_key not in seen:
+                seen.add(report_key)
+                values.append(meta.get(report_key))
+    return _first_non_empty(*values)
+
+
+def _metadata_text_from_candidates(meta: dict | None, *keys: str) -> str:
+    return str(_metadata_value_from_candidates(meta, *keys) or "").strip()
+
+
+def _format_burst_text(burst_position: int | None, burst_id: int | None) -> str:
+    if burst_position is None and burst_id is None:
+        return ""
+    position_text = str(burst_position) if burst_position is not None else "-"
+    id_text = str(burst_id) if burst_id is not None else "-"
+    return f"({position_text}/{id_text})"
+
+
 def _parse_positive_fraction_or_float(raw) -> float | None:
     """兼容 1/2000、0.0005、f/5.6 等常见 EXIF 数值文本。"""
     text = str(raw or "").strip()
@@ -597,6 +681,197 @@ def _format_aperture_value(raw) -> str:
     if aperture_value is None:
         return text
     return f"f/{aperture_value:g}"
+
+
+def _format_focal_length_value(raw) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    lower = text.lower()
+    if lower.endswith("mm") or text.endswith("毫米"):
+        return text
+    cleaned = (
+        lower.replace("millimeters", "")
+        .replace("millimeter", "")
+        .replace("毫米", "")
+        .replace("mm", "")
+        .strip()
+    )
+    value = _parse_positive_fraction_or_float(cleaned)
+    if value is None:
+        return text
+    return f"{value:g}mm"
+
+
+def _format_capture_time_value(raw) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    # EXIF commonly stores "YYYY:MM:DD HH:MM:SS"; keep it compact and sortable.
+    if len(text) >= 16 and text[4:5] == ":" and text[7:8] == ":":
+        return f"{text[0:4]}/{text[5:7]}/{text[8:10]} {text[11:16]}"
+    if "T" in text and len(text) >= 16:
+        return text.replace("T", " ")[:16]
+    return text
+
+
+def _format_score_value(raw) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    try:
+        return f"{float(text):.2f}".rstrip("0").rstrip(".")
+    except (ValueError, TypeError):
+        return text
+
+
+def _metadata_shutter_text(meta: dict | None) -> str:
+    return _format_shutter_value(
+        _metadata_value_from_candidates(
+            meta,
+            "XMP-exif:ExposureTime",
+            "shutter",
+            "shutter_speed",
+            "ExposureTime",
+            "ShutterSpeed",
+            "Composite:ShutterSpeed",
+            "ExifIFD:ExposureTime",
+            "EXIF:ExposureTime",
+        )
+    )
+
+
+def _metadata_aperture_text(meta: dict | None) -> str:
+    return _format_aperture_value(
+        _metadata_value_from_candidates(
+            meta,
+            "XMP-exif:FNumber",
+            "aperture",
+            "FNumber",
+            "Aperture",
+            "Composite:Aperture",
+            "ExifIFD:FNumber",
+            "EXIF:FNumber",
+        )
+    )
+
+
+def _metadata_iso_text(meta: dict | None) -> str:
+    return _format_iso_value(
+        _metadata_value_from_candidates(
+            meta,
+            "XMP-exif:PhotographicSensitivity",
+            "XMP-exif:ISOSpeedRatings",
+            "iso",
+            "ISO",
+            "PhotographicSensitivity",
+            "ISOSpeedRatings",
+            "ExifIFD:ISO",
+            "EXIF:ISO",
+            "EXIF:ISOSpeedRatings",
+        )
+    )
+
+
+def _metadata_focal_length_text(meta: dict | None) -> str:
+    return _format_focal_length_value(
+        _metadata_value_from_candidates(
+            meta,
+            "XMP-exif:FocalLength",
+            "focal_length",
+            "FocalLength",
+            "Composite:FocalLength",
+            "ExifIFD:FocalLength",
+            "EXIF:FocalLength",
+        )
+    )
+
+
+def _metadata_camera_model_text(meta: dict | None) -> str:
+    return _metadata_text_from_candidates(
+        meta,
+        "XMP-tiff:Model",
+        "camera_model",
+        "CameraModelName",
+        "Model",
+        "IFD0:Model",
+        "EXIF:Model",
+    )
+
+
+def _metadata_lens_model_text(meta: dict | None) -> str:
+    return _metadata_text_from_candidates(
+        meta,
+        "XMP-aux:LensModel",
+        "XMP-aux:Lens",
+        "XMP-exifEX:LensModel",
+        "lens_model",
+        "LensModel",
+        "Lens",
+        "Composite:LensModel",
+        "ExifIFD:LensModel",
+        "EXIF:LensModel",
+    )
+
+
+def _metadata_capture_time_text(meta: dict | None) -> str:
+    return _format_capture_time_value(
+        _metadata_value_from_candidates(
+            meta,
+            "XMP-exif:DateTimeOriginal",
+            "XMP-xmp:CreateDate",
+            "date_time_original",
+            "DateTimeOriginal",
+            "SubSecDateTimeOriginal",
+            "CreateDate",
+            "ExifIFD:DateTimeOriginal",
+            "EXIF:DateTimeOriginal",
+        )
+    )
+
+
+def _metadata_sharpness_text(meta: dict | None) -> str:
+    return _format_score_value(
+        _metadata_value_from_candidates(
+            meta,
+            "XMP:City",
+            "XMP-photoshop:City",
+            "IPTC:City",
+            "sharpness",
+            "adj_sharpness",
+            "head_sharp",
+            "city",
+        )
+    )
+
+
+def _metadata_aesthetic_text(meta: dict | None) -> str:
+    return _format_score_value(
+        _metadata_value_from_candidates(
+            meta,
+            "XMP:State",
+            "XMP-photoshop:State",
+            "IPTC:Province-State",
+            "aesthetic",
+            "adj_topiq",
+            "state_province",
+            "state",
+        )
+    )
+
+
+def _metadata_focus_status_text(meta: dict | None) -> str:
+    return _focus_status_to_display(
+        _metadata_text_from_candidates(
+            meta,
+            "XMP:Country",
+            "XMP-photoshop:Country",
+            "XMP-photoshop:Country-PrimaryLocationName",
+            "IPTC:Country-PrimaryLocationName",
+            "focus_status",
+            "country",
+        )
+    )
 
 
 def _focus_status_to_display(raw: str) -> str:

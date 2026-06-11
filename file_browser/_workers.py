@@ -301,6 +301,7 @@ class MetadataLoader(QThread):
         meta_proxy: PhotoMetaDataProxy,
         focus_source_paths: dict[str, str] | None = None,
         metadata_tags: list[str] | None = None,
+        report_rows_by_path: dict[str, dict] | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -312,6 +313,11 @@ class MetadataLoader(QThread):
             if display_path and source_path
         }
         self._metadata_tags = list(metadata_tags or [])
+        self._report_rows_by_path = {
+            os.path.normpath(path): dict(row)
+            for path, row in (report_rows_by_path or {}).items()
+            if path and isinstance(row, dict)
+        }
         self._stop_flag = False
 
     def stop(self) -> None:
@@ -372,6 +378,7 @@ class MetadataLoader(QThread):
     def _read_metadata_batch(self, paths: list[str]) -> dict[str, dict]:
         norm_paths = [os.path.normpath(p) for p in paths]
         result: dict[str, dict] = {norm: {"SourceFile": norm} for norm in norm_paths}
+        raw_batch: dict[str, dict] = {}
         try:
             raw_batch = read_batch_metadata(
                 paths,
@@ -383,6 +390,38 @@ class MetadataLoader(QThread):
                     result[norm_path].update(flat)
         except Exception as exc:
             _log.warning("[MetadataLoader._read_metadata_batch] read_batch_metadata failed: %s", exc)
+        for norm_path in norm_paths:
+            report_row = self._report_rows_by_path.get(norm_path)
+            if not isinstance(report_row, dict):
+                continue
+            try:
+                flat = report_row_to_exiftool_style(report_row, norm_path)
+            except Exception:
+                flat = {"SourceFile": norm_path}
+            raw_flat = raw_batch.get(norm_path, {}) if isinstance(raw_batch, dict) else {}
+            for key, value in flat.items():
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    continue
+                key_text = str(key or "").strip()
+                if not key_text:
+                    continue
+                if key_text.startswith("XMP"):
+                    result[norm_path].setdefault(key_text, value)
+                else:
+                    result[norm_path][key_text] = value
+            for key, value in report_row.items():
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    continue
+                key_text = str(key or "").strip()
+                if not key_text:
+                    continue
+                result[norm_path].setdefault(f"report.{key_text}", value)
+                if f"XMP-superpicky:{key_text}" not in result[norm_path]:
+                    result[norm_path].setdefault(key_text, value)
+            for key, value in raw_flat.items():
+                key_text = str(key or "").strip()
+                if key_text.startswith("XMP") and value is not None and (not isinstance(value, str) or value.strip()):
+                    result[norm_path][key_text] = value
         return result
 
     def _parse_rec(self, rec: dict) -> dict:
@@ -447,33 +486,23 @@ class MetadataLoader(QThread):
             or rec.get("XMP-photoshop:Country-PrimaryLocationName")
             or rec.get("IPTC:Country-PrimaryLocationName") or ""
         )
-        shutter_raw = _first_non_empty(
-            rec.get("ExifIFD:ExposureTime"),
-            rec.get("EXIF:ExposureTime"),
-            rec.get("XMP-exif:ExposureTime"),
-            rec.get("Composite:ShutterSpeed"),
-        )
-        iso_raw = _first_non_empty(
-            rec.get("ExifIFD:ISO"),
-            rec.get("EXIF:ISO"),
-            rec.get("XMP-exif:PhotographicSensitivity"),
-            rec.get("XMP-exif:ISOSpeedRatings"),
-        )
-        aperture_raw = _first_non_empty(
-            rec.get("ExifIFD:FNumber"),
-            rec.get("EXIF:FNumber"),
-            rec.get("XMP-exif:FNumber"),
-            rec.get("Composite:Aperture"),
-        )
-
         city = _format_optional_number(city_raw, "%06.2f")    # 锐度
         state = _format_optional_number(state_raw, "%05.2f") # 美学
         country = _focus_status_to_display(country_raw)      # 对焦状态 → 精焦/合焦/偏移/失焦
-        shutter = _format_shutter_value(shutter_raw)
-        iso = _format_iso_value(iso_raw)
-        aperture = _format_aperture_value(aperture_raw)
+        shutter = _metadata_shutter_text(rec)
+        aperture = _metadata_aperture_text(rec)
+        iso = _metadata_iso_text(rec)
+        focal_length = _metadata_focal_length_text(rec)
+        camera_model = _metadata_camera_model_text(rec)
+        lens_model = _metadata_lens_model_text(rec)
+        capture_time = _metadata_capture_time_text(rec)
+        sharpness = _metadata_sharpness_text(rec)
+        aesthetic = _metadata_aesthetic_text(rec)
+        focus_status = _metadata_focus_status_text(rec)
+        burst_id = _parse_optional_int(_metadata_value_from_candidates(rec, "burst_id"))
+        burst_position = _parse_optional_int(_metadata_value_from_candidates(rec, "burst_position"))
 
-        return {
+        meta = {
             "title":   str(title).strip(),
             "comment": comment,
             "tags":    tags,
@@ -486,7 +515,19 @@ class MetadataLoader(QThread):
             "shutter": shutter,
             "iso":     iso,
             "aperture": aperture,
+            "focal_length": focal_length,
+            "camera_model": camera_model,
+            "lens_model": lens_model,
+            "date_time_original": capture_time,
+            "sharpness": sharpness,
+            "aesthetic": aesthetic,
+            "focus_status": focus_status,
         }
+        if burst_id is not None:
+            meta["burst_id"] = burst_id
+        if burst_position is not None:
+            meta["burst_position"] = burst_position
+        return meta
 
     def _resolve_focus_source_path(self, display_path: str) -> str:
         norm_display = os.path.normpath(display_path) if display_path else ""

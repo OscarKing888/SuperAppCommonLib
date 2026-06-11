@@ -141,8 +141,15 @@ class FileTableEntry:
     state: str = ""
     country: str = ""
     shutter: str = ""
-    iso: str = ""
     aperture: str = ""
+    iso: str = ""
+    focal_length: str = ""
+    camera_model: str = ""
+    lens_model: str = ""
+    capture_time: str = ""
+    sharpness: str = ""
+    aesthetic: str = ""
+    focus_status: str = ""
     burst_position: int | None = None
     burst_id: int | None = None
     burst_text: str = ""
@@ -195,9 +202,16 @@ class FileTableModel(QAbstractTableModel):
         entry.city = str(meta.get("city", "") or "")
         entry.state = str(meta.get("state", "") or "")
         entry.country = str(meta.get("country", "") or "")
-        entry.shutter = str(meta.get("shutter", "") or "")
-        entry.iso = str(meta.get("iso", "") or "")
-        entry.aperture = str(meta.get("aperture", "") or "")
+        entry.shutter = _metadata_shutter_text(meta)
+        entry.aperture = _metadata_aperture_text(meta)
+        entry.iso = _metadata_iso_text(meta)
+        entry.focal_length = _metadata_focal_length_text(meta)
+        entry.camera_model = _metadata_camera_model_text(meta)
+        entry.lens_model = _metadata_lens_model_text(meta)
+        entry.capture_time = _metadata_capture_time_text(meta)
+        entry.sharpness = _metadata_sharpness_text(meta)
+        entry.aesthetic = _metadata_aesthetic_text(meta)
+        entry.focus_status = _metadata_focus_status_text(meta)
         entry.burst_position, entry.burst_id = _metadata_burst_values(meta)
         entry.burst_text = _format_burst_text(entry.burst_position, entry.burst_id)
 
@@ -241,6 +255,35 @@ class FileTableModel(QAbstractTableModel):
             return entry.rating
         if column == _TREE_COL_TAGS:
             return entry.tags_display.lower()
+        if column == _TREE_COL_SHUTTER:
+            return entry.shutter.lower()
+        if column == _TREE_COL_APERTURE:
+            return entry.aperture.lower()
+        if column == _TREE_COL_ISO:
+            try:
+                return (0, int(float(entry.iso)))
+            except Exception:
+                return (1, entry.iso.lower())
+        if column == _TREE_COL_FOCAL:
+            return entry.focal_length.lower()
+        if column == _TREE_COL_CAMERA:
+            return entry.camera_model.lower()
+        if column == _TREE_COL_LENS:
+            return entry.lens_model.lower()
+        if column == _TREE_COL_CAPTURE_TIME:
+            return entry.capture_time.lower()
+        if column == _TREE_COL_SHARP:
+            try:
+                return (0, float(entry.sharpness))
+            except Exception:
+                return (1, entry.sharpness.lower())
+        if column == _TREE_COL_AESTHETIC:
+            try:
+                return (0, float(entry.aesthetic))
+            except Exception:
+                return (1, entry.aesthetic.lower())
+        if column == _TREE_COL_FOCUS:
+            return entry.focus_status.lower()
         return ""
 
     def _display_value(self, entry: FileTableEntry, row: int, column: int) -> str:
@@ -258,6 +301,26 @@ class FileTableModel(QAbstractTableModel):
             return "★" * max(0, entry.rating)
         if column == _TREE_COL_TAGS:
             return entry.tags_display
+        if column == _TREE_COL_SHUTTER:
+            return entry.shutter
+        if column == _TREE_COL_APERTURE:
+            return entry.aperture
+        if column == _TREE_COL_ISO:
+            return entry.iso
+        if column == _TREE_COL_FOCAL:
+            return entry.focal_length
+        if column == _TREE_COL_CAMERA:
+            return entry.camera_model
+        if column == _TREE_COL_LENS:
+            return entry.lens_model
+        if column == _TREE_COL_CAPTURE_TIME:
+            return entry.capture_time
+        if column == _TREE_COL_SHARP:
+            return entry.sharpness
+        if column == _TREE_COL_AESTHETIC:
+            return entry.aesthetic
+        if column == _TREE_COL_FOCUS:
+            return entry.focus_status
         return ""
 
     def data(self, index: QModelIndex, role: int = int(_DisplayRole)):

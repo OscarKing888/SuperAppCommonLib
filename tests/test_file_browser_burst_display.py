@@ -1,14 +1,26 @@
 import os
 
+import app_common.file_browser._workers as _workers
 from app_common.file_browser._browser_core import (
     _DisplayRole,
     _MetaBurstTextRole,
     _SortRole,
     _ToolTipRole,
+    _TREE_COL_AESTHETIC,
+    _TREE_COL_APERTURE,
     _TREE_COL_BURST,
+    _TREE_COL_CAMERA,
+    _TREE_COL_CAPTURE_TIME,
+    _TREE_COL_FOCAL,
+    _TREE_COL_FOCUS,
+    _TREE_COL_ISO,
+    _TREE_COL_LENS,
     _TREE_COL_NAME,
+    _TREE_COL_SHARP,
+    _TREE_COL_SHUTTER,
 )
 from app_common.file_browser._models import FileTableModel, ThumbnailListModel
+from app_common.file_browser._workers import MetadataLoader
 
 
 def _tooltip(path: str) -> str:
@@ -72,6 +84,118 @@ def test_file_table_burst_sort_key_orders_by_group_then_position() -> None:
         "group12_pos3.jpg",
         "missing.jpg",
     ]
+
+
+def test_file_table_displays_camera_and_analysis_metadata() -> None:
+    path = os.path.normpath("C:/photos/a.jpg")
+    model = FileTableModel()
+    model.rebuild(
+        [path],
+        meta_cache={
+            path: {
+                "report.shutter_speed": "0.0005",
+                "XMP-superpicky:aperture": "5.6",
+                "EXIF:ISO": "800",
+                "FocalLength": "600",
+                "XMP-tiff:Model": "Alpha 1",
+                "XMP-aux:LensModel": "FE 600mm F4 GM OSS",
+                "EXIF:DateTimeOriginal": "2026:02:16 16:23:00",
+                "report.adj_sharpness": 0.96,
+                "XMP-superpicky:adj_topiq": "0.83",
+                "focus_status": "BEST",
+            }
+        },
+        tooltip_fn=_tooltip,
+        mismatch_fn=_mismatch,
+    )
+
+    assert model.data(model.index(0, _TREE_COL_SHUTTER), _DisplayRole) == "1/2000s"
+    assert model.data(model.index(0, _TREE_COL_APERTURE), _DisplayRole) == "f/5.6"
+    assert model.data(model.index(0, _TREE_COL_ISO), _DisplayRole) == "800"
+    assert model.data(model.index(0, _TREE_COL_FOCAL), _DisplayRole) == "600mm"
+    assert model.data(model.index(0, _TREE_COL_CAMERA), _DisplayRole) == "Alpha 1"
+    assert model.data(model.index(0, _TREE_COL_LENS), _DisplayRole) == "FE 600mm F4 GM OSS"
+    assert model.data(model.index(0, _TREE_COL_CAPTURE_TIME), _DisplayRole) == "2026/02/16 16:23"
+    assert model.data(model.index(0, _TREE_COL_SHARP), _DisplayRole) == "0.96"
+    assert model.data(model.index(0, _TREE_COL_AESTHETIC), _DisplayRole) == "0.83"
+    assert model.data(model.index(0, _TREE_COL_FOCUS), _DisplayRole) == "精焦"
+
+
+def test_metadata_loader_merges_report_rows_into_browser_meta(monkeypatch) -> None:
+    path = os.path.normpath("C:/photos/a.jpg")
+    row = {
+        "filename": "a",
+        "burst_id": 12,
+        "burst_position": 3,
+        "iso": 800,
+        "shutter_speed": "0.0005",
+        "aperture": "5.6",
+        "focal_length": 600,
+        "camera_model": "Alpha 1",
+        "lens_model": "FE 600mm F4 GM OSS",
+        "date_time_original": "2026:02:16 16:23:00",
+        "adj_sharpness": 0.96,
+        "adj_topiq": 0.83,
+        "focus_status": "BEST",
+    }
+
+    monkeypatch.setattr(_workers, "read_batch_metadata", lambda *args, **kwargs: {})
+
+    loader = MetadataLoader(
+        [path],
+        meta_proxy=object(),
+        metadata_tags=[],
+        report_rows_by_path={path: row},
+    )
+    raw = loader._read_metadata_batch([path])
+    meta = loader._parse_rec(raw[path])
+
+    assert meta["burst_id"] == 12
+    assert meta["burst_position"] == 3
+    assert meta["shutter"] == "1/2000s"
+    assert meta["aperture"] == "f/5.6"
+    assert meta["iso"] == "800"
+    assert meta["focal_length"] == "600mm"
+    assert meta["camera_model"] == "Alpha 1"
+    assert meta["lens_model"] == "FE 600mm F4 GM OSS"
+    assert meta["date_time_original"] == "2026/02/16 16:23"
+    assert meta["sharpness"] == "0.96"
+    assert meta["aesthetic"] == "0.83"
+    assert meta["focus_status"] == "精焦"
+
+
+def test_metadata_loader_lets_file_or_sidecar_metadata_override_report(monkeypatch) -> None:
+    path = os.path.normpath("C:/photos/a.jpg")
+    row = {
+        "filename": "a",
+        "burst_id": 12,
+        "iso": 800,
+        "lens_model": "Report Lens",
+    }
+
+    def fake_read_batch(paths, tags=None, use_cache=True):
+        return {
+            path: {
+                "XMP-superpicky:burst_id": 99,
+                "XMP-exif:PhotographicSensitivity": 1600,
+                "XMP-aux:LensModel": "Sidecar Lens",
+            }
+        }
+
+    monkeypatch.setattr(_workers, "read_batch_metadata", fake_read_batch)
+
+    loader = MetadataLoader(
+        [path],
+        meta_proxy=object(),
+        metadata_tags=["-EXIF:ISO"],
+        report_rows_by_path={path: row},
+    )
+    raw = loader._read_metadata_batch([path])
+    meta = loader._parse_rec(raw[path])
+
+    assert meta["burst_id"] == 99
+    assert meta["iso"] == "1600"
+    assert meta["lens_model"] == "Sidecar Lens"
 
 
 def test_thumbnail_model_keeps_display_role_filename_and_exposes_burst_role() -> None:

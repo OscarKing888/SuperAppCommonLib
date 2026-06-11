@@ -416,6 +416,16 @@ class FileListPanel(QWidget):
         self._tree_widget.setColumnWidth(_TREE_COL_COMMENT, 280)
         self._tree_widget.setColumnWidth(_TREE_COL_STAR, 72)
         self._tree_widget.setColumnWidth(_TREE_COL_TAGS, 240)
+        self._tree_widget.setColumnWidth(_TREE_COL_SHUTTER, 88)
+        self._tree_widget.setColumnWidth(_TREE_COL_APERTURE, 72)
+        self._tree_widget.setColumnWidth(_TREE_COL_ISO, 64)
+        self._tree_widget.setColumnWidth(_TREE_COL_FOCAL, 76)
+        self._tree_widget.setColumnWidth(_TREE_COL_CAMERA, 148)
+        self._tree_widget.setColumnWidth(_TREE_COL_LENS, 180)
+        self._tree_widget.setColumnWidth(_TREE_COL_CAPTURE_TIME, 128)
+        self._tree_widget.setColumnWidth(_TREE_COL_SHARP, 68)
+        self._tree_widget.setColumnWidth(_TREE_COL_AESTHETIC, 68)
+        self._tree_widget.setColumnWidth(_TREE_COL_FOCUS, 76)
         self._apply_tree_sort(_TREE_COL_NAME, _AscendingOrder, sync_indicator=True)
         self._tree_widget.setContextMenuPolicy(_CustomContextMenu)
         self._tree_widget.customContextMenuRequested.connect(self._on_tree_context_menu)
@@ -927,12 +937,76 @@ class FileListPanel(QWidget):
             "color",
             "country",
             "shutter",
+            "shutter_speed",
+            "ExposureTime",
+            "Composite:ShutterSpeed",
+            "ExifIFD:ExposureTime",
+            "EXIF:ExposureTime",
+            "XMP-exif:ExposureTime",
             "iso",
+            "ISO",
+            "PhotographicSensitivity",
+            "XMP-exif:PhotographicSensitivity",
+            "XMP-exif:ISOSpeedRatings",
             "aperture",
+            "FNumber",
+            "Composite:Aperture",
+            "ExifIFD:FNumber",
+            "EXIF:FNumber",
+            "XMP-exif:FNumber",
+            "focal_length",
+            "FocalLength",
+            "Composite:FocalLength",
+            "ExifIFD:FocalLength",
+            "EXIF:FocalLength",
+            "XMP-exif:FocalLength",
+            "camera_model",
+            "CameraModelName",
+            "Model",
+            "IFD0:Model",
+            "EXIF:Model",
+            "XMP-tiff:Model",
+            "lens_model",
+            "LensModel",
+            "Composite:LensModel",
+            "ExifIFD:LensModel",
+            "EXIF:LensModel",
+            "XMP-aux:LensModel",
+            "XMP-aux:Lens",
+            "date_time_original",
+            "DateTimeOriginal",
+            "ExifIFD:DateTimeOriginal",
+            "EXIF:DateTimeOriginal",
+            "XMP-exif:DateTimeOriginal",
+            "sharpness",
+            "adj_sharpness",
+            "aesthetic",
+            "adj_topiq",
+            "focus_status",
             "burst_id",
             "burst_position",
+            "report.shutter_speed",
+            "report.iso",
+            "report.aperture",
+            "report.focal_length",
+            "report.camera_model",
+            "report.lens_model",
+            "report.date_time_original",
+            "report.adj_sharpness",
+            "report.adj_topiq",
+            "report.focus_status",
             "report.burst_id",
             "report.burst_position",
+            "XMP-superpicky:shutter_speed",
+            "XMP-superpicky:iso",
+            "XMP-superpicky:aperture",
+            "XMP-superpicky:focal_length",
+            "XMP-superpicky:camera_model",
+            "XMP-superpicky:lens_model",
+            "XMP-superpicky:date_time_original",
+            "XMP-superpicky:adj_sharpness",
+            "XMP-superpicky:adj_topiq",
+            "XMP-superpicky:focus_status",
             "XMP-superpicky:burst_id",
             "XMP-superpicky:burst_position",
             "XMP-xmp:Rating",
@@ -1029,6 +1103,11 @@ class FileListPanel(QWidget):
                 if isinstance(row, dict):
                     report_row_by_path[norm_p] = row
         self._report_row_by_path = dict(report_row_by_path or {})
+        try:
+            self._meta_proxy.report_db.update_report_root(self._report_root_dir or None)
+            self._meta_proxy.report_db.update_cache(self._report_full_cache or self._report_cache or {})
+        except Exception:
+            pass
         self._probe_log("apply_listing.report_row_map", elapsed_ms=elapsed_ms(step_t0), rows=len(self._report_row_by_path))
         step_t0 = perf_counter()
         self._all_files = list(files)
@@ -3187,7 +3266,7 @@ class FileListPanel(QWidget):
             return False
         if filter_min_rating > 0 and rating != filter_min_rating:
             return False
-        if filter_focus_status and _focus_status_to_display(meta.get("country", "")) != filter_focus_status:
+        if filter_focus_status and _metadata_focus_status_text(meta) != filter_focus_status:
             return False
         return True
 
@@ -3958,6 +4037,28 @@ class FileListPanel(QWidget):
         item.setText(_TREE_COL_STAR, star_text); item.setData(_TREE_COL_STAR, _SortRole, sort_val)
         item.setText(_TREE_COL_TAGS, tags_display)
         item.setData(_TREE_COL_TAGS, _SortRole, tags_display.lower())
+        camera_values = {
+            _TREE_COL_SHUTTER: _metadata_shutter_text(meta),
+            _TREE_COL_APERTURE: _metadata_aperture_text(meta),
+            _TREE_COL_ISO: _metadata_iso_text(meta),
+            _TREE_COL_FOCAL: _metadata_focal_length_text(meta),
+            _TREE_COL_CAMERA: _metadata_camera_model_text(meta),
+            _TREE_COL_LENS: _metadata_lens_model_text(meta),
+            _TREE_COL_CAPTURE_TIME: _metadata_capture_time_text(meta),
+            _TREE_COL_SHARP: _metadata_sharpness_text(meta),
+            _TREE_COL_AESTHETIC: _metadata_aesthetic_text(meta),
+            _TREE_COL_FOCUS: _metadata_focus_status_text(meta),
+        }
+        for column, value in camera_values.items():
+            text = str(value or "")
+            item.setText(column, text)
+            sort_value = text.lower()
+            if column in (_TREE_COL_ISO, _TREE_COL_SHARP, _TREE_COL_AESTHETIC):
+                try:
+                    sort_value = (0, float(text))
+                except Exception:
+                    sort_value = (1, text.lower())
+            item.setData(column, _SortRole, sort_value)
 
     # ── 视图模式切换 ────────────────────────────────────────────────────────────
     def _view_uses_pixel_scroll(self, view) -> bool:
@@ -4869,6 +4970,7 @@ class FileListPanel(QWidget):
             meta_proxy=self._meta_proxy,
             focus_source_paths=self._build_metadata_focus_source_paths(paths),
             metadata_tags=_SUPERBIRDSTAMP_BROWSER_METADATA_TAGS,
+            report_rows_by_path=self._report_row_by_path,
         )
         loader.progress_updated.connect(self._on_metadata_progress)
         loader.metadata_batch_ready.connect(self._on_metadata_batch_ready)
