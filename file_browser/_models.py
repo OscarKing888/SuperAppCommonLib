@@ -433,16 +433,59 @@ class FileTableModel(QAbstractTableModel):
         return [entry.path for entry in self._entries]
 
     def set_meta_for_path(self, path: str, meta: dict | None) -> bool:
-        row = self.row_for_path(path)
-        if row is None:
-            return False
-        entry = self._entries[row]
-        self._apply_meta_to_entry(entry, meta)
-        entry.tooltip = _append_burst_tooltip(entry.base_tooltip, entry.burst_text)
-        left = self.index(row, _TREE_COL_BURST)
-        right = self.index(row, self.columnCount() - 1)
-        self.dataChanged.emit(left, right, [_DisplayRole, _SortRole, _ForegroundRole, _BackgroundRole, _ToolTipRole])
-        return True
+        return bool(self.set_meta_for_paths([(path, meta)]))
+
+    def set_meta_for_paths(self, updates: list[tuple[str, dict | None]]) -> int:
+        if not updates:
+            return 0
+        changed_rows: list[int] = []
+        for path, meta in updates:
+            row = self.row_for_path(path)
+            if row is None:
+                continue
+            entry = self._entries[row]
+            self._apply_meta_to_entry(entry, meta)
+            entry.tooltip = _append_burst_tooltip(entry.base_tooltip, entry.burst_text)
+            changed_rows.append(row)
+        if not changed_rows:
+            return 0
+        changed_rows = sorted(set(changed_rows))
+        roles = [_DisplayRole, _SortRole, _ForegroundRole, _BackgroundRole, _ToolTipRole]
+        first_meta_column = min(
+            _TREE_COL_SPECIES,
+            _TREE_COL_BURST,
+            _TREE_COL_FOCUS,
+            _TREE_COL_STAR,
+            _TREE_COL_SHARP,
+            _TREE_COL_AESTHETIC,
+            _TREE_COL_SHUTTER,
+            _TREE_COL_APERTURE,
+            _TREE_COL_ISO,
+            _TREE_COL_FOCAL,
+            _TREE_COL_CAPTURE_TIME,
+            _TREE_COL_LENS,
+            _TREE_COL_TAGS,
+            _TREE_COL_COMMENT,
+        )
+        range_start = changed_rows[0]
+        range_end = range_start
+        for row in changed_rows[1:]:
+            if row == range_end + 1:
+                range_end = row
+                continue
+            self.dataChanged.emit(
+                self.index(range_start, first_meta_column),
+                self.index(range_end, self.columnCount() - 1),
+                roles,
+            )
+            range_start = row
+            range_end = row
+        self.dataChanged.emit(
+            self.index(range_start, first_meta_column),
+            self.index(range_end, self.columnCount() - 1),
+            roles,
+        )
+        return len(changed_rows)
 
     def set_tooltip_for_path(self, path: str, tooltip: str) -> bool:
         row = self.row_for_path(path)
@@ -811,11 +854,7 @@ class ThumbnailListModel(QAbstractListModel):
         pixmap = entry.pixmap
         return isinstance(pixmap, QPixmap) and not pixmap.isNull() and int(entry.thumb_size or 0) == int(thumb_size)
 
-    def set_meta_for_path(self, path: str, meta: dict | None) -> bool:
-        row = self.row_for_path(path)
-        if row is None:
-            return False
-        entry = self._entries[row]
+    def _set_meta_on_entry(self, entry: ThumbnailListEntry, meta: dict | None) -> list[int]:
         meta = meta or {}
         changed_roles: list[int] = []
         new_color = str(meta.get("color", ""))
@@ -850,11 +889,49 @@ class ThumbnailListModel(QAbstractListModel):
             entry.burst_text = new_burst_text
             entry.tooltip = _append_burst_tooltip(entry.base_tooltip, new_burst_text)
             changed_roles.extend([_MetaBurstTextRole, _ToolTipRole])
+        return changed_roles
+
+    def set_meta_for_path(self, path: str, meta: dict | None) -> bool:
+        row = self.row_for_path(path)
+        if row is None:
+            return False
+        entry = self._entries[row]
+        changed_roles = self._set_meta_on_entry(entry, meta)
         if not changed_roles:
             return False
         idx = self.index(row, 0)
         self.dataChanged.emit(idx, idx, list(dict.fromkeys(changed_roles + [_DisplayRole])))
         return True
+
+    def set_meta_for_paths(self, updates: list[tuple[str, dict | None]]) -> int:
+        if not updates:
+            return 0
+        changed_rows: list[int] = []
+        all_roles: list[int] = []
+        for path, meta in updates:
+            row = self.row_for_path(path)
+            if row is None:
+                continue
+            changed_roles = self._set_meta_on_entry(self._entries[row], meta)
+            if not changed_roles:
+                continue
+            changed_rows.append(row)
+            all_roles.extend(changed_roles)
+        if not changed_rows:
+            return 0
+        changed_rows = sorted(set(changed_rows))
+        roles = list(dict.fromkeys(all_roles + [_DisplayRole]))
+        range_start = changed_rows[0]
+        range_end = range_start
+        for row in changed_rows[1:]:
+            if row == range_end + 1:
+                range_end = row
+                continue
+            self.dataChanged.emit(self.index(range_start, 0), self.index(range_end, 0), roles)
+            range_start = row
+            range_end = row
+        self.dataChanged.emit(self.index(range_start, 0), self.index(range_end, 0), roles)
+        return len(changed_rows)
 
     def set_pixmap_for_path(self, path: str, pixmap: QPixmap | None, thumb_size: int) -> int | None:
         row = self.row_for_path(path)

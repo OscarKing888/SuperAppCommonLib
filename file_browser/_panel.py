@@ -88,6 +88,7 @@ class FileListPanel(QWidget):
         self._meta_apply_list_hits: int = 0
         self._meta_apply_needs_filter: bool = False
         self._meta_apply_loader_finished: bool = True
+        self._meta_apply_order_by_path: dict[str, int] = {}
         self._meta_filter_refresh_timer: QTimer | None = None
         self._use_report_db = bool(getattr(type(self), "use_report_db", True))
         self._use_preview_cache = bool(getattr(type(self), "use_preview_cache", True))
@@ -2432,12 +2433,15 @@ class FileListPanel(QWidget):
 
     def _refresh_metadata_state_for_paths(self, paths: list[str]) -> None:
         unique_paths = self._unique_norm_paths(paths)
+        updates: list[tuple[str, dict]] = []
         for norm_path in unique_paths:
             meta = self._meta_cache.get(norm_path, {})
             if not isinstance(meta, dict):
                 continue
-            self._file_table_model.set_meta_for_path(norm_path, meta)
-            self._apply_thumb_meta_to_path(norm_path, meta)
+            updates.append((norm_path, meta))
+        if updates:
+            self._file_table_model.set_meta_for_paths(updates)
+            self._thumb_list_model.set_meta_for_paths(updates)
 
         if self._tree_widget.isSortingEnabled():
             self._apply_tree_sort(
@@ -5004,7 +5008,7 @@ class FileListPanel(QWidget):
             _log.info("[_start_metadata_loader] no paths, return")
             return
         self._stop_pending_meta_apply()
-        self._begin_meta_apply_session(total)
+        self._begin_meta_apply_session(total, ordered_paths=paths)
         loader = MetadataLoader(
             paths,
             meta_proxy=self._meta_proxy,
@@ -5545,7 +5549,7 @@ class FileListPanel(QWidget):
         timer.timeout.connect(self._flush_meta_filter_refresh)
         self._meta_filter_refresh_timer = timer
 
-    def _begin_meta_apply_session(self, expected_total: int) -> None:
+    def _begin_meta_apply_session(self, expected_total: int, ordered_paths: list[str] | None = None) -> None:
         self._ensure_meta_apply_timer()
         self._ensure_meta_filter_refresh_timer()
         self._meta_apply_items = []
@@ -5564,6 +5568,11 @@ class FileListPanel(QWidget):
             or self._filter_focus_status
         )
         self._meta_apply_loader_finished = False
+        self._meta_apply_order_by_path = {}
+        for index, path in enumerate(ordered_paths or []):
+            norm_path = os.path.normpath(path) if path else ""
+            if norm_path and norm_path not in self._meta_apply_order_by_path:
+                self._meta_apply_order_by_path[norm_path] = index
         self._set_tree_header_fast_mode(True)
         self._tree_widget.setSortingEnabled(False)
         self._show_meta_progress_status(
@@ -5596,6 +5605,7 @@ class FileListPanel(QWidget):
         self._meta_apply_list_hits = 0
         self._meta_apply_needs_filter = False
         self._meta_apply_loader_finished = True
+        self._meta_apply_order_by_path = {}
         self._set_tree_header_fast_mode(False)
         if sorting_was_disabled:
             self._tree_widget.setSortingEnabled(True)
@@ -5641,19 +5651,18 @@ class FileListPanel(QWidget):
         QTimer.singleShot(0, self._refresh_tree_row_numbers)
 
     def _order_meta_items_by_file_list(self, meta_dict: dict) -> list:
+        if not meta_dict:
+            return []
+        rank = self._meta_apply_order_by_path
+        fallback_base = len(rank) + 1
         ordered: list = []
-        seen: set = set()
-        preferred = self._filtered_files or self._all_files
-        for p in preferred:
-            norm = os.path.normpath(p)
-            if norm in meta_dict:
-                ordered.append((norm, meta_dict[norm]))
-                seen.add(norm)
-        for norm, meta in meta_dict.items():
-            if norm in seen:
+        for offset, (path, meta) in enumerate(meta_dict.items()):
+            norm = os.path.normpath(path) if path else ""
+            if not norm:
                 continue
-            ordered.append((norm, meta))
-        return ordered
+            ordered.append((rank.get(norm, fallback_base + offset), norm, meta))
+        ordered.sort(key=lambda item: (item[0], item[1]))
+        return [(norm, meta) for _rank, norm, meta in ordered]
 
     def _schedule_meta_filter_refresh(self) -> None:
         if not self._meta_apply_needs_filter:
@@ -5702,7 +5711,13 @@ class FileListPanel(QWidget):
         )
         self._schedule_meta_filter_refresh()
         if self._meta_apply_timer is not None and not self._meta_apply_timer.isActive():
-            self._meta_apply_timer.start(1)
+            self._apply_meta_batch_tick()
+        if (
+            self._meta_apply_timer is not None
+            and self._meta_apply_index < self._meta_apply_total
+            and not self._meta_apply_timer.isActive()
+        ):
+            self._meta_apply_timer.start(0)
 
     def _finish_meta_apply(self) -> None:
         if self._meta_filter_refresh_timer is not None and self._meta_filter_refresh_timer.isActive():
@@ -5770,18 +5785,17 @@ class FileListPanel(QWidget):
                 break
             if (i - start) >= 8 and (_time.perf_counter() - tick_t0) >= budget_s:
                 break
-            norm_path, meta = self._meta_apply_items[i]
-            if self._file_table_model.set_meta_for_path(norm_path, meta):
-                self._meta_apply_tree_hits += 1
-                if _DEBUG_FILE_LIST_LIMIT == 1:
-                    _log.info("[DEBUG][_apply_meta] norm=%r meta=%r", norm_path, meta)
-            if self._view_mode == self._MODE_THUMB:
-                if self._thumb_index_for_path(norm_path).isValid():
-                    self._meta_apply_list_hits += 1
-                    self._apply_thumb_meta_to_path(norm_path, meta)
             i += 1
 
         end = i
+        batch_items = self._meta_apply_items[start:end]
+        if batch_items:
+            self._meta_apply_tree_hits += self._file_table_model.set_meta_for_paths(batch_items)
+            if _DEBUG_FILE_LIST_LIMIT == 1:
+                for norm_path, meta in batch_items:
+                    _log.info("[DEBUG][_apply_meta] norm=%r meta=%r", norm_path, meta)
+            if self._view_mode == self._MODE_THUMB:
+                self._meta_apply_list_hits += self._thumb_list_model.set_meta_for_paths(batch_items)
         self._meta_apply_index = end
         self._show_meta_progress_status(
             "正在读取元数据",
