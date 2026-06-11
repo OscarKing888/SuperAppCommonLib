@@ -411,22 +411,22 @@ class FileListPanel(QWidget):
         self._tree_widget.selectionModel().selectionChanged.connect(self._on_view_selection_changed)
         for col in range(len(_FILE_TABLE_HEADERS)):
             hdr.setSectionResizeMode(col, _ResizeInteractive)
-        self._tree_widget.setColumnWidth(_TREE_COL_NAME, 15 * _TREE_COL_CHAR_PX)
-        self._tree_widget.setColumnWidth(_TREE_COL_SPECIES, 10 * _TREE_COL_CHAR_PX)
-        self._tree_widget.setColumnWidth(_TREE_COL_BURST, 8 * _TREE_COL_CHAR_PX)
-        self._tree_widget.setColumnWidth(_TREE_COL_STAR, 10 * _TREE_COL_CHAR_PX)
-        self._tree_widget.setColumnWidth(_TREE_COL_SHUTTER, 10 * _TREE_COL_CHAR_PX)
-        self._tree_widget.setColumnWidth(_TREE_COL_APERTURE, 10 * _TREE_COL_CHAR_PX)
-        self._tree_widget.setColumnWidth(_TREE_COL_ISO, 10 * _TREE_COL_CHAR_PX)
-        self._tree_widget.setColumnWidth(_TREE_COL_FOCAL, 10 * _TREE_COL_CHAR_PX)
-        self._tree_widget.setColumnWidth(_TREE_COL_LENS, 30 * _TREE_COL_CHAR_PX)
-        self._tree_widget.setColumnWidth(_TREE_COL_CAPTURE_TIME, 20 * _TREE_COL_CHAR_PX)
-        self._tree_widget.setColumnWidth(_TREE_COL_SHARP, 6 * _TREE_COL_CHAR_PX)
-        self._tree_widget.setColumnWidth(_TREE_COL_AESTHETIC, 6 * _TREE_COL_CHAR_PX)
-        self._tree_widget.setColumnWidth(_TREE_COL_FOCUS, 6 * _TREE_COL_CHAR_PX)
+        self._tree_widget.setColumnWidth(_TREE_COL_NAME, 7 * _TREE_COL_CHAR_PX)
+        self._tree_widget.setColumnWidth(_TREE_COL_SPECIES, 4 * _TREE_COL_CHAR_PX)
+        self._tree_widget.setColumnWidth(_TREE_COL_BURST, 3 * _TREE_COL_CHAR_PX)
+        self._tree_widget.setColumnWidth(_TREE_COL_STAR, 4 * _TREE_COL_CHAR_PX)
+        self._tree_widget.setColumnWidth(_TREE_COL_SHUTTER, 4 * _TREE_COL_CHAR_PX)
+        self._tree_widget.setColumnWidth(_TREE_COL_APERTURE, 3 * _TREE_COL_CHAR_PX)
+        self._tree_widget.setColumnWidth(_TREE_COL_ISO, 4 * _TREE_COL_CHAR_PX)
+        self._tree_widget.setColumnWidth(_TREE_COL_FOCAL, 4 * _TREE_COL_CHAR_PX)
+        self._tree_widget.setColumnWidth(_TREE_COL_LENS, 18 * _TREE_COL_CHAR_PX)
+        self._tree_widget.setColumnWidth(_TREE_COL_CAPTURE_TIME, 7 * _TREE_COL_CHAR_PX)
+        self._tree_widget.setColumnWidth(_TREE_COL_SHARP, 4 * _TREE_COL_CHAR_PX)
+        self._tree_widget.setColumnWidth(_TREE_COL_AESTHETIC, 2 * _TREE_COL_CHAR_PX)
+        self._tree_widget.setColumnWidth(_TREE_COL_FOCUS, 2 * _TREE_COL_CHAR_PX)
         
-        self._tree_widget.setColumnWidth(_TREE_COL_TAGS, 30 * _TREE_COL_CHAR_PX)
-        self._tree_widget.setColumnWidth(_TREE_COL_COMMENT, 35 * _TREE_COL_CHAR_PX)
+        self._tree_widget.setColumnWidth(_TREE_COL_TAGS, 15 * _TREE_COL_CHAR_PX)
+        self._tree_widget.setColumnWidth(_TREE_COL_COMMENT, 25 * _TREE_COL_CHAR_PX)
 
         self._apply_tree_sort(_TREE_COL_NAME, _AscendingOrder, sync_indicator=True)
         self._tree_widget.setContextMenuPolicy(_CustomContextMenu)
@@ -1986,11 +1986,11 @@ class FileListPanel(QWidget):
         payload = getattr(self, "_copied_species_payload", None) or {}
         label = str(payload.get("bird_species_cn") or payload.get("filename") or "").strip()
         if label:
-            return f"粘贴鸟种名称（{label}）"
-        return "粘贴鸟种名称"
+            return f"粘贴鸟名（{label}）"
+        return "粘贴鸟名"
 
     def _paste_species_to_paths(self, paths: list[str]) -> None:
-        if not self._file_writes_allowed("粘贴鸟种名称", warn=True):
+        if not self._file_writes_allowed("粘贴鸟名", warn=True):
             return
         payload = getattr(self, "_copied_species_payload", None)
         if not payload:
@@ -2604,6 +2604,7 @@ class FileListPanel(QWidget):
             return
         writes_allowed = self._rating_writes_allowed("修改评级")
         rating_menu = menu.addMenu("修改星级")
+        rating_menu.addSeparator()
         rating_menu.setEnabled(writes_allowed)
         if not writes_allowed:
             mark_write_action_disabled(
@@ -6504,18 +6505,17 @@ class FileListPanel(QWidget):
         return True
 
     def _add_send_to_external_app_actions(self, menu: QMenu, paths: list[str]) -> None:
-        """在右键菜单中加入「发送到其它应用」子菜单，使用当前选中的文件列表。"""
-        send_menu = menu.addMenu("发送到其它应用")
+        """在右键菜单中直接加入「发送到:应用名」动作，使用当前选中的文件列表。"""
         apps = get_external_apps()
         if not apps:
-            hint = send_menu.addAction("请在「文件 → 外部应用设置」中添加应用")
+            hint = menu.addAction("请在「文件 → 外部应用设置」中添加应用")
             hint.setEnabled(False)
             return
         base_dir = self.get_current_dir() or ""
         selected_paths = list(paths or [])
         for app in apps:
             name = (app.get("name") or app.get("path") or "未命名").strip()
-            act = send_menu.addAction(name)
+            act = menu.addAction(f"发送到:{name}")
             act.triggered.connect(
                 lambda checked=False, a=app, p=selected_paths: send_files_to_app(
                     p,
@@ -6527,13 +6527,13 @@ class FileListPanel(QWidget):
     def _add_species_menu_actions(self, menu: QMenu, primary_path: str | None, paths: list[str]) -> None:
         source_path = primary_path or (paths[0] if paths else "")
         copy_payload = self._get_species_payload_for_path(source_path) if source_path else None
-        act_copy_species = menu.addAction("复制鸟种名称")
+        act_copy_species = menu.addAction("复制鸟名")
         act_copy_species.setEnabled(copy_payload is not None)
         if copy_payload is not None:
             act_copy_species.triggered.connect(lambda: self._copy_species_from_path(source_path))
 
         act_paste_species = menu.addAction(self._get_paste_species_action_text())
-        writes_allowed = self._file_writes_allowed("粘贴鸟种名称")
+        writes_allowed = self._file_writes_allowed("粘贴鸟名")
         can_paste = (
             writes_allowed
             and getattr(self, "_copied_species_payload", None) is not None
@@ -6544,7 +6544,7 @@ class FileListPanel(QWidget):
         if not writes_allowed:
             mark_write_action_disabled(
                 act_paste_species,
-                self.file_writes_disabled_tooltip("粘贴鸟种名称"),
+                self.file_writes_disabled_tooltip("粘贴鸟名"),
             )
         if can_paste:
             act_paste_species.triggered.connect(lambda: self._paste_species_to_paths(paths))
@@ -6597,7 +6597,7 @@ class FileListPanel(QWidget):
         act_copy_filename.triggered.connect(lambda: self._copy_filenames_to_clipboard(paths))
         self._add_rating_menu_actions(menu, paths)
         menu.addSeparator()
-        #self._add_species_menu_actions(menu, self._tree_path_from_index(index) if index.isValid() else (paths[0] if paths else ""), paths)
+        self._add_species_menu_actions(menu, self._tree_path_from_index(index) if index.isValid() else (paths[0] if paths else ""), paths)
 
         self._add_photo_tag_menu_actions(menu, paths)
         menu.addSeparator()
@@ -6818,7 +6818,7 @@ class FileListPanel(QWidget):
         act_copy_filename.triggered.connect(lambda: self._copy_filenames_to_clipboard(paths))
         self._add_rating_menu_actions(menu, paths)
         menu.addSeparator()
-        #self._add_species_menu_actions(menu, self._thumb_path_from_index(index) if index.isValid() else (paths[0] if paths else ""), paths)
+        self._add_species_menu_actions(menu, self._thumb_path_from_index(index) if index.isValid() else (paths[0] if paths else ""), paths)
 
         self._add_photo_tag_menu_actions(menu, paths)
         menu.addSeparator()
