@@ -462,16 +462,14 @@ _COLOR_LABEL_COLORS: dict[str, tuple[str, str]] = {
 }
 
 # 对焦状态（XMP:Country 等）原始值 → 可读中文（精焦/合焦/偏移/失焦）
+# 生成端只写 BEST/GOOD/BAD/WORST；中文值用于兼容已规范化的缓存/显示值。
 _FOCUS_STATUS_DISPLAY: dict[str, str] = {
     "BEST": "精焦",
-    "IN FOCUS": "合焦",
-    "OK": "合焦",
     "GOOD": "合焦",
-    "OFF": "偏移",
-    "MISS": "失焦",
-    "OUT": "失焦",
-    "BAD": "失焦",
+    "BAD": "偏移",
+    "WORST": "失焦",
 }
+_FOCUS_STATUS_DISPLAY_ORDER: tuple[str, ...] = ("精焦", "合焦", "偏移", "失焦")
 _COLOR_SORT_ORDER: dict[str, int] = {
     k: i for i, k in enumerate(
         ["Red", "Orange", "Yellow", "Green", "Blue", "Purple", "White", ""]
@@ -481,10 +479,10 @@ _COLOR_SORT_ORDER: dict[str, int] = {
 _FOCUS_STATUS_TEXT_COLORS: dict[str, str] = {
     "精焦": COLORS["success"],
     "合焦": COLORS["warning"],
-    "偏移": COLORS["text_primary"],
-    "失焦": COLORS["text_secondary"],
+    "偏移": "#f97316",
+    "失焦": COLORS["error"],
 }
-_FOCUS_FILTER_OPTIONS: tuple[str, ...] = tuple(_FOCUS_STATUS_TEXT_COLORS.keys())
+_FOCUS_FILTER_OPTIONS: tuple[str, ...] = _FOCUS_STATUS_DISPLAY_ORDER
 
 
 def _format_optional_number(raw: str, fmt: str) -> str:
@@ -913,9 +911,22 @@ def _focus_status_to_display(raw: str) -> str:
     u = s.upper()
     if u in _FOCUS_STATUS_DISPLAY:
         return _FOCUS_STATUS_DISPLAY[u]
-    if s in ("精焦", "合焦", "偏移", "失焦"):
+    if s in _FOCUS_STATUS_DISPLAY_ORDER:
         return s
     return s
+
+
+def _focus_status_text_color(raw: str) -> str:
+    """返回对焦状态文本色；未知状态使用次级文字色。"""
+    status = _focus_status_to_display(raw)
+    return _FOCUS_STATUS_TEXT_COLORS.get(status, COLORS["text_secondary"])
+
+
+def _focus_status_brush(raw: str) -> "QBrush | None":
+    status = _focus_status_to_display(raw)
+    if not status:
+        return None
+    return QBrush(QColor(_focus_status_text_color(status)))
 
 
 def _qcolor_rgba_css(color_value: str, alpha: int) -> str:
@@ -974,8 +985,8 @@ def apply_compact_filter_badge_menu(
 
 
 def _focus_filter_button_stylesheet(status: str) -> str:
-    color = _FOCUS_STATUS_TEXT_COLORS.get(status, COLORS["text_secondary"])
-    checked_fg = "#111111" if status in ("??", "??") else "#f5f5f5"
+    color = _focus_status_text_color(status)
+    checked_fg = "#111111" if _focus_status_to_display(status) == "合焦" else "#f5f5f5"
     return _filter_badge_stylesheet(color, min_width=42, checked_fg=checked_fg)
 
 
@@ -1435,6 +1446,47 @@ def _thumb_source_stamp(path: str, auxiliary_path: str = "") -> float:
     return stamp
 
 
+def _thumb_cache_image_dimensions(cache_path: str) -> tuple[int, int] | None:
+    try:
+        from PIL import Image
+        with Image.open(cache_path) as img:
+            return int(img.width), int(img.height)
+    except Exception:
+        return None
+
+
+def _thumb_image_matches_size_for_source(
+    source_path: str,
+    width: int,
+    height: int,
+    size: int,
+) -> bool:
+    width = int(width)
+    height = int(height)
+    if width <= 0 or height <= 0:
+        return False
+    size_int = max(1, int(size))
+    max_edge = max(width, height)
+    if max_edge > size_int + 2:
+        return False
+    # 旧 RAW 缓存可能把 160px ThumbnailImage 写进 512/1024 目录，直接判失效重建。
+    if Path(source_path).suffix.lower() in RAW_EXTENSIONS and max_edge < int(size_int * 0.75):
+        return False
+    return True
+
+
+def _thumb_cache_image_matches_size(
+    cache_path: str,
+    source_path: str,
+    size: int,
+) -> bool:
+    dims = _thumb_cache_image_dimensions(cache_path)
+    if dims is None:
+        return False
+    width, height = dims
+    return _thumb_image_matches_size_for_source(source_path, width, height, size)
+
+
 def _existing_persistent_thumb_cache_path_for_exact_size(
     path: str,
     current_dir: str | None,
@@ -1450,6 +1502,8 @@ def _existing_persistent_thumb_cache_path_for_exact_size(
                     break
         if not cache_path or not os.path.isfile(cache_path):
             return ""
+    if not _thumb_cache_image_matches_size(cache_path, path, size):
+        return ""
     if source_stamp is None:
         source_stamp = _thumb_source_stamp(path)
     if source_stamp and source_stamp > 0:
@@ -1556,6 +1610,8 @@ def _read_thumb_from_disk_cache(path: str, mtime: float, size: int) -> "QImage |
             img = img.convert("RGB")
         data = img.tobytes("raw", "RGB")
         w, h = img.size
+        if not _thumb_image_matches_size_for_source(path, w, h, size):
+            return None
         qimg = QImage(data, w, h, w * 3, _QImageRGB888)
         return qimg.copy()
     except Exception:

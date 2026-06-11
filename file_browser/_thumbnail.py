@@ -896,6 +896,12 @@ class PersistentThumbCacheWorker(QThread):
             if (
                 target_path
                 and not output_image.isNull()
+                and _thumb_image_matches_size_for_source(
+                    source_path,
+                    int(output_image.width()),
+                    int(output_image.height()),
+                    int(size),
+                )
                 and _write_persistent_thumb_cache_image(
                     target_path,
                     output_image,

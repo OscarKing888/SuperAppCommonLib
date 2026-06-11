@@ -14,6 +14,9 @@ from __future__ import annotations
 
 import io as _io
 import os
+import subprocess
+import sys
+import tempfile
 import time as _time
 from pathlib import Path
 from typing import Callable, Generator
@@ -24,6 +27,7 @@ from app_common.image_formats import (
 )
 
 THUMB_FAST_DEFAULT_SIZE = 64
+RAW_PREVIEW_JPEG_TAGS = ("JpgFromRaw", "PreviewImage", "ThumbnailImage")
 
 # Chunk size for progressive JPEG feeding.  64 KB gives ~10–80 feed iterations
 # for typical camera JPEGs (2–5 MB), providing 2–5 visible intermediate frames
@@ -63,6 +67,66 @@ def _get_raw_thumbnail_bytes(path: str) -> bytes | None:
     except Exception:
         pass
     return None
+
+
+def _run_exiftool_binary_tag(path: str, tag: str) -> bytes | None:
+    """读取 exiftool 二进制标签，返回 JPEG 字节。"""
+    try:
+        from app_common.exif_io.exiftool_path import get_exiftool_executable_path
+    except Exception:
+        return None
+    exiftool_path = get_exiftool_executable_path()
+    if not exiftool_path:
+        return None
+    path_norm = os.path.normpath(path)
+    cmd_common = [
+        exiftool_path,
+        "-b",
+        "-charset",
+        "filename=UTF8",
+        "-api",
+        "largefilesupport=1",
+    ]
+    use_argfile = sys.platform.startswith("win") and any(ord(c) > 127 for c in path_norm)
+    argfile_path = ""
+    try:
+        if use_argfile:
+            fd, argfile_path = tempfile.mkstemp(suffix=".args", prefix="exiftool_preview_")
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                f.write(f"-{tag}\n")
+                f.write(path_norm + "\n")
+            cmd = [*cmd_common, "-@", argfile_path]
+        else:
+            cmd = [*cmd_common, f"-{tag}", path_norm]
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        data = proc.stdout or b""
+        if len(data) > 100 and data.startswith(b"\xff\xd8"):
+            return data
+    except Exception:
+        return None
+    finally:
+        if argfile_path:
+            try:
+                os.unlink(argfile_path)
+            except Exception:
+                pass
+    return None
+
+
+def get_raw_preview_jpeg(path: str) -> bytes | None:
+    """从 RAW 文件提取适合预览/缩略图的内嵌 JPEG，优先使用高清 JpgFromRaw。"""
+    if Path(path).suffix.lower() not in _RAW_EXTENSIONS:
+        return None
+    for tag in RAW_PREVIEW_JPEG_TAGS:
+        data = _run_exiftool_binary_tag(path, tag)
+        if data:
+            return data
+    return _get_raw_thumbnail_bytes(path)
 
 
 def _pil_to_rgb_thumb(img, size: int) -> tuple[bytes, int, int] | None:
@@ -128,6 +192,46 @@ def _pil_to_rgb_thumb_bilinear(img, size: int) -> tuple[bytes, int, int] | None:
         return None
 
 
+def _jpeg_image_is_progressive(img) -> bool:
+    """判断 PIL JPEG 是否为 progressive；失败时按非 progressive 处理。"""
+    try:
+        info = getattr(img, "info", {}) or {}
+        return bool(info.get("progressive") or info.get("progression"))
+    except Exception:
+        return False
+
+
+def _jpeg_file_is_progressive(path: str) -> bool:
+    try:
+        from PIL import Image
+        with Image.open(path) as img:
+            return _jpeg_image_is_progressive(img)
+    except Exception:
+        return False
+
+
+def _jpeg_bytes_are_progressive(data: bytes | None) -> bool:
+    if not data:
+        return False
+    try:
+        from PIL import Image
+        with Image.open(_io.BytesIO(data)) as img:
+            return _jpeg_image_is_progressive(img)
+    except Exception:
+        return False
+
+
+def _load_thumbnail_rgb_from_jpeg_bytes(data: bytes | None, size: int) -> tuple[bytes, int, int] | None:
+    if not data:
+        return None
+    try:
+        from PIL import Image
+        with Image.open(_io.BytesIO(data)) as img:
+            return _pil_to_rgb_thumb(img, size)
+    except Exception:
+        return None
+
+
 def load_thumbnail_rgb_fast(path: str, max_size: int = THUMB_FAST_DEFAULT_SIZE) -> tuple[bytes, int, int] | None:
     """
     仅针对 JPEG 做小尺寸快速解码（draft），用于首帧快速显示。
@@ -167,12 +271,11 @@ def load_thumbnail_rgb(path: str, size: int) -> tuple[bytes, int, int] | None:
         ext = Path(path).suffix.lower()
         img = None
         if ext in _RAW_EXTENSIONS:
-            raw_data = _get_raw_thumbnail_bytes(path)
+            raw_data = get_raw_preview_jpeg(path)
             if raw_data:
-                try:
-                    img = Image.open(_io.BytesIO(raw_data))
-                except Exception:
-                    img = None
+                result = _load_thumbnail_rgb_from_jpeg_bytes(raw_data, size)
+                if result is not None:
+                    return result
         if img is None:
             img = Image.open(path)
             if ext in _JPEG_EXTENSIONS:
@@ -197,13 +300,13 @@ def iter_thumbnail_rgb_progressive(
     "progressive texture streaming" pattern used in game engines:
 
     - For JPEG files:  reads the file in 64 KB chunks through PIL's
-      ImageFile.Parser.  Progressive-encoded JPEGs (common in camera
-      output) yield a blurry full-frame after the first scan and
-      successively sharper frames as more scans arrive.  Baseline JPEGs
-      show the top-N rows growing downward.  Each intermediate frame uses
-      BILINEAR scaling (fast); the final frame uses LANCZOS (best quality).
-    - For RAW files:   extracts the embedded JPEG thumbnail and applies the
-      same progressive pipeline.
+      ImageFile.Parser.  Progressive-encoded JPEGs yield a blurry full-frame
+      after the first scan and successively sharper frames as more scans arrive.
+      Baseline JPEGs are decoded in one complete pass to avoid top-N-row frames
+      with black lower/right regions.  Each progressive intermediate frame uses
+      BILINEAR scaling (fast); the final frame uses a complete LANCZOS decode.
+    - For RAW files:   extracts the best embedded preview JPEG first
+      (JpgFromRaw → PreviewImage → ThumbnailImage) and applies the same logic.
     - For all other formats (PNG, WebP, TIFF …): yields the single result
       from load_thumbnail_rgb (same as before).
 
@@ -228,13 +331,23 @@ def iter_thumbnail_rgb_progressive(
     # ── Obtain the JPEG stream source ───────────────────────────────────────
     jpeg_bytes: bytes | None = None
     if ext in _RAW_EXTENSIONS:
-        jpeg_bytes = _get_raw_thumbnail_bytes(path)
+        jpeg_bytes = get_raw_preview_jpeg(path)
         if jpeg_bytes is None:
             # Embedded JPEG unavailable → plain load
             result = load_thumbnail_rgb(path, size)
             if result:
                 yield result
             return
+        if not _jpeg_bytes_are_progressive(jpeg_bytes):
+            result = _load_thumbnail_rgb_from_jpeg_bytes(jpeg_bytes, size)
+            if result:
+                yield result
+            return
+    elif not _jpeg_file_is_progressive(path):
+        result = load_thumbnail_rgb(path, size)
+        if result:
+            yield result
+        return
 
     # ── Progressive feed loop ────────────────────────────────────────────────
     try:
@@ -309,22 +422,20 @@ def iter_thumbnail_rgb_progressive(
     except Exception:
         pass  # fall through to finalise
 
-    # ── Finalise: let libjpeg complete all remaining scans ───────────────────
+    # ── Finalise: decode the full JPEG again for the cacheable final frame ───
     try:
         parser.close()
     except Exception:
         pass
 
-    if parser.image is not None:
-        try:
-            # Final frame: LANCZOS for best quality (replaces all intermediates)
-            result = _pil_to_rgb_thumb(parser.image, size)
-        except Exception:
-            result = None
-        if result:
-            yield result
+    if jpeg_bytes is not None:
+        result = _load_thumbnail_rgb_from_jpeg_bytes(jpeg_bytes, size)
+    else:
+        result = load_thumbnail_rgb(path, size)
+    if result:
+        yield result
     elif not has_intermediate:
         # Parser gave nothing useful → plain fallback
-        result = load_thumbnail_rgb(path, size)
-        if result:
-            yield result
+        fallback = load_thumbnail_rgb(path, size)
+        if fallback:
+            yield fallback

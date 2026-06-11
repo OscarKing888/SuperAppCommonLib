@@ -3,6 +3,7 @@ import os
 import app_common.file_browser._workers as _workers
 from app_common.file_browser._browser_core import (
     _DisplayRole,
+    _ForegroundRole,
     _MetaBurstTextRole,
     _SortRole,
     _ToolTipRole,
@@ -18,6 +19,8 @@ from app_common.file_browser._browser_core import (
     _TREE_COL_NAME,
     _TREE_COL_SHARP,
     _TREE_COL_SHUTTER,
+    _focus_status_text_color,
+    _focus_status_to_display,
 )
 from app_common.file_browser._models import FileTableModel, ThumbnailListModel
 from app_common.file_browser._workers import MetadataLoader
@@ -29,6 +32,35 @@ def _tooltip(path: str) -> str:
 
 def _mismatch(_path: str) -> bool:
     return False
+
+
+def test_focus_status_display_and_color_mapping() -> None:
+    expected = {
+        "BEST": "精焦",
+        "GOOD": "合焦",
+        "BAD": "偏移",
+        "WORST": "失焦",
+    }
+
+    for raw, display in expected.items():
+        assert _focus_status_to_display(raw) == display
+        assert _focus_status_text_color(raw) == _focus_status_text_color(display)
+
+
+def test_file_table_focus_column_uses_status_foreground_color() -> None:
+    path = os.path.normpath("C:/photos/focus.jpg")
+    model = FileTableModel()
+    model.rebuild(
+        [path],
+        meta_cache={path: {"focus_status": "BAD"}},
+        tooltip_fn=_tooltip,
+        mismatch_fn=_mismatch,
+    )
+
+    assert model.data(model.index(0, _TREE_COL_FOCUS), _DisplayRole) == "偏移"
+    brush = model.data(model.index(0, _TREE_COL_FOCUS), _ForegroundRole)
+    assert brush is not None
+    assert brush.color().name().lower() == _focus_status_text_color("BAD").lower()
 
 
 def test_file_table_displays_burst_column_from_metadata_sources() -> None:

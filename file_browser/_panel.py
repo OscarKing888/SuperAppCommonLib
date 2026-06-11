@@ -4089,6 +4089,9 @@ class FileListPanel(QWidget):
         for column, value in camera_values.items():
             text = str(value or "")
             item.setText(column, text)
+            if column == _TREE_COL_FOCUS:
+                brush = _focus_status_brush(text)
+                item.setForeground(column, brush if brush is not None else QBrush())
             sort_value = text.lower()
             if column in (_TREE_COL_ISO, _TREE_COL_SHARP, _TREE_COL_AESTHETIC):
                 try:

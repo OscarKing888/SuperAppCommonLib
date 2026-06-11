@@ -344,6 +344,8 @@ class FileTableModel(QAbstractTableModel):
         if role == _ForegroundRole:
             if column == _TREE_COL_NAME and entry.mismatch:
                 return QBrush(QColor("#c0392b"))
+            if column == _TREE_COL_FOCUS:
+                return _focus_status_brush(entry.focus_status)
             return None
         return None
 
@@ -710,7 +712,7 @@ class ThumbnailListModel(QAbstractListModel):
             color=str(meta.get("color", "")),
             rating=rating,
             pick=pick,
-            focus_status=str(meta.get("country", "")),
+            focus_status=_metadata_focus_status_text(meta),
             species_cn=str(meta.get("bird_species_cn", "")),
             burst_position=burst_position,
             burst_id=burst_id,
@@ -828,7 +830,7 @@ class ThumbnailListModel(QAbstractListModel):
         if entry.pick != new_pick:
             entry.pick = new_pick
             changed_roles.append(_MetaPickRole)
-        new_focus_status = str(meta.get("country", ""))
+        new_focus_status = _metadata_focus_status_text(meta)
         if entry.focus_status != new_focus_status:
             entry.focus_status = new_focus_status
             changed_roles.append(_MetaFocusRole)

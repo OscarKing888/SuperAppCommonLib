@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from PIL import Image
+
 from app_common.file_browser._browser_core import (
     _collect_image_files_impl,
     _find_superpicky_dir,
@@ -10,6 +12,10 @@ from app_common.file_browser._browser_core import (
     _superpicky_cache_root_dir,
     _thumb_disk_cache_path,
 )
+
+
+def _write_jpeg(path: Path, size: tuple[int, int]) -> None:
+    Image.new("RGB", size, (80, 120, 160)).save(path, format="JPEG", quality=85)
 
 
 def test_persistent_thumb_cache_uses_existing_superpicky_root_for_descendants(tmp_path: Path) -> None:
@@ -63,15 +69,30 @@ def test_persistent_thumb_cache_migrates_legacy_thumb_cache_dir(tmp_path: Path) 
     photo = nested / "DSC00024.jpg"
     photo.write_bytes(b"image")
     legacy_path = legacy_dir / "2026__birds__DSC00024.jpg.thumb.jpg"
-    legacy_path.write_bytes(b"thumb")
+    _write_jpeg(legacy_path, (128, 96))
 
     migrated = Path(
         _existing_persistent_thumb_cache_path_for_exact_size(str(photo), str(nested), 128)
     )
 
     assert migrated == superpicky / "thumb_cache" / "128" / legacy_path.name
-    assert migrated.read_bytes() == b"thumb"
+    assert migrated.is_file()
     assert not legacy_path.exists()
+
+
+def test_persistent_thumb_cache_rejects_undersized_raw_large_cache(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    nested = root / "2026" / "birds"
+    superpicky = root / ".superpicky"
+    cache_dir = superpicky / "thumb_cache" / "1024"
+    cache_dir.mkdir(parents=True)
+    nested.mkdir(parents=True)
+    photo = nested / "DSC00024.ARW"
+    photo.write_bytes(b"raw")
+    cache_path = Path(_persistent_thumb_cache_path_for_file(str(photo), str(nested), 1024))
+    _write_jpeg(cache_path, (160, 120))
+
+    assert _existing_persistent_thumb_cache_path_for_exact_size(str(photo), str(nested), 1024) == ""
 
 
 def test_collect_image_files_skips_apple_double_metadata_files(tmp_path: Path) -> None:
