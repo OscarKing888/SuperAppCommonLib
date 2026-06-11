@@ -232,42 +232,52 @@ _MetaSpeciesCnRole = int(_UserRole) + 22
 _MetaBurstTextRole = int(_UserRole) + 23
 
 _TREE_COL_SEQ = -1
-_TREE_COL_NAME = 0
-_TREE_COL_BURST = 1
-_TREE_COL_COMMENT = 2
-_TREE_COL_STAR = 3
-_TREE_COL_TAGS = 4
-_TREE_COL_SHUTTER = 5
-_TREE_COL_APERTURE = 6
-_TREE_COL_ISO = 7
-_TREE_COL_FOCAL = 8
-_TREE_COL_CAMERA = 9
-_TREE_COL_LENS = 10
-_TREE_COL_CAPTURE_TIME = 11
-_TREE_COL_SHARP = 12
-_TREE_COL_AESTHETIC = 13
-_TREE_COL_FOCUS = 14
+
+# 列定义：每个元素为 (列键, 显示名)。
+# 只需调整本列表的顺序，即可调整列在表格中的显示顺序；
+# 下方的列索引常量(_TREE_COL_*)与表头(_FILE_TABLE_HEADERS)会按此顺序自动保持一致。
+_FILE_TABLE_COLUMNS = [
+    ("NAME", "文件名"),
+    ("SPECIES", "鸟名"),
+    ("BURST", "连拍"),
+    ("FOCUS", "对焦"),
+    ("STAR", "星级"),
+    ("SHARP", "锐度"),
+    ("AESTHETIC", "美学"),
+    ("SHUTTER", "快门"),
+    ("APERTURE", "光圈"),
+    ("ISO", "ISO"),
+    ("FOCAL", "焦距"),
+    ("CAPTURE_TIME", "拍摄时间"),
+    ("LENS", "镜头"),
+    ("TAGS", "标签"),
+    ("COMMENT", "注释"),
+]
+_FILE_TABLE_HEADERS = [display_name for _key, display_name in _FILE_TABLE_COLUMNS]
+_FILE_TABLE_COLUMN_INDEX = {key: index for index, (key, _display) in enumerate(_FILE_TABLE_COLUMNS)}
+
+# 列索引常量：均按 key 查表得到，与列表顺序无关，因此重排上面的列表时这里无需改动。
+_TREE_COL_NAME = _FILE_TABLE_COLUMN_INDEX["NAME"]
+_TREE_COL_SPECIES = _FILE_TABLE_COLUMN_INDEX["SPECIES"]
+_TREE_COL_BURST = _FILE_TABLE_COLUMN_INDEX["BURST"]
+_TREE_COL_FOCUS = _FILE_TABLE_COLUMN_INDEX["FOCUS"]
+_TREE_COL_STAR = _FILE_TABLE_COLUMN_INDEX["STAR"]
+_TREE_COL_TAGS = _FILE_TABLE_COLUMN_INDEX["TAGS"]
+_TREE_COL_SHUTTER = _FILE_TABLE_COLUMN_INDEX["SHUTTER"]
+_TREE_COL_APERTURE = _FILE_TABLE_COLUMN_INDEX["APERTURE"]
+_TREE_COL_ISO = _FILE_TABLE_COLUMN_INDEX["ISO"]
+_TREE_COL_FOCAL = _FILE_TABLE_COLUMN_INDEX["FOCAL"]
+_TREE_COL_COMMENT = _FILE_TABLE_COLUMN_INDEX["COMMENT"]
+_TREE_COL_LENS = _FILE_TABLE_COLUMN_INDEX["LENS"]
+_TREE_COL_CAPTURE_TIME = _FILE_TABLE_COLUMN_INDEX["CAPTURE_TIME"]
+_TREE_COL_SHARP = _FILE_TABLE_COLUMN_INDEX["SHARP"]
+_TREE_COL_AESTHETIC = _FILE_TABLE_COLUMN_INDEX["AESTHETIC"]
 _TREE_COL_TITLE = _TREE_COL_COMMENT
 _TREE_COL_COLOR = _TREE_COL_TAGS
 _TREE_COL_STATE = _TREE_COL_AESTHETIC
 _TREE_COL_COUNTRY = _TREE_COL_FOCUS
-_FILE_TABLE_HEADERS = [
-    "文件名",
-    "连拍",
-    "注释",
-    "星级",
-    "标签",
-    "快门",
-    "光圈",
-    "ISO",
-    "焦距",
-    "相机",
-    "镜头",
-    "拍摄时间",
-    "锐度",
-    "美学",
-    "对焦",
-]
+# 每个字符的像素宽度：列宽 = 字符数量 × 该常量
+_TREE_COL_CHAR_PX = 8
 _FILE_TAG_DISPLAY_SEPARATOR = "、"
 _SUPERBIRDSTAMP_CAMERA_METADATA_TAGS = [
     "-IFD0:Model",
@@ -564,6 +574,22 @@ def _metadata_comment_from_meta(meta: dict | None) -> str:
         meta.get("caption"),
     )
     return str(value or "").strip()
+
+
+def _metadata_species_text(meta: dict | None) -> str:
+    """鸟名（中文物种名），存于标题字段，兼容 report/superpicky 别名。"""
+    return _metadata_text_from_candidates(
+        meta,
+        "bird_species_cn",
+        "XMP-dc:Title",
+        "XMP:Title",
+        "Title",
+        "IFD0:XPTitle",
+        "XPTitle",
+        "IPTC:ObjectName",
+        "ObjectName",
+        "title",
+    )
 
 
 def _metadata_value_from_candidates(meta: dict | None, *keys: str):

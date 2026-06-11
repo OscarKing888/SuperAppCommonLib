@@ -252,8 +252,8 @@ class FileListPanel(QWidget):
         self._size_label.setFixedWidth(42)
         self._size_label.setToolTip("当前缩略图/快速预览尺寸")
 
-        toolbar.addWidget(self._btn_list)
         toolbar.addWidget(self._btn_thumb)
+        toolbar.addWidget(self._btn_list)
         toolbar.addSpacing(4)
         toolbar.addWidget(QLabel("大小:"))
         toolbar.addWidget(self._size_slider)
@@ -411,21 +411,23 @@ class FileListPanel(QWidget):
         self._tree_widget.selectionModel().selectionChanged.connect(self._on_view_selection_changed)
         for col in range(len(_FILE_TABLE_HEADERS)):
             hdr.setSectionResizeMode(col, _ResizeInteractive)
-        self._tree_widget.setColumnWidth(_TREE_COL_NAME, 240)
-        self._tree_widget.setColumnWidth(_TREE_COL_BURST, 72)
-        self._tree_widget.setColumnWidth(_TREE_COL_COMMENT, 280)
-        self._tree_widget.setColumnWidth(_TREE_COL_STAR, 72)
-        self._tree_widget.setColumnWidth(_TREE_COL_TAGS, 240)
-        self._tree_widget.setColumnWidth(_TREE_COL_SHUTTER, 88)
-        self._tree_widget.setColumnWidth(_TREE_COL_APERTURE, 72)
-        self._tree_widget.setColumnWidth(_TREE_COL_ISO, 64)
-        self._tree_widget.setColumnWidth(_TREE_COL_FOCAL, 76)
-        self._tree_widget.setColumnWidth(_TREE_COL_CAMERA, 148)
-        self._tree_widget.setColumnWidth(_TREE_COL_LENS, 180)
-        self._tree_widget.setColumnWidth(_TREE_COL_CAPTURE_TIME, 128)
-        self._tree_widget.setColumnWidth(_TREE_COL_SHARP, 68)
-        self._tree_widget.setColumnWidth(_TREE_COL_AESTHETIC, 68)
-        self._tree_widget.setColumnWidth(_TREE_COL_FOCUS, 76)
+        self._tree_widget.setColumnWidth(_TREE_COL_NAME, 15 * _TREE_COL_CHAR_PX)
+        self._tree_widget.setColumnWidth(_TREE_COL_SPECIES, 10 * _TREE_COL_CHAR_PX)
+        self._tree_widget.setColumnWidth(_TREE_COL_BURST, 8 * _TREE_COL_CHAR_PX)
+        self._tree_widget.setColumnWidth(_TREE_COL_STAR, 10 * _TREE_COL_CHAR_PX)
+        self._tree_widget.setColumnWidth(_TREE_COL_SHUTTER, 10 * _TREE_COL_CHAR_PX)
+        self._tree_widget.setColumnWidth(_TREE_COL_APERTURE, 10 * _TREE_COL_CHAR_PX)
+        self._tree_widget.setColumnWidth(_TREE_COL_ISO, 10 * _TREE_COL_CHAR_PX)
+        self._tree_widget.setColumnWidth(_TREE_COL_FOCAL, 10 * _TREE_COL_CHAR_PX)
+        self._tree_widget.setColumnWidth(_TREE_COL_LENS, 30 * _TREE_COL_CHAR_PX)
+        self._tree_widget.setColumnWidth(_TREE_COL_CAPTURE_TIME, 20 * _TREE_COL_CHAR_PX)
+        self._tree_widget.setColumnWidth(_TREE_COL_SHARP, 6 * _TREE_COL_CHAR_PX)
+        self._tree_widget.setColumnWidth(_TREE_COL_AESTHETIC, 6 * _TREE_COL_CHAR_PX)
+        self._tree_widget.setColumnWidth(_TREE_COL_FOCUS, 6 * _TREE_COL_CHAR_PX)
+        
+        self._tree_widget.setColumnWidth(_TREE_COL_TAGS, 30 * _TREE_COL_CHAR_PX)
+        self._tree_widget.setColumnWidth(_TREE_COL_COMMENT, 35 * _TREE_COL_CHAR_PX)
+
         self._apply_tree_sort(_TREE_COL_NAME, _AscendingOrder, sync_indicator=True)
         self._tree_widget.setContextMenuPolicy(_CustomContextMenu)
         self._tree_widget.customContextMenuRequested.connect(self._on_tree_context_menu)
@@ -4001,6 +4003,7 @@ class FileListPanel(QWidget):
 
     def _apply_meta_to_tree_item(self, item: SortableTreeItem, meta: dict) -> None:
         comment = _metadata_comment_from_meta(meta)
+        species = _metadata_species_text(meta)
         tags_display = _metadata_tags_display(meta)
         burst_position, burst_id = _metadata_burst_values(meta)
         burst_text = _format_burst_text(burst_position, burst_id)
@@ -4023,6 +4026,8 @@ class FileListPanel(QWidget):
                 burst_position if burst_position is not None else 10**12,
             ),
         )
+        item.setText(_TREE_COL_SPECIES, species)
+        item.setData(_TREE_COL_SPECIES, _SortRole, species.lower())
         item.setText(_TREE_COL_COMMENT, comment)
         item.setData(_TREE_COL_COMMENT, _SortRole, comment.lower())
         if pick == 1:
@@ -4042,7 +4047,6 @@ class FileListPanel(QWidget):
             _TREE_COL_APERTURE: _metadata_aperture_text(meta),
             _TREE_COL_ISO: _metadata_iso_text(meta),
             _TREE_COL_FOCAL: _metadata_focal_length_text(meta),
-            _TREE_COL_CAMERA: _metadata_camera_model_text(meta),
             _TREE_COL_LENS: _metadata_lens_model_text(meta),
             _TREE_COL_CAPTURE_TIME: _metadata_capture_time_text(meta),
             _TREE_COL_SHARP: _metadata_sharpness_text(meta),

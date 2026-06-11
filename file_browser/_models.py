@@ -130,6 +130,7 @@ class FileTableEntry:
     tooltip: str = ""
     mismatch: bool = False
     comment: str = ""
+    species: str = ""
     tags: list[str] = field(default_factory=list)
     tags_display: str = ""
     title: str = ""
@@ -192,6 +193,7 @@ class FileTableModel(QAbstractTableModel):
     def _apply_meta_to_entry(self, entry: FileTableEntry, meta: dict | None) -> None:
         meta = meta or {}
         entry.comment = _metadata_comment_from_meta(meta)
+        entry.species = _metadata_species_text(meta)
         entry.tags = _metadata_tags_from_meta(meta)
         entry.tags_display = _FILE_TAG_DISPLAY_SEPARATOR.join(entry.tags)
         entry.title = str(meta.get("title", "") or "")
@@ -237,6 +239,8 @@ class FileTableModel(QAbstractTableModel):
     def _sort_value(self, entry: FileTableEntry, column: int):
         if column == _TREE_COL_NAME:
             return entry.name.lower()
+        if column == _TREE_COL_SPECIES:
+            return entry.species.lower()
         if column == _TREE_COL_BURST:
             missing = entry.burst_position is None and entry.burst_id is None
             return (
@@ -266,8 +270,6 @@ class FileTableModel(QAbstractTableModel):
                 return (1, entry.iso.lower())
         if column == _TREE_COL_FOCAL:
             return entry.focal_length.lower()
-        if column == _TREE_COL_CAMERA:
-            return entry.camera_model.lower()
         if column == _TREE_COL_LENS:
             return entry.lens_model.lower()
         if column == _TREE_COL_CAPTURE_TIME:
@@ -289,6 +291,8 @@ class FileTableModel(QAbstractTableModel):
     def _display_value(self, entry: FileTableEntry, row: int, column: int) -> str:
         if column == _TREE_COL_NAME:
             return entry.name
+        if column == _TREE_COL_SPECIES:
+            return entry.species
         if column == _TREE_COL_BURST:
             return entry.burst_text
         if column == _TREE_COL_COMMENT:
@@ -309,8 +313,6 @@ class FileTableModel(QAbstractTableModel):
             return entry.iso
         if column == _TREE_COL_FOCAL:
             return entry.focal_length
-        if column == _TREE_COL_CAMERA:
-            return entry.camera_model
         if column == _TREE_COL_LENS:
             return entry.lens_model
         if column == _TREE_COL_CAPTURE_TIME:
