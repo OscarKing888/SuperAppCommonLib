@@ -1004,6 +1004,7 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
         burst_text = str(index.data(_MetaBurstTextRole) or "")
         rating = index.data(_MetaRatingRole)
         pick = index.data(_MetaPickRole)
+        focus_status = str(index.data(_MetaFocusRole) or "")
         pixmap = index.data(_ThumbPixmapRole)
         if not isinstance(pixmap, QPixmap):
             pixmap = None
@@ -1065,6 +1066,25 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
                 painter.setPen(fg)
                 painter.drawText(badge2, _AlignCenter, text)
 
+            def draw_focus_status_marker(status: str) -> None:
+                if not status:
+                    return
+                color = QColor(_focus_status_text_color(status))
+                if not color.isValid():
+                    return
+                size = max(7, min(12, draw_rect.width() // 12, draw_rect.height() // 12))
+                marker = QRect(
+                    draw_rect.left() + 4,
+                    draw_rect.bottom() - size - 4,
+                    size,
+                    size,
+                )
+                painter.setBrush(QBrush(QColor(0, 0, 0, 150)))
+                painter.setPen(_NoPen)
+                #painter.drawRect(marker.adjusted(-2, -2, 2, 2))
+                painter.setBrush(QBrush(color))
+                painter.drawRect(marker)
+
             if pick == 1:
                 draw_badge("🏆", QColor(0, 0, 0, 160), QColor(COLORS["star_gold"]), left=True)
             elif pick == -1:
@@ -1081,6 +1101,8 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
                     QColor(_STAR_SILVER_COLOR),
                     left=False,
                 )
+
+            draw_focus_status_marker(focus_status)
 
             text_rect = QRect(cell.left(), thumb_rect.bottom() + 4, cell.width(), name_height)
             text_color = opt.palette.highlightedText().color() if selected else opt.palette.text().color()
