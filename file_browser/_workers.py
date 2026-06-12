@@ -2,12 +2,14 @@
 """Background workers for app_common.file_browser."""
 from __future__ import annotations
 
+import concurrent.futures as _futures
+
 from app_common.file_browser._browser_core import *
 
 class DirectoryScanWorker(QThread):
     """在后台执行目录扫描与 report.db 加载，完成后通过信号回传结果。"""
 
-    scan_finished = pyqtSignal(str, object, object, object)  # (path, files_list, selected_report_cache, full_report_cache_or_none)
+    scan_finished = pyqtSignal(str, object, object, object, object)  # (path, files_list, selected_report_cache, full_report_cache_or_none, report_row_by_path)
     scan_progress = pyqtSignal(str, int, int, str)  # (path, found_files, scanned_dirs, current_dir)
 
     def __init__(
@@ -214,11 +216,31 @@ class DirectoryScanWorker(QThread):
                     maybe_emit_progress(self._path, force=True)
             except (PermissionError, OSError) as e:
                 _log.warning("[DirectoryScanWorker.run] scan error: %s", e)
+        report_row_by_path: dict = {}
+        if self._use_report_db:
+            try:
+                scoped_cache, scoped_full_cache, scoped_rows_by_path = _build_report_scope_maps_for_files(
+                    files,
+                    self._path,
+                )
+                if scoped_rows_by_path:
+                    report_cache = scoped_cache
+                    full_report_cache = scoped_full_cache
+                    report_row_by_path = scoped_rows_by_path
+                    report_source_available = True
+                _log.info(
+                    "[DirectoryScanWorker.run] report scopes selected=%s full=%s path_rows=%s",
+                    len(report_cache or {}),
+                    len(full_report_cache or {}),
+                    len(report_row_by_path or {}),
+                )
+            except Exception as exc:
+                _log.warning("[DirectoryScanWorker.run] build report scopes failed: %s", exc)
         maybe_emit_progress(self._path, force=True)
         _log.info("[DirectoryScanWorker.run] 目录扫描完成：列出 %s 个图像文件，report_cache %s 条，即将通知主线程加载 EXIF", len(files), len(report_cache))
         _log.info("[DirectoryScanWorker.run] scan done files=%s", len(files))
         if not self.isInterruptionRequested():
-            self.scan_finished.emit(self._path, files, report_cache, full_report_cache)
+            self.scan_finished.emit(self._path, files, report_cache, full_report_cache, report_row_by_path)
             _log.info("[DirectoryScanWorker.run] emit scan_finished END")
 
 
@@ -312,6 +334,7 @@ class MetadataLoader(QThread):
         focus_source_paths: dict[str, str] | None = None,
         metadata_tags: list[str] | None = None,
         report_rows_by_path: dict[str, dict] | None = None,
+        worker_count: int | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -328,53 +351,102 @@ class MetadataLoader(QThread):
             for path, row in (report_rows_by_path or {}).items()
             if path and isinstance(row, dict)
         }
+        try:
+            self._worker_count = max(1, int(worker_count or 1))
+        except Exception:
+            self._worker_count = 1
         self._stop_flag = False
 
     def stop(self) -> None:
         self._stop_flag = True
         self.requestInterruption()
 
+    def _stopped(self) -> bool:
+        return self._stop_flag or self.isInterruptionRequested()
+
     def run(self) -> None:
         if not self._paths or self._stop_flag:
             _log.debug("[MetadataLoader.run] no paths or stopped")
             return
-        _log.info("[MetadataLoader.run] START paths=%s", len(self._paths))
+        _log.info("[MetadataLoader.run] START paths=%s worker_count=%s", len(self._paths), self._worker_count)
         try:
             paths = self._paths
             total = len(paths)
             chunk_size = max(1, _METADATA_CHUNK_SIZE)
+            chunks = [paths[i : i + chunk_size] for i in range(0, total, chunk_size)]
+            worker_count = max(1, min(self._worker_count, len(chunks)))
             processed = 0
-            for i in range(0, total, chunk_size):
-                if self._stop_flag or self.isInterruptionRequested():
-                    _log.info("[MetadataLoader.run] interrupted")
-                    return
-                chunk = paths[i : i + chunk_size]
-                batch = self._read_metadata_batch(chunk)
-                focus_batch = self._build_focus_cache_batch(chunk) if self._should_prefetch_focus_cache() else {}
-                parsed_batch: dict = {}
-                for norm_path, flat in batch.items():
-                    if self._stop_flag or self.isInterruptionRequested():
+            if worker_count <= 1 or len(chunks) <= 1:
+                for chunk in chunks:
+                    if self._stopped():
+                        _log.info("[MetadataLoader.run] interrupted")
                         return
-                    meta = self._parse_rec(flat)
-                    species_cn = str(flat.get("bird_species_cn") or "").strip()
-                    if species_cn:
-                        meta["bird_species_cn"] = species_cn
-                    parsed_batch[norm_path] = meta
-                    _log.debug(
-                        "[MetadataLoader.run] path=%r title=%r rating=%s pick=%s",
-                        norm_path, meta.get("title", ""), meta.get("rating"), meta.get("pick"),
-                    )
-                if focus_batch and not (self._stop_flag or self.isInterruptionRequested()):
-                    _log.info("[MetadataLoader.run] emit focus_cache_batch_ready batch=%s", len(focus_batch))
-                    self.focus_cache_batch_ready.emit(focus_batch)
-                if parsed_batch and not (self._stop_flag or self.isInterruptionRequested()):
-                    _log.info("[MetadataLoader.run] emit metadata_batch_ready batch=%s", len(parsed_batch))
-                    self.metadata_batch_ready.emit(parsed_batch)
-                processed += len(chunk)
-                self.progress_updated.emit(min(processed, total), total)
+                    parsed_batch, focus_batch, processed_count = self._read_parse_chunk(chunk)
+                    if self._stopped():
+                        return
+                    self._emit_metadata_chunk(parsed_batch, focus_batch)
+                    processed += processed_count
+                    self.progress_updated.emit(min(processed, total), total)
+                return
+
+            with _futures.ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="file-metadata",
+            ) as executor:
+                future_to_size = {
+                    executor.submit(self._read_parse_chunk, chunk): len(chunk)
+                    for chunk in chunks
+                }
+                for future in _futures.as_completed(future_to_size):
+                    if self._stopped():
+                        for pending in future_to_size:
+                            pending.cancel()
+                        _log.info("[MetadataLoader.run] interrupted")
+                        return
+                    processed_count = future_to_size.get(future, 0)
+                    try:
+                        parsed_batch, focus_batch, parsed_count = future.result()
+                        processed_count = parsed_count
+                    except Exception as exc:
+                        _log.warning("[MetadataLoader.run] chunk failed: %s", exc)
+                        parsed_batch = {}
+                        focus_batch = {}
+                    if self._stopped():
+                        return
+                    self._emit_metadata_chunk(parsed_batch, focus_batch)
+                    processed += processed_count
+                    self.progress_updated.emit(min(processed, total), total)
         except Exception as e:
             _log.warning("[MetadataLoader.run] exception: %s", e)
         _log.info("[MetadataLoader.run] END")
+
+    def _read_parse_chunk(self, chunk: list[str]) -> tuple[dict, dict, int]:
+        if self._stopped():
+            return {}, {}, 0
+        batch = self._read_metadata_batch(chunk)
+        focus_batch = self._build_focus_cache_batch(chunk) if self._should_prefetch_focus_cache() else {}
+        parsed_batch: dict = {}
+        for norm_path, flat in batch.items():
+            if self._stopped():
+                return parsed_batch, focus_batch, len(chunk)
+            meta = self._parse_rec(flat)
+            species_cn = str(flat.get("bird_species_cn") or "").strip()
+            if species_cn:
+                meta["bird_species_cn"] = species_cn
+            parsed_batch[norm_path] = meta
+            _log.debug(
+                "[MetadataLoader.run] path=%r title=%r rating=%s pick=%s",
+                norm_path, meta.get("title", ""), meta.get("rating"), meta.get("pick"),
+            )
+        return parsed_batch, focus_batch, len(chunk)
+
+    def _emit_metadata_chunk(self, parsed_batch: dict, focus_batch: dict) -> None:
+        if focus_batch and not self._stopped():
+            _log.info("[MetadataLoader.run] emit focus_cache_batch_ready batch=%s", len(focus_batch))
+            self.focus_cache_batch_ready.emit(focus_batch)
+        if parsed_batch and not self._stopped():
+            _log.info("[MetadataLoader.run] emit metadata_batch_ready batch=%s", len(parsed_batch))
+            self.metadata_batch_ready.emit(parsed_batch)
 
     def _should_prefetch_focus_cache(self) -> bool:
         """

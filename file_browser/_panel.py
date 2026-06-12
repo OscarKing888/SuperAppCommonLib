@@ -29,7 +29,7 @@ class FileListPanel(QWidget):
 
     - 列表模式：含「文件名/标题/颜色/星级/城市/省区/国家」七列，可点击列头排序。
     - 缩略图模式：图标网格，缩略图显示文件名与星级/Pick 标记，
-      工具栏滑块可选 128/256/512/1024 px 四档大小。
+      工具栏滑块可选 128/256/512/1024/2048 px 五档大小。
     """
 
     # 子类可重载为 False 以不创建过滤栏（filter_bar）
@@ -107,6 +107,7 @@ class FileListPanel(QWidget):
         self._pending_selection_current_path: str = ""
         self._selected_display_path: str = ""
         self._thumb_loader_workers = _thumbnail_loader_worker_count()
+        self._metadata_loader_workers = _metadata_loader_worker_count()
         self._thumb_viewport_timer: QTimer | None = None
         self._thumb_visible_signature: tuple | None = None
         self._thumb_visible_range: ThumbViewportRange | None = None
@@ -130,6 +131,8 @@ class FileListPanel(QWidget):
         self._persistent_thumb_cache_timer: QTimer | None = None
         self._persistent_thumb_cache_pending_paths: list[str] = []
         self._persistent_thumb_cache_base_dir: str = ""
+        self._persistent_thumb_cache_scope_dirs: list[str] = []
+        self._persistent_thumb_cache_declined_dirs: set[str] = set()
         self._persistent_thumb_cache_generated: int = 0
         self._persistent_thumb_cache_skipped: int = 0
         self._persistent_thumb_cache_failed: int = 0
@@ -420,6 +423,7 @@ class FileListPanel(QWidget):
         self._tree_widget.setColumnWidth(_TREE_COL_APERTURE, 3 * _TREE_COL_CHAR_PX)
         self._tree_widget.setColumnWidth(_TREE_COL_ISO, 4 * _TREE_COL_CHAR_PX)
         self._tree_widget.setColumnWidth(_TREE_COL_FOCAL, 4 * _TREE_COL_CHAR_PX)
+        self._tree_widget.setColumnWidth(_TREE_COL_CAMERA, 10 * _TREE_COL_CHAR_PX)
         self._tree_widget.setColumnWidth(_TREE_COL_LENS, 18 * _TREE_COL_CHAR_PX)
         self._tree_widget.setColumnWidth(_TREE_COL_CAPTURE_TIME, 7 * _TREE_COL_CHAR_PX)
         self._tree_widget.setColumnWidth(_TREE_COL_SHARP, 4 * _TREE_COL_CHAR_PX)
@@ -766,16 +770,18 @@ class FileListPanel(QWidget):
         busy: bool = False,
         value: int = 0,
         total: int = 0,
+        worker_count: int | None = None,
     ) -> None:
+        suffix = f" ({max(1, int(worker_count))}线程)" if worker_count else ""
         if busy:
             self._meta_progress.setRange(0, 0)
-            self._meta_progress.setFormat(text)
+            self._meta_progress.setFormat(f"{text}{suffix}")
         else:
             bounded_total = max(1, int(total or 0))
             bounded_value = min(max(0, int(value or 0)), bounded_total)
             self._meta_progress.setRange(0, bounded_total)
             self._meta_progress.setValue(bounded_value)
-            self._meta_progress.setFormat(f"{text} {bounded_value}/{bounded_total}")
+            self._meta_progress.setFormat(f"{text} {bounded_value}/{bounded_total}{suffix}")
         self._meta_progress.show()
 
     @staticmethod
@@ -1102,7 +1108,7 @@ class FileListPanel(QWidget):
                 norm_p = os.path.normpath(p) if p else ""
                 if not norm_p:
                     continue
-                row = row_cache_for_path_map.get(Path(norm_p).stem)
+                row = _report_row_from_cache_for_path(norm_p, row_cache_for_path_map)
                 if isinstance(row, dict):
                     report_row_by_path[norm_p] = row
         self._report_row_by_path = dict(report_row_by_path or {})
@@ -1265,7 +1271,14 @@ class FileListPanel(QWidget):
             self._directory_scope_cache.clear()
             self._loaded_directory_recursive = False
         # report.db metadata 已停用；保留旧字段清理，目录列表直接从文件系统扫描。
-        new_report_root_dir = find_report_root(path, max_levels=4) if self._use_report_db else None
+        if self._use_report_db:
+            probe_path = os.path.join(path, "__superviewer_scope_probe__.jpg")
+            new_report_root_dir = _report_root_dir_for_file(probe_path, path)
+            if not new_report_root_dir:
+                local_report_root = find_report_root(path, max_levels=0)
+                new_report_root_dir = local_report_root if local_report_root else None
+        else:
+            new_report_root_dir = None
         if new_report_root_dir != self._report_root_dir:
             _log.info(
                 "[load_directory] report_root_dir changed old=%r new=%r",
@@ -1416,7 +1429,14 @@ class FileListPanel(QWidget):
                 current_dir=current_dir,
             )
 
-    def _on_directory_scan_finished(self, path: str, files: list, report_cache: dict, full_report_cache) -> None:
+    def _on_directory_scan_finished(
+        self,
+        path: str,
+        files: list,
+        report_cache: dict,
+        full_report_cache,
+        report_row_by_path: dict | None = None,
+    ) -> None:
         _log.info("[_on_directory_scan_finished] 收到目录扫描结果 path=%r files=%s report_entries=%s，开始列出文件并查询 EXIF", path, len(files), len(report_cache))
         _log.info("[_on_directory_scan_finished] path=%r _current_dir=%r files=%s report_entries=%s", path, self._current_dir, len(files), len(report_cache))
         if path != self._current_dir:
@@ -1439,7 +1459,14 @@ class FileListPanel(QWidget):
         self._show_meta_progress_status("正在准备生成缩略图...", busy=True)
         self._directory_scan_worker = None
         self._probe_set_phase("apply_listing_queued", files=len(files))
-        self._pending_directory_listing_result = (path, files, report_cache, full_report_cache, recursive)
+        self._pending_directory_listing_result = (
+            path,
+            files,
+            report_cache,
+            full_report_cache,
+            recursive,
+            report_row_by_path or {},
+        )
         QTimer.singleShot(0, self._apply_pending_directory_listing_result)
         _log.info("[_on_directory_scan_finished] END")
 
@@ -1449,7 +1476,11 @@ class FileListPanel(QWidget):
         if not pending:
             self._probe_log("apply_listing_timer_fired_empty")
             return
-        path, files, report_cache, full_report_cache, recursive = pending
+        if len(pending) >= 6:
+            path, files, report_cache, full_report_cache, recursive, report_row_by_path = pending
+        else:
+            path, files, report_cache, full_report_cache, recursive = pending
+            report_row_by_path = {}
         self._probe_set_phase("apply_listing_timer_fired", path=path, files=len(files))
         self._apply_directory_listing_result(
             path,
@@ -1457,6 +1488,7 @@ class FileListPanel(QWidget):
             report_cache,
             full_report_cache,
             recursive=recursive,
+            report_row_by_path=report_row_by_path,
         )
 
     def get_current_dir(self) -> str:
@@ -2695,10 +2727,10 @@ class FileListPanel(QWidget):
         norm_path = os.path.normpath(path) if path else ""
         if not norm_path or not self._use_preview_cache:
             return ""
-        preview_base_dir = self._report_root_dir or self._current_dir
+        preview_base_dir = self._current_dir
         report_cache = self._report_full_cache or self._report_cache or {}
         if preview_base_dir:
-            preview_target = get_preview_path_for_file(norm_path, preview_base_dir, report_cache)
+            preview_target = _resolve_thumb_source_path(norm_path, report_cache, preview_base_dir)
             if preview_target and os.path.isfile(preview_target):
                 return preview_target
         actual_path = self._get_actual_path_for_display(norm_path)
@@ -2708,7 +2740,7 @@ class FileListPanel(QWidget):
         norm_path = os.path.normpath(path) if path else ""
         if not norm_path or not self._use_preview_cache:
             return ""
-        preview_base_dir = self._report_root_dir or self._current_dir
+        preview_base_dir = self._current_dir
         if not preview_base_dir:
             return ""
         actual_path = self._get_actual_path_for_display(norm_path)
@@ -2722,6 +2754,7 @@ class FileListPanel(QWidget):
             requested_size=self._thumb_size,
             source_stamp=source_stamp,
             candidate_sizes=_effective_persistent_thumb_cache_sizes(self._thumb_size),
+            selected_dir=preview_base_dir,
         )
         if persistent_thumb_path:
             return persistent_thumb_path
@@ -2730,7 +2763,7 @@ class FileListPanel(QWidget):
                 thumb_mtime = float(os.path.getmtime(thumb_source))
             except Exception:
                 thumb_mtime = 0.0
-            thumb_disk_path = _thumb_disk_cache_path(thumb_source, thumb_mtime, self._thumb_size)
+            thumb_disk_path = _thumb_disk_cache_path(thumb_source, thumb_mtime, self._thumb_size, preview_base_dir)
             if thumb_disk_path and os.path.isfile(thumb_disk_path):
                 return thumb_disk_path
         return ""
@@ -2739,11 +2772,11 @@ class FileListPanel(QWidget):
         norm_path = os.path.normpath(path) if path else ""
         if not norm_path or not self._use_preview_cache:
             return ""
-        preview_base_dir = self._report_root_dir or self._current_dir
+        preview_base_dir = self._current_dir
         if not preview_base_dir:
             return ""
         report_cache = self._report_full_cache or self._report_cache or {}
-        preview_target = get_preview_path_for_file(norm_path, preview_base_dir, report_cache)
+        preview_target = _resolve_thumb_source_path(norm_path, report_cache, preview_base_dir)
         if preview_target and os.path.isfile(preview_target):
             return preview_target
         return ""
@@ -3026,7 +3059,7 @@ class FileListPanel(QWidget):
         actual_path = self._get_actual_path_for_display(norm_path)
         if not self._use_preview_cache:
             return actual_path or norm_path
-        preview_base_dir = self._report_root_dir or self._current_dir
+        preview_base_dir = self._current_dir
         report_cache = self._report_full_cache or self._report_cache or {}
         source_path = actual_path or norm_path
         if prefer_fast_preview:
@@ -3038,6 +3071,7 @@ class FileListPanel(QWidget):
                 requested_size=self._thumb_size,
                 source_stamp=source_stamp,
                 candidate_sizes=_effective_persistent_thumb_cache_sizes(self._thumb_size),
+                selected_dir=preview_base_dir,
             )
             if persistent_thumb_path:
                 _log.info(
@@ -3053,7 +3087,7 @@ class FileListPanel(QWidget):
                     thumb_mtime = float(os.path.getmtime(thumb_source))
                 except Exception:
                     thumb_mtime = 0.0
-                thumb_disk_path = _thumb_disk_cache_path(thumb_source, thumb_mtime, self._thumb_size)
+                thumb_disk_path = _thumb_disk_cache_path(thumb_source, thumb_mtime, self._thumb_size, preview_base_dir)
                 if thumb_disk_path and os.path.isfile(thumb_disk_path):
                     _log.info(
                         "[resolve_preview_path] fast source=%r thumb_disk=%r actual=%r preview_base_dir=%r size=%s",
@@ -3064,7 +3098,7 @@ class FileListPanel(QWidget):
                         self._thumb_size,
                     )
                     return thumb_disk_path
-        preview_target = get_preview_path_for_file(norm_path, preview_base_dir, report_cache)
+        preview_target = _resolve_thumb_source_path(norm_path, report_cache, preview_base_dir)
         preview_path = preview_target if (preview_target and os.path.isfile(preview_target)) else ""
         _log.info(
             "[resolve_preview_path] source=%r preview=%r preview_target=%r actual=%r preview_base_dir=%r report_entries=%s fast=%s",
@@ -3089,9 +3123,9 @@ class FileListPanel(QWidget):
         if not stem:
             return None
         cache = self._report_full_cache or self._report_cache or {}
-        row = cache.get(stem)
+        row = _report_row_from_cache_for_path(norm_path or path, cache)
         if isinstance(row, dict):
-            _log.info("[_get_report_row_for_path] source=%r matched=stem_cache stem=%r", path, stem)
+            _log.info("[_get_report_row_for_path] source=%r matched=cache stem=%r", path, stem)
         return row if isinstance(row, dict) else None
 
     def _resolve_report_current_abs_path(self, path: str) -> str | None:
@@ -3101,7 +3135,7 @@ class FileListPanel(QWidget):
         cp_text = str(row.get("current_path") or "").strip()
         if not cp_text:
             return None
-        base_dir = self._report_root_dir or self._current_dir
+        base_dir = str(row.get("_report_root_dir") or self._report_root_dir or self._current_dir)
         if os.path.isabs(cp_text):
             return os.path.normpath(cp_text)
         if not base_dir:
@@ -3113,7 +3147,7 @@ class FileListPanel(QWidget):
         cp_abs = None
         cp_text_raw = _get_report_current_path_raw(row) if isinstance(row, dict) else ""
         if cp_text_raw:
-            base_dir = self._report_root_dir or self._current_dir
+            base_dir = str(row.get("_report_root_dir") or self._report_root_dir or self._current_dir)
             if os.path.isabs(cp_text_raw):
                 cp_abs = os.path.normpath(cp_text_raw)
             elif base_dir:
@@ -3358,7 +3392,7 @@ class FileListPanel(QWidget):
         mb = stats["bytes"] / (1024.0 * 1024.0)
         tooltip = (
             "清除当前会话的缩略图内存缓存。\n"
-            f"- JPEG/JPG: 按 128/256/512/1024 级别缓存 MIP\n"
+            f"- JPEG/JPG: 按 128/256/512/1024/2048 级别缓存 MIP\n"
             f"- 其它格式: 直接缓存 {_THUMB_CACHE_BASE_SIZE}px 基础图，再按当前视图缩放\n"
             f"- 后台加载线程数: {self._thumb_loader_workers}\n"
             f"- 当前缓存: {stats['entries']} 项 ({mb:.1f} MB)\n"
@@ -4084,6 +4118,7 @@ class FileListPanel(QWidget):
             _TREE_COL_APERTURE: _metadata_aperture_text(meta),
             _TREE_COL_ISO: _metadata_iso_text(meta),
             _TREE_COL_FOCAL: _metadata_focal_length_text(meta),
+            _TREE_COL_CAMERA: _metadata_camera_model_text(meta),
             _TREE_COL_LENS: _metadata_lens_model_text(meta),
             _TREE_COL_CAPTURE_TIME: _metadata_capture_time_text(meta),
             _TREE_COL_SHARP: _metadata_sharpness_text(meta),
@@ -4841,6 +4876,7 @@ class FileListPanel(QWidget):
         self._thumb_profile_enabled = _thumb_profile_enabled()
         self._sync_file_browser_probe_timer()
         self._thumb_loader_workers = _thumbnail_loader_worker_count()
+        self._metadata_loader_workers = _metadata_loader_worker_count()
         self._set_key_navigation_fps(get_key_navigation_fps(), persist=False)
         self._invalidate_visible_thumbnail_signature()
         self._stop_thumbnail_loader()
@@ -4946,16 +4982,12 @@ class FileListPanel(QWidget):
                 float(cache_stats.get("bytes", 0)) / (1024.0 * 1024.0),
             )
 
-        preview_base_dir = (
-            _superpicky_cache_root_dir(self._report_root_dir or self._current_dir)
-            if self._use_preview_cache
-            else ""
-        )
+        preview_base_dir = self._current_dir if self._use_preview_cache else ""
         self._thumb_request_token += 1
         loader = ThumbnailLoader(
             self._thumb_size,
             self._thumb_request_token,
-            report_cache=self._report_cache,
+            report_cache=self._report_full_cache or self._report_cache or {},
             current_dir=preview_base_dir,
             thumb_cache=self._thumb_memory_cache,
         )
@@ -5015,6 +5047,7 @@ class FileListPanel(QWidget):
             focus_source_paths=self._build_metadata_focus_source_paths(paths),
             metadata_tags=_SUPERBIRDSTAMP_BROWSER_METADATA_TAGS,
             report_rows_by_path=self._report_row_by_path,
+            worker_count=self._metadata_loader_workers,
         )
         loader.progress_updated.connect(self._on_metadata_progress)
         loader.metadata_batch_ready.connect(self._on_metadata_batch_ready)
@@ -5163,7 +5196,7 @@ class FileListPanel(QWidget):
         if entry_size != int(self._thumb_size):
             return ""
         source_path = self._get_actual_path_for_display(norm_path) or norm_path
-        preview_base_dir = self._report_root_dir or self._current_dir
+        preview_base_dir = self._current_dir
         report_cache = self._report_full_cache or self._report_cache or {}
         load_target_path = _resolve_thumb_source_path(
             source_path,
@@ -5176,7 +5209,7 @@ class FileListPanel(QWidget):
             mtime = float(os.path.getmtime(load_target_path))
         except Exception:
             mtime = 0.0
-        cache_path = _thumb_disk_cache_path(load_target_path, mtime, self._thumb_size)
+        cache_path = _thumb_disk_cache_path(load_target_path, mtime, self._thumb_size, preview_base_dir)
         if not cache_path:
             return ""
         if os.path.isfile(cache_path):
@@ -5240,25 +5273,29 @@ class FileListPanel(QWidget):
             return
         done = min(max(0, int(self._persistent_thumb_cache_done)), total)
         status_text = self._persistent_thumb_cache_status_text or "生成预览缩略图"
+        worker_count = _persistent_thumb_cache_worker_count()
+        worker_suffix = f" ({worker_count}线程)"
         if status_text.startswith("正在"):
             self._persistent_thumb_progress.setRange(0, 0)
-            self._persistent_thumb_progress.setFormat(status_text)
+            self._persistent_thumb_progress.setFormat(f"{status_text}{worker_suffix}")
         else:
             self._persistent_thumb_progress.setRange(0, max(1, total))
             self._persistent_thumb_progress.setValue(done)
-            self._persistent_thumb_progress.setFormat(f"{status_text} {done}/{total}")
+            self._persistent_thumb_progress.setFormat(f"{status_text} {done}/{total}{worker_suffix}")
         sizes = _effective_persistent_thumb_cache_sizes(self._thumb_size)
-        cache_dirs = [
-            _persistent_thumb_cache_dir(self._persistent_thumb_cache_base_dir, size)
-            for size in sizes
-        ]
+        cache_dirs = []
+        for scope_dir in self._persistent_thumb_cache_scope_dirs[:4]:
+            for size in sizes:
+                cache_dirs.append(os.path.join(scope_dir, "thumb_cache", _persistent_thumb_cache_dirname(size)))
+        if len(self._persistent_thumb_cache_scope_dirs) > 4:
+            cache_dirs.append(f"... 另 {len(self._persistent_thumb_cache_scope_dirs) - 4} 个 scope")
         current_name = os.path.basename(self._persistent_thumb_cache_current_path) if self._persistent_thumb_cache_current_path else "(waiting)"
         tooltip = (
             f"后台持久化小缩略图缓存\n"
             f"- 目录: {self._persistent_thumb_cache_base_dir or '(none)'}\n"
             f"- 缓存目录: {'; '.join(cache_dirs) if cache_dirs else '(none)'}\n"
             f"- 尺寸层级: {', '.join(str(size) for size in sizes) or '(none)'}\n"
-            f"- 生成线程: {_persistent_thumb_cache_worker_count()}\n"
+            f"- 生成线程: {worker_count}\n"
             f"- 进度: {done}/{total}\n"
             f"- 新生成: {self._persistent_thumb_cache_generated}\n"
             f"- 已跳过: {self._persistent_thumb_cache_skipped}\n"
@@ -5268,10 +5305,75 @@ class FileListPanel(QWidget):
         self._persistent_thumb_progress.setToolTip(tooltip)
         self._persistent_thumb_progress.show()
 
+    def _prompt_create_superpicky_cache_scope(self, missing_count: int) -> bool:
+        current_dir = os.path.normpath(self._current_dir) if self._current_dir else ""
+        if not current_dir or current_dir in self._persistent_thumb_cache_declined_dirs:
+            return False
+        target_dir = os.path.join(current_dir, ".superpicky")
+        standard_buttons = getattr(QMessageBox, "StandardButton", None)
+        if standard_buttons is not None:
+            yes = standard_buttons.Yes
+            no = standard_buttons.No
+        else:
+            yes = QMessageBox.Yes
+            no = QMessageBox.No
+        try:
+            answer = QMessageBox.question(
+                self,
+                "创建缩略图缓存目录",
+                (
+                    f"当前有 {missing_count} 张图片没有可用的 .superpicky 缓存目录。\n\n"
+                    f"是否在当前目录创建：\n{target_dir}\n\n"
+                    "只会创建目录用于预览缓存，不会创建 report.db。"
+                ),
+                yes | no,
+                yes,
+            )
+        except Exception:
+            answer = no
+        if answer != yes:
+            self._persistent_thumb_cache_declined_dirs.add(current_dir)
+            return False
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+            _log.info("[_prompt_create_superpicky_cache_scope] created=%r", target_dir)
+            return True
+        except Exception as exc:
+            _log.warning("[_prompt_create_superpicky_cache_scope] create failed path=%r: %s", target_dir, exc)
+            try:
+                QMessageBox.warning(
+                    self,
+                    "无法创建缩略图缓存目录",
+                    f"无法创建：\n{target_dir}\n\n{exc}",
+                )
+            except Exception:
+                pass
+            self._persistent_thumb_cache_declined_dirs.add(current_dir)
+            return False
+
+    def _filter_paths_with_cache_scope(self, paths: list[str]) -> tuple[list[str], list[str], list[str]]:
+        selected_dir = self._current_dir
+        scoped_paths: list[str] = []
+        missing_paths: list[str] = []
+        scope_dirs: list[str] = []
+        seen_scopes: set[str] = set()
+        for path in ThumbnailLoader._normalize_unique_paths(paths or []):
+            superpicky_dir = _find_cache_superpicky_dir_for_file(path, selected_dir)
+            if superpicky_dir:
+                scoped_paths.append(path)
+                key = _path_key(superpicky_dir)
+                if key not in seen_scopes:
+                    seen_scopes.add(key)
+                    scope_dirs.append(superpicky_dir)
+            else:
+                missing_paths.append(path)
+        return scoped_paths, missing_paths, scope_dirs
+
     def _schedule_persistent_thumb_cache_build(self, paths: list[str] | None) -> None:
         if not self._use_preview_cache:
             self._persistent_thumb_cache_pending_paths = []
             self._persistent_thumb_cache_base_dir = ""
+            self._persistent_thumb_cache_scope_dirs = []
             self._persistent_thumb_cache_total = 0
             self._persistent_thumb_cache_done = 0
             self._persistent_thumb_cache_current_path = ""
@@ -5281,11 +5383,22 @@ class FileListPanel(QWidget):
         if not self._file_writes_allowed("生成预览缩略图"):
             self._stop_persistent_thumb_cache_worker()
             return
-        base_dir = _superpicky_cache_root_dir(self._report_root_dir or self._current_dir)
         pending_paths = ThumbnailLoader._normalize_unique_paths(paths or [])
+        scoped_paths, missing_paths, scope_dirs = self._filter_paths_with_cache_scope(pending_paths)
+        if missing_paths and self._prompt_create_superpicky_cache_scope(len(missing_paths)):
+            scoped_paths, missing_paths, scope_dirs = self._filter_paths_with_cache_scope(pending_paths)
+        elif missing_paths:
+            _log.info(
+                "[_schedule_persistent_thumb_cache_build] skip paths without cache scope current_dir=%r missing=%s scoped=%s",
+                self._current_dir,
+                len(missing_paths),
+                len(scoped_paths),
+            )
+        pending_paths = scoped_paths
         self._persistent_thumb_cache_focus_priority -= 1
         self._persistent_thumb_cache_pending_paths = pending_paths
-        self._persistent_thumb_cache_base_dir = base_dir or ""
+        self._persistent_thumb_cache_base_dir = os.path.normpath(self._current_dir) if self._current_dir else ""
+        self._persistent_thumb_cache_scope_dirs = scope_dirs
         self._persistent_thumb_cache_pending_priority = self._persistent_thumb_cache_focus_priority
         self._persistent_thumb_cache_generated = 0
         self._persistent_thumb_cache_skipped = 0
@@ -5302,10 +5415,30 @@ class FileListPanel(QWidget):
                     self._report_root_dir,
                 )
             self._persistent_thumb_cache_status_text = ""
+            self._persistent_thumb_cache_scope_dirs = []
+            self._update_persistent_thumb_progress_widget()
+            return
+        if (
+            _PERSISTENT_THUMB_CACHE_AUTO_LIMIT > 0
+            and len(pending_paths) > _PERSISTENT_THUMB_CACHE_AUTO_LIMIT
+        ):
+            _log.info(
+                "[_schedule_persistent_thumb_cache_build] skip automatic persistent cache: files=%s limit=%s base_dir=%r",
+                len(pending_paths),
+                _PERSISTENT_THUMB_CACHE_AUTO_LIMIT,
+                self._persistent_thumb_cache_base_dir,
+            )
+            self._persistent_thumb_cache_pending_paths = []
+            self._persistent_thumb_cache_status_text = ""
+            self._persistent_thumb_cache_scope_dirs = []
+            self._persistent_thumb_cache_total = 0
+            self._persistent_thumb_cache_done = 0
+            self._persistent_thumb_cache_current_path = ""
             self._update_persistent_thumb_progress_widget()
             return
         self._update_persistent_thumb_progress_widget()
-        self._start_persistent_thumb_cache_worker()
+        self._ensure_persistent_thumb_cache_timer()
+        self._persistent_thumb_cache_timer.start(_PERSISTENT_THUMB_CACHE_START_DELAY_MS)
 
     def _start_persistent_thumb_cache_worker(self) -> None:
         if self._background_shutdown_started:
@@ -5386,6 +5519,7 @@ class FileListPanel(QWidget):
             self._persistent_thumb_cache_worker = None
         self._persistent_thumb_cache_pending_paths = []
         self._persistent_thumb_cache_base_dir = ""
+        self._persistent_thumb_cache_scope_dirs = []
         self._persistent_thumb_cache_generated = 0
         self._persistent_thumb_cache_skipped = 0
         self._persistent_thumb_cache_failed = 0
@@ -5579,6 +5713,7 @@ class FileListPanel(QWidget):
             "正在读取元数据",
             value=0,
             total=self._meta_apply_expected_total,
+            worker_count=self._metadata_loader_workers,
         )
         perf_log(
             _log,
@@ -5700,6 +5835,7 @@ class FileListPanel(QWidget):
             "正在读取元数据",
             value=self._meta_apply_index,
             total=self._meta_apply_expected_total or self._meta_apply_total,
+            worker_count=self._metadata_loader_workers,
         )
         perf_log(
             _log,
@@ -5752,6 +5888,7 @@ class FileListPanel(QWidget):
             "正在读取元数据",
             value=self._meta_progress.maximum(),
             total=self._meta_progress.maximum(),
+            worker_count=self._metadata_loader_workers,
         )
         QTimer.singleShot(400, self._meta_progress.hide)
         elapsed = (_time.perf_counter() - self._meta_apply_started_at) if self._meta_apply_started_at > 0 else 0.0
@@ -5801,6 +5938,7 @@ class FileListPanel(QWidget):
             "正在读取元数据",
             value=end,
             total=self._meta_progress.maximum(),
+            worker_count=self._metadata_loader_workers,
         )
         if end % 1000 == 0 or end >= total:
             perf_log(
@@ -5938,6 +6076,7 @@ class FileListPanel(QWidget):
             "正在读取元数据",
             value=self._meta_apply_index,
             total=self._meta_apply_expected_total,
+            worker_count=self._metadata_loader_workers,
         )
         _log.debug(
             "[_on_metadata_progress] loaded=%s/%s applied=%s queued=%s",
@@ -6772,12 +6911,7 @@ class FileListPanel(QWidget):
         source_path = os.path.normpath(source_path) if source_path else ""
         if not source_path:
             return []
-        preview_base_dir = (
-            _superpicky_cache_root_dir(self._report_root_dir or self._current_dir or os.path.dirname(source_path))
-            or self._report_root_dir
-            or self._current_dir
-            or os.path.dirname(source_path)
-        )
+        preview_base_dir = self._current_dir or os.path.dirname(source_path)
         report_cache = self._report_full_cache or self._report_cache or {}
         try:
             thumb_source = _resolve_thumb_source_path(
@@ -6812,13 +6946,23 @@ class FileListPanel(QWidget):
             except Exception:
                 mtime = 0.0
             for size in _THUMB_SIZE_STEPS:
-                add_cache_path(_thumb_disk_cache_path(candidate, mtime, size))
+                add_cache_path(_thumb_disk_cache_path(candidate, mtime, size, preview_base_dir))
 
         # 持久小缩略图以原图路径命名；新版平铺和旧版 hash 分目录都清理。
         if preview_base_dir:
             for size in _THUMB_SIZE_STEPS:
-                add_cache_path(_persistent_thumb_cache_path_for_file(source_path, preview_base_dir, size))
-                add_cache_path(_legacy_persistent_thumb_cache_path_for_file(source_path, preview_base_dir, size))
+                add_cache_path(_persistent_thumb_cache_path_for_file(
+                    source_path,
+                    preview_base_dir,
+                    size,
+                    selected_dir=preview_base_dir,
+                ))
+                add_cache_path(_legacy_persistent_thumb_cache_path_for_file(
+                    source_path,
+                    preview_base_dir,
+                    size,
+                    selected_dir=preview_base_dir,
+                ))
         return cache_paths
 
     def _delete_thumbnail_cache_paths(self, cache_paths: list[str]) -> int:

@@ -368,6 +368,7 @@ class ThumbnailLoader(QThread):
             requested_size=self._size,
             source_stamp=source_stamp,
             candidate_sizes=_effective_persistent_thumb_cache_sizes(self._size),
+            selected_dir=self._current_dir,
         )
         if persistent_path:
             return persistent_path
@@ -488,7 +489,7 @@ class ThumbnailLoader(QThread):
             except Exception:
                 mtime = 0.0
 
-            disk_img = _read_thumb_from_disk_cache(load_target_path, mtime, load_size)
+            disk_img = _read_thumb_from_disk_cache(load_target_path, mtime, load_size, self._current_dir)
             if disk_img is not None and not disk_img.isNull():
                 if cache is not None:
                     cache.put(path_to_load, load_size, disk_img)
@@ -503,7 +504,7 @@ class ThumbnailLoader(QThread):
 
             # Progressive decode – emit each frame as it arrives
             if not allow_progressive:
-                qimg = _load_thumbnail_image(load_target_path, load_size)
+                qimg = _load_thumbnail_image(load_target_path, load_size, self._current_dir)
                 if qimg is None or qimg.isNull() or stopped():
                     return
                 if cache is not None:
@@ -534,7 +535,7 @@ class ThumbnailLoader(QThread):
             if final_qimg is not None and not final_qimg.isNull():
                 if cache is not None:
                     cache.put(path_to_load, load_size, final_qimg)
-                cache_path = _thumb_disk_cache_path(load_target_path, mtime, load_size)
+                cache_path = _thumb_disk_cache_path(load_target_path, mtime, load_size, self._current_dir)
                 _schedule_thumb_disk_cache_write(cache_path, final_qimg)
                 self._profile_record_decode(
                     path_to_load,
@@ -545,7 +546,7 @@ class ThumbnailLoader(QThread):
 
         # ── 3. Other formats: single-shot load (handles disk cache internally) ─
         else:
-            qimg = _load_thumbnail_image(load_target_path, load_size)
+            qimg = _load_thumbnail_image(load_target_path, load_size, self._current_dir)
             if qimg is None or qimg.isNull() or stopped():
                 return
             if cache is not None:
@@ -692,6 +693,7 @@ class PersistentThumbCacheTask:
     source_path: str
     current_dir: str
     report_cache: dict
+    report_root_dir: str
     sizes: tuple[int, ...]
 
     @property
@@ -699,6 +701,7 @@ class PersistentThumbCacheTask:
         return (
             _path_key(self.source_path),
             _path_key(self.current_dir),
+            _path_key(self.report_root_dir),
             tuple(int(size) for size in self.sizes),
         )
 
@@ -773,10 +776,21 @@ class PersistentThumbCacheWorker(QThread):
         result: list[PersistentThumbCacheTask] = []
         seen: set[tuple[str, str, tuple[int, ...]]] = set()
         for source_path in ThumbnailLoader._normalize_unique_paths(paths or []):
+            if current_dir_norm and not _find_cache_superpicky_dir_for_file(source_path, current_dir_norm):
+                continue
+            report_row = _report_row_from_cache_for_path(source_path, cache)
+            report_root_dir = ""
+            report_cache_for_task = cache
+            if isinstance(report_row, dict):
+                report_root_dir = str(report_row.get("_report_root_dir") or "").strip()
+                report_cache_for_task = {Path(source_path).stem: report_row}
+            if not report_root_dir:
+                report_root_dir = _report_root_dir_for_file(source_path, current_dir_norm)
             task = PersistentThumbCacheTask(
                 source_path=os.path.normpath(source_path),
                 current_dir=current_dir_norm,
-                report_cache=cache,
+                report_cache=report_cache_for_task,
+                report_root_dir=os.path.normpath(report_root_dir) if report_root_dir else current_dir_norm,
                 sizes=sizes_tuple,
             )
             if task.key in seen:
@@ -863,7 +877,7 @@ class PersistentThumbCacheWorker(QThread):
         load_target_path = _resolve_thumb_source_path(
             source_path,
             task.report_cache,
-            task.current_dir,
+            task.report_root_dir or task.current_dir,
         )
         source_stamp = _thumb_source_stamp(source_path, load_target_path)
         missing_sizes = [
@@ -874,13 +888,14 @@ class PersistentThumbCacheWorker(QThread):
                 task.current_dir,
                 size,
                 source_stamp=source_stamp,
+                selected_dir=task.current_dir,
             )
         ]
         if not missing_sizes:
             return source_path, 0, 1, 0
         if stop_event.is_set():
             return source_path, 0, 0, 1
-        base_image = _load_thumbnail_image(load_target_path, max(missing_sizes))
+        base_image = _load_thumbnail_image(load_target_path, max(missing_sizes), task.current_dir)
         if base_image is None or base_image.isNull():
             return source_path, 0, 0, 1
         wrote_any = False
@@ -891,6 +906,7 @@ class PersistentThumbCacheWorker(QThread):
                 source_path,
                 task.current_dir,
                 size,
+                selected_dir=task.current_dir,
             )
             output_image = base_image if size >= max(missing_sizes) else _scale_qimage_for_thumb(base_image, size)
             if (

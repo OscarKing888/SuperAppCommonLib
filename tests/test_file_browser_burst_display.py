@@ -1,4 +1,6 @@
 import os
+import threading
+import time
 
 import app_common.file_browser._workers as _workers
 from app_common.file_browser._browser_core import (
@@ -244,3 +246,24 @@ def test_thumbnail_model_keeps_display_role_filename_and_exposes_burst_role() ->
     assert model.data(index, _DisplayRole) == "a.jpg"
     assert model.data(index, _MetaBurstTextRole) == "(3/12)"
     assert "连拍: (3/12)" in model.data(index, _ToolTipRole)
+
+
+def test_metadata_loader_reads_chunks_with_configured_worker_pool(monkeypatch) -> None:
+    paths = [os.path.normpath(f"C:/photos/{i}.jpg") for i in range(8)]
+    thread_names: set[str] = set()
+
+    def fake_read_batch(batch_paths, tags=None, use_cache=True):
+        thread_names.add(threading.current_thread().name)
+        time.sleep(0.02)
+        return {
+            os.path.normpath(path): {"SourceFile": os.path.normpath(path)}
+            for path in batch_paths
+        }
+
+    monkeypatch.setattr(_workers, "_METADATA_CHUNK_SIZE", 1)
+    monkeypatch.setattr(_workers, "read_batch_metadata", fake_read_batch)
+
+    loader = MetadataLoader(paths, meta_proxy=object(), worker_count=4)
+    loader.run()
+
+    assert len(thread_names) > 1

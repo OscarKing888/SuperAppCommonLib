@@ -94,6 +94,7 @@ from app_common.superviewer_user_options import (
     get_persistent_thumb_workers,
     get_runtime_user_options,
     get_thumbnail_loader_workers,
+    get_metadata_loader_workers,
     save_user_options,
 )
 from app_common.ui_style.styles import COLORS
@@ -254,6 +255,7 @@ _FILE_TABLE_COLUMNS = [
     ("ISO", "ISO"),
     ("FOCAL", "焦距"),
     ("CAPTURE_TIME", "拍摄时间"),
+    ("CAMERA", "相机"),
     ("LENS", "镜头"),
     ("TAGS", "标签"),
     ("COMMENT", "注释"),
@@ -273,6 +275,7 @@ _TREE_COL_APERTURE = _FILE_TABLE_COLUMN_INDEX["APERTURE"]
 _TREE_COL_ISO = _FILE_TABLE_COLUMN_INDEX["ISO"]
 _TREE_COL_FOCAL = _FILE_TABLE_COLUMN_INDEX["FOCAL"]
 _TREE_COL_COMMENT = _FILE_TABLE_COLUMN_INDEX["COMMENT"]
+_TREE_COL_CAMERA = _FILE_TABLE_COLUMN_INDEX["CAMERA"]
 _TREE_COL_LENS = _FILE_TABLE_COLUMN_INDEX["LENS"]
 _TREE_COL_CAPTURE_TIME = _FILE_TABLE_COLUMN_INDEX["CAPTURE_TIME"]
 _TREE_COL_SHARP = _FILE_TABLE_COLUMN_INDEX["SHARP"]
@@ -379,6 +382,10 @@ _PERSISTENT_THUMB_CACHE_START_DELAY_MS = max(
     500,
     _env_int("SuperViewer_PERSISTENT_THUMB_DELAY_MS", 1800),
 )
+_PERSISTENT_THUMB_CACHE_AUTO_LIMIT = max(
+    0,
+    _env_int("SuperViewer_PERSISTENT_THUMB_AUTO_LIMIT", 0),
+)
 _FAST_PREVIEW_COMMIT_DELAY_MS = max(
     60,
     _env_int("SuperViewer_FAST_PREVIEW_COMMIT_DELAY_MS", 140),
@@ -444,7 +451,7 @@ def _log_thumb_bottleneck_summary() -> None:
             top_values,
         )
 
-_THUMB_SIZE_STEPS = [128, 256, 512, 1024]
+_THUMB_SIZE_STEPS = [128, 256, 512, 1024, 2048]
 _THUMB_CACHE_BASE_SIZE = max(_THUMB_SIZE_STEPS)
 _JPEG_MIP_EXTENSIONS = frozenset({".jpg", ".jpeg"})
 _STAR_SILVER_COLOR = "#c0c0c0"
@@ -1211,11 +1218,15 @@ def _thumb_disk_cache_dir() -> str:
     return os.path.join(base, "SuperViewer", "thumb_cache")
 
 
-def _thumb_disk_cache_dir_for_path(path: str) -> str:
+def _thumb_disk_cache_dir_for_path(path: str, selected_dir: str | None = None) -> str:
     if path:
         try:
             current_dir = os.path.dirname(os.path.normpath(os.path.abspath(path)))
-            superpicky_dir = _find_superpicky_dir(current_dir)
+            superpicky_dir = (
+                _find_cache_superpicky_dir_for_file(path, selected_dir)
+                if selected_dir
+                else _find_superpicky_dir(current_dir)
+            )
         except Exception:
             superpicky_dir = ""
         if superpicky_dir:
@@ -1223,13 +1234,13 @@ def _thumb_disk_cache_dir_for_path(path: str) -> str:
     return _thumb_disk_cache_dir()
 
 
-def _thumb_disk_cache_path(path: str, mtime: float, size: int) -> str:
+def _thumb_disk_cache_path(path: str, mtime: float, size: int, selected_dir: str | None = None) -> str:
     """Full path to cached thumbnail file; path must be absolute/normalized for stable key."""
     try:
         size_dir = str(int(size))
     except Exception:
         size_dir = str(size)
-    cache_dir = os.path.join(_thumb_disk_cache_dir_for_path(path), size_dir)
+    cache_dir = os.path.join(_thumb_disk_cache_dir_for_path(path, selected_dir), size_dir)
     raw = f"{_path_key(path)}\0{mtime}\0{size}"
     name = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24] + ".jpg"
     return os.path.join(cache_dir, name)
@@ -1237,7 +1248,7 @@ def _thumb_disk_cache_path(path: str, mtime: float, size: int) -> str:
 
 def _persistent_thumb_cache_max_size() -> int:
     override = _env_int("SuperViewer_PERSISTENT_THUMB_SIZE", 0)
-    if override in (128, 256, 512, 1024):
+    if override in (128, 256, 512, 1024, 2048):
         return override
     return get_persistent_thumb_max_size()
 
@@ -1293,8 +1304,81 @@ def _persistent_thumb_cache_worker_count() -> int:
     return max(1, get_persistent_thumb_workers())
 
 
+def _metadata_loader_worker_count() -> int:
+    override = _env_int("SuperViewer_METADATA_WORKERS", 0)
+    if override > 0:
+        return max(1, override)
+    return max(1, get_metadata_loader_workers())
+
+
 def _persistent_thumb_cache_dirname(size: int) -> str:
     return str(int(size))
+
+
+_ANCESTOR_SUPERPICKY_MAX_VOLUME_DEPTH = 3
+
+
+def _volume_root_for_path(path: str) -> str:
+    if not path:
+        return ""
+    try:
+        norm = os.path.normpath(os.path.abspath(path))
+        drive, _tail = os.path.splitdrive(norm)
+        if drive:
+            return os.path.normpath(drive + os.sep)
+        anchor = Path(norm).anchor
+        return os.path.normpath(anchor or os.path.abspath(os.sep))
+    except Exception:
+        return ""
+
+
+def _path_depth_from_volume_root(path: str) -> int:
+    """Return path component count below the drive / filesystem root."""
+    if not path:
+        return 0
+    try:
+        norm = os.path.normpath(os.path.abspath(path))
+        root = _volume_root_for_path(norm)
+        if not root:
+            return 0
+        rel = os.path.relpath(norm, root)
+    except Exception:
+        return 0
+    if not rel or rel == os.curdir:
+        return 0
+    return len([part for part in rel.split(os.sep) if part and part != os.curdir])
+
+
+def _is_within_volume_root_depth(path: str, max_depth: int = _ANCESTOR_SUPERPICKY_MAX_VOLUME_DEPTH) -> bool:
+    return _path_depth_from_volume_root(path) <= int(max_depth)
+
+
+def _superpicky_report_db_path(superpicky_dir: str | None) -> str:
+    if not superpicky_dir:
+        return ""
+    path = os.path.join(os.path.normpath(superpicky_dir), ReportDB.DB_FILENAME)
+    return os.path.normpath(path) if os.path.isfile(path) else ""
+
+
+def _iter_superpicky_dirs_upward(current_dir: str, max_levels: int | None = 6):
+    if not current_dir:
+        return
+    candidate = os.path.normpath(current_dir)
+    if os.path.basename(candidate) == ".superpicky" and os.path.isdir(candidate):
+        yield candidate
+        candidate = os.path.dirname(candidate)
+    depth = 0
+    while candidate:
+        if max_levels is not None and depth > max_levels:
+            break
+        superpicky = os.path.join(candidate, ".superpicky")
+        if os.path.isdir(superpicky):
+            yield os.path.normpath(superpicky)
+        parent = os.path.dirname(candidate)
+        if parent == candidate:
+            break
+        candidate = parent
+        depth += 1
 
 
 def _find_superpicky_dir(current_dir: str, max_levels: int | None = 6) -> str:
@@ -1305,22 +1389,67 @@ def _find_superpicky_dir(current_dir: str, max_levels: int | None = 6) -> str:
     """
     if not current_dir:
         return ""
-    candidate = os.path.normpath(current_dir)
-    if os.path.basename(candidate) == ".superpicky" and os.path.isdir(candidate):
-        return candidate
-    depth = 0
-    while candidate:
-        if max_levels is not None and depth > max_levels:
-            break
-        superpicky = os.path.join(candidate, ".superpicky")
-        if os.path.isdir(superpicky):
-            return superpicky
-        parent = os.path.dirname(candidate)
-        if parent == candidate:
-            break
-        candidate = parent
-        depth += 1
+    for superpicky in _iter_superpicky_dirs_upward(current_dir, max_levels=max_levels):
+        return superpicky
     return ""
+
+
+def _superpicky_scope_allowed_for_selected_dir(
+    superpicky_dir: str,
+    selected_dir: str | None,
+    *,
+    require_report_db_for_ancestor: bool = True,
+) -> bool:
+    if not superpicky_dir:
+        return False
+    if not selected_dir:
+        return True
+    root_dir = os.path.dirname(os.path.normpath(superpicky_dir))
+    selected = os.path.normpath(selected_dir)
+    if _is_same_or_child_path(selected, root_dir):
+        return True
+    if _is_same_or_child_path(root_dir, selected):
+        if not require_report_db_for_ancestor:
+            return True
+        return bool(_superpicky_report_db_path(superpicky_dir)) and _is_within_volume_root_depth(selected)
+    # Actual files can be resolved outside the currently selected tree; in that
+    # case use the file's own nearest scope rather than forcing the selected one.
+    return True
+
+
+def _find_cache_superpicky_dir_for_file(path: str, selected_dir: str | None = None) -> str:
+    if not path:
+        return ""
+    current_dir = os.path.dirname(os.path.normpath(os.path.abspath(path)))
+    for superpicky_dir in _iter_superpicky_dirs_upward(current_dir):
+        if _superpicky_scope_allowed_for_selected_dir(
+            superpicky_dir,
+            selected_dir,
+            require_report_db_for_ancestor=True,
+        ):
+            return superpicky_dir
+    return ""
+
+
+def _find_report_superpicky_dir_for_file(path: str, selected_dir: str | None = None) -> str:
+    if not path:
+        return ""
+    current_dir = os.path.dirname(os.path.normpath(os.path.abspath(path)))
+    for superpicky_dir in _iter_superpicky_dirs_upward(current_dir):
+        if not _superpicky_report_db_path(superpicky_dir):
+            continue
+        if _superpicky_scope_allowed_for_selected_dir(
+            superpicky_dir,
+            selected_dir,
+            require_report_db_for_ancestor=True,
+        ):
+            return superpicky_dir
+    return ""
+
+
+def _report_root_dir_for_file(path: str, selected_dir: str | None = None) -> str:
+    superpicky_dir = _find_report_superpicky_dir_for_file(path, selected_dir)
+    return os.path.dirname(superpicky_dir) if superpicky_dir else ""
 
 
 def _superpicky_cache_root_dir(current_dir: str | None) -> str:
@@ -1331,10 +1460,19 @@ def _superpicky_cache_root_dir(current_dir: str | None) -> str:
     return os.path.dirname(superpicky_dir)
 
 
+def _superpicky_cache_root_dir_for_file(path: str, selected_dir: str | None = None) -> str:
+    superpicky_dir = _find_cache_superpicky_dir_for_file(path, selected_dir)
+    return os.path.dirname(superpicky_dir) if superpicky_dir else ""
+
+
 def _preview_cache_target_for_file(path: str, current_dir: str | None) -> str:
-    if not path or not current_dir:
+    if not path:
         return ""
-    superpicky_dir = _find_superpicky_dir(current_dir)
+    superpicky_dir = (
+        _find_cache_superpicky_dir_for_file(path, current_dir)
+        if current_dir
+        else _find_superpicky_dir(os.path.dirname(os.path.normpath(path)))
+    )
     if not superpicky_dir:
         return ""
     preview_dir = os.path.join(superpicky_dir, "cache", "temp_preview")
@@ -1387,14 +1525,24 @@ def _persistent_thumb_cache_filename_for_file(path: str, current_dir: str | None
     return f"{name}.thumb.jpg"
 
 
-def _legacy_persistent_thumb_cache_paths_for_file(path: str, current_dir: str | None, size: int) -> list[str]:
+def _legacy_persistent_thumb_cache_paths_for_file(
+    path: str,
+    current_dir: str | None,
+    size: int,
+    *,
+    selected_dir: str | None = None,
+) -> list[str]:
     if not current_dir or not path:
         return []
-    superpicky_dir = _find_superpicky_dir(current_dir)
+    superpicky_dir = (
+        _find_cache_superpicky_dir_for_file(path, selected_dir)
+        if selected_dir
+        else _find_superpicky_dir(current_dir)
+    )
     if not superpicky_dir:
         return []
     legacy_dir = os.path.join(superpicky_dir, "cache", f"thumb_cache_{int(size)}")
-    cache_root_dir = _superpicky_cache_root_dir(current_dir)
+    cache_root_dir = os.path.dirname(superpicky_dir)
     paths = [
         os.path.join(legacy_dir, _persistent_thumb_cache_filename_for_file(path, cache_root_dir or current_dir))
     ]
@@ -1403,16 +1551,44 @@ def _legacy_persistent_thumb_cache_paths_for_file(path: str, current_dir: str | 
     return paths
 
 
-def _legacy_persistent_thumb_cache_path_for_file(path: str, current_dir: str | None, size: int) -> str:
-    paths = _legacy_persistent_thumb_cache_paths_for_file(path, current_dir, size)
+def _legacy_persistent_thumb_cache_path_for_file(
+    path: str,
+    current_dir: str | None,
+    size: int,
+    *,
+    selected_dir: str | None = None,
+) -> str:
+    paths = _legacy_persistent_thumb_cache_paths_for_file(
+        path,
+        current_dir,
+        size,
+        selected_dir=selected_dir,
+    )
     return paths[0] if paths else ""
 
 
-def _persistent_thumb_cache_path_for_file(path: str, current_dir: str | None, size: int) -> str:
-    cache_dir = _persistent_thumb_cache_dir(current_dir, size)
-    if not cache_dir or not path:
+def _persistent_thumb_cache_path_for_file(
+    path: str,
+    current_dir: str | None,
+    size: int,
+    *,
+    selected_dir: str | None = None,
+) -> str:
+    if not path:
         return ""
-    cache_root_dir = _superpicky_cache_root_dir(current_dir)
+    if selected_dir:
+        superpicky_dir = _find_cache_superpicky_dir_for_file(path, selected_dir)
+        cache_root_dir = os.path.dirname(superpicky_dir) if superpicky_dir else ""
+        cache_dir = (
+            os.path.join(superpicky_dir, "thumb_cache", _persistent_thumb_cache_dirname(size))
+            if superpicky_dir
+            else ""
+        )
+    else:
+        cache_dir = _persistent_thumb_cache_dir(current_dir, size)
+        cache_root_dir = _superpicky_cache_root_dir(current_dir)
+    if not cache_dir:
+        return ""
     return os.path.join(cache_dir, _persistent_thumb_cache_filename_for_file(path, cache_root_dir or current_dir))
 
 
@@ -1492,10 +1668,22 @@ def _existing_persistent_thumb_cache_path_for_exact_size(
     current_dir: str | None,
     size: int,
     source_stamp: float | None = None,
+    *,
+    selected_dir: str | None = None,
 ) -> str:
-    cache_path = _persistent_thumb_cache_path_for_file(path, current_dir, size)
+    cache_path = _persistent_thumb_cache_path_for_file(
+        path,
+        current_dir,
+        size,
+        selected_dir=selected_dir,
+    )
     if not cache_path or not os.path.isfile(cache_path):
-        for legacy_path in _legacy_persistent_thumb_cache_paths_for_file(path, current_dir, size):
+        for legacy_path in _legacy_persistent_thumb_cache_paths_for_file(
+            path,
+            current_dir,
+            size,
+            selected_dir=selected_dir,
+        ):
             if legacy_path and os.path.isfile(legacy_path):
                 cache_path = _migrate_legacy_persistent_thumb_cache_path(cache_path, legacy_path)
                 if cache_path and os.path.isfile(cache_path):
@@ -1523,6 +1711,7 @@ def _existing_persistent_thumb_cache_path_for_file(
     requested_size: int,
     source_stamp: float | None = None,
     candidate_sizes: list[int] | tuple[int, ...] | None = None,
+    selected_dir: str | None = None,
 ) -> str:
     for size in _preferred_persistent_thumb_sizes_for_request(
         requested_size,
@@ -1533,6 +1722,7 @@ def _existing_persistent_thumb_cache_path_for_file(
             current_dir,
             size,
             source_stamp=source_stamp,
+            selected_dir=selected_dir,
         )
         if cache_path:
             return cache_path
@@ -1573,19 +1763,157 @@ def _write_persistent_thumb_cache_image(
             pass
 
 
+def _report_row_candidate_paths(row: dict, report_root: str) -> list[str]:
+    candidates: list[str] = []
+    if not isinstance(row, dict):
+        return candidates
+    base_dir = report_root or str(row.get("_report_root_dir") or "")
+    for key in ("current_path", "_current_path_report_raw", "original_path"):
+        text = str(row.get(key) or "").strip()
+        if not text:
+            continue
+        text = text.replace("\\", os.sep).replace("/", os.sep)
+        if os.path.isabs(text):
+            candidates.append(os.path.normpath(text))
+        elif base_dir:
+            candidates.append(os.path.normpath(os.path.join(base_dir, text)))
+    current_text = str(row.get("current_path") or "").strip().replace("\\", os.sep).replace("/", os.sep)
+    original_text = str(row.get("original_path") or "").strip().replace("\\", os.sep).replace("/", os.sep)
+    original_ext = Path(original_text).suffix if original_text else ""
+    if current_text and original_ext:
+        try:
+            current_full = current_text if os.path.isabs(current_text) else os.path.join(base_dir, current_text)
+            candidates.append(os.path.normpath(str(Path(current_full).with_suffix(original_ext))))
+        except Exception:
+            pass
+    return candidates
+
+
+def _report_row_matches_path(row: dict, path: str, report_root: str = "") -> bool:
+    if not isinstance(row, dict) or not path:
+        return False
+    target_key = _path_key(path)
+    if target_key and any(_path_key(candidate) == target_key for candidate in _report_row_candidate_paths(row, report_root)):
+        return True
+    has_path_fields = any(str(row.get(key) or "").strip() for key in ("current_path", "_current_path_report_raw", "original_path"))
+    if has_path_fields:
+        return False
+    stem = Path(path).stem
+    if stem and str(row.get("filename") or "").strip() == stem:
+        return True
+    for key in ("current_path", "_current_path_report_raw", "original_path"):
+        text = str(row.get(key) or "").strip()
+        if text and Path(text.replace("\\", os.sep).replace("/", os.sep)).stem == stem:
+            return True
+    return False
+
+
+def _report_row_from_cache_for_path(path: str, report_cache: dict | None) -> dict | None:
+    if not path or not isinstance(report_cache, dict):
+        return None
+    stem = Path(path).stem
+    if stem:
+        row = report_cache.get(stem)
+        if isinstance(row, dict) and _report_row_matches_path(row, path, str(row.get("_report_root_dir") or "")):
+            return row
+    for row in report_cache.values():
+        if isinstance(row, dict) and _report_row_matches_path(row, path, str(row.get("_report_root_dir") or "")):
+            return row
+    return None
+
+
+def _load_report_cache_for_root(report_root: str) -> dict[str, dict]:
+    if not report_root:
+        return {}
+    db = ReportDB.open_if_exists(report_root)
+    if not db:
+        return {}
+    cache: dict[str, dict] = {}
+    try:
+        for idx, row in enumerate(db.get_all_photos()):
+            if not isinstance(row, dict):
+                continue
+            r = _normalize_report_row_paths(dict(row))
+            r["_report_root_dir"] = os.path.normpath(report_root)
+            stem = str(r.get("filename") or "").strip()
+            key = stem or f"__row_{idx}"
+            if key in cache:
+                key = f"{key}\0{idx}"
+            cache[key] = r
+    finally:
+        db.close()
+    return cache
+
+
+def _merge_report_cache_rows(caches_by_root: dict[str, dict[str, dict]]) -> dict[str, dict]:
+    merged: dict[str, dict] = {}
+    stem_counts: dict[str, int] = {}
+    rows: list[tuple[str, dict]] = []
+    for report_root, cache in caches_by_root.items():
+        for row in cache.values():
+            if not isinstance(row, dict):
+                continue
+            stem = str(row.get("filename") or "").strip()
+            if stem:
+                stem_counts[stem] = stem_counts.get(stem, 0) + 1
+            rows.append((report_root, row))
+    for idx, (report_root, row) in enumerate(rows):
+        stem = str(row.get("filename") or "").strip()
+        if stem and stem_counts.get(stem, 0) == 1:
+            key = stem
+        else:
+            key = f"{stem or 'row'}\0{idx}"
+        out = dict(row)
+        out.setdefault("_report_root_dir", os.path.normpath(report_root))
+        merged[key] = out
+    return merged
+
+
+def _build_report_scope_maps_for_files(
+    files: list[str],
+    selected_dir: str | None,
+) -> tuple[dict[str, dict], dict[str, dict], dict[str, dict]]:
+    caches_by_root: dict[str, dict[str, dict]] = {}
+    report_row_by_path: dict[str, dict] = {}
+    for raw_path in files or []:
+        norm_path = os.path.normpath(raw_path) if raw_path else ""
+        if not norm_path:
+            continue
+        report_root = _report_root_dir_for_file(norm_path, selected_dir)
+        if not report_root:
+            continue
+        cache = caches_by_root.get(report_root)
+        if cache is None:
+            cache = _load_report_cache_for_root(report_root)
+            caches_by_root[report_root] = cache
+        row = _report_row_from_cache_for_path(norm_path, cache)
+        if isinstance(row, dict):
+            annotated = dict(row)
+            annotated.setdefault("_report_root_dir", os.path.normpath(report_root))
+            report_row_by_path[norm_path] = annotated
+    full_report_cache = _merge_report_cache_rows(caches_by_root)
+    selected_report_cache: dict[str, dict] = {}
+    for row in report_row_by_path.values():
+        stem = str(row.get("filename") or "").strip()
+        if stem and stem not in selected_report_cache:
+            selected_report_cache[stem] = row
+    return selected_report_cache, full_report_cache, report_row_by_path
+
+
 def _resolve_thumb_source_path(path: str, report_cache: dict | None, current_dir: str | None) -> str:
     norm_path = os.path.normpath(path)
     stem = Path(norm_path).stem
     if stem and isinstance(report_cache, dict):
-        row = report_cache.get(stem)
+        row = _report_row_from_cache_for_path(norm_path, report_cache)
         if isinstance(row, dict):
             temp_jpeg_path = str(row.get("temp_jpeg_path") or "").strip()
             if temp_jpeg_path:
+                base_dir = str(row.get("_report_root_dir") or current_dir or "").strip()
                 candidate = (
                     os.path.normpath(temp_jpeg_path)
                     if os.path.isabs(temp_jpeg_path)
-                    else os.path.normpath(os.path.join(current_dir, temp_jpeg_path))
-                    if current_dir
+                    else os.path.normpath(os.path.join(base_dir, temp_jpeg_path))
+                    if base_dir
                     else ""
                 )
                 if candidate and os.path.isfile(candidate):
@@ -1594,9 +1922,14 @@ def _resolve_thumb_source_path(path: str, report_cache: dict | None, current_dir
     return preview_path or norm_path
 
 
-def _read_thumb_from_disk_cache(path: str, mtime: float, size: int) -> "QImage | None":
+def _read_thumb_from_disk_cache(
+    path: str,
+    mtime: float,
+    size: int,
+    selected_dir: str | None = None,
+) -> "QImage | None":
     """Load thumbnail from disk cache if present and valid; returns QImage or None."""
-    cache_path = _thumb_disk_cache_path(path, mtime, size)
+    cache_path = _thumb_disk_cache_path(path, mtime, size, selected_dir)
     if not os.path.isfile(cache_path):
         return None
     try:
@@ -1884,7 +2217,7 @@ def _get_raw_thumbnail(path: str) -> bytes | None:
     return None
 
 
-def _load_thumbnail_image(path: str, size: int) -> "QImage | None":
+def _load_thumbnail_image(path: str, size: int, selected_dir: str | None = None) -> "QImage | None":
     """
     线程安全的缩略图生成，返回 QImage（不使用 QPixmap）。
     先查磁盘缓存；未命中则调用 thumb_stream.load_thumbnail_rgb 解码，再异步写入磁盘缓存。
@@ -1895,7 +2228,7 @@ def _load_thumbnail_image(path: str, size: int) -> "QImage | None":
             mtime = os.path.getmtime(path)
         except Exception:
             pass
-        disk_cached = _read_thumb_from_disk_cache(path, mtime, size)
+        disk_cached = _read_thumb_from_disk_cache(path, mtime, size, selected_dir)
         if disk_cached is not None and not disk_cached.isNull():
             return disk_cached
         result = thumb_stream.load_thumbnail_rgb(path, size)
@@ -1903,7 +2236,7 @@ def _load_thumbnail_image(path: str, size: int) -> "QImage | None":
             return None
         data, w, h = result
         out = _rgb_bytes_to_qimage(data, w, h)
-        cache_path = _thumb_disk_cache_path(path, mtime, size)
+        cache_path = _thumb_disk_cache_path(path, mtime, size, selected_dir)
         _schedule_thumb_disk_cache_write(cache_path, out)
         return out
     except Exception:

@@ -270,6 +270,8 @@ class FileTableModel(QAbstractTableModel):
                 return (1, entry.iso.lower())
         if column == _TREE_COL_FOCAL:
             return entry.focal_length.lower()
+        if column == _TREE_COL_CAMERA:
+            return entry.camera_model.lower()
         if column == _TREE_COL_LENS:
             return entry.lens_model.lower()
         if column == _TREE_COL_CAPTURE_TIME:
@@ -313,6 +315,8 @@ class FileTableModel(QAbstractTableModel):
             return entry.iso
         if column == _TREE_COL_FOCAL:
             return entry.focal_length
+        if column == _TREE_COL_CAMERA:
+            return entry.camera_model
         if column == _TREE_COL_LENS:
             return entry.lens_model
         if column == _TREE_COL_CAPTURE_TIME:

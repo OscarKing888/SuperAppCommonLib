@@ -7,15 +7,18 @@ import sys
 import threading
 
 USER_OPTIONS_FILENAME = "SuperViewerUser.cfg"
-PERSISTENT_THUMB_SIZE_LEVELS = (128, 256, 512, 1024)
+PERSISTENT_THUMB_SIZE_LEVELS = (128, 256, 512, 1024, 2048)
 KEY_NAVIGATION_FPS_OPTIONS = (1, 2, 4, 8, 10, 12, 13, 15, 20, 24, 25, 30, 40, 45, 50, 60, 120)
 KEY_PERF_PROBES_ENABLED = "perf_probes_enabled"
 
 _OPTIONS_LOCK = threading.RLock()
 _DEFAULT_CPU_COUNT = max(1, os.cpu_count() or 1)
+_DEFAULT_METADATA_WORKERS = max(1, min(8, _DEFAULT_CPU_COUNT // 4 or 1))
+_DEFAULT_PERSISTENT_THUMB_WORKERS = max(1, _DEFAULT_CPU_COUNT - _DEFAULT_METADATA_WORKERS)
 _DEFAULT_OPTIONS = {
     "thumbnail_loader_workers": _DEFAULT_CPU_COUNT,
-    "persistent_thumb_workers": _DEFAULT_CPU_COUNT,
+    "metadata_loader_workers": _DEFAULT_METADATA_WORKERS,
+    "persistent_thumb_workers": _DEFAULT_PERSISTENT_THUMB_WORKERS,
     "persistent_thumb_max_size": 128,
     "key_navigation_fps": 24,
     "keep_view_on_switch": 1,
@@ -41,6 +44,8 @@ def get_user_options_path() -> str:
 def normalize_user_options(data: dict | None) -> dict[str, int]:
     source = data if isinstance(data, dict) else {}
     normalized = dict(_DEFAULT_OPTIONS)
+    metadata_missing = "metadata_loader_workers" not in source
+    persistent_missing = "persistent_thumb_workers" not in source
 
     try:
         value = int(source.get("thumbnail_loader_workers", normalized["thumbnail_loader_workers"]) or 0)
@@ -49,8 +54,16 @@ def normalize_user_options(data: dict | None) -> dict[str, int]:
     normalized["thumbnail_loader_workers"] = max(1, value)
 
     try:
+        value = int(source.get("metadata_loader_workers", normalized["metadata_loader_workers"]) or 0)
+    except Exception:
+        value = normalized["metadata_loader_workers"]
+    normalized["metadata_loader_workers"] = max(1, value)
+
+    try:
         value = int(source.get("persistent_thumb_workers", normalized["persistent_thumb_workers"]) or 0)
     except Exception:
+        value = normalized["persistent_thumb_workers"]
+    if metadata_missing and not persistent_missing and value == _DEFAULT_CPU_COUNT:
         value = normalized["persistent_thumb_workers"]
     normalized["persistent_thumb_workers"] = max(1, value)
 
@@ -125,6 +138,11 @@ def get_runtime_user_options() -> dict[str, int]:
 def get_thumbnail_loader_workers() -> int:
     with _OPTIONS_LOCK:
         return int(_RUNTIME_OPTIONS["thumbnail_loader_workers"])
+
+
+def get_metadata_loader_workers() -> int:
+    with _OPTIONS_LOCK:
+        return int(_RUNTIME_OPTIONS["metadata_loader_workers"])
 
 
 def get_persistent_thumb_workers() -> int:

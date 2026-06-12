@@ -1289,15 +1289,17 @@ class PhotoMetaDataReportDB(PhotoMetaData):
         return candidates
 
     def _row_matches_path(self, row: dict[str, Any], path: str) -> bool:
-        stem = Path(path).stem if path else ""
-        if stem and str((row or {}).get("filename") or "").strip() == stem:
-            return True
-        for key in ("current_path", "_current_path_report_raw", "original_path"):
-            text = str((row or {}).get(key) or "").strip()
-            if text and Path(text.replace("\\", os.sep).replace("/", os.sep)).stem == stem:
-                return True
         target_key = self._path_key(path)
-        return bool(target_key and any(self._path_key(candidate) == target_key for candidate in self._row_candidate_paths(row)))
+        if target_key and any(self._path_key(candidate) == target_key for candidate in self._row_candidate_paths(row)):
+            return True
+        has_path_fields = any(
+            str((row or {}).get(key) or "").strip()
+            for key in ("current_path", "_current_path_report_raw", "original_path")
+        )
+        if has_path_fields:
+            return False
+        stem = Path(path).stem if path else ""
+        return bool(stem and str((row or {}).get("filename") or "").strip() == stem)
 
     def _row_for(self, path: str) -> dict[str, Any] | None:
         stem = Path(path).stem
@@ -1305,7 +1307,7 @@ class PhotoMetaDataReportDB(PhotoMetaData):
         # Fast path: in-memory cache
         if self._cache is not None:
             cached = self._cache.get(stem)
-            if cached is not None:
+            if cached is not None and self._row_matches_path(cached, path):
                 return cached
             for row in self._cache.values():
                 if isinstance(row, dict) and self._row_matches_path(row, path):
