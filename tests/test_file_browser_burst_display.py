@@ -251,10 +251,15 @@ def test_thumbnail_model_keeps_display_role_filename_and_exposes_burst_role() ->
 def test_metadata_loader_reads_chunks_with_configured_worker_pool(monkeypatch) -> None:
     paths = [os.path.normpath(f"C:/photos/{i}.jpg") for i in range(8)]
     thread_names: set[str] = set()
+    emitted_paths: list[str] = []
 
     def fake_read_batch(batch_paths, tags=None, use_cache=True):
         thread_names.add(threading.current_thread().name)
-        time.sleep(0.02)
+        first = os.path.normpath(batch_paths[0])
+        if first.endswith("0.jpg"):
+            time.sleep(0.04)
+        else:
+            time.sleep(0.005)
         return {
             os.path.normpath(path): {"SourceFile": os.path.normpath(path)}
             for path in batch_paths
@@ -264,6 +269,8 @@ def test_metadata_loader_reads_chunks_with_configured_worker_pool(monkeypatch) -
     monkeypatch.setattr(_workers, "read_batch_metadata", fake_read_batch)
 
     loader = MetadataLoader(paths, meta_proxy=object(), worker_count=4)
+    loader.metadata_batch_ready.connect(lambda batch: emitted_paths.extend(batch.keys()))
     loader.run()
 
     assert len(thread_names) > 1
+    assert emitted_paths == paths

@@ -47,23 +47,23 @@ def _get_raw_thumbnail_bytes(path: str) -> bytes | None:
     """从 RAW 文件提取嵌入 JPEG 缩略图字节。"""
     if Path(path).suffix.lower() not in _RAW_EXTENSIONS:
         return None
+    # Prefer rawpy's camera embedded JPEG.  piexif often exposes only a tiny
+    # 160x120 EXIF thumbnail for ARW files, which is too small for preview.
+    try:
+        import rawpy
+        with rawpy.imread(path) as rp:
+            thumb = rp.extract_thumb()
+        if thumb is not None and hasattr(rawpy, "ThumbFormat") and thumb.format == rawpy.ThumbFormat.JPEG:
+            if isinstance(thumb.data, bytes):
+                return thumb.data
+    except Exception:
+        pass
     try:
         import piexif
         data = piexif.load(path)
         thumb = data.get("thumbnail")
         if isinstance(thumb, bytes) and len(thumb) > 100:
             return thumb
-    except Exception:
-        pass
-    try:
-        import rawpy
-        with rawpy.imread(path) as rp:
-            thumb = rp.extract_thumb()
-        if thumb is None:
-            return None
-        if hasattr(rawpy, "ThumbFormat") and thumb.format == rawpy.ThumbFormat.JPEG:
-            if isinstance(thumb.data, bytes):
-                return thumb.data
     except Exception:
         pass
     return None

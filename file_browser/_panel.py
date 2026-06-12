@@ -4826,6 +4826,9 @@ class FileListPanel(QWidget):
         finally:
             combo.blockSignals(False)
 
+    def preview_quick_size(self) -> int:
+        return max(1, int(self._thumb_size or 128))
+
     def _set_key_navigation_fps(self, fps: int, *, persist: bool) -> None:
         try:
             value = int(fps)

@@ -41,3 +41,44 @@ def test_raw_thumbnail_uses_embedded_jpeg_long_edge(monkeypatch, tmp_path: Path)
     assert result[2] in (170, 171)
     assert len(frames) == 1
     assert frames[0][1:] == result[1:]
+
+
+def test_raw_preview_prefers_rawpy_embedded_jpeg_over_piexif_thumbnail(monkeypatch, tmp_path: Path) -> None:
+    raw_path = tmp_path / "sample.arw"
+    raw_path.write_bytes(b"raw placeholder")
+    tiny = _jpeg_bytes((160, 120), (40, 40, 40), progressive=False)
+    embedded = _jpeg_bytes((1200, 800), (80, 130, 180), progressive=False)
+
+    class _Thumb:
+        data = embedded
+        format = object()
+
+    class _Raw:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def extract_thumb(self):
+            return _Thumb()
+
+    class _Rawpy:
+        ThumbFormat = type("ThumbFormat", (), {"JPEG": _Thumb.format})
+
+        @staticmethod
+        def imread(path):
+            return _Raw()
+
+    class _Piexif:
+        @staticmethod
+        def load(path):
+            return {"thumbnail": tiny}
+
+    monkeypatch.setattr(thumb_stream, "_run_exiftool_binary_tag", lambda path, tag: None)
+    monkeypatch.setitem(__import__("sys").modules, "rawpy", _Rawpy)
+    monkeypatch.setitem(__import__("sys").modules, "piexif", _Piexif)
+
+    data = thumb_stream.get_raw_preview_jpeg(str(raw_path))
+
+    assert data == embedded

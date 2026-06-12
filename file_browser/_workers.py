@@ -393,17 +393,17 @@ class MetadataLoader(QThread):
                 max_workers=worker_count,
                 thread_name_prefix="file-metadata",
             ) as executor:
-                future_to_size = {
-                    executor.submit(self._read_parse_chunk, chunk): len(chunk)
+                futures = [
+                    (executor.submit(self._read_parse_chunk, chunk), len(chunk))
                     for chunk in chunks
-                }
-                for future in _futures.as_completed(future_to_size):
+                ]
+                for future, chunk_len in futures:
                     if self._stopped():
-                        for pending in future_to_size:
+                        for pending, _pending_len in futures:
                             pending.cancel()
                         _log.info("[MetadataLoader.run] interrupted")
                         return
-                    processed_count = future_to_size.get(future, 0)
+                    processed_count = chunk_len
                     try:
                         parsed_batch, focus_batch, parsed_count = future.result()
                         processed_count = parsed_count
