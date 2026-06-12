@@ -367,11 +367,68 @@ def test_file_list_cached_focus_box_state_distinguishes_checked_none() -> None:
     assert FileListPanel.get_cached_focus_box_state_for_path(panel, path) == (True, None)
 
 
-def test_metadata_loader_prefers_raw_embedded_focus_metadata(monkeypatch, tmp_path) -> None:
+def test_pending_persistent_thumb_queue_is_not_running_thumbnail_work() -> None:
+    panel = FileListPanel.__new__(FileListPanel)
+    panel._thumbnail_loader = None
+    panel._persistent_thumb_cache_worker = None
+    panel._persistent_thumb_cache_pending_paths = ["C:/photos/a.jpg"]
+
+    class ActiveTimer:
+        def isActive(self) -> bool:
+            return True
+
+    panel._persistent_thumb_cache_timer = ActiveTimer()
+
+    assert FileListPanel._thumbnail_work_actively_running(panel) is False
+    assert FileListPanel._thumbnail_work_active_or_pending(panel) is True
+
+
+def test_metadata_loader_uses_batch_focus_metadata_without_raw_rescan(monkeypatch, tmp_path) -> None:
     path = os.path.normpath(str(tmp_path / "sample.ARW"))
     Path(path).write_bytes(b"raw")
 
-    monkeypatch.setattr(_workers, "read_batch_metadata", lambda *args, **kwargs: {path: {"SourceFile": path}})
+    monkeypatch.setattr(
+        _workers,
+        "read_batch_metadata",
+        lambda *args, **kwargs: {
+            path: {
+                "SourceFile": path,
+                "Make": "SONY",
+                "Model": "ILCE-1M2",
+                "ExifImageWidth": 5472,
+                "ExifImageHeight": 3648,
+                "MakernoteTag0x2027": "5472 3648 2736 1824 640 480",
+            }
+        },
+    )
+
+    def _fail_raw_focus(_path):
+        raise AssertionError("普通 metadata 批量路径不应重复读取 RAW 内嵌焦点")
+
+    monkeypatch.setattr(_workers, "read_raw_embedded_focus_metadata", _fail_raw_focus)
+
+    loader = MetadataLoader([path], meta_proxy=object())
+    raw = loader._read_metadata_batch([path])
+    meta = loader._parse_rec(raw[path])
+
+    assert "focus_box" in meta
+
+
+def test_metadata_loader_report_fast_path_uses_raw_embedded_focus(monkeypatch, tmp_path) -> None:
+    path = os.path.normpath(str(tmp_path / "sample.ARW"))
+    Path(path).write_bytes(b"raw")
+    row = {
+        "filename": "sample",
+        "iso": 800,
+        "shutter_speed": "0.0005",
+        "aperture": "5.6",
+        "focal_length": 600,
+        "camera_model": "Report Camera",
+        "lens_model": "Report Lens",
+        "date_time_original": "2026:02:16 16:23:00",
+    }
+
+    monkeypatch.setattr(_workers, "read_batch_metadata", lambda *args, **kwargs: {})
     monkeypatch.setattr(
         _workers,
         "read_raw_embedded_focus_metadata",
@@ -385,7 +442,7 @@ def test_metadata_loader_prefers_raw_embedded_focus_metadata(monkeypatch, tmp_pa
         },
     )
 
-    loader = MetadataLoader([path], meta_proxy=object())
+    loader = MetadataLoader([path], meta_proxy=object(), report_rows_by_path={path: row})
     raw = loader._read_metadata_batch([path])
     meta = loader._parse_rec(raw[path])
 
@@ -528,4 +585,5 @@ def test_metadata_loader_reads_chunks_with_configured_worker_pool(monkeypatch) -
     loader.run()
 
     assert len(thread_names) > 1
-    assert emitted_paths == paths
+    assert set(emitted_paths) == set(paths)
+    assert emitted_paths[0] != paths[0]

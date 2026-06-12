@@ -364,6 +364,8 @@ def _metadata_chunk_size_for_worker_count(total: int, worker_count: int) -> int:
     total_count = max(1, int(total or 0))
     requested_workers = max(1, int(worker_count or 1))
     max_chunk_size = max(1, _METADATA_CHUNK_SIZE)
+    if requested_workers >= 8:
+        max_chunk_size = max(1, min(max_chunk_size, 75))
     if total_count <= requested_workers:
         return 1
     target_chunk_size = (total_count + requested_workers - 1) // requested_workers
@@ -465,13 +467,14 @@ class MetadataLoader(QThread):
                 max_workers=worker_count,
                 thread_name_prefix="file-metadata",
             ) as executor:
-                futures = [
-                    (executor.submit(self._read_parse_chunk, chunk), len(chunk))
+                future_to_len = {
+                    executor.submit(self._read_parse_chunk, chunk): len(chunk)
                     for chunk in chunks
-                ]
-                for future, chunk_len in futures:
+                }
+                for future in _futures.as_completed(future_to_len):
+                    chunk_len = future_to_len[future]
                     if self._stopped():
-                        for pending, _pending_len in futures:
+                        for pending in future_to_len:
                             pending.cancel()
                         _log.info("[MetadataLoader.run] interrupted")
                         return
@@ -573,12 +576,6 @@ class MetadataLoader(QThread):
         original_by_norm = {os.path.normpath(p): p for p in paths}
         result: dict[str, dict] = {norm: {"SourceFile": norm} for norm in norm_paths}
         raw_batch: dict[str, dict] = {}
-        raw_focus_t0 = perf_counter()
-        raw_focus_batch = self._read_raw_embedded_focus_batch(paths)
-        raw_focus_ms = elapsed_ms(raw_focus_t0)
-        for norm_path, focus_meta in raw_focus_batch.items():
-            if norm_path in result and focus_meta:
-                result[norm_path].update(focus_meta)
 
         report_fast_paths: list[str] = []
         exiftool_paths: list[str] = []
@@ -604,6 +601,15 @@ class MetadataLoader(QThread):
                 exiftool_paths.extend(report_fast_paths)
                 report_fast_paths = []
         sidecar_fast_ms = elapsed_ms(sidecar_fast_t0)
+
+        # 普通 exiftool 批量路径已经包含焦点相关标签；只在 report 快速路径跳过
+        # exiftool 时补读 RAW 内嵌焦点，避免每张 RAW 被 exifread 重复扫描。
+        raw_focus_t0 = perf_counter()
+        raw_focus_batch = self._read_raw_embedded_focus_batch(report_fast_paths) if report_fast_paths else {}
+        raw_focus_ms = elapsed_ms(raw_focus_t0)
+        for norm_path, focus_meta in raw_focus_batch.items():
+            if norm_path in result and focus_meta:
+                result[norm_path].update(focus_meta)
 
         read_batch_t0 = perf_counter()
         if exiftool_paths:

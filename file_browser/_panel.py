@@ -5044,12 +5044,17 @@ class FileListPanel(QWidget):
         self._thumb_profile_ready_received_at.clear()
         self._pending_loaders = [l for l in self._pending_loaders if l.isRunning()]
 
-    def _thumbnail_work_active_or_pending(self) -> bool:
+    def _thumbnail_work_actively_running(self) -> bool:
         loader = self._thumbnail_loader
         if loader is not None and loader.isRunning():
             return True
         worker = self._persistent_thumb_cache_worker
         if worker is not None and worker.isRunning():
+            return True
+        return False
+
+    def _thumbnail_work_active_or_pending(self) -> bool:
+        if self._thumbnail_work_actively_running():
             return True
         timer = self._persistent_thumb_cache_timer
         if timer is not None and timer.isActive():
@@ -5071,7 +5076,7 @@ class FileListPanel(QWidget):
             _log.info("[_start_metadata_loader] no paths, return")
             return
         self._stop_pending_meta_apply()
-        thumbnail_work_active = self._thumbnail_work_active_or_pending()
+        thumbnail_work_active = self._thumbnail_work_actively_running()
         self._metadata_loader_workers = min(
             max(1, total),
             _metadata_loader_worker_count_for_thumbnail_state(thumbnail_work_active),
@@ -5488,6 +5493,17 @@ class FileListPanel(QWidget):
             return
         if not self._persistent_thumb_cache_pending_paths or not self._persistent_thumb_cache_base_dir:
             self._update_persistent_thumb_progress_widget()
+            return
+        metadata_loader = self._metadata_loader
+        if metadata_loader is not None and metadata_loader.isRunning():
+            self._persistent_thumb_cache_status_text = "等待元数据读取完成后生成缩略图..."
+            self._update_persistent_thumb_progress_widget()
+            self._ensure_persistent_thumb_cache_timer()
+            self._persistent_thumb_cache_timer.start(_PERSISTENT_THUMB_CACHE_START_DELAY_MS)
+            _log.info(
+                "[_start_persistent_thumb_cache_worker] delayed until metadata loader finishes total=%s",
+                len(self._persistent_thumb_cache_pending_paths),
+            )
             return
         existing_worker = self._persistent_thumb_cache_worker
         if existing_worker is not None and existing_worker.isRunning():
@@ -6193,6 +6209,9 @@ class FileListPanel(QWidget):
         )
         if self._meta_apply_index >= self._meta_apply_total:
             self._finish_meta_apply()
+        if self._persistent_thumb_cache_pending_paths and self._persistent_thumb_cache_base_dir:
+            self._ensure_persistent_thumb_cache_timer()
+            self._persistent_thumb_cache_timer.start(0)
 
     def _emit_file_selected_for_path(self, path: str) -> None:
         """更新当前显示路径并发出 file_selected，供点击与键盘选择共用。"""

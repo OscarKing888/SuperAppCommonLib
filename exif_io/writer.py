@@ -567,13 +567,15 @@ def _batch_read_xmp_sidecar(paths: list) -> dict:
     逐文件读取 XMP sidecar，转换为 exiftool 风格平坦字典。
     返回 {os.path.normpath(path): flat_dict}（无 sidecar 的文件也有空条目）。
     """
-    from app_common.exif_io.xmp_sidecar import read_xmp_sidecar  # 局部导入避免循环
+    from app_common.exif_io.xmp_sidecar import find_xmp_sidecars, read_xmp_file  # 局部导入避免循环
 
     result: dict = {}
+    sidecars_by_norm = find_xmp_sidecars([os.path.normpath(path) for path in paths])
     for path in paths:
         norm = os.path.normpath(path)
         try:
-            xmp_rows = read_xmp_sidecar(path)
+            xmp_path = sidecars_by_norm.get(norm)
+            xmp_rows = read_xmp_file(xmp_path) if xmp_path else []
             result[norm] = _xmp_rows_to_flat_dict(path, xmp_rows) if xmp_rows else {"SourceFile": path}
         except Exception:
             result[norm] = {"SourceFile": path}
@@ -702,22 +704,19 @@ def read_batch_metadata(paths: list, tags: list | None = None, use_cache: bool =
     sidecar_merge_rows = 0
     if need_merge:
         _log.debug("[read_batch_metadata] 合并 XMP sidecar 补全 paths=%s", [os.path.normpath(p) for p in need_merge])
-        from app_common.exif_io.xmp_sidecar import read_xmp_sidecar
         sidecar_merge_t0 = perf_counter()
-        for path in need_merge:
-            norm = os.path.normpath(path)
-            try:
-                xmp_rows = read_xmp_sidecar(path)
-            except Exception:
+        sidecar_batch = _batch_read_xmp_sidecar(need_merge)
+        for norm, xmp_rec in sidecar_batch.items():
+            if not isinstance(xmp_rec, dict) or len(xmp_rec) <= 1:
                 continue
-            if not xmp_rows:
+            rec = new_result.get(norm)
+            if not isinstance(rec, dict):
                 continue
-            rec = new_result[norm]
-            for group, name, value in xmp_rows:
-                key = f"{group}:{name}"
-                if not rec.get(key):
+            for key, value in xmp_rec.items():
+                if key == "SourceFile":
+                    continue
+                if value is not None and not rec.get(key):
                     rec[key] = value
-            # 保证文件列表「标题」「对焦状态」能从 sidecar 显示：补全浏览器使用的键名
             _apply_browser_metadata_aliases(rec)
             sidecar_merge_rows += 1
         sidecar_merge_ms = elapsed_ms(sidecar_merge_t0)

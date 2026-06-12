@@ -117,6 +117,54 @@ def find_xmp_sidecar(image_path: str) -> str | None:
     return None
 
 
+def _build_xmp_dir_index(dir_path: Path) -> dict[str, str]:
+    index: dict[str, str] = {}
+    try:
+        for entry in os.scandir(str(dir_path)):
+            name = entry.name
+            if not name.lower().endswith(".xmp"):
+                continue
+            try:
+                if not entry.is_file():
+                    continue
+            except OSError:
+                continue
+            index.setdefault(name.lower(), entry.path)
+    except (PermissionError, OSError):
+        pass
+    return index
+
+
+def find_xmp_sidecars(image_paths: list[str]) -> dict[str, str]:
+    """
+    批量查找 XMP sidecar，避免同一目录被每张 RAW 重复 scandir。
+
+    返回 {norm_image_path: xmp_path}，找不到的图片不包含在结果中。
+    """
+    result: dict[str, str] = {}
+    dir_indexes: dict[str, dict[str, str]] = {}
+    for image_path in image_paths or []:
+        norm = os.path.normpath(image_path)
+        p = Path(image_path)
+        stems = _candidate_sidecar_stems(p)
+        if not stems:
+            continue
+        for dir_path in _candidate_sidecar_dirs(p, stems):
+            dir_key = os.path.normpath(str(dir_path))
+            index = dir_indexes.get(dir_key)
+            if index is None:
+                index = _build_xmp_dir_index(dir_path)
+                dir_indexes[dir_key] = index
+            for stem in stems:
+                found = index.get(f"{stem.lower()}.xmp")
+                if found:
+                    result[norm] = found
+                    break
+            if norm in result:
+                break
+    return result
+
+
 def _ns_to_prefix(ns_url: str) -> str:
     """将命名空间 URL 转为短前缀，优先用已知映射。"""
     if ns_url in _NS_PREFIXES:
@@ -165,22 +213,8 @@ def _extract_text_value(element) -> str | None:
     return None
 
 
-def read_xmp_sidecar(image_path: str) -> list[tuple[str, str, str]]:
-    """
-    读取图片旁的 XMP sidecar 文件，解析所有元数据标签。
-
-    返回 [(group, tag_name, value), ...] 列表：
-    - group  : 命名空间前缀，格式为 "XMP-{prefix}"（如 "XMP-dc"），
-               与 exiftool 输出风格一致
-    - tag_name: XML 局部名称（如 "Title"、"Rating"、"FNumber"）
-    - value  : 字符串形式的值
-
-    找不到 sidecar 文件或解析失败时返回空列表。
-    """
-    xmp_path = find_xmp_sidecar(image_path)
-    if not xmp_path:
-        return []
-
+def read_xmp_file(xmp_path: str) -> list[tuple[str, str, str]]:
+    """读取一个 XMP 文件，解析所有元数据标签。"""
     try:
         tree = ET.parse(xmp_path)
         root = tree.getroot()
@@ -221,3 +255,21 @@ def read_xmp_sidecar(image_path: str) -> list[tuple[str, str, str]]:
                 results.append((group, local, value))
 
     return results
+
+
+def read_xmp_sidecar(image_path: str) -> list[tuple[str, str, str]]:
+    """
+    读取图片旁的 XMP sidecar 文件，解析所有元数据标签。
+
+    返回 [(group, tag_name, value), ...] 列表：
+    - group  : 命名空间前缀，格式为 "XMP-{prefix}"（如 "XMP-dc"），
+               与 exiftool 输出风格一致
+    - tag_name: XML 局部名称（如 "Title"、"Rating"、"FNumber"）
+    - value  : 字符串形式的值
+
+    找不到 sidecar 文件或解析失败时返回空列表。
+    """
+    xmp_path = find_xmp_sidecar(image_path)
+    if not xmp_path:
+        return []
+    return read_xmp_file(xmp_path)

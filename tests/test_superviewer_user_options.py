@@ -58,7 +58,7 @@ def test_metadata_workers_boost_when_thumbnail_work_is_idle(monkeypatch) -> None
             }
         )
 
-        assert _browser_core._metadata_loader_worker_count_for_thumbnail_state(False) == 24
+        assert _browser_core._metadata_loader_worker_count_for_thumbnail_state(False) == 12
         assert _browser_core._metadata_loader_worker_count_for_thumbnail_state(True) == 8
     finally:
         superviewer_user_options.apply_runtime_user_options(previous)

@@ -1314,7 +1314,11 @@ def _metadata_loader_worker_count() -> int:
 
 def _metadata_loader_idle_worker_count() -> int:
     cpu_count = max(1, os.cpu_count() or 1)
-    idle_target = max(24, (cpu_count * 3) // 4)
+    # Metadata loading is dominated by exiftool + sidecar I/O.  Use more than
+    # the reserved metadata budget when thumbnail generation is idle, but avoid
+    # launching so many parallel exiftool/sidecar scans that an external disk
+    # stalls before the first batch can report progress.
+    idle_target = min(12, max(4, (cpu_count * 2 + 2) // 3))
     return max(_metadata_loader_worker_count(), min(cpu_count, idle_target))
 
 
