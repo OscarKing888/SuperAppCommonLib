@@ -47,3 +47,10 @@ try:
 except ModuleNotFoundError as exc:
     if not str(getattr(exc, "name", "")).startswith("PyQt"):
         raise
+
+try:
+    from app_common.triangle_toggle_splitter import TriangleToggleSplitter, TriangleToggleSplitterHandle
+    __all__.extend(["TriangleToggleSplitter", "TriangleToggleSplitterHandle"])
+except ModuleNotFoundError as exc:
+    if not str(getattr(exc, "name", "")).startswith("PyQt"):
+        raise

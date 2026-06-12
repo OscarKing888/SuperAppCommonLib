@@ -5,6 +5,7 @@ import threading
 import time
 
 import app_common.file_browser._workers as _workers
+from app_common.exif_io.writer import _xmp_rows_to_flat_dict
 from app_common.file_browser._browser_core import (
     _DisplayRole,
     _ForegroundRole,
@@ -494,6 +495,55 @@ def test_metadata_loader_report_fast_path_skips_exiftool_but_keeps_raw_focus(mon
     assert meta["camera_model"] == "Report Camera"
     assert meta["iso"] == "800"
     assert meta["focus_box"][0] > 0.4
+
+
+def test_metadata_loader_xmp_fast_path_skips_exiftool_without_report_row(monkeypatch, tmp_path) -> None:
+    path = os.path.normpath(str(tmp_path / "sample.ARW"))
+    Path(path).write_bytes(b"raw")
+    sidecar_flat = _xmp_rows_to_flat_dict(
+        path,
+        [
+            ("XMP-dc", "Title", "白鹭"),
+            ("XMP-superpicky", "iso", "800"),
+            ("XMP-superpicky", "shutter_speed", "0.0005"),
+            ("XMP-superpicky", "aperture", "5.6"),
+            ("XMP-superpicky", "focal_length", "600"),
+            ("XMP-superpicky", "camera_model", "XMP Camera"),
+            ("XMP-superpicky", "lens_model", "XMP Lens"),
+            ("XMP-superpicky", "date_time_original", "2026:02:16 16:23:00"),
+            ("XMP-superpicky", "focus_x", "0.5"),
+            ("XMP-superpicky", "focus_y", "0.5"),
+            ("XMP-superpicky", "rating", "4"),
+            ("XMP-superpicky", "pick", "1"),
+        ],
+    )
+
+    monkeypatch.setattr(_workers, "_batch_read_xmp_sidecar", lambda _paths: {path: sidecar_flat})
+    monkeypatch.setattr(
+        _workers,
+        "read_batch_metadata",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("complete XMP sidecar should not call exiftool during browser metadata load")
+        ),
+    )
+    monkeypatch.setattr(
+        _workers,
+        "read_raw_embedded_focus_metadata",
+        lambda _path: (_ for _ in ()).throw(AssertionError("XMP fast path should not pre-read RAW focus")),
+    )
+
+    loader = MetadataLoader([path], meta_proxy=object(), metadata_tags=["-EXIF:ISO"])
+    raw = loader._read_metadata_batch([path])
+    meta = loader._parse_rec(raw[path])
+
+    assert meta["title"] == "白鹭"
+    assert meta["camera_model"] == "XMP Camera"
+    assert meta["lens_model"] == "XMP Lens"
+    assert meta["iso"] == "800"
+    assert meta["shutter"] == "1/2000s"
+    assert meta["rating"] == 4
+    assert meta["pick"] == 1
+    assert meta["focus_box"] == (0.4775, 0.4775, 0.5225, 0.5225)
 
 
 def test_metadata_loader_does_not_fallback_to_report_focus_when_raw_focus_checked(monkeypatch, tmp_path) -> None:

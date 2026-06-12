@@ -49,6 +49,25 @@ def _report_row_has_browser_fast_path(row: dict | None) -> bool:
     browser_hits = sum(1 for key in _REPORT_FAST_PATH_BROWSER_COLUMNS if _metadata_has_value(row.get(key)))
     return capture_hits >= 3 and browser_hits >= 2
 
+
+def _flat_metadata_has_browser_fast_path(meta: dict | None) -> bool:
+    """Return True when a sidecar/flat metadata dict can satisfy browser columns."""
+    if not isinstance(meta, dict) or not meta:
+        return False
+    capture_hits = sum(
+        1
+        for key in _REPORT_FAST_PATH_CAPTURE_COLUMNS
+        if _metadata_has_value(_metadata_value_from_candidates(meta, key))
+    )
+    if capture_hits >= 5:
+        return True
+    browser_hits = sum(
+        1
+        for key in _REPORT_FAST_PATH_BROWSER_COLUMNS
+        if _metadata_has_value(_metadata_value_from_candidates(meta, key))
+    )
+    return capture_hits >= 3 and browser_hits >= 2
+
 class DirectoryScanWorker(QThread):
     """在后台执行目录扫描与 report.db 加载，完成后通过信号回传结果。"""
 
@@ -577,30 +596,30 @@ class MetadataLoader(QThread):
         result: dict[str, dict] = {norm: {"SourceFile": norm} for norm in norm_paths}
         raw_batch: dict[str, dict] = {}
 
+        sidecar_batch: dict[str, dict] = {}
+        sidecar_t0 = perf_counter()
+        try:
+            sidecar_batch = _batch_read_xmp_sidecar(paths)
+            for norm_path, flat in sidecar_batch.items():
+                if norm_path in result and flat:
+                    result[norm_path].update(flat)
+        except Exception as exc:
+            _log.warning("[MetadataLoader._read_metadata_batch] XMP sidecar read failed: %s", exc)
+            sidecar_batch = {}
+        sidecar_ms = elapsed_ms(sidecar_t0)
+
         report_fast_paths: list[str] = []
+        xmp_fast_paths: list[str] = []
         exiftool_paths: list[str] = []
         for norm_path in norm_paths:
             report_row = self._report_rows_by_path.get(norm_path)
             original_path = original_by_norm.get(norm_path, norm_path)
             if _report_row_has_browser_fast_path(report_row):
                 report_fast_paths.append(original_path)
+            elif _flat_metadata_has_browser_fast_path(sidecar_batch.get(norm_path)):
+                xmp_fast_paths.append(original_path)
             else:
                 exiftool_paths.append(original_path)
-
-        sidecar_fast_batch: dict[str, dict] = {}
-        sidecar_fast_t0 = perf_counter()
-        if report_fast_paths:
-            try:
-                sidecar_fast_batch = _batch_read_xmp_sidecar(report_fast_paths)
-                for norm_path, flat in sidecar_fast_batch.items():
-                    if norm_path in result and flat:
-                        result[norm_path].update(flat)
-            except Exception as exc:
-                _log.warning("[MetadataLoader._read_metadata_batch] XMP fast path failed: %s", exc)
-                sidecar_fast_batch = {}
-                exiftool_paths.extend(report_fast_paths)
-                report_fast_paths = []
-        sidecar_fast_ms = elapsed_ms(sidecar_fast_t0)
 
         # 普通 exiftool 批量路径已经包含焦点相关标签；只在 report 快速路径跳过
         # exiftool 时补读 RAW 内嵌焦点，避免每张 RAW 被 exifread 重复扫描。
@@ -640,8 +659,8 @@ class MetadataLoader(QThread):
             except Exception:
                 flat = {"SourceFile": norm_path}
             raw_flat = raw_batch.get(norm_path, {}) if isinstance(raw_batch, dict) else {}
-            if not raw_flat and isinstance(sidecar_fast_batch, dict):
-                raw_flat = sidecar_fast_batch.get(norm_path, {})
+            if not raw_flat and isinstance(sidecar_batch, dict):
+                raw_flat = sidecar_batch.get(norm_path, {})
             for key, value in flat.items():
                 if value is None or (isinstance(value, str) and not value.strip()):
                     continue
@@ -673,16 +692,17 @@ class MetadataLoader(QThread):
         merge_ms = elapsed_ms(merge_t0)
         perf_log(
             _log,
-            "[metadata.read_batch] thread=%s paths=%s raw_focus_paths=%s report_fast_paths=%s exiftool_paths=%s raw_batch_entries=%s report_rows=%s raw_focus_ms=%.1f sidecar_fast_ms=%.1f read_batch_ms=%.1f merge_ms=%.1f total_ms=%.1f tags=%s xmp_restore=%s raw_restore=%s",
+            "[metadata.read_batch] thread=%s paths=%s raw_focus_paths=%s report_fast_paths=%s xmp_fast_paths=%s exiftool_paths=%s raw_batch_entries=%s report_rows=%s raw_focus_ms=%.1f sidecar_ms=%.1f read_batch_ms=%.1f merge_ms=%.1f total_ms=%.1f tags=%s xmp_restore=%s raw_restore=%s",
             threading.current_thread().name,
             len(norm_paths),
             raw_focus_merge_count,
             len(report_fast_paths),
+            len(xmp_fast_paths),
             len(exiftool_paths),
             len(raw_batch) if isinstance(raw_batch, dict) else 0,
             report_merge_count,
             raw_focus_ms,
-            sidecar_fast_ms,
+            sidecar_ms,
             read_batch_ms,
             merge_ms,
             elapsed_ms(batch_t0),

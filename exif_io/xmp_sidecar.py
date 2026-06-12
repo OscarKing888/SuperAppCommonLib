@@ -9,6 +9,11 @@ import os
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from app_common.log import get_logger
+from app_common.perf_probe import elapsed_ms, perf_counter, perf_log
+
+_log = get_logger("xmp_sidecar")
+
 # 常见 XMP 命名空间 URL → 短前缀映射（含无尾斜杠变体，便于属性匹配）
 _NS_PREFIXES: dict[str, str] = {
     "http://www.w3.org/1999/02/22-rdf-syntax-ns#": "rdf",
@@ -143,17 +148,32 @@ def find_xmp_sidecars(image_paths: list[str]) -> dict[str, str]:
     """
     result: dict[str, str] = {}
     dir_indexes: dict[str, dict[str, str]] = {}
+    batch_t0 = perf_counter()
+    index_ms = 0.0
+    lookup_ms = 0.0
+    slowest_dir = ""
+    slowest_dir_ms = 0.0
+    candidate_dirs = 0
     for image_path in image_paths or []:
+        lookup_t0 = perf_counter()
         norm = os.path.normpath(image_path)
         p = Path(image_path)
         stems = _candidate_sidecar_stems(p)
         if not stems:
+            lookup_ms += elapsed_ms(lookup_t0)
             continue
         for dir_path in _candidate_sidecar_dirs(p, stems):
             dir_key = os.path.normpath(str(dir_path))
             index = dir_indexes.get(dir_key)
             if index is None:
+                candidate_dirs += 1
+                index_t0 = perf_counter()
                 index = _build_xmp_dir_index(dir_path)
+                dir_ms = elapsed_ms(index_t0)
+                index_ms += dir_ms
+                if dir_ms > slowest_dir_ms:
+                    slowest_dir_ms = dir_ms
+                    slowest_dir = dir_key
                 dir_indexes[dir_key] = index
             for stem in stems:
                 found = index.get(f"{stem.lower()}.xmp")
@@ -162,6 +182,19 @@ def find_xmp_sidecars(image_paths: list[str]) -> dict[str, str]:
                     break
             if norm in result:
                 break
+        lookup_ms += elapsed_ms(lookup_t0)
+    perf_log(
+        _log,
+        "[metadata.xmp_sidecar.find_batch] paths=%s found=%s dirs=%s index_ms=%.1f lookup_ms=%.1f total_ms=%.1f slowest_dir_ms=%.1f slowest_dir=%r",
+        len(image_paths or []),
+        len(result),
+        candidate_dirs,
+        index_ms,
+        lookup_ms,
+        elapsed_ms(batch_t0),
+        slowest_dir_ms,
+        slowest_dir,
+    )
     return result
 
 

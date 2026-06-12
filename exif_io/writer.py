@@ -507,6 +507,9 @@ def _xmp_rows_to_flat_dict(path: str, xmp_rows: list) -> dict:
     for group, name, value in xmp_rows:
         key = f"{group}:{name}"
         rec[key] = value
+        if group == "XMP-superpicky":
+            rec[str(name)] = value
+            rec[f"report.{name}"] = value
     _apply_browser_metadata_aliases(rec)
     return rec
 
@@ -569,16 +572,52 @@ def _batch_read_xmp_sidecar(paths: list) -> dict:
     """
     from app_common.exif_io.xmp_sidecar import find_xmp_sidecars, read_xmp_file  # 局部导入避免循环
 
+    batch_t0 = perf_counter()
     result: dict = {}
+    find_t0 = perf_counter()
     sidecars_by_norm = find_xmp_sidecars([os.path.normpath(path) for path in paths])
+    find_ms = elapsed_ms(find_t0)
+    parse_ms = 0.0
+    flatten_ms = 0.0
+    parsed_files = 0
+    parsed_rows = 0
+    slowest_parse_path = ""
+    slowest_parse_ms = 0.0
     for path in paths:
         norm = os.path.normpath(path)
         try:
             xmp_path = sidecars_by_norm.get(norm)
-            xmp_rows = read_xmp_file(xmp_path) if xmp_path else []
+            if xmp_path:
+                parse_t0 = perf_counter()
+                xmp_rows = read_xmp_file(xmp_path)
+                file_parse_ms = elapsed_ms(parse_t0)
+                parse_ms += file_parse_ms
+                parsed_files += 1
+                parsed_rows += len(xmp_rows)
+                if file_parse_ms > slowest_parse_ms:
+                    slowest_parse_ms = file_parse_ms
+                    slowest_parse_path = xmp_path
+            else:
+                xmp_rows = []
+            flatten_t0 = perf_counter()
             result[norm] = _xmp_rows_to_flat_dict(path, xmp_rows) if xmp_rows else {"SourceFile": path}
+            flatten_ms += elapsed_ms(flatten_t0)
         except Exception:
             result[norm] = {"SourceFile": path}
+    perf_log(
+        _log,
+        "[metadata.xmp_sidecar.read_batch] paths=%s found=%s parsed_files=%s parsed_rows=%s find_ms=%.1f parse_ms=%.1f flatten_ms=%.1f total_ms=%.1f slowest_parse_ms=%.1f slowest_parse=%r",
+        len(paths or []),
+        len(sidecars_by_norm),
+        parsed_files,
+        parsed_rows,
+        find_ms,
+        parse_ms,
+        flatten_ms,
+        elapsed_ms(batch_t0),
+        slowest_parse_ms,
+        slowest_parse_path,
+    )
     return result
 
 
