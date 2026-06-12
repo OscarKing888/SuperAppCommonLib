@@ -203,6 +203,8 @@ def _focus_point_from_dimension_prefixed_block(numbers: list[float]) -> tuple[fl
     """
     if len(numbers) < 4:
         return None
+    if _is_default_center_dimension_prefixed_block(numbers):
+        return None
     block_w = float(numbers[0])
     block_h = float(numbers[1])
     x = float(numbers[2])
@@ -210,6 +212,23 @@ def _focus_point_from_dimension_prefixed_block(numbers: list[float]) -> tuple[fl
     if block_w <= 0 or block_h <= 0:
         return None
     return (clamp01(x / block_w), clamp01(y / block_h))
+
+
+def _is_default_center_dimension_prefixed_block(numbers: list[float]) -> bool:
+    if len(numbers) < 4 or len(numbers) >= 6:
+        return False
+    try:
+        block_w = float(numbers[0])
+        block_h = float(numbers[1])
+        x = float(numbers[2])
+        y = float(numbers[3])
+    except Exception:
+        return False
+    if block_w <= 0 or block_h <= 0:
+        return False
+    tol_x = max(16.0, block_w * 0.003)
+    tol_y = max(16.0, block_h * 0.003)
+    return abs(x - (block_w * 0.5)) <= tol_x and abs(y - (block_h * 0.5)) <= tol_y
 
 
 def _focus_box_from_dimension_prefixed_block(
@@ -220,6 +239,8 @@ def _focus_box_from_dimension_prefixed_block(
     解析 Sony MakerNote 焦点块 [block_w, block_h, x, y, (opt)w, (opt)h]。
     """
     if len(numbers) < 4:
+        return None
+    if _is_default_center_dimension_prefixed_block(numbers):
         return None
     block_w = int(round(float(numbers[0])))
     block_h = int(round(float(numbers[1])))

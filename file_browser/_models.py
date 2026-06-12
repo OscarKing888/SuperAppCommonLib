@@ -83,6 +83,52 @@ def _metadata_burst_values(meta: dict | None) -> tuple[int | None, int | None]:
     )
 
 
+def _clamp01_float(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def _coerce_normalized_focus_box(raw) -> tuple[float, float, float, float] | None:
+    values: list[float] = []
+    if isinstance(raw, dict):
+        keys = ("left", "top", "right", "bottom")
+        if all(key in raw for key in keys):
+            values = [float(raw[key]) for key in keys]
+        else:
+            xywh = ("x", "y", "w", "h")
+            if all(key in raw for key in xywh):
+                x, y, w, h = [float(raw[key]) for key in xywh]
+                values = [x, y, x + w, y + h]
+    elif isinstance(raw, (list, tuple)) and len(raw) >= 4:
+        try:
+            values = [float(raw[index]) for index in range(4)]
+        except (TypeError, ValueError):
+            values = []
+    elif isinstance(raw, str):
+        cleaned = raw.strip().strip("()[]{}")
+        parts = [part for part in cleaned.replace(";", ",").replace(" ", ",").split(",") if part.strip()]
+        if len(parts) >= 4:
+            try:
+                values = [float(parts[index]) for index in range(4)]
+            except (TypeError, ValueError):
+                values = []
+    if len(values) < 4:
+        return None
+    left, top, right, bottom = values[:4]
+    if max(abs(left), abs(top), abs(right), abs(bottom)) > 1.000001:
+        return None
+    left, right = sorted((_clamp01_float(left), _clamp01_float(right)))
+    top, bottom = sorted((_clamp01_float(top), _clamp01_float(bottom)))
+    if right - left <= 1e-6 or bottom - top <= 1e-6:
+        return None
+    return (left, top, right, bottom)
+
+
+def _metadata_focus_box(meta: dict | None) -> tuple[float, float, float, float] | None:
+    if not isinstance(meta, dict):
+        return None
+    return _coerce_normalized_focus_box(meta.get("focus_box"))
+
+
 def _format_burst_text(burst_position: int | None, burst_id: int | None) -> str:
     if burst_position is None and burst_id is None:
         return ""
@@ -676,6 +722,7 @@ class ThumbnailListEntry:
     rating: int = 0
     pick: int = 0
     focus_status: str = ""
+    focus_box: tuple[float, float, float, float] | None = None
     species_cn: str = ""
     burst_position: int | None = None
     burst_id: int | None = None
@@ -725,6 +772,8 @@ class ThumbnailListModel(QAbstractListModel):
             return entry.pick
         if role == _MetaFocusRole:
             return entry.focus_status
+        if role == _MetaFocusBoxRole:
+            return entry.focus_box
         if role == _MetaSpeciesCnRole:
             return entry.species_cn
         if role == _MetaBurstTextRole:
@@ -760,6 +809,7 @@ class ThumbnailListModel(QAbstractListModel):
             rating=rating,
             pick=pick,
             focus_status=_metadata_focus_status_text(meta),
+            focus_box=_metadata_focus_box(meta),
             species_cn=str(meta.get("bird_species_cn", "")),
             burst_position=burst_position,
             burst_id=burst_id,
@@ -877,6 +927,10 @@ class ThumbnailListModel(QAbstractListModel):
         if entry.focus_status != new_focus_status:
             entry.focus_status = new_focus_status
             changed_roles.append(_MetaFocusRole)
+        new_focus_box = _metadata_focus_box(meta)
+        if entry.focus_box != new_focus_box:
+            entry.focus_box = new_focus_box
+            changed_roles.append(_MetaFocusBoxRole)
         new_species_cn = str(meta.get("bird_species_cn", ""))
         if entry.species_cn != new_species_cn:
             entry.species_cn = new_species_cn
@@ -1086,6 +1140,7 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
         rating = index.data(_MetaRatingRole)
         pick = index.data(_MetaPickRole)
         focus_status = str(index.data(_MetaFocusRole) or "")
+        focus_box = index.data(_MetaFocusBoxRole)
         pixmap = index.data(_ThumbPixmapRole)
         if not isinstance(pixmap, QPixmap):
             pixmap = None
@@ -1147,24 +1202,51 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
                 painter.setPen(fg)
                 painter.drawText(badge2, _AlignCenter, text)
 
-            def draw_focus_status_marker(status: str) -> None:
-                if not status:
+            def _set_pen_color_width(color: QColor, width: float) -> None:
+                pen = QPen(color)
+                try:
+                    pen.setWidthF(float(width))
+                except Exception:
+                    pen.setWidth(max(1, int(round(width))))
+                painter.setPen(pen)
+
+            def draw_focus_box_overlay(box) -> None:
+                normalized = _coerce_normalized_focus_box(box)
+                if normalized is None or draw_rect.width() <= 0 or draw_rect.height() <= 0:
                     return
-                color = QColor(_focus_status_text_color(status))
-                if not color.isValid():
-                    return
-                size = max(7, min(12, draw_rect.width() // 12, draw_rect.height() // 12))
-                marker = QRect(
-                    draw_rect.left() + 4,
-                    draw_rect.bottom() - size - 4,
-                    size,
-                    size,
-                )
-                painter.setBrush(QBrush(QColor(0, 0, 0, 150)))
-                painter.setPen(_NoPen)
-                #painter.drawRect(marker.adjusted(-2, -2, 2, 2))
-                painter.setBrush(QBrush(color))
-                painter.drawRect(marker)
+                left, top, right, bottom = normalized
+                x1 = draw_rect.left() + int(round(left * draw_rect.width()))
+                y1 = draw_rect.top() + int(round(top * draw_rect.height()))
+                x2 = draw_rect.left() + int(round(right * draw_rect.width()))
+                y2 = draw_rect.top() + int(round(bottom * draw_rect.height()))
+                base = max(1, min(draw_rect.width(), draw_rect.height()))
+                min_side = max(9, min(28, int(round(base * 0.055))))
+                if x2 - x1 < min_side:
+                    center_x = (x1 + x2) // 2
+                    x1 = center_x - min_side // 2
+                    x2 = x1 + min_side
+                if y2 - y1 < min_side:
+                    center_y = (y1 + y2) // 2
+                    y1 = center_y - min_side // 2
+                    y2 = y1 + min_side
+                x1 = max(draw_rect.left() + 1, min(draw_rect.right() - 2, x1))
+                y1 = max(draw_rect.top() + 1, min(draw_rect.bottom() - 2, y1))
+                x2 = max(x1 + 2, min(draw_rect.right() - 1, x2))
+                y2 = max(y1 + 2, min(draw_rect.bottom() - 1, y2))
+                box_rect = QRect(x1, y1, x2 - x1, y2 - y1)
+                line_width = max(1.25, min(4.0, base / 150.0))
+                shadow = QColor(0, 0, 0, 190)
+                focus_color = QColor("#00ff00")
+                if not focus_color.isValid():
+                    focus_color = QColor("#ff0000")
+
+                painter.setBrush(QBrush())
+                _set_pen_color_width(shadow, line_width + 1.6)
+                painter.drawRect(box_rect)
+                _set_pen_color_width(focus_color, line_width)
+                painter.drawRect(box_rect)
+
+            draw_focus_box_overlay(focus_box)
 
             if pick == 1:
                 draw_badge("🏆", QColor(0, 0, 0, 160), QColor(COLORS["star_gold"]), left=True)
@@ -1182,9 +1264,6 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
                     QColor(_STAR_SILVER_COLOR),
                     left=False,
                 )
-
-            draw_focus_status_marker(focus_status)
-
             text_rect = QRect(cell.left(), thumb_rect.bottom() + 4, cell.width(), name_height)
             text_color = opt.palette.highlightedText().color() if selected else opt.palette.text().color()
             painter.setPen(text_color)

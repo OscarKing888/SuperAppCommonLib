@@ -1230,17 +1230,9 @@ class PhotoMetaDataReportDB(PhotoMetaData):
     directory changes.
     """
 
-    RAW_READ_FIELDS: frozenset[str] = frozenset({
-        "rating",
-        "pick",
-        "bird_species_cn",
-        "bird_species_en",
-        "iso",
-        "shutter_speed",
-        "aperture",
-        "burst_id",
-        "burst_position",
-    })
+    # Compatibility extras that may exist in older SBT report.db files even if
+    # they are not present in the current SuperPicky PHOTO_COLUMNS definition.
+    LEGACY_RAW_READ_FIELDS: frozenset[str] = frozenset({"pick"})
 
     def __init__(
         self,
@@ -1350,6 +1342,23 @@ class PhotoMetaDataReportDB(PhotoMetaData):
                 return filename
         return Path(path).stem
 
+    @classmethod
+    def _report_column_names(cls) -> tuple[str, ...]:
+        try:
+            from app_common.report_db import PHOTO_COLUMNS
+            columns = [str(column_name) for column_name, _type_def, _default in PHOTO_COLUMNS]
+        except Exception:
+            columns = []
+        seen: set[str] = set()
+        result: list[str] = []
+        for column_name in [*columns, *sorted(cls.LEGACY_RAW_READ_FIELDS)]:
+            text = str(column_name or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            result.append(text)
+        return tuple(result)
+
     # ------------------------------------------------------------------
     # PhotoMetaData interface
     # ------------------------------------------------------------------
@@ -1361,11 +1370,14 @@ class PhotoMetaDataReportDB(PhotoMetaData):
         try:
             from app_common.report_db import report_row_to_exiftool_style
             flat = report_row_to_exiftool_style(row, path)
-            # Also carry raw DB fields that UI layers read directly.
-            for key in self.RAW_READ_FIELDS:
+            # Also carry every report column that UI/template layers read
+            # directly. Missing columns in old report.db rows are skipped.
+            for key in self._report_column_names():
                 val = row.get(key)
                 if val is not None and (not isinstance(val, str) or val.strip()):
                     flat[key] = val
+                    flat[f"report.{key}"] = val
+                    flat[f"XMP-superpicky:{key}"] = val
             return flat
         except Exception:
             return {}
@@ -1410,6 +1422,7 @@ _REPORT_DB_ONLY_FIELDS: frozenset[str] = frozenset({
     "bird_species_cn", "bird_species_en", "birdid_confidence",
     "exposure_status",
     "burst_id", "burst_position",
+    "rarity_index", "iucn_category", "gbif_rarity_100",
 })
 
 

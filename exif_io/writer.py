@@ -15,6 +15,7 @@ import piexif
 
 from app_common.exif_io.exiftool_path import get_exiftool_executable_path
 from app_common.log import get_logger
+from app_common.perf_probe import elapsed_ms, perf_counter, perf_log
 
 _log = get_logger("exif_io")
 
@@ -611,6 +612,8 @@ def read_batch_metadata(paths: list, tags: list | None = None, use_cache: bool =
     if not paths:
         return {}
 
+    probe_t0 = perf_counter()
+    cache_t0 = perf_counter()
     result = {}
     uncached = []
     seen = set()
@@ -632,6 +635,7 @@ def read_batch_metadata(paths: list, tags: list | None = None, use_cache: bool =
                 continue
             seen.add(norm)
             uncached.append(p)
+    cache_ms = elapsed_ms(cache_t0)
 
     cached_norms = set(result.keys())
     _log.info("[read_batch_metadata] 批量查询 paths=%s 缓存命中=%s 未命中=%s", len(paths), len(cached_norms), len(uncached))
@@ -641,9 +645,20 @@ def read_batch_metadata(paths: list, tags: list | None = None, use_cache: bool =
             _log.debug("[read_batch_metadata] path=%r 来源=缓存 %s", norm, _summarize_rec_for_log(rec))
 
     if not uncached:
+        perf_log(
+            _log,
+            "[metadata.exif_io.read_batch] paths=%s cached=%s uncached=0 cache_ms=%.1f total_ms=%.1f use_cache=%s tags=%s",
+            len(paths),
+            len(cached_norms),
+            cache_ms,
+            elapsed_ms(probe_t0),
+            int(bool(use_cache)),
+            len(tags or DEFAULT_METADATA_TAGS),
+        )
         return result
 
     # 仅对未命中缓存的路径调用 exiftool / sidecar（不加锁，允许多线程并行 I/O）
+    exiftool_t0 = perf_counter()
     et = get_exiftool_executable_path()
     if et:
         new_result = _batch_read_exiftool(et, uncached, tags)
@@ -652,12 +667,17 @@ def read_batch_metadata(paths: list, tags: list | None = None, use_cache: bool =
         new_result = {}
         _log.debug("[read_batch_metadata] 无 exiftool，跳过文件内读取")
 
+    exiftool_ms = elapsed_ms(exiftool_t0)
+
     exiftool_norms = set(new_result.keys())
     missing = [p for p in uncached if os.path.normpath(p) not in new_result]
+    sidecar_fallback_ms = 0.0
     if missing:
         _log.debug("[read_batch_metadata] exiftool 未返回 改用 XMP sidecar paths=%s", [os.path.normpath(p) for p in missing])
+        sidecar_t0 = perf_counter()
         sidecar_result = _batch_read_xmp_sidecar(missing)
         new_result.update(sidecar_result)
+        sidecar_fallback_ms = elapsed_ms(sidecar_t0)
 
     # 用于判断「是否需合并 XMP sidecar」；含标题、对焦状态等，缺一不可，勿删。
     _XMP_INDICATORS = (
@@ -678,9 +698,12 @@ def read_batch_metadata(paths: list, tags: list | None = None, use_cache: bool =
         if os.path.normpath(p) in new_result
         and not any(new_result[os.path.normpath(p)].get(f) for f in _XMP_INDICATORS)
     ]
+    sidecar_merge_ms = 0.0
+    sidecar_merge_rows = 0
     if need_merge:
         _log.debug("[read_batch_metadata] 合并 XMP sidecar 补全 paths=%s", [os.path.normpath(p) for p in need_merge])
         from app_common.exif_io.xmp_sidecar import read_xmp_sidecar
+        sidecar_merge_t0 = perf_counter()
         for path in need_merge:
             norm = os.path.normpath(path)
             try:
@@ -696,6 +719,8 @@ def read_batch_metadata(paths: list, tags: list | None = None, use_cache: bool =
                     rec[key] = value
             # 保证文件列表「标题」「对焦状态」能从 sidecar 显示：补全浏览器使用的键名
             _apply_browser_metadata_aliases(rec)
+            sidecar_merge_rows += 1
+        sidecar_merge_ms = elapsed_ms(sidecar_merge_t0)
 
     need_merge_norms = {os.path.normpath(p) for p in need_merge}
     for norm, rec in new_result.items():
@@ -707,13 +732,35 @@ def read_batch_metadata(paths: list, tags: list | None = None, use_cache: bool =
         _log.debug("[read_batch_metadata] path=%r 来源=%s %s", norm, source, _summarize_rec_for_log(rec))
 
     # 写入缓存（副本），超出上限时 FIFO 淘汰（加锁保证多线程安全）
+    cache_store_ms = 0.0
     if use_cache:
+        cache_store_t0 = perf_counter()
         with _METADATA_CACHE_LOCK:
             while len(_METADATA_CACHE) + len(new_result) > _METADATA_CACHE_MAX:
                 first = next(iter(_METADATA_CACHE))
                 del _METADATA_CACHE[first]
             for norm, rec in new_result.items():
                 _METADATA_CACHE[norm] = rec.copy()
+        cache_store_ms = elapsed_ms(cache_store_t0)
+    perf_log(
+        _log,
+        "[metadata.exif_io.read_batch] paths=%s cached=%s uncached=%s exiftool_hits=%s missing=%s sidecar_merge=%s result=%s cache_ms=%.1f exiftool_ms=%.1f sidecar_fallback_ms=%.1f sidecar_merge_ms=%.1f cache_store_ms=%.1f total_ms=%.1f use_cache=%s tags=%s",
+        len(paths),
+        len(cached_norms),
+        len(uncached),
+        len(exiftool_norms),
+        len(missing),
+        sidecar_merge_rows,
+        len(result),
+        cache_ms,
+        exiftool_ms,
+        sidecar_fallback_ms,
+        sidecar_merge_ms,
+        cache_store_ms,
+        elapsed_ms(probe_t0),
+        int(bool(use_cache)),
+        len(tags or DEFAULT_METADATA_TAGS),
+    )
 
     _log.debug("[read_batch_metadata] 批量查询完成 结果总数=%s", len(result))
     return result

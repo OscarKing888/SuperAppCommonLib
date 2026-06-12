@@ -24,7 +24,7 @@ _log = get_logger("report_db")
 
 
 # Schema 版本，用于未来升级
-SCHEMA_VERSION = "5"
+SCHEMA_VERSION = "8"
 
 # 所有列定义（有序），用于 CREATE TABLE 和数据验证
 PHOTO_COLUMNS = [
@@ -40,6 +40,8 @@ PHOTO_COLUMNS = [
     ("is_flying",     "INTEGER", 0),          # 0=no, 1=yes
     ("flight_conf",   "REAL", None),
     ("rating",        "INTEGER", 0),          # -1/0/1/2/3
+    # Compatibility: current SuperPicky report_db no longer creates this
+    # column, but old processed folders and SBT XMP logic still read it.
     ("pick",          "INTEGER", 0),          # -1=reject, 0=none, 1=pick
     ("focus_status",  "TEXT", None),           # BEST/GOOD/BAD/WORST
     ("focus_x",       "REAL", None),
@@ -89,6 +91,18 @@ PHOTO_COLUMNS = [
     # V5: 连拍分组
     ("burst_id",         "INTEGER", None),
     ("burst_position",   "INTEGER", None),
+
+    # V6: 懂鸟罕见指数 (0-10，越大越罕见)
+    # V6: BirdID rarity index (0-10, higher = rarer)
+    ("rarity_index",     "REAL", None),
+
+    # V7: IUCN 红色名录保护级别 (LC/NT/VU/EN/CR/CR(PE)/CR(PEW)/EW/EX/DD/NE)
+    # V7: IUCN Red List category
+    ("iucn_category",    "TEXT", None),
+
+    # V8: GBIF 全球罕见度 (0-100 分制，越大越罕见，CC0+CC-BY 4.0 子集派生)
+    # V8: GBIF-derived global rarity score (0-100, higher = rarer)
+    ("gbif_rarity_100",  "REAL", None),
     
     ("created_at",    "TEXT", None),
     ("updated_at",    "TEXT", None),
@@ -364,7 +378,22 @@ def report_row_to_exiftool_style(row: Dict[str, Any], source_file: str) -> Dict[
         _set("Composite:GPSAltitude", alt)
         _set("EXIF:GPSAltitude", alt)
 
-    _log.debug("[report_row_to_exiftool_style] 完成 out_keys=%s", len(out))
+    base_out_keys = len(out)
+    # Lossless SuperPicky namespace export: keep every available report.db
+    # column readable without requiring old folders to be reprocessed.
+    for column_name, _type_def, _default in PHOTO_COLUMNS:
+        value = row.get(column_name)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        out.setdefault(column_name, value)
+        out.setdefault(f"report.{column_name}", value)
+        out[f"XMP-superpicky:{column_name}"] = value
+
+    _log.debug(
+        "[report_row_to_exiftool_style] 完成 base_out_keys=%s out_keys=%s",
+        base_out_keys,
+        len(out),
+    )
     return out
 
 

@@ -934,7 +934,10 @@ class FileListPanel(QWidget):
         """
         if not isinstance(meta, dict) or not meta:
             return False
+        if "focus_box" not in meta and not bool(meta.get("focus_box_checked")):
+            return False
         for key in (
+            "focus_box",
             "rating",
             "pick",
             "comment",
@@ -1511,6 +1514,19 @@ class FileListPanel(QWidget):
     def get_report_row_for_path(self, path: str) -> dict | None:
         row = self._get_report_row_for_path(path)
         return dict(row) if isinstance(row, dict) else None
+
+    def get_cached_focus_box_state_for_path(self, path: str) -> tuple[bool, tuple[float, float, float, float] | None]:
+        norm_path = os.path.normpath(path) if path else ""
+        if not norm_path:
+            return (False, None)
+        meta = self._meta_cache.get(norm_path)
+        if not isinstance(meta, dict):
+            return (False, None)
+        if "focus_box" in meta:
+            return (True, _coerce_normalized_focus_box(meta.get("focus_box")))
+        if bool(meta.get("focus_box_checked")):
+            return (True, None)
+        return (False, None)
 
     def get_photo_metadata_for_path(self, path: str, *, allow_slow_read: bool = False) -> dict:
         """
@@ -5028,6 +5044,18 @@ class FileListPanel(QWidget):
         self._thumb_profile_ready_received_at.clear()
         self._pending_loaders = [l for l in self._pending_loaders if l.isRunning()]
 
+    def _thumbnail_work_active_or_pending(self) -> bool:
+        loader = self._thumbnail_loader
+        if loader is not None and loader.isRunning():
+            return True
+        worker = self._persistent_thumb_cache_worker
+        if worker is not None and worker.isRunning():
+            return True
+        timer = self._persistent_thumb_cache_timer
+        if timer is not None and timer.isActive():
+            return True
+        return bool(self._persistent_thumb_cache_pending_paths)
+
     def _start_metadata_loader(self, paths: list) -> None:
         start_t0 = perf_counter()
         self._probe_set_phase("metadata_loader_start", paths=len(paths))
@@ -5043,6 +5071,11 @@ class FileListPanel(QWidget):
             _log.info("[_start_metadata_loader] no paths, return")
             return
         self._stop_pending_meta_apply()
+        thumbnail_work_active = self._thumbnail_work_active_or_pending()
+        self._metadata_loader_workers = min(
+            max(1, total),
+            _metadata_loader_worker_count_for_thumbnail_state(thumbnail_work_active),
+        )
         self._begin_meta_apply_session(total, ordered_paths=paths)
         loader = MetadataLoader(
             paths,
@@ -5059,7 +5092,11 @@ class FileListPanel(QWidget):
         self._metadata_loader = loader
         loader.start()
         self._probe_set_phase("metadata_loader_running", paths=len(paths), elapsed_ms=elapsed_ms(start_t0))
-        _log.info("[_start_metadata_loader] MetadataLoader started via PhotoMetaDataProxy")
+        _log.info(
+            "[_start_metadata_loader] MetadataLoader started via PhotoMetaDataProxy workers=%s thumbnail_work_active=%s",
+            self._metadata_loader_workers,
+            thumbnail_work_active,
+        )
 
     def _stop_metadata_loader(self) -> None:
         if self._metadata_loader:

@@ -3,8 +3,51 @@
 from __future__ import annotations
 
 import concurrent.futures as _futures
+import threading
 
 from app_common.file_browser._browser_core import *
+from app_common.perf_probe import elapsed_ms, perf_counter, perf_log, perf_probes_enabled
+from app_common.raw_focus_metadata import is_raw_image_path, read_raw_embedded_focus_metadata
+from app_common.exif_io.writer import _batch_read_xmp_sidecar
+
+
+_RAW_FOCUS_CHECKED_KEY = "_superviewer_raw_focus_checked"
+_REPORT_FAST_PATH_CAPTURE_COLUMNS = (
+    "iso",
+    "shutter_speed",
+    "aperture",
+    "focal_length",
+    "camera_model",
+    "lens_model",
+    "date_time_original",
+)
+_REPORT_FAST_PATH_BROWSER_COLUMNS = (
+    "adj_sharpness",
+    "adj_topiq",
+    "focus_status",
+    "burst_id",
+    "burst_position",
+    "bird_species_cn",
+    "rating",
+    "pick",
+    "caption",
+    "title",
+)
+
+
+def _metadata_has_value(value) -> bool:
+    return value is not None and (not isinstance(value, str) or value.strip() != "")
+
+
+def _report_row_has_browser_fast_path(row: dict | None) -> bool:
+    """Return True when report.db already has enough browser metadata to skip exiftool."""
+    if not isinstance(row, dict) or not row:
+        return False
+    capture_hits = sum(1 for key in _REPORT_FAST_PATH_CAPTURE_COLUMNS if _metadata_has_value(row.get(key)))
+    if capture_hits >= 5:
+        return True
+    browser_hits = sum(1 for key in _REPORT_FAST_PATH_BROWSER_COLUMNS if _metadata_has_value(row.get(key)))
+    return capture_hits >= 3 and browser_hits >= 2
 
 class DirectoryScanWorker(QThread):
     """在后台执行目录扫描与 report.db 加载，完成后通过信号回传结果。"""
@@ -317,6 +360,16 @@ class PathLookupWorker(QThread):
         self.resolved.emit(source_path, actual_path)
 
 
+def _metadata_chunk_size_for_worker_count(total: int, worker_count: int) -> int:
+    total_count = max(1, int(total or 0))
+    requested_workers = max(1, int(worker_count or 1))
+    max_chunk_size = max(1, _METADATA_CHUNK_SIZE)
+    if total_count <= requested_workers:
+        return 1
+    target_chunk_size = (total_count + requested_workers - 1) // requested_workers
+    return max(1, min(max_chunk_size, target_chunk_size))
+
+
 class MetadataLoader(QThread):
     """
     批量读取图像文件的列表列元数据。
@@ -368,14 +421,32 @@ class MetadataLoader(QThread):
         if not self._paths or self._stop_flag:
             _log.debug("[MetadataLoader.run] no paths or stopped")
             return
+        run_t0 = perf_counter()
+        processed = 0
+        chunk_count = 0
+        chunk_size = 0
+        active_worker_count = 0
+        completed = False
         _log.info("[MetadataLoader.run] START paths=%s worker_count=%s", len(self._paths), self._worker_count)
         try:
             paths = self._paths
             total = len(paths)
-            chunk_size = max(1, _METADATA_CHUNK_SIZE)
+            chunk_size = _metadata_chunk_size_for_worker_count(total, self._worker_count)
             chunks = [paths[i : i + chunk_size] for i in range(0, total, chunk_size)]
+            chunk_count = len(chunks)
             worker_count = max(1, min(self._worker_count, len(chunks)))
-            processed = 0
+            active_worker_count = worker_count
+            perf_log(
+                _log,
+                "[metadata.run] start paths=%s chunks=%s chunk_size=%s requested_workers=%s active_workers=%s tags=%s report_rows=%s",
+                total,
+                chunk_count,
+                chunk_size,
+                self._worker_count,
+                active_worker_count,
+                len(self._metadata_tags),
+                len(self._report_rows_by_path),
+            )
             if worker_count <= 1 or len(chunks) <= 1:
                 for chunk in chunks:
                     if self._stopped():
@@ -387,6 +458,7 @@ class MetadataLoader(QThread):
                     self._emit_metadata_chunk(parsed_batch, focus_batch)
                     processed += processed_count
                     self.progress_updated.emit(min(processed, total), total)
+                completed = True
                 return
 
             with _futures.ThreadPoolExecutor(
@@ -416,20 +488,44 @@ class MetadataLoader(QThread):
                     self._emit_metadata_chunk(parsed_batch, focus_batch)
                     processed += processed_count
                     self.progress_updated.emit(min(processed, total), total)
+            completed = True
         except Exception as e:
             _log.warning("[MetadataLoader.run] exception: %s", e)
-        _log.info("[MetadataLoader.run] END")
+        finally:
+            perf_log(
+                _log,
+                "[metadata.run] end status=%s processed=%s/%s chunks=%s chunk_size=%s active_workers=%s elapsed_ms=%.1f",
+                "completed" if completed else ("stopped" if self._stopped() else "failed"),
+                min(processed, len(self._paths)),
+                len(self._paths),
+                chunk_count,
+                chunk_size,
+                active_worker_count,
+                elapsed_ms(run_t0),
+            )
+            _log.info("[MetadataLoader.run] END")
 
     def _read_parse_chunk(self, chunk: list[str]) -> tuple[dict, dict, int]:
         if self._stopped():
             return {}, {}, 0
+        chunk_t0 = perf_counter()
         batch = self._read_metadata_batch(chunk)
+        read_ms = elapsed_ms(chunk_t0)
+        focus_t0 = perf_counter()
         focus_batch = self._build_focus_cache_batch(chunk) if self._should_prefetch_focus_cache() else {}
+        focus_ms = elapsed_ms(focus_t0)
+        parse_t0 = perf_counter()
         parsed_batch: dict = {}
+        focus_box_count = 0
+        checked_focus_count = 0
         for norm_path, flat in batch.items():
             if self._stopped():
                 return parsed_batch, focus_batch, len(chunk)
             meta = self._parse_rec(flat)
+            if meta.get("focus_box") is not None:
+                focus_box_count += 1
+            if meta.get("focus_box_checked"):
+                checked_focus_count += 1
             species_cn = str(flat.get("bird_species_cn") or "").strip()
             if species_cn:
                 meta["bird_species_cn"] = species_cn
@@ -438,6 +534,20 @@ class MetadataLoader(QThread):
                 "[MetadataLoader.run] path=%r title=%r rating=%s pick=%s",
                 norm_path, meta.get("title", ""), meta.get("rating"), meta.get("pick"),
             )
+        parse_ms = elapsed_ms(parse_t0)
+        perf_log(
+            _log,
+            "[metadata.chunk] thread=%s paths=%s parsed=%s focus_checked=%s focus_box=%s read_ms=%.1f focus_cache_ms=%.1f parse_ms=%.1f total_ms=%.1f",
+            threading.current_thread().name,
+            len(chunk),
+            len(parsed_batch),
+            checked_focus_count,
+            focus_box_count,
+            read_ms,
+            focus_ms,
+            parse_ms,
+            elapsed_ms(chunk_t0),
+        )
         return parsed_batch, focus_batch, len(chunk)
 
     def _emit_metadata_chunk(self, parsed_batch: dict, focus_batch: dict) -> None:
@@ -458,29 +568,74 @@ class MetadataLoader(QThread):
         return False
 
     def _read_metadata_batch(self, paths: list[str]) -> dict[str, dict]:
+        batch_t0 = perf_counter()
         norm_paths = [os.path.normpath(p) for p in paths]
+        original_by_norm = {os.path.normpath(p): p for p in paths}
         result: dict[str, dict] = {norm: {"SourceFile": norm} for norm in norm_paths}
         raw_batch: dict[str, dict] = {}
-        try:
-            raw_batch = read_batch_metadata(
-                paths,
-                tags=self._metadata_tags or None,
-                use_cache=not bool(self._metadata_tags),
-            )
-            for norm_path, flat in raw_batch.items():
-                if norm_path in result and flat:
-                    result[norm_path].update(flat)
-        except Exception as exc:
-            _log.warning("[MetadataLoader._read_metadata_batch] read_batch_metadata failed: %s", exc)
+        raw_focus_t0 = perf_counter()
+        raw_focus_batch = self._read_raw_embedded_focus_batch(paths)
+        raw_focus_ms = elapsed_ms(raw_focus_t0)
+        for norm_path, focus_meta in raw_focus_batch.items():
+            if norm_path in result and focus_meta:
+                result[norm_path].update(focus_meta)
+
+        report_fast_paths: list[str] = []
+        exiftool_paths: list[str] = []
+        for norm_path in norm_paths:
+            report_row = self._report_rows_by_path.get(norm_path)
+            original_path = original_by_norm.get(norm_path, norm_path)
+            if _report_row_has_browser_fast_path(report_row):
+                report_fast_paths.append(original_path)
+            else:
+                exiftool_paths.append(original_path)
+
+        sidecar_fast_batch: dict[str, dict] = {}
+        sidecar_fast_t0 = perf_counter()
+        if report_fast_paths:
+            try:
+                sidecar_fast_batch = _batch_read_xmp_sidecar(report_fast_paths)
+                for norm_path, flat in sidecar_fast_batch.items():
+                    if norm_path in result and flat:
+                        result[norm_path].update(flat)
+            except Exception as exc:
+                _log.warning("[MetadataLoader._read_metadata_batch] XMP fast path failed: %s", exc)
+                sidecar_fast_batch = {}
+                exiftool_paths.extend(report_fast_paths)
+                report_fast_paths = []
+        sidecar_fast_ms = elapsed_ms(sidecar_fast_t0)
+
+        read_batch_t0 = perf_counter()
+        if exiftool_paths:
+            try:
+                raw_batch = read_batch_metadata(
+                    exiftool_paths,
+                    tags=self._metadata_tags or None,
+                    use_cache=not bool(self._metadata_tags),
+                )
+                for norm_path, flat in raw_batch.items():
+                    if norm_path in result and flat:
+                        result[norm_path].update(flat)
+            except Exception as exc:
+                _log.warning("[MetadataLoader._read_metadata_batch] read_batch_metadata failed: %s", exc)
+        read_batch_ms = elapsed_ms(read_batch_t0)
+        merge_t0 = perf_counter()
+        raw_focus_merge_count = len(raw_focus_batch)
+        report_merge_count = 0
+        report_xmp_restore_count = 0
+        report_raw_key_restore_count = 0
         for norm_path in norm_paths:
             report_row = self._report_rows_by_path.get(norm_path)
             if not isinstance(report_row, dict):
                 continue
+            report_merge_count += 1
             try:
                 flat = report_row_to_exiftool_style(report_row, norm_path)
             except Exception:
                 flat = {"SourceFile": norm_path}
             raw_flat = raw_batch.get(norm_path, {}) if isinstance(raw_batch, dict) else {}
+            if not raw_flat and isinstance(sidecar_fast_batch, dict):
+                raw_flat = sidecar_fast_batch.get(norm_path, {})
             for key, value in flat.items():
                 if value is None or (isinstance(value, str) and not value.strip()):
                     continue
@@ -489,8 +644,10 @@ class MetadataLoader(QThread):
                     continue
                 if key_text.startswith("XMP"):
                     result[norm_path].setdefault(key_text, value)
+                    report_xmp_restore_count += 1
                 else:
                     result[norm_path][key_text] = value
+                    report_raw_key_restore_count += 1
             for key, value in report_row.items():
                 if value is None or (isinstance(value, str) and not value.strip()):
                     continue
@@ -504,7 +661,153 @@ class MetadataLoader(QThread):
                 key_text = str(key or "").strip()
                 if key_text.startswith("XMP") and value is not None and (not isinstance(value, str) or value.strip()):
                     result[norm_path][key_text] = value
+            focus_flat = raw_focus_batch.get(norm_path, {})
+            if isinstance(focus_flat, dict) and focus_flat:
+                result[norm_path].update(focus_flat)
+        merge_ms = elapsed_ms(merge_t0)
+        perf_log(
+            _log,
+            "[metadata.read_batch] thread=%s paths=%s raw_focus_paths=%s report_fast_paths=%s exiftool_paths=%s raw_batch_entries=%s report_rows=%s raw_focus_ms=%.1f sidecar_fast_ms=%.1f read_batch_ms=%.1f merge_ms=%.1f total_ms=%.1f tags=%s xmp_restore=%s raw_restore=%s",
+            threading.current_thread().name,
+            len(norm_paths),
+            raw_focus_merge_count,
+            len(report_fast_paths),
+            len(exiftool_paths),
+            len(raw_batch) if isinstance(raw_batch, dict) else 0,
+            report_merge_count,
+            raw_focus_ms,
+            sidecar_fast_ms,
+            read_batch_ms,
+            merge_ms,
+            elapsed_ms(batch_t0),
+            len(self._metadata_tags),
+            report_xmp_restore_count,
+            report_raw_key_restore_count,
+        )
         return result
+
+    @staticmethod
+    def _read_raw_embedded_focus_batch(paths: list[str]) -> dict[str, dict]:
+        probe_enabled = perf_probes_enabled()
+        batch_t0 = perf_counter()
+        result: dict[str, dict] = {}
+        raw_candidates = 0
+        metadata_hits = 0
+        slowest_path = ""
+        slowest_ms = 0.0
+        for path in paths:
+            if not is_raw_image_path(path):
+                continue
+            raw_candidates += 1
+            norm_path = os.path.normpath(path)
+            result[norm_path] = {"SourceFile": norm_path, _RAW_FOCUS_CHECKED_KEY: True}
+            file_t0 = perf_counter()
+            focus_meta = read_raw_embedded_focus_metadata(path)
+            file_ms = elapsed_ms(file_t0)
+            if file_ms > slowest_ms:
+                slowest_ms = file_ms
+                slowest_path = norm_path
+            if focus_meta:
+                metadata_hits += 1
+                result[norm_path].update(focus_meta)
+        if probe_enabled and raw_candidates:
+            perf_log(
+                _log,
+                "[metadata.raw_focus] thread=%s raw_candidates=%s hits=%s checked=%s slowest_ms=%.1f slowest=%r total_ms=%.1f",
+                threading.current_thread().name,
+                raw_candidates,
+                metadata_hits,
+                len(result),
+                slowest_ms,
+                slowest_path,
+                elapsed_ms(batch_t0),
+            )
+        return result
+
+    @staticmethod
+    def _parse_focus_float(raw) -> float | None:
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _clamp_focus_value(value: float) -> float:
+        return max(0.0, min(1.0, float(value)))
+
+    @classmethod
+    def _focus_box_from_center(
+        cls,
+        center_x: float,
+        center_y: float,
+        span_x: float,
+        span_y: float,
+    ) -> tuple[float, float, float, float]:
+        cx = cls._clamp_focus_value(center_x)
+        cy = cls._clamp_focus_value(center_y)
+        sx = max(0.001, min(1.0, float(span_x)))
+        sy = max(0.001, min(1.0, float(span_y)))
+        return (
+            cls._clamp_focus_value(cx - sx / 2.0),
+            cls._clamp_focus_value(cy - sy / 2.0),
+            cls._clamp_focus_value(cx + sx / 2.0),
+            cls._clamp_focus_value(cy + sy / 2.0),
+        )
+
+    @classmethod
+    def _build_report_focus_box(cls, rec: dict) -> tuple[float, float, float, float] | None:
+        focus_x = cls._parse_focus_float(_metadata_value_from_candidates(rec, "focus_x"))
+        focus_y = cls._parse_focus_float(_metadata_value_from_candidates(rec, "focus_y"))
+        if focus_x is None or focus_y is None:
+            return None
+        if focus_x <= 1.0 and focus_y <= 1.0:
+            return cls._focus_box_from_center(focus_x, focus_y, 0.045, 0.045)
+        width = cls._parse_focus_float(
+            _metadata_value_from_candidates(
+                rec,
+                "ExifImageWidth",
+                "EXIF:ExifImageWidth",
+                "ImageWidth",
+                "File:ImageWidth",
+                "RawImageWidth",
+            )
+        )
+        height = cls._parse_focus_float(
+            _metadata_value_from_candidates(
+                rec,
+                "ExifImageHeight",
+                "EXIF:ExifImageHeight",
+                "ImageHeight",
+                "File:ImageHeight",
+                "RawImageHeight",
+            )
+        )
+        if not width or not height or width <= 0 or height <= 0:
+            return None
+        return cls._focus_box_from_center(
+            focus_x / width,
+            focus_y / height,
+            min(0.12, max(0.02, 128.0 / width)),
+            min(0.12, max(0.02, 128.0 / height)),
+        )
+
+    @classmethod
+    def _build_focus_box_from_metadata(cls, rec: dict) -> tuple[float, float, float, float] | None:
+        if not isinstance(rec, dict) or not rec:
+            return None
+        try:
+            camera_type = resolve_focus_camera_type_from_metadata(rec)
+            focus_box = extract_focus_box_for_display(rec, 1, 1, camera_type=camera_type)
+        except Exception:
+            focus_box = None
+        if focus_box:
+            return focus_box
+        if rec.get(_RAW_FOCUS_CHECKED_KEY):
+            return None
+        return cls._build_report_focus_box(rec)
 
     def _parse_rec(self, rec: dict) -> dict:
         # 注释、标签、星级等支持 XMP sidecar（由 read_batch_metadata 合并），勿删以下键名。
@@ -581,6 +884,7 @@ class MetadataLoader(QThread):
         sharpness = _metadata_sharpness_text(rec)
         aesthetic = _metadata_aesthetic_text(rec)
         focus_status = _metadata_focus_status_text(rec)
+        focus_box = self._build_focus_box_from_metadata(rec)
         burst_id = _parse_optional_int(_metadata_value_from_candidates(rec, "burst_id"))
         burst_position = _parse_optional_int(_metadata_value_from_candidates(rec, "burst_position"))
 
@@ -604,7 +908,10 @@ class MetadataLoader(QThread):
             "sharpness": sharpness,
             "aesthetic": aesthetic,
             "focus_status": focus_status,
+            "focus_box_checked": True,
         }
+        if focus_box is not None:
+            meta["focus_box"] = focus_box
         if burst_id is not None:
             meta["burst_id"] = burst_id
         if burst_position is not None:
@@ -639,17 +946,23 @@ class MetadataLoader(QThread):
             ordered_source_paths.append(os.path.normpath(source_path))
         if not ordered_source_paths:
             return {}
+        raw_focus_map = self._read_raw_embedded_focus_batch(ordered_source_paths)
         try:
-            raw_map = read_batch_metadata(ordered_source_paths)
+            remaining_paths = [
+                path
+                for path in ordered_source_paths
+                if os.path.normpath(path) not in raw_focus_map
+            ]
+            raw_map = read_batch_metadata(remaining_paths) if remaining_paths else {}
         except Exception as exc:
             _log.warning("[MetadataLoader._build_focus_cache_batch] read_batch_metadata failed: %s", exc)
-            return {}
+            raw_map = {}
         focus_batch: dict[str, dict] = {}
         for source_path in ordered_source_paths:
             if self._stop_flag or self.isInterruptionRequested():
                 return {}
             norm_source = os.path.normpath(source_path)
-            raw = raw_map.get(norm_source) or raw_map.get(source_path)
+            raw = raw_focus_map.get(norm_source) or raw_map.get(norm_source) or raw_map.get(source_path)
             payload = self._build_focus_cache_payload(norm_source, raw)
             if payload is None:
                 continue

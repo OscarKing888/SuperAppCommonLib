@@ -1,4 +1,6 @@
 import os
+import math
+from pathlib import Path
 import threading
 import time
 
@@ -7,6 +9,7 @@ from app_common.file_browser._browser_core import (
     _DisplayRole,
     _ForegroundRole,
     _MetaBurstTextRole,
+    _MetaFocusBoxRole,
     _SortRole,
     _ToolTipRole,
     _TREE_COL_AESTHETIC,
@@ -25,6 +28,7 @@ from app_common.file_browser._browser_core import (
     _focus_status_to_display,
 )
 from app_common.file_browser._models import FileTableModel, ThumbnailListModel
+from app_common.file_browser._panel import FileListPanel
 from app_common.file_browser._workers import MetadataLoader
 
 
@@ -246,6 +250,257 @@ def test_thumbnail_model_keeps_display_role_filename_and_exposes_burst_role() ->
     assert model.data(index, _DisplayRole) == "a.jpg"
     assert model.data(index, _MetaBurstTextRole) == "(3/12)"
     assert "连拍: (3/12)" in model.data(index, _ToolTipRole)
+
+
+def test_thumbnail_model_exposes_focus_box_role_from_metadata() -> None:
+    path = os.path.normpath("C:/photos/a.jpg")
+    focus_box = (0.25, 0.3, 0.4, 0.5)
+    model = ThumbnailListModel()
+    model.rebuild(
+        [path],
+        meta_cache={path: {"focus_box": focus_box}},
+        tooltip_fn=_tooltip,
+        mismatch_fn=_mismatch,
+    )
+
+    assert model.data(model.index(0, 0), _MetaFocusBoxRole) == focus_box
+
+
+def test_thumbnail_model_ignores_downstream_focus_box_sources() -> None:
+    path = os.path.normpath("C:/photos/a.jpg")
+    model = ThumbnailListModel()
+    model.rebuild(
+        [path],
+        meta_cache={
+            path: {
+                "XMP-superpicky:focus_box": "(0.1, 0.2, 0.8, 0.9)",
+                "report.focus_box": "(0.2, 0.3, 0.7, 0.8)",
+            }
+        },
+        tooltip_fn=_tooltip,
+        mismatch_fn=_mismatch,
+    )
+
+    assert model.data(model.index(0, 0), _MetaFocusBoxRole) is None
+
+
+def test_thumbnail_model_does_not_derive_focus_box_from_focus_xy() -> None:
+    path = os.path.normpath("C:/photos/a.jpg")
+    model = ThumbnailListModel()
+    model.rebuild(
+        [path],
+        meta_cache={path: {"focus_x": 0.25, "focus_y": 0.3}},
+        tooltip_fn=_tooltip,
+        mismatch_fn=_mismatch,
+    )
+
+    assert model.data(model.index(0, 0), _MetaFocusBoxRole) is None
+
+
+def test_metadata_loader_derives_focus_box_from_focus_metadata() -> None:
+    path = os.path.normpath("C:/photos/a.jpg")
+    loader = MetadataLoader([path], meta_proxy=object())
+    meta = loader._parse_rec(
+        {
+            "SourceFile": path,
+            "Make": "SONY",
+            "Model": "ILCE-1M2",
+            "ExifImageWidth": 5472,
+            "ExifImageHeight": 3648,
+            "MakernoteTag0x2027": "5472 3648 2736 1824 640 480",
+        }
+    )
+
+    assert "focus_box" in meta
+    assert meta["focus_box_checked"] is True
+    expected = (
+        0.4415204678362573,
+        0.4342105263157895,
+        0.5584795321637427,
+        0.5657894736842105,
+    )
+    assert all(
+        math.isclose(actual, target, rel_tol=1e-9, abs_tol=1e-9)
+        for actual, target in zip(meta["focus_box"], expected)
+    )
+
+
+def test_metadata_loader_marks_default_center_focus_as_checked_without_box() -> None:
+    path = os.path.normpath("C:/photos/a.arw")
+    loader = MetadataLoader([path], meta_proxy=object())
+    meta = loader._parse_rec(
+        {
+            "SourceFile": path,
+            "Make": "SONY",
+            "Model": "ILCE-1M2",
+            "ExifImageWidth": 5616,
+            "ExifImageHeight": 3744,
+            "MakerNote Tag 0x2027": "5616 3744 2816 1864",
+        }
+    )
+
+    assert meta["focus_box_checked"] is True
+    assert "focus_box" not in meta
+
+
+def test_metadata_cache_requires_focus_box_checked_marker() -> None:
+    assert not FileListPanel._metadata_cache_has_browser_fields(
+        {
+            "rating": 3,
+            "focus_status": "GOOD",
+            "XMP-superpicky:focus_box": "(0.1,0.2,0.8,0.9)",
+        }
+    )
+    assert FileListPanel._metadata_cache_has_browser_fields(
+        {
+            "rating": 3,
+            "focus_box_checked": True,
+        }
+    )
+
+
+def test_file_list_cached_focus_box_state_distinguishes_checked_none() -> None:
+    path = os.path.normpath("C:/photos/a.jpg")
+    panel = FileListPanel.__new__(FileListPanel)
+    panel._meta_cache = {path: {"focus_box_checked": True}}
+
+    assert FileListPanel.get_cached_focus_box_state_for_path(panel, path) == (True, None)
+
+
+def test_metadata_loader_prefers_raw_embedded_focus_metadata(monkeypatch, tmp_path) -> None:
+    path = os.path.normpath(str(tmp_path / "sample.ARW"))
+    Path(path).write_bytes(b"raw")
+
+    monkeypatch.setattr(_workers, "read_batch_metadata", lambda *args, **kwargs: {path: {"SourceFile": path}})
+    monkeypatch.setattr(
+        _workers,
+        "read_raw_embedded_focus_metadata",
+        lambda _path: {
+            "SourceFile": path,
+            "Make": "SONY",
+            "Model": "ILCE-1M2",
+            "ExifImageWidth": 5472,
+            "ExifImageHeight": 3648,
+            "MakerNote Tag 0x2027": "5472 3648 2736 1824 640 480",
+        },
+    )
+
+    loader = MetadataLoader([path], meta_proxy=object())
+    raw = loader._read_metadata_batch([path])
+    meta = loader._parse_rec(raw[path])
+
+    assert "focus_box" in meta
+
+
+def test_metadata_loader_report_fast_path_skips_exiftool_but_keeps_raw_focus(monkeypatch, tmp_path) -> None:
+    path = os.path.normpath(str(tmp_path / "sample.ARW"))
+    Path(path).write_bytes(b"raw")
+    row = {
+        "filename": "sample",
+        "iso": 800,
+        "shutter_speed": "0.0005",
+        "aperture": "5.6",
+        "focal_length": 600,
+        "camera_model": "Report Camera",
+        "lens_model": "Report Lens",
+        "date_time_original": "2026:02:16 16:23:00",
+        "focus_x": 0.1,
+        "focus_y": 0.1,
+    }
+
+    def _fail_read_batch(*_args, **_kwargs):
+        raise AssertionError("complete report rows should not call exiftool during browser metadata load")
+
+    monkeypatch.setattr(_workers, "read_batch_metadata", _fail_read_batch)
+    monkeypatch.setattr(
+        _workers,
+        "read_raw_embedded_focus_metadata",
+        lambda _path: {
+            "SourceFile": path,
+            "Make": "SONY",
+            "Model": "ILCE-1M2",
+            "ExifImageWidth": 5472,
+            "ExifImageHeight": 3648,
+            "MakerNote Tag 0x2027": "5472 3648 2736 1824 640 480",
+        },
+    )
+
+    loader = MetadataLoader(
+        [path],
+        meta_proxy=object(),
+        metadata_tags=["-EXIF:ISO"],
+        report_rows_by_path={path: row},
+    )
+    raw = loader._read_metadata_batch([path])
+    meta = loader._parse_rec(raw[path])
+
+    assert meta["camera_model"] == "Report Camera"
+    assert meta["iso"] == "800"
+    assert meta["focus_box"][0] > 0.4
+
+
+def test_metadata_loader_does_not_fallback_to_report_focus_when_raw_focus_checked(monkeypatch, tmp_path) -> None:
+    path = os.path.normpath(str(tmp_path / "sample.ARW"))
+    Path(path).write_bytes(b"raw")
+    row = {
+        "filename": "sample",
+        "iso": 800,
+        "shutter_speed": "0.0005",
+        "aperture": "5.6",
+        "focal_length": 600,
+        "camera_model": "Report Camera",
+        "lens_model": "Report Lens",
+        "date_time_original": "2026:02:16 16:23:00",
+        "focus_x": 0.1,
+        "focus_y": 0.1,
+    }
+
+    monkeypatch.setattr(
+        _workers,
+        "read_batch_metadata",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("fast path should skip exiftool")),
+    )
+    monkeypatch.setattr(_workers, "read_raw_embedded_focus_metadata", lambda _path: {})
+
+    loader = MetadataLoader(
+        [path],
+        meta_proxy=object(),
+        metadata_tags=["-EXIF:ISO"],
+        report_rows_by_path={path: row},
+    )
+    raw = loader._read_metadata_batch([path])
+    meta = loader._parse_rec(raw[path])
+
+    assert meta["focus_box_checked"] is True
+    assert "focus_box" not in meta
+
+
+def test_focus_cache_batch_uses_raw_embedded_focus_without_batch_metadata(monkeypatch, tmp_path) -> None:
+    path = os.path.normpath(str(tmp_path / "sample.ARW"))
+    Path(path).write_bytes(b"raw")
+
+    def _fail_read_batch(*_args, **_kwargs):
+        raise AssertionError("RAW focus cache should not call read_batch_metadata when embedded focus is available")
+
+    monkeypatch.setattr(_workers, "read_batch_metadata", _fail_read_batch)
+    monkeypatch.setattr(
+        _workers,
+        "read_raw_embedded_focus_metadata",
+        lambda _path: {
+            "SourceFile": path,
+            "Make": "SONY",
+            "Model": "ILCE-1M2",
+            "ExifImageWidth": 5472,
+            "ExifImageHeight": 3648,
+            "MakerNote Tag 0x2027": "5472 3648 2736 1824 640 480",
+        },
+    )
+
+    loader = MetadataLoader([path], meta_proxy=object())
+    focus_batch = loader._build_focus_cache_batch([path])
+
+    assert path in focus_batch
+    assert focus_batch[path]["focus_box"] is not None
 
 
 def test_metadata_loader_reads_chunks_with_configured_worker_pool(monkeypatch) -> None:

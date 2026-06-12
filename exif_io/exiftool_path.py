@@ -32,6 +32,36 @@ def _absolute_exiftool_candidates() -> list[str]:
     ]
 
 
+def _env_exiftool_candidates() -> list[str]:
+    """Return explicit exiftool paths from environment variables."""
+    candidates: list[str] = []
+    for name in ("EXIFTOOL_EXE", "EXIFTOOL_PATH"):
+        value = str(os.environ.get(name) or "").strip().strip('"')
+        if value:
+            candidates.append(value)
+    return candidates
+
+
+def _sibling_app_exiftool_candidates() -> list[str]:
+    """Return exiftool candidates from adjacent local SuperPicky checkouts."""
+    if not sys.platform.startswith("win"):
+        return []
+    candidates: list[str] = []
+    seen: set[str] = set()
+    cur = os.path.abspath(_module_dir())
+    last = None
+    while cur and cur != last:
+        for app_dir in ("SuperPicky", "SuperPickyOsk"):
+            path = os.path.join(cur, app_dir, "exiftools_win", "exiftool.exe")
+            norm = os.path.normpath(path)
+            if norm not in seen:
+                seen.add(norm)
+                candidates.append(norm)
+        last = cur
+        cur = os.path.dirname(cur)
+    return candidates
+
+
 @lru_cache(maxsize=32)
 def _is_usable_exiftool(executable_path: str) -> bool:
     """
@@ -66,6 +96,10 @@ def get_exiftool_executable_path() -> str | None:
     → 常见绝对安装路径 → 系统 PATH。
     Windows 仅使用 .exe，不使用 .pl（避免依赖 Perl）。
     """
+    for p in _env_exiftool_candidates():
+        if _is_usable_exiftool(p):
+            return p
+
     rel_candidates = []
     if sys.platform == "darwin":
         rel_candidates.append(os.path.join("exiftools_mac", "exiftool"))
@@ -100,6 +134,10 @@ def get_exiftool_executable_path() -> str | None:
 
     # Finder 启动的 .app 往往拿不到 shell PATH，这里补常见绝对路径兜底。
     for p in _absolute_exiftool_candidates():
+        if _is_usable_exiftool(p):
+            return p
+
+    for p in _sibling_app_exiftool_candidates():
         if _is_usable_exiftool(p):
             return p
 

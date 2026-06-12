@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-from app_common.exif_io.photo_meta import PhotoMetaDataProxy, PhotoMetaDataXMP
+from app_common.exif_io.photo_meta import PhotoMetaDataProxy, PhotoMetaDataReportDB, PhotoMetaDataXMP
 from app_common.exif_io.writer import invalidate_metadata_cache, read_batch_metadata
 from app_common.report_db import PHOTO_COLUMNS, ReportDB
 
@@ -91,6 +91,8 @@ def _all_photo_column_values(stem: str) -> dict:
         "gps_longitude",
         "gps_altitude",
         "birdid_confidence",
+        "rarity_index",
+        "gbif_rarity_100",
     }
     int_columns = {
         "has_bird",
@@ -139,6 +141,48 @@ def test_proxy_reads_report_db_after_sidecar_before_embedded_exif() -> None:
     proxy = PhotoMetaDataProxy(exif=_FakeExifMeta(), xmp=_EmptyMeta(), report_db=_FakeReportMeta("2"))
     assert proxy.read("/tmp/img.jpg")["rating"] == 2
     assert proxy.read_batch(["/tmp/img.jpg"])[os.path.normpath("/tmp/img.jpg")]["rating"] == 2
+
+
+def test_report_db_read_exposes_all_photo_columns_and_superpicky_aliases(tmp_path: Path) -> None:
+    photo_path = tmp_path / "img001.jpg"
+    photo_path.write_bytes(b"not an image")
+    report_row = _all_photo_column_values("img001")
+    report_row["rarity_index"] = 8.5
+    report_row["iucn_category"] = "LC"
+    report_row["gbif_rarity_100"] = 72.25
+    _insert_report_row(tmp_path, report_row)
+
+    meta = PhotoMetaDataReportDB(report_root=str(tmp_path)).read(str(photo_path))
+
+    for column_name, _type_def, _default in PHOTO_COLUMNS:
+        if column_name == "filename":
+            continue
+        assert column_name in meta
+        assert f"report.{column_name}" in meta
+        assert f"XMP-superpicky:{column_name}" in meta
+    assert meta["rarity_index"] == 8.5
+    assert meta["report.iucn_category"] == "LC"
+    assert meta["XMP-superpicky:gbif_rarity_100"] == 72.25
+
+
+def test_report_db_read_remains_compatible_with_old_rows_missing_new_columns(tmp_path: Path) -> None:
+    photo_path = tmp_path / "img001.jpg"
+    photo_path.write_bytes(b"not an image")
+    old_row = {
+        "filename": "img001",
+        "rating": 2,
+        "pick": 1,
+        "bird_species_cn": "旧库鸟名",
+    }
+
+    meta = PhotoMetaDataReportDB(report_root=str(tmp_path), cache={"img001": old_row}).read(str(photo_path))
+
+    assert meta["rating"] == 2
+    assert meta["pick"] == 1
+    assert meta["XMP-superpicky:bird_species_cn"] == "旧库鸟名"
+    assert "rarity_index" not in meta
+    assert "iucn_category" not in meta
+    assert "gbif_rarity_100" not in meta
 
 
 def test_proxy_write_routes_only_to_xmp_source() -> None:
@@ -223,6 +267,9 @@ def test_xmp_write_hydrates_report_db_photo_columns_when_bird_marker_missing(tmp
     assert meta.get("XMP-superpicky:has_bird") == "0"
     assert meta.get("XMP-superpicky:burst_id") == "12"
     assert meta.get("XMP-superpicky:original_path") == "original_path-value"
+    assert meta.get("XMP-superpicky:rarity_index") == "0.75"
+    assert meta.get("XMP-superpicky:iucn_category") == "iucn_category-value"
+    assert meta.get("XMP-superpicky:gbif_rarity_100") == "0.75"
     assert meta.get("XMP-superpicky:rating") == "5"
     assert meta.get("XMP-xmp:Rating") == "5"
 

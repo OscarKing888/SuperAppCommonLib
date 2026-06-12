@@ -39,7 +39,7 @@ try:
     )
     from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal, QRect, QTimer, QUrl, QMimeData, QPoint, QEvent, QAbstractListModel, QAbstractTableModel, QModelIndex, QItemSelectionModel, QSortFilterProxyModel
     from PyQt6.QtGui import (
-        QPixmap, QImage, QFont, QColor, QIcon, QPainter, QBrush,
+        QPixmap, QImage, QFont, QColor, QIcon, QPainter, QBrush, QPen,
         QKeySequence, QShortcut,
     )
 except ImportError:
@@ -53,7 +53,7 @@ except ImportError:
     )
     from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal, QRect, QTimer, QUrl, QMimeData, QPoint, QEvent, QAbstractListModel, QAbstractTableModel, QModelIndex, QItemSelectionModel, QSortFilterProxyModel
     from PyQt5.QtGui import (
-        QPixmap, QImage, QFont, QColor, QIcon, QPainter, QBrush,
+        QPixmap, QImage, QFont, QColor, QIcon, QPainter, QBrush, QPen,
         QKeySequence,
     )
 
@@ -236,6 +236,7 @@ _ThumbPixmapRole = int(_UserRole) + 20
 _ThumbSizeRole = int(_UserRole) + 21
 _MetaSpeciesCnRole = int(_UserRole) + 22
 _MetaBurstTextRole = int(_UserRole) + 23
+_MetaFocusBoxRole = int(_UserRole) + 24
 
 _TREE_COL_SEQ = -1
 
@@ -1309,6 +1310,20 @@ def _metadata_loader_worker_count() -> int:
     if override > 0:
         return max(1, override)
     return max(1, get_metadata_loader_workers())
+
+
+def _metadata_loader_idle_worker_count() -> int:
+    cpu_count = max(1, os.cpu_count() or 1)
+    idle_target = max(24, (cpu_count * 3) // 4)
+    return max(_metadata_loader_worker_count(), min(cpu_count, idle_target))
+
+
+def _metadata_loader_worker_count_for_thumbnail_state(thumbnail_work_active: bool) -> int:
+    if _env_int("SuperViewer_METADATA_WORKERS", 0) > 0:
+        return _metadata_loader_worker_count()
+    if thumbnail_work_active:
+        return _metadata_loader_worker_count()
+    return _metadata_loader_idle_worker_count()
 
 
 def _persistent_thumb_cache_dirname(size: int) -> str:

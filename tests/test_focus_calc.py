@@ -39,3 +39,37 @@ def test_extract_focus_box_for_display_accepts_legacy_and_precache_sony_makernot
         0.5657894736842105,
     )
     assert all(math.isclose(actual, target, rel_tol=1e-9, abs_tol=1e-9) for actual, target in zip(legacy_focus_box, expected))
+
+
+def test_sony_default_center_makernote_focus_block_is_not_a_focus_box() -> None:
+    raw = {
+        "Make": "SONY",
+        "Model": "ILCE-1M2",
+        "ExifImageWidth": 5616,
+        "ExifImageHeight": 3744,
+        "MakerNote Tag 0x2027": "5616 3744 2816 1864",
+    }
+
+    assert extract_focus_box_for_display(
+        raw,
+        5616,
+        3744,
+        camera_type=resolve_focus_camera_type_from_metadata(raw),
+    ) is None
+
+
+def test_sony_offset_makernote_focus_block_still_builds_focus_box() -> None:
+    raw = {
+        "Make": "SONY",
+        "Model": "ILCE-1M2",
+        "ExifImageWidth": 5616,
+        "ExifImageHeight": 3744,
+        "MakerNote Tag 0x2027": "5616 3744 3273 1232",
+    }
+
+    assert extract_focus_box_for_display(
+        raw,
+        5616,
+        3744,
+        camera_type=resolve_focus_camera_type_from_metadata(raw),
+    ) is not None
