@@ -33,10 +33,10 @@ except AttributeError:
     _PainterAntialiasing = QPainter.Antialiasing  # type: ignore[attr-defined]
 
 
-DEFAULT_HANDLE_WIDTH = 10
-DEFAULT_TOGGLE_BUTTON_LENGTH = 28
-_MIN_HANDLE_WIDTH = 6
-_MIN_BUTTON_LENGTH = 16
+DEFAULT_HANDLE_WIDTH = 5
+DEFAULT_TOGGLE_BUTTON_LENGTH = 10
+_MIN_HANDLE_WIDTH = 5
+_MIN_BUTTON_LENGTH = 10
 _TRIANGLE_HALF_LENGTH = 6
 _TRIANGLE_DEPTH = 4
 
@@ -142,7 +142,7 @@ class TriangleToggleSplitterHandle(QSplitterHandle):
             if not button_rect.isEmpty():
                 painter.fillRect(button_rect, QColor(255, 255, 255, 30 if hover else 10))
             color = QColor(220, 225, 230, 230 if hover else 168)
-            painter.setPen(QPen(color, 1))
+            painter.setPen(QPen(color, 0))
             painter.setBrush(color)
             painter.drawPolygon(self._triangle_polygon())
         finally:
@@ -189,16 +189,15 @@ class TriangleToggleSplitterHandle(QSplitterHandle):
 
     def _triangle_polygon(self) -> QPolygon:
         rect = self._toggle_button_rect()
-        cx = rect.center().x()
-        cy = rect.center().y()
+        cx = rect.x() + rect.width() // 2
+        cy = rect.y() + rect.height() // 2
         splitter = self.splitter()
         collapsed = (
             isinstance(splitter, TriangleToggleSplitter)
             and splitter.is_target_panel_collapsed_for_handle(self)
         )
         side = splitter.target_panel_side_for_handle(self) if isinstance(splitter, TriangleToggleSplitter) else "left"
-        long = _TRIANGLE_HALF_LENGTH
-        depth = _TRIANGLE_DEPTH
+        long, depth = self._triangle_extents(rect)
         if self.orientation() == _Horizontal:
             if side == "right":
                 points = self._left_triangle(cx, cy, long, depth) if collapsed else self._right_triangle(cx, cy, long, depth)
@@ -210,6 +209,17 @@ class TriangleToggleSplitterHandle(QSplitterHandle):
             else:
                 points = self._down_triangle(cx, cy, long, depth) if collapsed else self._up_triangle(cx, cy, long, depth)
         return QPolygon(points)
+
+    def _triangle_extents(self, rect: QRect) -> tuple[int, int]:
+        if self.orientation() == _Horizontal:
+            long_span = rect.height()
+            depth_span = rect.width()
+        else:
+            long_span = rect.width()
+            depth_span = rect.height()
+        long = min(_TRIANGLE_HALF_LENGTH, max(1, (long_span - 2) // 2))
+        depth = min(_TRIANGLE_DEPTH, max(1, (depth_span - 1) // 2))
+        return long, depth
 
     @staticmethod
     def _left_triangle(cx: int, cy: int, long: int, depth: int) -> list[QPoint]:
