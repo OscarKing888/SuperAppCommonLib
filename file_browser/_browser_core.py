@@ -1247,6 +1247,34 @@ def _thumb_disk_cache_path(path: str, mtime: float, size: int, selected_dir: str
     return os.path.join(cache_dir, name)
 
 
+def _meta_disk_cache_db_dir() -> str:
+    """无 .superpicky 作用域时，文件派生元数据磁盘缓存的本机回退目录。"""
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+    else:
+        base = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+    return os.path.join(base, "SuperViewer", "meta_cache")
+
+
+def _meta_disk_cache_db_path_for_file(path: str, selected_dir: str | None = None) -> str:
+    """返回某图片文件的元数据磁盘缓存 db 路径。
+
+    优先放在最近的 .superpicky/meta_cache 下（与 thumb_cache 同一作用域规则）；
+    无可用 .superpicky 作用域时回退到本机应用缓存目录，便于外置盘/无 report.db 目录也能加速重访。
+    """
+    cache_dir = ""
+    if path:
+        try:
+            superpicky_dir = _find_cache_superpicky_dir_for_file(path, selected_dir)
+        except Exception:
+            superpicky_dir = ""
+        if superpicky_dir:
+            cache_dir = os.path.join(superpicky_dir, "meta_cache")
+    if not cache_dir:
+        cache_dir = _meta_disk_cache_db_dir()
+    return os.path.join(cache_dir, "meta_cache.db")
+
+
 def _persistent_thumb_cache_max_size() -> int:
     override = _env_int("SuperViewer_PERSISTENT_THUMB_SIZE", 0)
     if override in (128, 256, 512, 1024, 2048):

@@ -175,6 +175,10 @@ class FileTableEntry:
     base_tooltip: str = ""
     tooltip: str = ""
     mismatch: bool = False
+    # 惰性解析标记：tooltip / mismatch 涉及 os.path.isfile 等磁盘 IO，
+    # 填充阶段不计算（避免主线程卡顿），首次在 data() 被请求时按需解析并记忆。
+    tooltip_resolved: bool = False
+    mismatch_resolved: bool = False
     comment: str = ""
     species: str = ""
     tags: list[str] = field(default_factory=list)
@@ -209,6 +213,8 @@ class FileTableModel(QAbstractTableModel):
         super().__init__(parent)
         self._entries: list[FileTableEntry] = []
         self._row_by_path: dict[str, int] = {}
+        self._tooltip_fn = None
+        self._mismatch_fn = None
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         if parent.isValid():
@@ -272,15 +278,32 @@ class FileTableModel(QAbstractTableModel):
         mismatch_fn,
     ) -> FileTableEntry:
         norm = os.path.normpath(path)
-        entry = FileTableEntry(
-            path=path,
-            name=Path(path).name,
-            base_tooltip=tooltip_fn(path),
-            mismatch=bool(mismatch_fn(path)),
-        )
+        # tooltip / mismatch 留待 data() 惰性解析，填充阶段不做磁盘 IO。
+        entry = FileTableEntry(path=path, name=Path(path).name)
         self._apply_meta_to_entry(entry, meta_cache.get(norm, {}) if isinstance(meta_cache, dict) else {})
         entry.tooltip = _append_burst_tooltip(entry.base_tooltip, entry.burst_text)
         return entry
+
+    def _resolve_tooltip(self, entry: FileTableEntry) -> str:
+        if not entry.tooltip_resolved:
+            entry.tooltip_resolved = True
+            if self._tooltip_fn is not None:
+                try:
+                    entry.base_tooltip = self._tooltip_fn(entry.path) or ""
+                except Exception:
+                    entry.base_tooltip = ""
+            entry.tooltip = _append_burst_tooltip(entry.base_tooltip, entry.burst_text)
+        return entry.tooltip
+
+    def _resolve_mismatch(self, entry: FileTableEntry) -> bool:
+        if not entry.mismatch_resolved:
+            entry.mismatch_resolved = True
+            if self._mismatch_fn is not None:
+                try:
+                    entry.mismatch = bool(self._mismatch_fn(entry.path))
+                except Exception:
+                    entry.mismatch = False
+        return entry.mismatch
 
     def _sort_value(self, entry: FileTableEntry, column: int):
         if column == _TREE_COL_NAME:
@@ -388,11 +411,11 @@ class FileTableModel(QAbstractTableModel):
         if role == _UserRole:
             return entry.path
         if role == _ToolTipRole:
-            return entry.tooltip
+            return self._resolve_tooltip(entry)
         if role == _SortRole:
             return self._sort_value(entry, column)
         if role == _ForegroundRole:
-            if column == _TREE_COL_NAME and entry.mismatch:
+            if column == _TREE_COL_NAME and self._resolve_mismatch(entry):
                 return QBrush(QColor("#c0392b"))
             if column == _TREE_COL_FOCUS:
                 return _focus_status_brush(entry.focus_status)
@@ -415,6 +438,8 @@ class FileTableModel(QAbstractTableModel):
     ) -> int:
         if not paths:
             return 0
+        self._tooltip_fn = tooltip_fn
+        self._mismatch_fn = mismatch_fn
         start_row = len(self._entries)
         new_entries = [
             self._build_entry(
@@ -440,6 +465,8 @@ class FileTableModel(QAbstractTableModel):
         tooltip_fn,
         mismatch_fn,
     ) -> None:
+        self._tooltip_fn = tooltip_fn
+        self._mismatch_fn = mismatch_fn
         entries = [
             self._build_entry(
                 path,
@@ -543,6 +570,7 @@ class FileTableModel(QAbstractTableModel):
             return False
         entry = self._entries[row]
         entry.base_tooltip = tooltip
+        entry.tooltip_resolved = True
         entry.tooltip = _append_burst_tooltip(entry.base_tooltip, entry.burst_text)
         left = self.index(row, 0)
         right = self.index(row, self.columnCount() - 1)
@@ -554,6 +582,7 @@ class FileTableModel(QAbstractTableModel):
         if row is None:
             return False
         self._entries[row].mismatch = bool(mismatch)
+        self._entries[row].mismatch_resolved = True
         idx = self.index(row, _TREE_COL_NAME)
         self.dataChanged.emit(idx, idx, [_ForegroundRole])
         return True
@@ -718,6 +747,9 @@ class ThumbnailListEntry:
     base_tooltip: str = ""
     tooltip: str = ""
     mismatch: bool = False
+    # 惰性解析标记，含义同 FileTableEntry。
+    tooltip_resolved: bool = False
+    mismatch_resolved: bool = False
     color: str = ""
     rating: int = 0
     pick: int = 0
@@ -738,6 +770,8 @@ class ThumbnailListModel(QAbstractListModel):
         super().__init__(parent)
         self._entries: list[ThumbnailListEntry] = []
         self._row_by_path: dict[str, int] = {}
+        self._tooltip_fn = None
+        self._mismatch_fn = None
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         if parent.isValid():
@@ -761,9 +795,9 @@ class ThumbnailListModel(QAbstractListModel):
         if role == _UserRole:
             return entry.path
         if role == _ToolTipRole:
-            return entry.tooltip
+            return self._resolve_tooltip(entry)
         if role == _ForegroundRole:
-            return QBrush(QColor("#c0392b")) if entry.mismatch else None
+            return QBrush(QColor("#c0392b")) if self._resolve_mismatch(entry) else None
         if role == _MetaColorRole:
             return entry.color
         if role == _MetaRatingRole:
@@ -798,13 +832,11 @@ class ThumbnailListModel(QAbstractListModel):
         pick = _metadata_pick_value(meta)
         burst_position, burst_id = _metadata_burst_values(meta)
         burst_text = _format_burst_text(burst_position, burst_id)
-        base_tooltip = tooltip_fn(path)
+        # tooltip / mismatch 留待 data() 惰性解析，填充阶段不做磁盘 IO。
         return ThumbnailListEntry(
             path=path,
             name=Path(path).name,
-            base_tooltip=base_tooltip,
-            tooltip=_append_burst_tooltip(base_tooltip, burst_text),
-            mismatch=bool(mismatch_fn(path)),
+            tooltip=_append_burst_tooltip("", burst_text),
             color=str(meta.get("color", "")),
             rating=rating,
             pick=pick,
@@ -815,6 +847,27 @@ class ThumbnailListModel(QAbstractListModel):
             burst_id=burst_id,
             burst_text=burst_text,
         )
+
+    def _resolve_tooltip(self, entry: ThumbnailListEntry) -> str:
+        if not entry.tooltip_resolved:
+            entry.tooltip_resolved = True
+            if self._tooltip_fn is not None:
+                try:
+                    entry.base_tooltip = self._tooltip_fn(entry.path) or ""
+                except Exception:
+                    entry.base_tooltip = ""
+            entry.tooltip = _append_burst_tooltip(entry.base_tooltip, entry.burst_text)
+        return entry.tooltip
+
+    def _resolve_mismatch(self, entry: ThumbnailListEntry) -> bool:
+        if not entry.mismatch_resolved:
+            entry.mismatch_resolved = True
+            if self._mismatch_fn is not None:
+                try:
+                    entry.mismatch = bool(self._mismatch_fn(entry.path))
+                except Exception:
+                    entry.mismatch = False
+        return entry.mismatch
 
     def clear(self) -> None:
         self.beginResetModel()
@@ -832,6 +885,8 @@ class ThumbnailListModel(QAbstractListModel):
     ) -> int:
         if not paths:
             return 0
+        self._tooltip_fn = tooltip_fn
+        self._mismatch_fn = mismatch_fn
         start_row = len(self._entries)
         new_entries = [
             self._build_entry(
@@ -857,6 +912,8 @@ class ThumbnailListModel(QAbstractListModel):
         tooltip_fn,
         mismatch_fn,
     ) -> None:
+        self._tooltip_fn = tooltip_fn
+        self._mismatch_fn = mismatch_fn
         entries = [
             self._build_entry(
                 path,
@@ -1081,6 +1138,7 @@ class ThumbnailListModel(QAbstractListModel):
             return False
         entry = self._entries[row]
         entry.base_tooltip = tooltip
+        entry.tooltip_resolved = True
         entry.tooltip = _append_burst_tooltip(entry.base_tooltip, entry.burst_text)
         idx = self.index(row, 0)
         self.dataChanged.emit(idx, idx, [_ToolTipRole])
@@ -1091,6 +1149,7 @@ class ThumbnailListModel(QAbstractListModel):
         if row is None:
             return False
         self._entries[row].mismatch = bool(mismatch)
+        self._entries[row].mismatch_resolved = True
         idx = self.index(row, 0)
         self.dataChanged.emit(idx, idx, [_ForegroundRole])
         return True
@@ -1141,6 +1200,7 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
         pick = index.data(_MetaPickRole)
         focus_status = str(index.data(_MetaFocusRole) or "")
         focus_box = index.data(_MetaFocusBoxRole)
+        species_cn = str(index.data(_MetaSpeciesCnRole) or "").strip()
         pixmap = index.data(_ThumbPixmapRole)
         if not isinstance(pixmap, QPixmap):
             pixmap = None
@@ -1247,6 +1307,33 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
                 painter.drawRect(box_rect)
 
             draw_focus_box_overlay(focus_box)
+
+            def draw_species_overlay(text: str) -> None:
+                if not text or draw_rect.width() <= 0 or draw_rect.height() <= 0:
+                    return
+                f3 = QFont(opt.font)
+                f3.setPixelSize(12)
+                painter.setFont(f3)
+                fm3 = painter.fontMetrics()
+                pad_x, pad_y = 6, 2
+                max_w = max(8, draw_rect.width() - 8)
+                elided = fm3.elidedText(text, _ElideRight, max_w - pad_x * 2)
+                try:
+                    tw = fm3.horizontalAdvance(elided)
+                except AttributeError:
+                    tw = fm3.width(elided)
+                bw = min(max_w, tw + pad_x * 2)
+                bh = fm3.height() + pad_y * 2
+                bx = draw_rect.left() + (draw_rect.width() - bw) // 2
+                by = draw_rect.bottom() - bh - 3
+                label_rect = QRect(bx, by, bw, bh)
+                painter.setBrush(QBrush(QColor(0, 0, 0, 150)))
+                painter.setPen(_NoPen)
+                painter.drawRoundedRect(label_rect, 4, 4)
+                painter.setPen(QColor("#00ff00"))
+                painter.drawText(label_rect, _AlignCenter, elided)
+
+            draw_species_overlay(species_cn)
 
             if pick == 1:
                 draw_badge("🏆", QColor(0, 0, 0, 160), QColor(COLORS["star_gold"]), left=True)

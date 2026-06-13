@@ -9,6 +9,8 @@ from app_common.file_browser._browser_core import *
 from app_common.perf_probe import elapsed_ms, perf_counter, perf_log, perf_probes_enabled
 from app_common.raw_focus_metadata import is_raw_image_path, read_raw_embedded_focus_metadata
 from app_common.exif_io.writer import _batch_read_xmp_sidecar
+from app_common.exif_io.fast_reader import fast_read_browser_metadata
+from app_common.exif_io import meta_disk_cache
 
 
 _RAW_FOCUS_CHECKED_KEY = "_superviewer_raw_focus_checked"
@@ -409,11 +411,13 @@ class MetadataLoader(QThread):
         metadata_tags: list[str] | None = None,
         report_rows_by_path: dict[str, dict] | None = None,
         worker_count: int | None = None,
+        selected_dir: str | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self._paths = list(paths)
         self._meta_proxy = meta_proxy
+        self._selected_dir = str(selected_dir or "") or None
         self._focus_source_paths = {
             os.path.normpath(display_path): os.path.normpath(source_path)
             for display_path, source_path in (focus_source_paths or {}).items()
@@ -630,11 +634,79 @@ class MetadataLoader(QThread):
             if norm_path in result and focus_meta:
                 result[norm_path].update(focus_meta)
 
+        # Tier1 磁盘缓存：按 (mtime, size) 命中上次的「文件派生」结果，跳过文件读取。
+        # 只缓存文件本身的拍摄/对焦字段，sidecar/report 仍在每次加载时新读合并，故无需额外失效。
+        disk_cache_t0 = perf_counter()
+        cache_stats: dict[str, tuple[float, int]] = {}
+        cache_db_by_norm: dict[str, str] = {}
+        for path in exiftool_paths:
+            norm = os.path.normpath(path)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            cache_stats[norm] = (st.st_mtime, st.st_size)
+            try:
+                cache_db_by_norm[norm] = _meta_disk_cache_db_path_for_file(path, self._selected_dir)
+            except Exception:
+                pass
+        cache_hits: dict[str, dict] = {}
+        if cache_stats:
+            by_db: dict[str, dict[str, tuple[float, int]]] = {}
+            for norm, st in cache_stats.items():
+                db = cache_db_by_norm.get(norm)
+                if db:
+                    by_db.setdefault(db, {})[norm] = st
+            for db, group in by_db.items():
+                try:
+                    cache_hits.update(meta_disk_cache.get_many(db, group))
+                except Exception as exc:
+                    _log.debug("[MetadataLoader._read_metadata_batch] disk cache get failed: %s", exc)
+        for norm_path, flat in cache_hits.items():
+            if norm_path in result and flat:
+                result[norm_path].update(flat)
+        disk_cache_ms = elapsed_ms(disk_cache_t0)
+
+        to_read_paths = [p for p in exiftool_paths if os.path.normpath(p) not in cache_hits]
+
+        # Tier2 进程内快速读取：相机直出 RAW/JPEG/TIFF 的拍摄/对焦字段由 exifread 取得，
+        # 避免每张文件启动 exiftool 子进程。用户可写元数据已由上方 sidecar 合并覆盖。
+        fast_t0 = perf_counter()
+        fast_records: dict = {}
+        fallback_paths = to_read_paths
+        if to_read_paths:
+            try:
+                fast_records, fallback_paths = fast_read_browser_metadata(to_read_paths)
+                for norm_path, flat in fast_records.items():
+                    if norm_path in result and flat:
+                        result[norm_path].update(flat)
+            except Exception as exc:
+                _log.warning("[MetadataLoader._read_metadata_batch] fast_read failed: %s", exc)
+                fast_records = {}
+                fallback_paths = to_read_paths
+        fast_ms = elapsed_ms(fast_t0)
+
+        # 把本批新读到的「文件派生」快速结果写回磁盘缓存（仅 fast 结果，绝不含 sidecar/report）。
+        if fast_records and cache_stats:
+            store_by_db: dict[str, dict[str, tuple[float, int, dict]]] = {}
+            for norm_path, flat in fast_records.items():
+                st = cache_stats.get(norm_path)
+                db = cache_db_by_norm.get(norm_path)
+                if not st or not db or not flat:
+                    continue
+                store_by_db.setdefault(db, {})[norm_path] = (st[0], st[1], flat)
+            for db, items in store_by_db.items():
+                try:
+                    meta_disk_cache.put_many(db, items)
+                except Exception as exc:
+                    _log.debug("[MetadataLoader._read_metadata_batch] disk cache put failed: %s", exc)
+
+        # Tier3 兜底：快速路径未覆盖（HEIF/PNG/读取失败/字段不齐）的文件才走 exiftool。
         read_batch_t0 = perf_counter()
-        if exiftool_paths:
+        if fallback_paths:
             try:
                 raw_batch = read_batch_metadata(
-                    exiftool_paths,
+                    fallback_paths,
                     tags=self._metadata_tags or None,
                     use_cache=not bool(self._metadata_tags),
                 )
@@ -692,17 +764,22 @@ class MetadataLoader(QThread):
         merge_ms = elapsed_ms(merge_t0)
         perf_log(
             _log,
-            "[metadata.read_batch] thread=%s paths=%s raw_focus_paths=%s report_fast_paths=%s xmp_fast_paths=%s exiftool_paths=%s raw_batch_entries=%s report_rows=%s raw_focus_ms=%.1f sidecar_ms=%.1f read_batch_ms=%.1f merge_ms=%.1f total_ms=%.1f tags=%s xmp_restore=%s raw_restore=%s",
+            "[metadata.read_batch] thread=%s paths=%s raw_focus_paths=%s report_fast_paths=%s xmp_fast_paths=%s exiftool_paths=%s disk_cache_hits=%s fast_hits=%s exiftool_fallback=%s raw_batch_entries=%s report_rows=%s raw_focus_ms=%.1f sidecar_ms=%.1f disk_cache_ms=%.1f fast_ms=%.1f read_batch_ms=%.1f merge_ms=%.1f total_ms=%.1f tags=%s xmp_restore=%s raw_restore=%s",
             threading.current_thread().name,
             len(norm_paths),
             raw_focus_merge_count,
             len(report_fast_paths),
             len(xmp_fast_paths),
             len(exiftool_paths),
+            len(cache_hits),
+            len(fast_records),
+            len(fallback_paths),
             len(raw_batch) if isinstance(raw_batch, dict) else 0,
             report_merge_count,
             raw_focus_ms,
             sidecar_ms,
+            disk_cache_ms,
+            fast_ms,
             read_batch_ms,
             merge_ms,
             elapsed_ms(batch_t0),

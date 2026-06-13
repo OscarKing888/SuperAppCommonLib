@@ -5089,6 +5089,7 @@ class FileListPanel(QWidget):
             metadata_tags=_SUPERBIRDSTAMP_BROWSER_METADATA_TAGS,
             report_rows_by_path=self._report_row_by_path,
             worker_count=self._metadata_loader_workers,
+            selected_dir=self._current_dir,
         )
         loader.progress_updated.connect(self._on_metadata_progress)
         loader.metadata_batch_ready.connect(self._on_metadata_batch_ready)

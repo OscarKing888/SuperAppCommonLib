@@ -521,6 +521,10 @@ def _batch_read_exiftool(et_path: str, paths: list, extra_tags: list | None) -> 
     返回 {os.path.normpath(path): raw_rec_dict}。
     """
     tag_args = [
+        # -fast：跳过文件尾部的耗时扫描（不读 MakerNote 之后的 trailer/预览），
+        # 实测对浏览器列字段与 Sony 对焦块结果零差异，但在机械/外置盘上显著降低单次读取耗时。
+        # 注意不要升级为 -fast2：那会跳过 MakerNote，导致对焦块丢失。
+        "-fast",
         "-j",
         "-G1",
         "-n",
