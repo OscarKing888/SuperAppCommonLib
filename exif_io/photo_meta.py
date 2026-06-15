@@ -496,37 +496,35 @@ class PhotoMetaDataXMP(PhotoMetaData):
 
         try:
             from .exiftool_path import get_exiftool_executable_path
+            from .exiftool_runner import run_exiftool
             et = get_exiftool_executable_path()
             if not et:
                 return False
             xmp_path = str(self.sidecar_path_for(path))
             # exiftool: write to sidecar only
             assignments = [f"-{k}={v}" for k, v in remaining_fields.items()]
-            # We write to the sidecar by passing the image path and using -o
-            import subprocess
-            all_args = ["-overwrite_original", *assignments, f"-o={xmp_path}", os.path.normpath(path)]
-            fd, argfile = tempfile.mkstemp(suffix=".args", prefix="et_xmp_")
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    for a in all_args:
-                        f.write(a + "\n")
-                cp = subprocess.run(
-                    [et, "-@", argfile],
-                    capture_output=True, check=False,
+            # Existing sidecars are edited directly; new sidecars are created from the image.
+            if os.path.isfile(xmp_path):
+                all_args = ["-overwrite_original", "-charset", "filename=UTF8", *assignments, xmp_path]
+            else:
+                all_args = [
+                    "-overwrite_original",
+                    "-charset",
+                    "filename=UTF8",
+                    *assignments,
+                    "-o",
+                    xmp_path,
+                    os.path.normpath(path),
+                ]
+            cp = run_exiftool(et, all_args)
+            ok = cp.returncode == 0
+            if ok:
+                self._hydrate_report_db_sidecar_if_needed(
+                    path,
+                    protected_report_fields=protected_report_fields,
                 )
-                ok = cp.returncode == 0
-                if ok:
-                    self._hydrate_report_db_sidecar_if_needed(
-                        path,
-                        protected_report_fields=protected_report_fields,
-                    )
-                    self._invalidate_metadata_cache(path)
-                return ok and success
-            finally:
-                try:
-                    os.unlink(argfile)
-                except OSError:
-                    pass
+                self._invalidate_metadata_cache(path)
+            return ok and success
         except Exception:
             return False
 

@@ -5,6 +5,7 @@ exif_io：EXIF 配置、exiftool 路径、EXIF 读写（exiftool + piexif）。
 """
 from __future__ import annotations
 
+from app_common.exif_io.exiftool_runner import close_exiftool_process
 from app_common.exif_io.exiftool_path import get_exiftool_executable_path
 from app_common.exif_io.reader import (
     extract_many,
@@ -40,6 +41,7 @@ from app_common.exif_io.photo_meta import (
 
 __all__ = [
     "get_exiftool_executable_path",
+    "close_exiftool_process",
     "run_exiftool_json",
     "run_exiftool_assignments",
     "write_exif_with_exiftool",

@@ -73,6 +73,7 @@ def _run_exiftool_binary_tag(path: str, tag: str) -> bytes | None:
     """读取 exiftool 二进制标签，返回 JPEG 字节。"""
     try:
         from app_common.exif_io.exiftool_path import get_exiftool_executable_path
+        from app_common.exif_io.exiftool_runner import run_exiftool_once
     except Exception:
         return None
     exiftool_path = get_exiftool_executable_path()
@@ -98,7 +99,7 @@ def _run_exiftool_binary_tag(path: str, tag: str) -> bytes | None:
             cmd = [*cmd_common, "-@", argfile_path]
         else:
             cmd = [*cmd_common, f"-{tag}", path_norm]
-        proc = subprocess.run(
+        proc = run_exiftool_once(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,

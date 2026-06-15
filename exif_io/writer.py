@@ -7,12 +7,11 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
-import tempfile
 import threading
 
 import piexif
 
+from app_common.exif_io.exiftool_runner import run_exiftool
 from app_common.exif_io.exiftool_path import get_exiftool_executable_path
 from app_common.log import get_logger
 from app_common.perf_probe import elapsed_ms, perf_counter, perf_log
@@ -152,23 +151,14 @@ def run_exiftool_json(path: str) -> list[dict]:
     if not exiftool_path:
         return []
     path_norm = os.path.normpath(path)
-    use_argfile = sys.platform.startswith("win") and any(ord(c) > 127 for c in path_norm)
     try:
-        if use_argfile:
-            fd, argfile_path = tempfile.mkstemp(suffix=".args", prefix="exiftool_")
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    f.write(path_norm + "\n")
-                cmd = [exiftool_path, "-charset", "filename=UTF8", "-j", "-G1", "-@", argfile_path]
-                cp = subprocess.run(cmd, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
-            finally:
-                try:
-                    os.unlink(argfile_path)
-                except OSError:
-                    pass
-        else:
-            cmd = [exiftool_path, "-j", "-G1", path_norm]
-            cp = subprocess.run(cmd, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        cp = run_exiftool(
+            exiftool_path,
+            ["-charset", "filename=UTF8", "-j", "-G1", path_norm],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
         if cp.returncode != 0 or not (cp.stdout or "").strip():
             return []
         out = json.loads(cp.stdout)
@@ -196,40 +186,33 @@ def run_exiftool_assignments(path: str, assignments: list[str]) -> None:
         except Exception:
             found = None
         target_norm = os.path.normpath(found or os.path.splitext(path_norm)[0] + ".xmp")
-        args = [
-            "-overwrite_original",
-            "-charset",
-            "filename=UTF8",
-            *assignments,
-            f"-o={target_norm}",
-            path_norm,
-        ]
+        if found:
+            args = ["-overwrite_original", "-charset", "filename=UTF8", *assignments, target_norm]
+        else:
+            args = [
+                "-overwrite_original",
+                "-charset",
+                "filename=UTF8",
+                *assignments,
+                "-o",
+                target_norm,
+                path_norm,
+            ]
 
     def _invoke(*, ignore_minor: bool) -> subprocess.CompletedProcess:
-        fd, argfile_path = tempfile.mkstemp(suffix=".args", prefix="exiftool_")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                for a in args:
-                    f.write(a + "\n")
-            cmd = [exiftool_path]
-            if ignore_minor:
-                # 针对 DxO 导出的部分 TIFF，写入时可能出现 [minor] Error copying hidden data。
-                # 加 -m 后会降级为 warning 并完成写入。
-                cmd.append("-m")
-            cmd.extend(["-@", argfile_path])
-            return subprocess.run(
-                cmd,
-                check=False,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
-        finally:
-            try:
-                os.unlink(argfile_path)
-            except OSError:
-                pass
+        cmd_args = []
+        if ignore_minor:
+            # 针对 DxO 导出的部分 TIFF，写入时可能出现 [minor] Error copying hidden data。
+            # 加 -m 后会降级为 warning 并完成写入。
+            cmd_args.append("-m")
+        cmd_args.extend(args)
+        return run_exiftool(
+            exiftool_path,
+            cmd_args,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
 
     cp = _invoke(ignore_minor=False)
     if cp.returncode == 0:
@@ -537,17 +520,14 @@ def _batch_read_exiftool(et_path: str, paths: list, extra_tags: list | None) -> 
     tag_args += (extra_tags if extra_tags is not None else DEFAULT_METADATA_TAGS)
     all_args = tag_args + [os.path.normpath(p) for p in paths]
 
-    fd, argfile = tempfile.mkstemp(suffix=".args", prefix="et_bm_")
     result: dict = {}
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            for a in all_args:
-                f.write(a + "\n")
-        fd = -1
-        cp = subprocess.run(
-            [et_path, "-@", argfile],
-            check=False, capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
+        cp = run_exiftool(
+            et_path,
+            all_args,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         if cp.returncode == 0 and (cp.stdout or "").strip():
             records = json.loads(cp.stdout)
@@ -559,13 +539,6 @@ def _batch_read_exiftool(et_path: str, paths: list, extra_tags: list | None) -> 
                     result[src] = rec
     except Exception:
         pass
-    finally:
-        try:
-            if fd >= 0:
-                os.close(fd)
-            os.unlink(argfile)
-        except Exception:
-            pass
     return result
 
 

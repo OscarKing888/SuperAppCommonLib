@@ -6,9 +6,10 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 import sys
 from functools import lru_cache
+
+from app_common.exif_io.exiftool_runner import run_exiftool_once
 
 
 def _module_dir() -> str:
@@ -72,7 +73,7 @@ def _is_usable_exiftool(executable_path: str) -> bool:
     if not p or not os.path.isfile(p):
         return False
     try:
-        cp = subprocess.run(
+        cp = run_exiftool_once(
             [p, "-ver"],
             check=False,
             capture_output=True,
