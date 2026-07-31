@@ -2,6 +2,7 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 
+from app_common.exif_io import find_same_stem_xmp_sidecar, find_xmp_sidecar
 from app_common.file_utils import is_apple_double_metadata_file, move_to_trash
 
 
@@ -56,3 +57,30 @@ def test_move_to_trash_does_not_move_parent_sidecar_for_derived_file(monkeypatch
 
     assert move_to_trash(str(exported))
     assert sent == [str(exported)]
+
+
+def test_strict_same_stem_xmp_stays_in_source_directory(tmp_path: Path) -> None:
+    export_dir = tmp_path / "DxO"
+    export_dir.mkdir()
+    source = export_dir / "Bird-DxO_DeepPRIME.jpg"
+    source.write_bytes(b"jpg")
+    parent_sidecar = tmp_path / "Bird.xmp"
+    parent_sidecar.write_text("parent", encoding="utf-8")
+
+    assert find_xmp_sidecar(str(source)) == str(parent_sidecar)
+    assert find_same_stem_xmp_sidecar(str(source)) is None
+
+
+def test_strict_same_stem_xmp_accepts_suffix_case_but_not_derived_stem(tmp_path: Path) -> None:
+    source = tmp_path / "Photo.RAW"
+    source.write_bytes(b"raw")
+    wrong = tmp_path / "Photo-edit.xmp"
+    wrong.write_text("wrong", encoding="utf-8")
+
+    assert find_same_stem_xmp_sidecar(str(source)) is None
+
+    exact = tmp_path / "pHoTo.XmP"
+    exact.write_text("exact", encoding="utf-8")
+    found = find_same_stem_xmp_sidecar(str(source))
+    assert found is not None
+    assert Path(found).samefile(exact)

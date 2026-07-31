@@ -122,6 +122,23 @@ def find_xmp_sidecar(image_path: str) -> str | None:
     return None
 
 
+def find_same_stem_xmp_sidecar(image_path: str) -> str | None:
+    """Return only a same-directory, same-stem XMP sidecar.
+
+    This strict resolver is for file lifecycle operations such as copy, move,
+    rename and trash.  Unlike :func:`find_xmp_sidecar`, it never searches a
+    parent directory and never maps a derived export stem back to its source.
+    The ``.xmp`` suffix and filename comparison are case-insensitive so it also
+    works with sidecars created on Windows and moved to macOS.
+    """
+    if not image_path:
+        return None
+    path = Path(os.path.normpath(image_path))
+    if path.suffix.lower() == ".xmp" or not path.stem:
+        return None
+    return _find_xmp_by_stem_in_dir(path.parent, path.stem)
+
+
 def _build_xmp_dir_index(dir_path: Path) -> dict[str, str]:
     index: dict[str, str] = {}
     try:

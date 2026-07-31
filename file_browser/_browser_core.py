@@ -59,6 +59,7 @@ except ImportError:
 
 from app_common.exif_io import (
     DEFAULT_METADATA_TAGS,
+    find_same_stem_xmp_sidecar,
     find_xmp_sidecar,
     inject_metadata_cache,
     read_batch_metadata,
@@ -1007,6 +1008,9 @@ except AttributeError:
 try:
     _EventResize = QEvent.Type.Resize
     _EventShow = QEvent.Type.Show
+    _EventHide = QEvent.Type.Hide
+    _EventFocusOut = QEvent.Type.FocusOut
+    _EventWindowDeactivate = QEvent.Type.WindowDeactivate
     _EventKeyPress = QEvent.Type.KeyPress
     _EventKeyRelease = QEvent.Type.KeyRelease
     _EventToolTip = QEvent.Type.ToolTip
@@ -1015,11 +1019,19 @@ try:
 except AttributeError:
     _EventResize = QEvent.Resize  # type: ignore[attr-defined]
     _EventShow = QEvent.Show  # type: ignore[attr-defined]
+    _EventHide = QEvent.Hide  # type: ignore[attr-defined]
+    _EventFocusOut = QEvent.FocusOut  # type: ignore[attr-defined]
+    _EventWindowDeactivate = QEvent.WindowDeactivate  # type: ignore[attr-defined]
     _EventKeyPress = QEvent.KeyPress  # type: ignore[attr-defined]
     _EventKeyRelease = QEvent.KeyRelease  # type: ignore[attr-defined]
     _EventToolTip = QEvent.ToolTip  # type: ignore[attr-defined]
     _EventWheel = QEvent.Wheel  # type: ignore[attr-defined]
     _EventMouseButtonPress = QEvent.MouseButtonPress  # type: ignore[attr-defined]
+
+try:
+    _PreciseTimer = Qt.TimerType.PreciseTimer
+except AttributeError:
+    _PreciseTimer = Qt.PreciseTimer  # type: ignore[attr-defined]
 
 _KeyUp = getattr(Qt.Key, "Key_Up", None) or getattr(Qt, "Key_Up", None)
 _KeyDown = getattr(Qt.Key, "Key_Down", None) or getattr(Qt, "Key_Down", None)

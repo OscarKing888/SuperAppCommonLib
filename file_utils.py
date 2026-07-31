@@ -5,7 +5,6 @@ import os
 import subprocess
 import sys
 
-_XMP_SIDECAR_SUFFIX_CANDIDATES = (".xmp", ".XMP", ".Xmp")
 _APPLE_DOUBLE_METADATA_PREFIX = "._"
 
 
@@ -115,29 +114,12 @@ def unhide_path(path):
 
 
 def _find_sibling_xmp_sidecar_for_file(path):
+    """Compatibility wrapper around the strict shared lifecycle resolver."""
     if not path or not os.path.isfile(path):
         return ""
-    try:
-        source_abs = os.path.normpath(os.path.abspath(path))
-    except Exception:
-        return ""
-    if os.path.splitext(source_abs)[1].lower() == ".xmp":
-        return ""
-    base_path, _ = os.path.splitext(source_abs)
-    for suffix in _XMP_SIDECAR_SUFFIX_CANDIDATES:
-        candidate = base_path + suffix
-        if os.path.isfile(candidate):
-            return os.path.normpath(candidate)
+    from app_common.exif_io.xmp_sidecar import find_same_stem_xmp_sidecar
 
-    parent = os.path.dirname(source_abs)
-    target_name = os.path.basename(base_path).lower() + ".xmp"
-    try:
-        for entry in os.scandir(parent):
-            if entry.name.lower() == target_name and entry.is_file():
-                return os.path.normpath(entry.path)
-    except Exception:
-        return ""
-    return ""
+    return find_same_stem_xmp_sidecar(path) or ""
 
 
 def move_to_trash(path):

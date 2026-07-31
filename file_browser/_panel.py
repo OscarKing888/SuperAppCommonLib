@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import tempfile
 
 from app_common.perf_probe import elapsed_ms, perf_counter, perf_log, perf_probes_enabled
 from app_common.file_browser._browser_core import *
@@ -27,20 +28,27 @@ class FileListPanel(QWidget):
     """
     图像文件列表面板。
 
-    - 列表模式：含「文件名/标题/颜色/星级/城市/省区/国家」七列，可点击列头排序。
+    - 列表模式：显示文件名、标题、评分、连拍、相机/曝光及报告评分等字段，可排序。
     - 缩略图模式：图标网格，缩略图显示文件名与星级/Pick 标记，
       工具栏滑块可选 128/256/512/1024/2048 px 五档大小。
+    - report.db 只作为兼容读取/补水来源；所有用户元数据编辑写入 XMP sidecar。
     """
 
     # 子类可重载为 False 以不创建过滤栏（filter_bar）
     create_filter_bar = True
-    # report.db metadata 已停用；文件列表只读取 sidecar 和文件内 EXIF/XMP。
+    # Application-owned held-key playback is opt-in.  SuperBirdStamp subclasses
+    # intentionally keep native Qt selection/currentItemChanged semantics.
+    enable_key_navigation_playback = False
+    enable_in_memory_fast_preview = False
+    skip_uncached_fast_preview = False
+    # report.db is optional read-only fallback.  Subclasses may disable it.
     use_report_db = True
     # 子类可重载为 False，避免使用 .superpicky/cache 下的派生预览图与持久缩略图。
     use_preview_cache = True
 
     file_selected = pyqtSignal(str)
     file_fast_preview_requested = pyqtSignal(str)
+    file_fast_preview_pixmap_requested = pyqtSignal(str, object, int)
     files_loaded = pyqtSignal(object)
     focus_cache_batch_ready = pyqtSignal(object)
     _MODE_LIST  = 0
@@ -72,6 +80,10 @@ class FileListPanel(QWidget):
         self._directory_scope_cache: dict[bool, dict] = {}  # 当前目录 shallow/recursive 两个 scope 的文件列表缓存
         self._report_cache:  dict = {}   # legacy report row cache；sidecar/EXIF 模式下保持为空
         self._report_row_by_path: dict = {}
+        # report.db is immutable fallback input.  When a file is deleted we
+        # remember its exact (DB scope, canonical path) for this panel session
+        # so a later reload cannot resurrect the stale row.
+        self._report_deleted_path_tombstones: set[tuple[str, str]] = set()
         self._loaded_directory_recursive: bool = False
         self._requested_directory_recursive: bool = False
         self._pending_loaders: list = []
@@ -124,8 +136,16 @@ class FileListPanel(QWidget):
         self._selection_key_nav_auto_repeat: bool = False
         self._selection_key_nav_hold_active: bool = False
         self._thumb_selection_anchor_row: int = -1
+        self._tree_selection_anchor_row: int = -1
         self._key_navigation_fps: int = get_key_navigation_fps()
         self._key_navigation_last_step_at: float = 0.0
+        self._key_navigation_playback_timer: QTimer | None = None
+        self._key_navigation_playback_active: bool = False
+        self._key_navigation_playback_key = None
+        self._key_navigation_playback_view: str = ""
+        self._key_navigation_playback_modifiers = None
+        self._key_navigation_playback_final_path: str = ""
+        self._key_navigation_playback_advancing: bool = False
         self._combo_key_navigation_fps: QComboBox | None = None
         self._persistent_thumb_cache_worker: PersistentThumbCacheWorker | None = None
         self._persistent_thumb_cache_timer: QTimer | None = None
@@ -207,6 +227,7 @@ class FileListPanel(QWidget):
             create_filter_bar = getattr(type(self), "create_filter_bar", True)
         self._create_filter_bar = bool(create_filter_bar)
         self._init_ui()
+        self.installEventFilter(self)
         app = QApplication.instance()
         if app is not None:
             try:
@@ -1062,6 +1083,18 @@ class FileListPanel(QWidget):
             report_row_by_path = {}
             self._report_full_root_dir = None
             self._report_full_cache = None
+        else:
+            (
+                files,
+                report_cache,
+                full_report_cache,
+                report_row_by_path,
+            ) = self._filter_deleted_report_tombstones(
+                files,
+                report_cache,
+                full_report_cache,
+                report_row_by_path,
+            )
         self._probe_log("apply_listing.report_mode", elapsed_ms=elapsed_ms(step_t0), use_report_db=bool(self._use_report_db))
         if self._report_root_dir:
             self._report_full_root_dir = self._report_root_dir
@@ -1237,6 +1270,7 @@ class FileListPanel(QWidget):
         递归遍历该目录及所有子目录（不进入 . 开头目录）。过滤切换同目录 scope 时可复用当前内存中的
         文件列表和 metadata 缓存，避免重复全量读取。
         """
+        self._stop_key_navigation_playback(commit=False)
         load_t0 = perf_counter()
         recursive = True
         same_dir = path == self._current_dir
@@ -1273,7 +1307,8 @@ class FileListPanel(QWidget):
         if not same_dir:
             self._directory_scope_cache.clear()
             self._loaded_directory_recursive = False
-        # report.db metadata 已停用；保留旧字段清理，目录列表直接从文件系统扫描。
+        # Resolve an optional read-only report scope; no browser operation
+        # creates or mutates report.db.
         if self._use_report_db:
             probe_path = os.path.join(path, "__superviewer_scope_probe__.jpg")
             new_report_root_dir = _report_root_dir_for_file(probe_path, path)
@@ -2398,10 +2433,13 @@ class FileListPanel(QWidget):
         return "xmp_sidecar"
 
     def _resolve_metadata_write_target(self, path: str) -> str:
-        sidecar_path = self._resolve_sidecar_path(path)
-        if sidecar_path and os.path.isfile(sidecar_path):
-            return sidecar_path
         source_path = self._resolve_source_path_for_action(path)
+        try:
+            sidecar_path = find_same_stem_xmp_sidecar(source_path or path)
+        except Exception:
+            sidecar_path = None
+        if sidecar_path and os.path.isfile(sidecar_path):
+            return os.path.normpath(sidecar_path)
         if source_path and os.path.isfile(source_path):
             return source_path
         return source_path or sidecar_path or os.path.normpath(path)
@@ -2752,7 +2790,12 @@ class FileListPanel(QWidget):
         actual_path = self._get_actual_path_for_display(norm_path)
         return actual_path or norm_path
 
-    def _resolve_existing_sized_preview_image_path(self, path: str) -> str:
+    def _resolve_existing_sized_preview_image_path(
+        self,
+        path: str,
+        *,
+        exact_size_only: bool = False,
+    ) -> str:
         norm_path = os.path.normpath(path) if path else ""
         if not norm_path or not self._use_preview_cache:
             return ""
@@ -2764,12 +2807,17 @@ class FileListPanel(QWidget):
         source_path = actual_path or norm_path
         thumb_source = _resolve_thumb_source_path(source_path, report_cache, preview_base_dir)
         source_stamp = _thumb_source_stamp(source_path, thumb_source)
+        candidate_sizes = (
+            (int(self._thumb_size),)
+            if exact_size_only
+            else _effective_persistent_thumb_cache_sizes(self._thumb_size)
+        )
         persistent_thumb_path = _existing_persistent_thumb_cache_path_for_file(
             source_path,
             preview_base_dir,
             requested_size=self._thumb_size,
             source_stamp=source_stamp,
-            candidate_sizes=_effective_persistent_thumb_cache_sizes(self._thumb_size),
+            candidate_sizes=candidate_sizes,
             selected_dir=preview_base_dir,
         )
         if persistent_thumb_path:
@@ -4268,6 +4316,15 @@ class FileListPanel(QWidget):
         tree_viewport = tree_widget.viewport() if tree_widget is not None else None
         list_widget = getattr(self, "_list_widget", None)
         list_viewport = list_widget.viewport() if list_widget is not None else None
+        if event is not None:
+            event_type = event.type()
+            if event_type in (_EventFocusOut, _EventWindowDeactivate, _EventHide):
+                self._stop_key_navigation_playback(commit=False)
+            elif (
+                event_type == _EventMouseButtonPress
+                and obj in (tree_widget, tree_viewport, list_widget, list_viewport)
+            ):
+                self._stop_key_navigation_playback(commit=False)
         if event is not None and event.type() == _EventToolTip:
             if obj is tree_viewport and tree_widget is not None:
                 idx = tree_widget.indexAt(event.pos())
@@ -4374,13 +4431,18 @@ class FileListPanel(QWidget):
         ):
             key = event.key()
             if key in (_KeyUp, _KeyDown, _KeyLeft, _KeyRight):
-                if not self._accept_key_navigation_step(event):
-                    return True
+                if not bool(getattr(type(self), "enable_key_navigation_playback", False)):
+                    return super().eventFilter(obj, event)
+                if self._event_has_key_navigation_blocked_modifier(event):
+                    self._stop_key_navigation_playback(commit=False)
+                    return super().eventFilter(obj, event)
                 is_auto_repeat = self._event_is_auto_repeat(event)
-                self._selection_key_nav_auto_repeat = is_auto_repeat
-                self._selection_key_nav_hold_active = is_auto_repeat
                 if is_auto_repeat:
-                    QTimer.singleShot(0, lambda: setattr(self, "_selection_key_nav_auto_repeat", False))
+                    self._start_key_navigation_playback(event, view_name="tree")
+                    return True
+                self._stop_key_navigation_playback(commit=False)
+                current_index = tree_widget.currentIndex()
+                self._tree_selection_anchor_row = current_index.row() if current_index.isValid() else -1
         if (
             obj is tree_widget
             and event is not None
@@ -4389,8 +4451,15 @@ class FileListPanel(QWidget):
             and tree_widget is not None
         ):
             key = event.key()
-            if key in (_KeyUp, _KeyDown, _KeyLeft, _KeyRight):
-                self._commit_deferred_file_selected()
+            if (
+                key in (_KeyUp, _KeyDown, _KeyLeft, _KeyRight)
+                and bool(getattr(type(self), "enable_key_navigation_playback", False))
+            ):
+                if self._event_is_auto_repeat(event):
+                    return True
+                if self._key_navigation_playback_active and key == self._key_navigation_playback_key:
+                    self._stop_key_navigation_playback(commit=True)
+                    return True
         if (
             obj is list_widget
             and event is not None
@@ -4402,62 +4471,22 @@ class FileListPanel(QWidget):
             key = event.key()
             if key not in (_KeyUp, _KeyDown, _KeyLeft, _KeyRight):
                 return super().eventFilter(obj, event)
-            if not self._accept_key_navigation_step(event):
+            if not bool(getattr(type(self), "enable_key_navigation_playback", False)):
+                return super().eventFilter(obj, event)
+            if self._event_has_key_navigation_blocked_modifier(event):
+                self._stop_key_navigation_playback(commit=False)
+                return super().eventFilter(obj, event)
+            if self._event_is_auto_repeat(event):
+                self._start_key_navigation_playback(event, view_name="thumb")
                 return True
-            viewport = list_widget.viewport()
-            grid = list_widget.gridSize()
-            gw = max(1, grid.width())
-            cols = max(1, viewport.rect().width() // gw)
-            count = self._thumb_row_count()
-            current_index = list_widget.currentIndex()
-            idx = current_index.row() if current_index.isValid() else 0
-            row, col = idx // cols, idx % cols
-            new_idx = -1
-            if key == _KeyUp and row > 0:
-                new_idx = (row - 1) * cols + col
-            elif key == _KeyDown:
-                new_idx = (row + 1) * cols + col
-                if new_idx >= count:
-                    new_idx = -1
-            elif key == _KeyLeft and idx > 0:
-                new_idx = idx - 1
-            elif key == _KeyRight and idx < count - 1:
-                new_idx = idx + 1
-            if new_idx >= 0 and new_idx < count:
-                fast_preview = self._event_is_auto_repeat(event)
-                self._selection_key_nav_hold_active = fast_preview
-                shift = _ShiftModifier and (event.modifiers() & _ShiftModifier)
-                new_index = self._thumb_index_for_row(new_idx)
-                if not new_index.isValid():
-                    return True
-                if shift:
-                    sm = list_widget.selectionModel()
-                    anchor = self._thumb_selection_anchor_row
-                    if anchor < 0 or anchor >= count:
-                        anchor = idx
-                    self._thumb_selection_anchor_row = anchor
-                    lo, hi = min(anchor, new_idx), max(anchor, new_idx)
-                    list_widget.setCurrentIndex(new_index)
-                    list_widget.clearSelection()
-                    for i in range(lo, hi + 1):
-                        it = self._thumb_index_for_row(i)
-                        if it.isValid() and sm is not None:
-                            sm.select(it, _Select)
-                else:
-                    self._thumb_selection_anchor_row = new_idx
-                    list_widget.clearSelection()
-                    list_widget.setCurrentIndex(new_index)
-                    sm = list_widget.selectionModel()
-                    if sm is not None:
-                        sm.select(new_index, _SelectCurrent)
-                path = self._thumb_path_from_index(list_widget.currentIndex())
-                if path:
-                    self._handle_selection_preview_request(
-                        path,
-                        fast_preview=fast_preview,
-                        defer_full=fast_preview,
-                    )
-                return True
+            self._stop_key_navigation_playback(commit=False)
+            self._advance_key_navigation_step(
+                key,
+                event.modifiers(),
+                view_name="thumb",
+                fast_preview=False,
+            )
+            return True
         if (
             obj is list_widget
             and event is not None
@@ -4466,8 +4495,15 @@ class FileListPanel(QWidget):
             and list_widget is not None
         ):
             key = event.key()
-            if key in (_KeyUp, _KeyDown, _KeyLeft, _KeyRight):
-                self._commit_deferred_file_selected()
+            if (
+                key in (_KeyUp, _KeyDown, _KeyLeft, _KeyRight)
+                and bool(getattr(type(self), "enable_key_navigation_playback", False))
+            ):
+                if self._event_is_auto_repeat(event):
+                    return True
+                if self._key_navigation_playback_active and key == self._key_navigation_playback_key:
+                    self._stop_key_navigation_playback(commit=True)
+                    return True
         return super().eventFilter(obj, event)
 
     def _ensure_thumb_viewport_timer(self) -> None:
@@ -4778,6 +4814,7 @@ class FileListPanel(QWidget):
             self._report_thumb_profile("viewport")
 
     def _set_view_mode(self, mode: int) -> None:
+        self._stop_key_navigation_playback(commit=False)
         if self._view_mode == mode and self._stack.currentIndex() == (0 if mode == self._MODE_LIST else 1):
             self._update_selection_status()
             return
@@ -4854,6 +4891,10 @@ class FileListPanel(QWidget):
             value = 24
         self._key_navigation_fps = value
         self._key_navigation_last_step_at = 0.0
+        if self._key_navigation_playback_timer is not None:
+            self._key_navigation_playback_timer.setInterval(
+                max(1, int(round(1000.0 / float(max(1, value)))))
+            )
         self._sync_key_navigation_fps_combo()
         if not persist:
             return
@@ -4875,7 +4916,204 @@ class FileListPanel(QWidget):
             return
         self._set_key_navigation_fps(value, persist=True)
 
+    def _event_has_key_navigation_blocked_modifier(self, event) -> bool:
+        try:
+            modifiers = event.modifiers()
+        except Exception:
+            return False
+        for modifier in (_ControlModifier, _AltModifier, _MetaModifier):
+            if modifier and modifiers & modifier:
+                return True
+        return False
+
+    def _ensure_key_navigation_playback_timer(self) -> None:
+        if self._key_navigation_playback_timer is not None:
+            return
+        timer = QTimer(self)
+        timer.setSingleShot(False)
+        try:
+            timer.setTimerType(_PreciseTimer)
+        except Exception:
+            pass
+        timer.setInterval(max(1, int(round(1000.0 / float(max(1, self._key_navigation_fps))))))
+        timer.timeout.connect(self._on_key_navigation_playback_tick)
+        self._key_navigation_playback_timer = timer
+
+    def _start_key_navigation_playback(self, event, *, view_name: str) -> None:
+        if not bool(getattr(type(self), "enable_key_navigation_playback", False)):
+            return
+        try:
+            key = event.key()
+            modifiers = event.modifiers()
+        except Exception:
+            return
+        if key not in (_KeyUp, _KeyDown, _KeyLeft, _KeyRight):
+            return
+        if (
+            self._key_navigation_playback_active
+            and key == self._key_navigation_playback_key
+            and view_name == self._key_navigation_playback_view
+        ):
+            return
+        self._stop_key_navigation_playback(commit=False)
+        self._key_navigation_playback_active = True
+        self._key_navigation_playback_key = key
+        self._key_navigation_playback_view = str(view_name or "")
+        self._key_navigation_playback_modifiers = modifiers
+        self._key_navigation_playback_final_path = ""
+        self._selection_key_nav_hold_active = True
+        self._ensure_key_navigation_playback_timer()
+        # The first OS auto-repeat event is the first held-playback frame.
+        self._on_key_navigation_playback_tick()
+        timer = self._key_navigation_playback_timer
+        if self._key_navigation_playback_active and timer is not None and not timer.isActive():
+            timer.start()
+
+    def _on_key_navigation_playback_tick(self) -> None:
+        if not self._key_navigation_playback_active:
+            return
+        path = self._advance_key_navigation_step(
+            self._key_navigation_playback_key,
+            self._key_navigation_playback_modifiers,
+            view_name=self._key_navigation_playback_view,
+            fast_preview=True,
+        )
+        if path:
+            self._key_navigation_playback_final_path = os.path.normpath(path)
+
+    def _stop_key_navigation_playback(self, *, commit: bool) -> None:
+        timer = self._key_navigation_playback_timer
+        if timer is not None and timer.isActive():
+            timer.stop()
+        was_active = self._key_navigation_playback_active
+        final_path = self._key_navigation_playback_final_path or self._deferred_file_selected_path
+        self._key_navigation_playback_active = False
+        self._key_navigation_playback_key = None
+        self._key_navigation_playback_view = ""
+        self._key_navigation_playback_modifiers = None
+        self._key_navigation_playback_final_path = ""
+        self._key_navigation_playback_advancing = False
+        self._selection_key_nav_auto_repeat = False
+        self._selection_key_nav_hold_active = False
+        if commit and was_active and final_path:
+            self._deferred_file_selected_path = os.path.normpath(final_path)
+            self._commit_deferred_file_selected()
+        else:
+            self._cancel_deferred_file_selected()
+
+    def stop_key_navigation_playback(self, *, commit: bool = False) -> None:
+        """Idempotently stop application-owned held-key playback.
+
+        External owners should normally keep ``commit`` false during focus
+        changes and shutdown.  A real non-auto-repeat release is the only
+        normal caller that commits the final full selection.
+        """
+        self._stop_key_navigation_playback(commit=bool(commit))
+
+    def _advance_key_navigation_step(
+        self,
+        key,
+        modifiers,
+        *,
+        view_name: str,
+        fast_preview: bool,
+    ) -> str:
+        if view_name == "tree":
+            widget = self._tree_widget
+            model = widget.model()
+            count = int(model.rowCount()) if model is not None else 0
+            current_index = widget.currentIndex()
+            current_row = current_index.row() if current_index.isValid() else 0
+            delta = -1 if key in (_KeyUp, _KeyLeft) else 1
+            new_row = current_row + delta
+            if count <= 0 or new_row < 0 or new_row >= count:
+                return ""
+            column = current_index.column() if current_index.isValid() else 0
+            new_index = model.index(new_row, max(0, column))
+            if not new_index.isValid():
+                return ""
+            selection_model = widget.selectionModel()
+            shift = bool(_ShiftModifier and modifiers and modifiers & _ShiftModifier)
+            self._key_navigation_playback_advancing = bool(fast_preview)
+            try:
+                if shift and selection_model is not None:
+                    anchor = self._tree_selection_anchor_row
+                    if anchor < 0 or anchor >= count:
+                        anchor = current_row
+                    self._tree_selection_anchor_row = anchor
+                    widget.setCurrentIndex(new_index)
+                    widget.clearSelection()
+                    for row in range(min(anchor, new_row), max(anchor, new_row) + 1):
+                        index = model.index(row, max(0, column))
+                        if index.isValid():
+                            selection_model.select(index, _Select)
+                else:
+                    self._tree_selection_anchor_row = new_row
+                    widget.clearSelection()
+                    widget.setCurrentIndex(new_index)
+                    if selection_model is not None:
+                        selection_model.select(new_index, _SelectCurrent)
+            finally:
+                self._key_navigation_playback_advancing = False
+            path = self._tree_path_from_index(widget.currentIndex())
+        else:
+            widget = self._list_widget
+            viewport = widget.viewport()
+            grid = widget.gridSize()
+            cols = max(1, viewport.rect().width() // max(1, grid.width()))
+            count = self._thumb_row_count()
+            current_index = widget.currentIndex()
+            current_row = current_index.row() if current_index.isValid() else 0
+            grid_row, grid_col = divmod(current_row, cols)
+            new_row = -1
+            if key == _KeyUp and grid_row > 0:
+                new_row = (grid_row - 1) * cols + grid_col
+            elif key == _KeyDown:
+                candidate = (grid_row + 1) * cols + grid_col
+                new_row = candidate if candidate < count else -1
+            elif key == _KeyLeft and current_row > 0:
+                new_row = current_row - 1
+            elif key == _KeyRight and current_row < count - 1:
+                new_row = current_row + 1
+            if new_row < 0 or new_row >= count:
+                return ""
+            new_index = self._thumb_index_for_row(new_row)
+            if not new_index.isValid():
+                return ""
+            selection_model = widget.selectionModel()
+            shift = bool(_ShiftModifier and modifiers and modifiers & _ShiftModifier)
+            if shift and selection_model is not None:
+                anchor = self._thumb_selection_anchor_row
+                if anchor < 0 or anchor >= count:
+                    anchor = current_row
+                self._thumb_selection_anchor_row = anchor
+                widget.setCurrentIndex(new_index)
+                widget.clearSelection()
+                for row in range(min(anchor, new_row), max(anchor, new_row) + 1):
+                    index = self._thumb_index_for_row(row)
+                    if index.isValid():
+                        selection_model.select(index, _Select)
+            else:
+                self._thumb_selection_anchor_row = new_row
+                widget.clearSelection()
+                widget.setCurrentIndex(new_index)
+                if selection_model is not None:
+                    selection_model.select(new_index, _SelectCurrent)
+            path = self._thumb_path_from_index(widget.currentIndex())
+        if path:
+            self._handle_selection_preview_request(
+                path,
+                fast_preview=bool(fast_preview),
+                defer_full=bool(fast_preview),
+            )
+            return os.path.normpath(path)
+        return ""
+
     def _accept_key_navigation_step(self, event) -> bool:
+        """Compatibility helper retained for external subclasses.
+
+        Application-owned playback no longer calls this OS-repeat throttle.
+        """
         try:
             auto_repeat = bool(event.isAutoRepeat())
         except Exception:
@@ -5076,7 +5314,10 @@ class FileListPanel(QWidget):
             _log.info("[_start_metadata_loader] no paths, return")
             return
         self._stop_pending_meta_apply()
-        thumbnail_work_active = self._thumbnail_work_actively_running()
+        # Persistent thumbnail work is scheduled before metadata starts.  Count
+        # pending work as active so metadata keeps its reserved CPU budget and
+        # both independent worker pools may run concurrently.
+        thumbnail_work_active = self._thumbnail_work_active_or_pending()
         self._metadata_loader_workers = min(
             max(1, total),
             _metadata_loader_worker_count_for_thumbnail_state(thumbnail_work_active),
@@ -5207,22 +5448,118 @@ class FileListPanel(QWidget):
     def _emit_fast_preview_for_path(self, path: str) -> None:
         if not path:
             return
-        self._selected_display_path = os.path.normpath(path)
-        resolved_path = self._resolve_source_path_for_action(path)
-        preview_path = self.resolve_preview_path(path, prefer_fast_preview=True)
+        norm_path = os.path.normpath(path)
+        self._selected_display_path = norm_path
+        if bool(getattr(self, "enable_in_memory_fast_preview", False)):
+            pixmap_fn = getattr(self, "_current_thumbnail_fast_preview_pixmap", None)
+            pixmap = pixmap_fn(norm_path) if callable(pixmap_fn) else None
+            if isinstance(pixmap, QPixmap) and not pixmap.isNull():
+                self.file_fast_preview_pixmap_requested.emit(
+                    norm_path,
+                    pixmap,
+                    max(1, int(self._thumb_size or 128)),
+                )
+                return
+
+        preview_path = self.resolve_preview_path(norm_path, prefer_fast_preview=True)
+        resolved_path = ""
         if (
             preview_path
-            and resolved_path
-            and _path_key(preview_path) == _path_key(resolved_path)
+            and _path_key(preview_path) == _path_key(norm_path)
         ):
             preview_path = ""
+        if preview_path and os.path.isfile(preview_path):
+            self.file_fast_preview_requested.emit(preview_path)
+            return
+
+        if bool(getattr(self, "skip_uncached_fast_preview", False)):
+            prioritize_fn = getattr(self, "_prioritize_fast_preview_thumbnail", None)
+            if callable(prioritize_fn):
+                prioritize_fn(norm_path)
+            return
+
+        resolved_path = self._resolve_source_path_for_action(norm_path)
         if not preview_path or not os.path.isfile(preview_path):
-            preview_path = self._materialize_current_thumbnail_fast_preview(path)
+            preview_path = self._materialize_current_thumbnail_fast_preview(norm_path)
         if (not preview_path or not os.path.isfile(preview_path)) and (
             not resolved_path or not os.path.isfile(resolved_path)
         ):
-            self._request_actual_path_lookup(path)
-        self.file_fast_preview_requested.emit(preview_path or resolved_path or path)
+            self._request_actual_path_lookup(norm_path)
+        self.file_fast_preview_requested.emit(preview_path or resolved_path or norm_path)
+
+    def _current_thumbnail_fast_preview_pixmap(self, path: str):
+        """Return an already-decoded pixmap for exactly the selected tier."""
+        norm_path = os.path.normpath(path) if path else ""
+        if not norm_path:
+            return None
+        index = self._thumb_index_for_path(norm_path)
+        if index.isValid():
+            try:
+                entry_size = int(self._thumb_list_model.data(index, _ThumbSizeRole) or 0)
+            except Exception:
+                entry_size = 0
+            pixmap = self._thumb_list_model.data(index, _ThumbPixmapRole)
+            if (
+                entry_size == int(self._thumb_size)
+                and isinstance(pixmap, QPixmap)
+                and not pixmap.isNull()
+            ):
+                return pixmap
+        cached = self._thumb_memory_cache.get(norm_path, self._thumb_size)
+        if cached is None or cached.isNull():
+            return None
+        pixmap = QPixmap.fromImage(cached)
+        return pixmap if not pixmap.isNull() else None
+
+    def _prioritize_fast_preview_thumbnail(self, path: str) -> None:
+        """Prioritize an uncached exact-tier frame without blocking the GUI."""
+        norm_path = os.path.normpath(path) if path else ""
+        if not norm_path or self._background_shutdown_started:
+            return
+
+        loader = self._thumbnail_loader
+        if (
+            loader is not None
+            and loader.isRunning()
+            and int(getattr(loader, "_size", 0) or 0) == int(self._thumb_size)
+        ):
+            loader.promote([norm_path])
+        elif loader is None or not loader.isRunning():
+            self._thumb_request_token += 1
+            loader = ThumbnailLoader(
+                self._thumb_size,
+                self._thumb_request_token,
+                report_cache=self._report_full_cache or self._report_cache or {},
+                current_dir=self._current_dir if self._use_preview_cache else "",
+                thumb_cache=self._thumb_memory_cache,
+            )
+            loader.enqueue([norm_path], priority=ThumbnailLoader.PRIORITY_VISIBLE)
+            loader.set_desired_paths([norm_path], [])
+            loader.thumbnail_ready.connect(self._on_thumbnail_ready)
+            loader.finished.connect(self._schedule_visible_thumbnail_update)
+            self._thumbnail_loader = loader
+            loader.start()
+
+        persistent_worker = self._persistent_thumb_cache_worker
+        if persistent_worker is not None and persistent_worker.isRunning():
+            persistent_worker.enqueue_paths(
+                [norm_path],
+                self._current_dir,
+                report_cache=self._report_full_cache or self._report_cache or {},
+                sizes=(int(self._thumb_size),),
+                priority=-1,
+                replace_focus=True,
+            )
+        elif self._persistent_thumb_cache_base_dir:
+            pending = [
+                candidate
+                for candidate in self._persistent_thumb_cache_pending_paths
+                if _path_key(candidate) != _path_key(norm_path)
+            ]
+            self._persistent_thumb_cache_pending_paths = [norm_path, *pending]
+            self._persistent_thumb_cache_pending_priority = -1
+            self._ensure_persistent_thumb_cache_timer()
+            self._persistent_thumb_cache_timer.start(0)
 
     def _materialize_current_thumbnail_fast_preview(self, path: str) -> str:
         """把当前缩略图视图中已有的同尺寸缩略图落盘，供方向键快速预览复用。"""
@@ -5495,17 +5832,6 @@ class FileListPanel(QWidget):
         if not self._persistent_thumb_cache_pending_paths or not self._persistent_thumb_cache_base_dir:
             self._update_persistent_thumb_progress_widget()
             return
-        metadata_loader = self._metadata_loader
-        if metadata_loader is not None and metadata_loader.isRunning():
-            self._persistent_thumb_cache_status_text = "等待元数据读取完成后生成缩略图..."
-            self._update_persistent_thumb_progress_widget()
-            self._ensure_persistent_thumb_cache_timer()
-            self._persistent_thumb_cache_timer.start(_PERSISTENT_THUMB_CACHE_START_DELAY_MS)
-            _log.info(
-                "[_start_persistent_thumb_cache_worker] delayed until metadata loader finishes total=%s",
-                len(self._persistent_thumb_cache_pending_paths),
-            )
-            return
         existing_worker = self._persistent_thumb_cache_worker
         if existing_worker is not None and existing_worker.isRunning():
             self._persistent_thumb_cache_status_text = "生成预览缩略图"
@@ -5677,6 +6003,7 @@ class FileListPanel(QWidget):
         if self._background_shutdown_started:
             return
         self._background_shutdown_started = True
+        self._stop_key_navigation_playback(commit=False)
 
         directory_worker = self._directory_scan_worker
         lookup_workers = list(self._path_lookup_workers)
@@ -6261,12 +6588,15 @@ class FileListPanel(QWidget):
         )
 
     def _on_tree_item_clicked(self, index) -> None:
+        self._stop_key_navigation_playback(commit=False)
         path = self._tree_path_from_index(index)
         if path:
             self._handle_selection_preview_request(path)
 
     def _on_tree_current_item_changed(self, current, previous) -> None:
         """列表模式下键盘上下/Shift 改变当前项时触发刷新。"""
+        if self._key_navigation_playback_advancing:
+            return
         if current is None or not current.isValid():
             return
         path = self._tree_path_from_index(current)
@@ -6280,6 +6610,7 @@ class FileListPanel(QWidget):
             )
 
     def _on_list_item_clicked(self, index) -> None:
+        self._stop_key_navigation_playback(commit=False)
         path = self._thumb_path_from_index(index)
         if path:
             self._handle_selection_preview_request(path)
@@ -6327,7 +6658,10 @@ class FileListPanel(QWidget):
             seen.add(key)
             sidecars.append(abs_path)
 
-        add(self._resolve_sidecar_path(display_path))
+        # File lifecycle operations must never pull a parent/derived-stem XMP
+        # into a copy, move or trash operation.
+        _ = display_path
+        add(find_same_stem_xmp_sidecar(source_path))
         return sidecars
 
     @staticmethod
@@ -6499,7 +6833,7 @@ class FileListPanel(QWidget):
         for path in norm_paths:
             parent_key = os.path.normcase(os.path.dirname(path))
             if Path(path).suffix.lower() == ".xmp":
-                xmp_by_stem[(parent_key, Path(path).stem)] = path
+                xmp_by_stem[(parent_key, Path(path).stem.casefold())] = path
 
         paired_sidecars: set[str] = set()
         entries: list[dict[str, str]] = []
@@ -6508,7 +6842,7 @@ class FileListPanel(QWidget):
                 continue
             parent_key = os.path.normcase(os.path.dirname(path))
             sidecars = []
-            xmp_sidecar = xmp_by_stem.get((parent_key, Path(path).stem), "")
+            xmp_sidecar = xmp_by_stem.get((parent_key, Path(path).stem.casefold()), "")
             for sidecar in (xmp_sidecar,):
                 if not sidecar:
                     continue
@@ -6562,11 +6896,13 @@ class FileListPanel(QWidget):
         dest_dir: str,
         *,
         action: str,
+        reserved_destinations: set[str] | None = None,
     ) -> tuple[str, list[str]]:
         """计算主文件和 sidecar 的目标路径，避免覆盖并保持 sidecar 跟随主文件名。"""
         source = Path(source_path)
         base_stem = source.stem
         suffix = source.suffix
+        reserved = reserved_destinations if reserved_destinations is not None else set()
 
         for i in range(0, 10000):
             if i == 0:
@@ -6584,11 +6920,16 @@ class FileListPanel(QWidget):
             source_conflict = os.path.exists(dest_source) and not (
                 action == "cut" and self._same_file_path(source_path, dest_source)
             )
+            if os.path.normcase(os.path.normpath(dest_source)) in reserved:
+                source_conflict = True
             sidecar_conflict = False
             candidate_keys = {os.path.normcase(os.path.normpath(dest_source))}
             for sidecar_path, dest_sidecar in zip(sidecar_paths, dest_sidecars):
                 key = os.path.normcase(os.path.normpath(dest_sidecar))
                 if key in candidate_keys:
+                    sidecar_conflict = True
+                    break
+                if key in reserved:
                     sidecar_conflict = True
                     break
                 candidate_keys.add(key)
@@ -6598,8 +6939,164 @@ class FileListPanel(QWidget):
                     sidecar_conflict = True
                     break
             if not source_conflict and not sidecar_conflict:
+                reserved.update(candidate_keys)
                 return dest_source, dest_sidecars
         raise RuntimeError(f"无法为 {source.name} 生成不冲突的目标文件名。")
+
+    @classmethod
+    def _paste_file_bundle_transaction(
+        cls,
+        source_path: str,
+        sidecar_paths: list[str],
+        dest_source: str,
+        dest_sidecars: list[str],
+        *,
+        action: str,
+    ) -> list[str]:
+        """Copy/move one image and its sidecars as a rollback-safe bundle.
+
+        Every member is first staged in the destination directory.  Only after
+        all staging succeeds are the temporary files renamed to their final
+        names.  A failure in either phase removes copied output or restores
+        every moved source before the error is reported.
+        """
+        if action not in {"copy", "cut"}:
+            raise ValueError(f"Unsupported clipboard action: {action!r}")
+        if len(sidecar_paths) != len(dest_sidecars):
+            raise ValueError("Sidecar source/destination counts differ.")
+
+        pairs: list[tuple[str, str]] = [
+            (os.path.abspath(source_path), os.path.abspath(dest_source))
+        ]
+        pairs.extend(
+            (os.path.abspath(source), os.path.abspath(dest))
+            for source, dest in zip(sidecar_paths, dest_sidecars)
+        )
+        return cls._paste_path_pairs_transaction(pairs, action=action)
+
+    @classmethod
+    def _paste_path_pairs_transaction(
+        cls,
+        path_pairs: list[tuple[str, str]],
+        *,
+        action: str,
+    ) -> list[str]:
+        """Atomically stage/commit every pair in one clipboard paste."""
+        if action not in {"copy", "cut"}:
+            raise ValueError(f"Unsupported clipboard action: {action!r}")
+        pairs = [
+            (os.path.abspath(source), os.path.abspath(dest))
+            for source, dest in path_pairs
+        ]
+        pairs = [
+            (source, dest)
+            for source, dest in pairs
+            if not cls._same_file_path(source, dest)
+        ]
+        if not pairs:
+            return []
+
+        staged: list[tuple[str, str, str]] = []
+        committed: list[tuple[str, str, str]] = []
+        rollback_errors: list[str] = []
+        try:
+            for source, dest in pairs:
+                if not os.path.isfile(source):
+                    raise FileNotFoundError(source)
+                if os.path.exists(dest):
+                    raise FileExistsError(dest)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                fd, temp_path = tempfile.mkstemp(
+                    prefix=f".{Path(dest).name}.sbt-paste-",
+                    suffix=".tmp",
+                    dir=os.path.dirname(dest),
+                )
+                os.close(fd)
+                # mkstemp reserves a collision-free name.  Remove its empty
+                # placeholder so same-volume cut uses a fast rename instead
+                # of a copy-over-existing fallback on Windows.
+                os.remove(temp_path)
+                try:
+                    if action == "cut":
+                        shutil.move(source, temp_path)
+                    else:
+                        shutil.copy2(source, temp_path)
+                except Exception as stage_exc:
+                    stage_rollback_error = ""
+                    if action == "cut" and os.path.exists(temp_path) and not os.path.exists(source):
+                        try:
+                            # A filesystem move may complete and then raise
+                            # (for example while copying metadata).  Restore
+                            # the only surviving copy before unwinding.
+                            shutil.move(temp_path, source)
+                        except Exception as rollback_exc:
+                            stage_rollback_error = (
+                                f"{temp_path!r} -> {source!r}: {rollback_exc}"
+                            )
+                    elif os.path.exists(temp_path):
+                        try:
+                            os.remove(temp_path)
+                        except Exception as rollback_exc:
+                            stage_rollback_error = f"remove {temp_path!r}: {rollback_exc}"
+                    elif action == "cut" and not os.path.exists(source):
+                        stage_rollback_error = (
+                            f"both source and staging path are missing for {source!r}"
+                        )
+                    if stage_rollback_error:
+                        raise RuntimeError(
+                            f"Clipboard staging failed ({stage_exc}); rollback was incomplete: "
+                            f"{stage_rollback_error}"
+                        ) from stage_exc
+                    raise
+                staged.append((source, temp_path, dest))
+
+            for source, temp_path, dest in staged:
+                # Do not silently overwrite a destination created after the
+                # initial collision check.
+                if os.path.exists(dest):
+                    raise FileExistsError(dest)
+                os.replace(temp_path, dest)
+                committed.append((source, temp_path, dest))
+
+            touched: list[str] = []
+            for source, _temp_path, dest in committed:
+                if action == "cut":
+                    touched.append(source)
+                touched.append(dest)
+            return touched
+        except Exception as exc:
+            if action == "cut":
+                committed_by_source = {source: dest for source, _tmp, dest in committed}
+                staged_by_source = {source: temp for source, temp, _dest in staged}
+                for source, _temp_path, _dest in reversed(staged):
+                    current = committed_by_source.get(source) or staged_by_source.get(source)
+                    if not current or not os.path.exists(current):
+                        continue
+                    try:
+                        if os.path.exists(source):
+                            raise FileExistsError(source)
+                        shutil.move(current, source)
+                    except Exception as rollback_exc:
+                        rollback_errors.append(f"{current!r} -> {source!r}: {rollback_exc}")
+            else:
+                for _source, _temp_path, dest in reversed(committed):
+                    try:
+                        if os.path.exists(dest):
+                            os.remove(dest)
+                    except Exception as rollback_exc:
+                        rollback_errors.append(f"remove {dest!r}: {rollback_exc}")
+            for _source, temp_path, _dest in reversed(staged):
+                try:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                except Exception as rollback_exc:
+                    rollback_errors.append(f"remove {temp_path!r}: {rollback_exc}")
+            if rollback_errors:
+                raise RuntimeError(
+                    f"Clipboard bundle failed ({exc}); rollback was incomplete: "
+                    + "; ".join(rollback_errors)
+                ) from exc
+            raise
 
     def _paste_clipboard_to_current_dir(self) -> None:
         """将剪贴板中的文件粘贴到当前目录；内部剪切会移动，复制会复制。"""
@@ -6621,45 +7118,36 @@ class FileListPanel(QWidget):
         pasted_sources: list[str] = []
         touched_paths: list[str] = []
         failures: list[str] = []
+        paste_plans: list[tuple[str, list[str], str, list[str]]] = []
+        reserved_destinations: set[str] = set()
         for entry in entries:
             source_path = os.path.abspath(str(entry.get("source") or ""))
-            sidecar_paths = [
-                os.path.abspath(path)
-                for path in self._sidecar_paths_from_clipboard_entry(entry)
-                if path and os.path.isfile(path)
-            ]
             if not source_path or not os.path.isfile(source_path):
                 failures.append(source_path or "(empty)")
                 continue
+            declared_sidecars = {
+                os.path.normcase(os.path.normpath(os.path.abspath(path)))
+                for path in self._sidecar_paths_from_clipboard_entry(entry)
+                if path and os.path.isfile(path)
+            }
+            strict_sidecar = find_same_stem_xmp_sidecar(source_path)
+            sidecar_paths = []
+            if (
+                strict_sidecar
+                and os.path.normcase(os.path.normpath(os.path.abspath(strict_sidecar)))
+                in declared_sidecars
+            ):
+                sidecar_paths.append(os.path.abspath(strict_sidecar))
             try:
                 dest_source, dest_sidecars = self._unique_paste_destinations(
                     source_path,
                     sidecar_paths,
                     dest_dir,
                     action=action,
+                    reserved_destinations=reserved_destinations,
                 )
-                if action == "cut":
-                    if not self._same_file_path(source_path, dest_source):
-                        shutil.move(source_path, dest_source)
-                        touched_paths.extend([source_path, dest_source])
-                    for sidecar_path, dest_sidecar in zip(sidecar_paths, dest_sidecars):
-                        if not self._same_file_path(sidecar_path, dest_sidecar):
-                            shutil.move(sidecar_path, dest_sidecar)
-                            touched_paths.extend([sidecar_path, dest_sidecar])
-                else:
-                    shutil.copy2(source_path, dest_source)
-                    touched_paths.extend([dest_source])
-                    for sidecar_path, dest_sidecar in zip(sidecar_paths, dest_sidecars):
-                        shutil.copy2(sidecar_path, dest_sidecar)
-                        touched_paths.extend([dest_sidecar])
-                pasted_sources.append(dest_source)
-                _log.info(
-                    "[_paste_clipboard_to_current_dir] action=%r source=%r sidecars=%s dest=%r dest_sidecars=%s",
-                    action,
-                    source_path,
-                    sidecar_paths,
-                    dest_source,
-                    dest_sidecars,
+                paste_plans.append(
+                    (source_path, sidecar_paths, dest_source, dest_sidecars)
                 )
             except Exception as exc:
                 _log.warning(
@@ -6670,6 +7158,37 @@ class FileListPanel(QWidget):
                     exc,
                 )
                 failures.append(source_path)
+
+        # One clipboard payload is one transaction.  Do not leave a cut
+        # payload half-valid when a later entry fails.
+        if paste_plans and not failures:
+            path_pairs: list[tuple[str, str]] = []
+            for source_path, sidecar_paths, dest_source, dest_sidecars in paste_plans:
+                path_pairs.append((source_path, dest_source))
+                path_pairs.extend(zip(sidecar_paths, dest_sidecars))
+            try:
+                touched_paths = self._paste_path_pairs_transaction(
+                    path_pairs,
+                    action=action,
+                )
+                pasted_sources = [plan[2] for plan in paste_plans]
+                for source_path, sidecar_paths, dest_source, dest_sidecars in paste_plans:
+                    _log.info(
+                        "[_paste_clipboard_to_current_dir] action=%r source=%r sidecars=%s dest=%r dest_sidecars=%s",
+                        action,
+                        source_path,
+                        sidecar_paths,
+                        dest_source,
+                        dest_sidecars,
+                    )
+            except Exception as exc:
+                failures = [plan[0] for plan in paste_plans]
+                _log.warning(
+                    "[_paste_clipboard_to_current_dir] action=%r transaction failed entries=%s: %s",
+                    action,
+                    len(paste_plans),
+                    exc,
+                )
 
         if touched_paths:
             try:
@@ -6893,78 +7412,143 @@ class FileListPanel(QWidget):
             log_prefix="_on_tree_context_menu",
         )
 
-    def _collect_report_filenames_for_paths(self, paths: list[str]) -> list[str]:
-        filenames: list[str] = []
-        seen: set[str] = set()
-        for path in paths or []:
-            norm_path = os.path.normpath(path) if path else ""
-            row = self._get_report_row_for_path(norm_path)
-            filename = str((row or {}).get("filename") or Path(norm_path).stem or "").strip()
-            if not filename or filename in seen:
-                continue
-            seen.add(filename)
-            filenames.append(filename)
-        return filenames
+    def _report_scope_path_key(self, row: dict | None = None) -> str:
+        root = str((row or {}).get("_report_root_dir") or self._report_root_dir or "").strip()
+        return _path_key(os.path.abspath(root)) if root else ""
 
-    def _remove_report_cache_entries_for_filenames(self, filenames: list[str]) -> None:
-        filename_set = {str(name or "").strip() for name in filenames if str(name or "").strip()}
-        if not filename_set:
+    def _report_identity_keys_for_row(
+        self,
+        row: dict | None,
+        *,
+        fallback_path: str = "",
+    ) -> set[tuple[str, str]]:
+        if not isinstance(row, dict):
+            row = {}
+        root = str(row.get("_report_root_dir") or self._report_root_dir or "").strip()
+        scope_key = self._report_scope_path_key(row)
+        candidates = _report_row_candidate_paths(row, root)
+        if fallback_path:
+            candidates.append(os.path.abspath(fallback_path))
+        return {
+            (scope_key, _path_key(os.path.abspath(candidate)))
+            for candidate in candidates
+            if candidate
+        }
+
+    def _report_row_is_tombstoned(self, row: dict | None, *, fallback_path: str = "") -> bool:
+        tombstones = getattr(self, "_report_deleted_path_tombstones", set())
+        if not tombstones:
+            return False
+        identities = self._report_identity_keys_for_row(row, fallback_path=fallback_path)
+        return bool(identities.intersection(tombstones))
+
+    def _evict_tombstoned_report_cache_entries(self) -> None:
+        """Remove only exact stale report rows; duplicate stems remain intact."""
+        tombstones = getattr(self, "_report_deleted_path_tombstones", set())
+        if not tombstones:
             return
-        if isinstance(self._report_full_cache, dict):
-            for filename in filename_set:
-                self._report_full_cache.pop(filename, None)
-        if isinstance(self._report_cache, dict):
-            for filename in filename_set:
-                self._report_cache.pop(filename, None)
-        if self._report_row_by_path:
-            self._report_row_by_path = {
-                path: row
-                for path, row in self._report_row_by_path.items()
-                if str((row or {}).get("filename") or Path(path).stem or "").strip() not in filename_set
+
+        def filtered(cache):
+            if not isinstance(cache, dict):
+                return cache
+            return {
+                key: row
+                for key, row in cache.items()
+                if not self._report_row_is_tombstoned(row)
             }
-        _log.info(
-            "[_remove_report_cache_entries_for_filenames] removed=%s full_cache=%s selected_cache=%s path_map=%s",
-            len(filename_set),
-            len(self._report_full_cache or {}),
-            len(self._report_cache or {}),
-            len(self._report_row_by_path or {}),
+
+        self._report_full_cache = filtered(self._report_full_cache)
+        self._report_cache = filtered(self._report_cache) or {}
+        self._report_row_by_path = {
+            path: row
+            for path, row in (self._report_row_by_path or {}).items()
+            if not self._report_row_is_tombstoned(row, fallback_path=path)
+        }
+        try:
+            self._meta_proxy.report_db.update_cache(self._report_full_cache or self._report_cache or {})
+        except Exception:
+            pass
+
+    def _filter_deleted_report_tombstones(
+        self,
+        files: list[str],
+        report_cache: dict,
+        full_report_cache,
+        report_row_by_path: dict | None,
+    ) -> tuple[list[str], dict, object, dict]:
+        """Suppress stale DB-only paths while allowing a newly recreated file."""
+        if not getattr(self, "_report_deleted_path_tombstones", set()):
+            return files, report_cache, full_report_cache, dict(report_row_by_path or {})
+        path_rows = dict(report_row_by_path or {})
+        filtered_files: list[str] = []
+        for path in files:
+            norm_path = os.path.normpath(path) if path else ""
+            row = path_rows.get(norm_path)
+            if row is None:
+                row = _report_row_from_cache_for_path(norm_path, full_report_cache or report_cache or {})
+            if (
+                norm_path
+                and not os.path.isfile(norm_path)
+                and self._report_row_is_tombstoned(row, fallback_path=norm_path)
+            ):
+                continue
+            filtered_files.append(path)
+
+        def filtered_cache(cache):
+            if not isinstance(cache, dict):
+                return cache
+            return {
+                key: row
+                for key, row in cache.items()
+                if not self._report_row_is_tombstoned(row)
+            }
+
+        allowed_paths = {_path_key(path) for path in filtered_files if path}
+        filtered_path_rows = {
+            path: row
+            for path, row in path_rows.items()
+            if _path_key(path) in allowed_paths
+            and not self._report_row_is_tombstoned(row, fallback_path=path)
+        }
+        return (
+            filtered_files,
+            filtered_cache(report_cache) or {},
+            filtered_cache(full_report_cache),
+            filtered_path_rows,
         )
 
-    def _delete_report_rows_for_paths(self, paths: list[str]) -> int:
-        if not self._file_writes_allowed("删除 report.db 记录"):
-            return 0
-        if not self._use_report_db:
-            _log.info("[_delete_report_rows_for_paths] skip reason=report_db_disabled")
-            return 0
-        filenames = self._collect_report_filenames_for_paths(paths)
-        if not filenames:
-            _log.info("[_delete_report_rows_for_paths] skip reason=no_filenames")
-            return 0
-        db_dir = self._report_root_dir or self._current_dir
-        db = ReportDB.open_if_exists(db_dir) if db_dir else None
-        if db is None:
-            _log.info("[_delete_report_rows_for_paths] skip db_dir=%r reason=no_report_db", db_dir)
-            return 0
-        try:
-            deleted = db.delete_photos_by_filenames(filenames)
-        except Exception as exc:
-            _log.warning(
-                "[_delete_report_rows_for_paths] db_dir=%r filenames=%s delete_failed: %s",
-                db_dir,
-                len(filenames),
-                exc,
+    def _delete_report_rows_for_paths(
+        self,
+        paths: list[str],
+        *,
+        resolved_paths: list[str] | None = None,
+    ) -> int:
+        """Tombstone exact deleted fallback rows without mutating report.db."""
+        if not hasattr(self, "_report_deleted_path_tombstones"):
+            self._report_deleted_path_tombstones = set()
+        resolved = list(resolved_paths or [])
+        added = 0
+        for index, path in enumerate(paths or []):
+            norm_path = os.path.normpath(path) if path else ""
+            if not norm_path:
+                continue
+            row = self._get_report_row_for_path(norm_path)
+            actual_path = (
+                os.path.normpath(resolved[index])
+                if index < len(resolved) and resolved[index]
+                else norm_path
             )
-            return 0
-        finally:
-            db.close()
-        self._remove_report_cache_entries_for_filenames(filenames)
+            identity = (self._report_scope_path_key(row), _path_key(os.path.abspath(actual_path)))
+            if identity not in self._report_deleted_path_tombstones:
+                self._report_deleted_path_tombstones.add(identity)
+                added += 1
+        self._evict_tombstoned_report_cache_entries()
         _log.info(
-            "[_delete_report_rows_for_paths] db_dir=%r filenames=%s deleted=%s",
-            db_dir,
-            len(filenames),
-            deleted,
+            "[_delete_report_rows_for_paths] read_only_exact_tombstones added=%s session_total=%s",
+            added,
+            len(self._report_deleted_path_tombstones),
         )
-        return deleted
+        return 0
 
     def _collect_thumbnail_cache_paths_for_source(self, source_path: str) -> list[str]:
         """收集源文件对应的缩略图缓存路径；需在移动/删除源文件前调用。"""
@@ -7040,7 +7624,7 @@ class FileListPanel(QWidget):
         return deleted
 
     def _move_paths_to_trash(self, paths: list) -> None:
-        """将选中路径移动到垃圾桶，并同步删除 report.db 中对应记录。"""
+        """将选中路径及同 stem XMP 移到垃圾桶；report.db 始终只读。"""
         if not paths:
             return
         if not self._file_operation_paths_allowed(paths, "删除文件", warn=True):
@@ -7048,6 +7632,7 @@ class FileListPanel(QWidget):
         ok_count = 0
         deleted_thumb_cache_count = 0
         moved_display_paths: list[str] = []
+        moved_resolved_paths: list[str] = []
         for p in paths:
             norm_path = os.path.normpath(p) if p else ""
             if not norm_path:
@@ -7059,6 +7644,7 @@ class FileListPanel(QWidget):
                 if move_to_trash(target_path):
                     ok_count += 1
                     moved_display_paths.append(norm_path)
+                    moved_resolved_paths.append(target_path)
                     deleted_thumb_cache_count += self._delete_thumbnail_cache_paths(thumb_cache_paths)
                     _log.info(
                         "[_move_paths_to_trash] moved source=%r target=%r",
@@ -7072,7 +7658,10 @@ class FileListPanel(QWidget):
                     target_path,
                 )
         if moved_display_paths:
-            self._delete_report_rows_for_paths(moved_display_paths)
+            self._delete_report_rows_for_paths(
+                moved_display_paths,
+                resolved_paths=moved_resolved_paths,
+            )
         if deleted_thumb_cache_count:
             _log.info("[_move_paths_to_trash] deleted_thumb_cache=%s", deleted_thumb_cache_count)
         if ok_count and self._current_dir:

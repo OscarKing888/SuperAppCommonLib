@@ -185,6 +185,109 @@ def test_report_db_read_remains_compatible_with_old_rows_missing_new_columns(tmp
     assert "gbif_rarity_100" not in meta
 
 
+def test_report_cache_index_distinguishes_duplicate_stems_by_path(tmp_path: Path) -> None:
+    first = tmp_path / "day1" / "img001.jpg"
+    second = tmp_path / "day2" / "img001.jpg"
+    first.parent.mkdir()
+    second.parent.mkdir()
+    rows = {
+        "img001": {
+            "filename": "img001",
+            "current_path": str(first.relative_to(tmp_path)),
+            "rating": 1,
+        },
+        "img001\0duplicate": {
+            "filename": "img001",
+            "current_path": str(second.relative_to(tmp_path)),
+            "rating": 5,
+        },
+    }
+    provider = PhotoMetaDataReportDB(report_root=str(tmp_path), cache=rows)
+
+    assert provider.read(str(first))["rating"] == 1
+    assert provider.read(str(second))["rating"] == 5
+
+
+def test_report_cache_reads_do_not_rescan_all_rows(tmp_path: Path) -> None:
+    class _CountingCache(dict):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.values_calls = 0
+
+        def values(self):
+            self.values_calls += 1
+            return super().values()
+
+    photo = tmp_path / "img001.jpg"
+    cache = _CountingCache(
+        {
+            "img001": {
+                "filename": "img001",
+                "current_path": "img001.jpg",
+                "rating": 4,
+            }
+        }
+    )
+    provider = PhotoMetaDataReportDB(report_root=str(tmp_path), cache=cache)
+    build_calls = cache.values_calls
+
+    for _ in range(10):
+        assert provider.read(str(photo))["rating"] == 4
+
+    assert build_calls == 1
+    assert cache.values_calls == build_calls
+
+
+def test_report_cache_unique_stem_fallback_is_scoped_to_report_root(tmp_path: Path) -> None:
+    first_root = tmp_path / "library_a"
+    second_root = tmp_path / "library_b"
+    first_root.mkdir()
+    second_root.mkdir()
+    rows = {
+        "img001": {
+            "filename": "img001",
+            "_report_root_dir": str(first_root),
+            "rating": 1,
+        },
+        "img001\0other_scope": {
+            "filename": "img001",
+            "_report_root_dir": str(second_root),
+            "rating": 5,
+        },
+    }
+    provider = PhotoMetaDataReportDB(report_root=str(first_root), cache=rows)
+
+    assert provider.read(str(first_root / "img001.jpg"))["rating"] == 1
+    assert provider.read(str(second_root / "img001.jpg"))["rating"] == 5
+    assert provider.row_for(str(first_root / "img001.jpg"))["rating"] == 1
+    assert provider.row_for(str(second_root / "img001.jpg"))["rating"] == 5
+
+
+def test_report_db_index_reloads_when_db_mtime_changes(tmp_path: Path) -> None:
+    photo = tmp_path / "img001.jpg"
+    photo.write_bytes(b"not an image")
+    db = ReportDB(str(tmp_path))
+    try:
+        db.insert_photo({"filename": "img001", "rating": 1})
+        db_path = Path(db.db_path)
+    finally:
+        db.close()
+    provider = PhotoMetaDataReportDB(report_root=str(tmp_path))
+
+    assert provider.read(str(photo))["rating"] == 1
+
+    db = ReportDB.open_if_exists(str(tmp_path))
+    assert db is not None
+    try:
+        assert db.update_photo("img001", {"rating": 5})
+    finally:
+        db.close()
+    current_mtime = db_path.stat().st_mtime_ns
+    os.utime(db_path, ns=(current_mtime + 1_000_000_000, current_mtime + 1_000_000_000))
+
+    assert provider.read(str(photo))["rating"] == 5
+
+
 def test_proxy_write_routes_only_to_xmp_source() -> None:
     exif = _EmptyMeta()
     xmp = _FakeXmpMeta("4")
@@ -235,6 +338,21 @@ def test_xmp_write_maps_legacy_exif_title_to_sidecar(tmp_path: Path) -> None:
     meta = PhotoMetaDataProxy().read(str(photo_path))
     assert meta.get("XMP-dc:Title") == "sidecar title"
     assert meta.get("Title") == "sidecar title"
+
+
+def test_xmp_write_does_not_modify_parent_sidecar_for_derived_export(tmp_path: Path) -> None:
+    parent_sidecar = tmp_path / "IMG_0001.xmp"
+    export_dir = tmp_path / "exports"
+    export_dir.mkdir()
+    derived = export_dir / "IMG_0001-DxO_DeepPRIME.jpg"
+    parent_content = "<x:xmpmeta>source metadata</x:xmpmeta>"
+    parent_sidecar.write_text(parent_content, encoding="utf-8")
+    derived.write_bytes(b"not an image")
+
+    assert PhotoMetaDataXMP().write_title(str(derived), "Derived title")
+
+    assert parent_sidecar.read_text(encoding="utf-8") == parent_content
+    assert (export_dir / "IMG_0001-DxO_DeepPRIME.xmp").is_file()
 
 
 def test_read_batch_metadata_exposes_sidecar_description_aliases(tmp_path: Path) -> None:

@@ -177,57 +177,60 @@ def run_exiftool_assignments(path: str, assignments: list[str]) -> None:
         )
     path_norm = os.path.normpath(path)
     target_norm = path_norm
-    if os.path.splitext(path_norm)[1].lower() == ".xmp":
-        args = ["-overwrite_original", "-charset", "filename=UTF8", *assignments, path_norm]
-    else:
-        try:
-            from app_common.exif_io.xmp_sidecar import find_xmp_sidecar
-            found = find_xmp_sidecar(path_norm)
-        except Exception:
-            found = None
-        target_norm = os.path.normpath(found or os.path.splitext(path_norm)[0] + ".xmp")
-        if found:
-            args = ["-overwrite_original", "-charset", "filename=UTF8", *assignments, target_norm]
+    from app_common.exif_io.exiftool_runner import utf8_safe_exiftool_assignments
+
+    with utf8_safe_exiftool_assignments(assignments) as safe_assignments:
+        if os.path.splitext(path_norm)[1].lower() == ".xmp":
+            args = ["-overwrite_original", "-charset", "filename=UTF8", *safe_assignments, path_norm]
         else:
-            args = [
-                "-overwrite_original",
-                "-charset",
-                "filename=UTF8",
-                *assignments,
-                "-o",
-                target_norm,
-                path_norm,
-            ]
+            try:
+                from app_common.exif_io.xmp_sidecar import find_same_stem_xmp_sidecar
+                found = find_same_stem_xmp_sidecar(path_norm)
+            except Exception:
+                found = None
+            target_norm = os.path.normpath(found or os.path.splitext(path_norm)[0] + ".xmp")
+            if found:
+                args = ["-overwrite_original", "-charset", "filename=UTF8", *safe_assignments, target_norm]
+            else:
+                args = [
+                    "-overwrite_original",
+                    "-charset",
+                    "filename=UTF8",
+                    *safe_assignments,
+                    "-o",
+                    target_norm,
+                    path_norm,
+                ]
 
-    def _invoke(*, ignore_minor: bool) -> subprocess.CompletedProcess:
-        cmd_args = []
-        if ignore_minor:
-            # 针对 DxO 导出的部分 TIFF，写入时可能出现 [minor] Error copying hidden data。
-            # 加 -m 后会降级为 warning 并完成写入。
-            cmd_args.append("-m")
-        cmd_args.extend(args)
-        return run_exiftool(
-            exiftool_path,
-            cmd_args,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
+        def _invoke(*, ignore_minor: bool) -> subprocess.CompletedProcess:
+            cmd_args = []
+            if ignore_minor:
+                # 针对 DxO 导出的部分 TIFF，写入时可能出现 [minor] Error copying hidden data。
+                # 加 -m 后会降级为 warning 并完成写入。
+                cmd_args.append("-m")
+            cmd_args.extend(args)
+            return run_exiftool(
+                exiftool_path,
+                cmd_args,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
 
-    cp = _invoke(ignore_minor=False)
-    if cp.returncode == 0:
-        return
-
-    detail = _format_process_message(cp.stdout or "", cp.stderr or "")
-    if _is_hidden_data_minor_copy_error(detail):
-        _cleanup_exiftool_temp_output(target_norm)
-        cp_retry = _invoke(ignore_minor=True)
-        if cp_retry.returncode == 0:
+        cp = _invoke(ignore_minor=False)
+        if cp.returncode == 0:
             return
-        retry_detail = _format_process_message(cp_retry.stdout or "", cp_retry.stderr or "")
-        raise RuntimeError(f"ExifTool 写入失败：{retry_detail}")
 
-    raise RuntimeError(f"ExifTool 写入失败：{detail}")
+        detail = _format_process_message(cp.stdout or "", cp.stderr or "")
+        if _is_hidden_data_minor_copy_error(detail):
+            _cleanup_exiftool_temp_output(target_norm)
+            cp_retry = _invoke(ignore_minor=True)
+            if cp_retry.returncode == 0:
+                return
+            retry_detail = _format_process_message(cp_retry.stdout or "", cp_retry.stderr or "")
+            raise RuntimeError(f"ExifTool 写入失败：{retry_detail}")
+
+        raise RuntimeError(f"ExifTool 写入失败：{detail}")
 
 
 def write_exif_with_exiftool(path: str, ifd_name: str, tag_id: int, new_val: str, raw_value) -> None:

@@ -385,10 +385,10 @@ class PhotoMetaDataXMP(PhotoMetaData):
     SUBJECT_KEYS = _XMP_SUBJECT_KEYS
 
     def sidecar_path_for(self, path: str) -> Path:
-        """Return the existing or default sidecar path for ``path``."""
+        """Return only the strict same-stem sidecar or its default write path."""
         try:
-            from .xmp_sidecar import find_xmp_sidecar
-            found = find_xmp_sidecar(path)
+            from .xmp_sidecar import find_same_stem_xmp_sidecar
+            found = find_same_stem_xmp_sidecar(path)
             if found:
                 return Path(found)
         except Exception:
@@ -496,27 +496,34 @@ class PhotoMetaDataXMP(PhotoMetaData):
 
         try:
             from .exiftool_path import get_exiftool_executable_path
-            from .exiftool_runner import run_exiftool
+            from .exiftool_runner import run_exiftool, utf8_safe_exiftool_assignments
             et = get_exiftool_executable_path()
             if not et:
                 return False
             xmp_path = str(self.sidecar_path_for(path))
             # exiftool: write to sidecar only
             assignments = [f"-{k}={v}" for k, v in remaining_fields.items()]
-            # Existing sidecars are edited directly; new sidecars are created from the image.
-            if os.path.isfile(xmp_path):
-                all_args = ["-overwrite_original", "-charset", "filename=UTF8", *assignments, xmp_path]
-            else:
-                all_args = [
-                    "-overwrite_original",
-                    "-charset",
-                    "filename=UTF8",
-                    *assignments,
-                    "-o",
-                    xmp_path,
-                    os.path.normpath(path),
-                ]
-            cp = run_exiftool(et, all_args)
+            with utf8_safe_exiftool_assignments(assignments) as safe_assignments:
+                # Existing sidecars are edited directly; new sidecars are created from the image.
+                if os.path.isfile(xmp_path):
+                    all_args = [
+                        "-overwrite_original",
+                        "-charset",
+                        "filename=UTF8",
+                        *safe_assignments,
+                        xmp_path,
+                    ]
+                else:
+                    all_args = [
+                        "-overwrite_original",
+                        "-charset",
+                        "filename=UTF8",
+                        *safe_assignments,
+                        "-o",
+                        xmp_path,
+                        os.path.normpath(path),
+                    ]
+                cp = run_exiftool(et, all_args)
             ok = cp.returncode == 0
             if ok:
                 self._hydrate_report_db_sidecar_if_needed(
@@ -1215,14 +1222,16 @@ def extract_exposure_settings(metadata: dict[str, Any] | None) -> tuple[str, str
 # ---------------------------------------------------------------------------
 
 class PhotoMetaDataReportDB(PhotoMetaData):
-    """Reads / writes metadata stored in a SuperPicky ``report.db``.
+    """Read-only metadata fallback backed by a SuperPicky ``report.db``.
 
     Two modes:
-    * **Cache mode** – supply ``cache`` (a ``stem → row_dict`` mapping already
-      loaded by ``DirectoryScanWorker``).  All reads are O(1) in-memory lookups.
+    * **Cache mode** – supply ``cache`` (an arbitrary unique row-key to
+      ``row_dict`` mapping already loaded by a scanner/editor). Path/stem
+      indexes are built once when the cache changes, so reads do not scan
+      every row. Cache keys are not used for resolution.
     * **DB mode** – supply ``report_root`` (directory containing ``.superpicky``).
-      Each :meth:`read` opens the DB for a single ``get_photo`` query.
-      Prefer cache mode for bulk reads inside the file browser.
+      Rows are indexed on first use and rebuilt when the DB path/mtime/size
+      signature changes.  Prefer cache mode for bulk reads inside the browser.
 
     Call :meth:`update_cache` / :meth:`update_report_root` when the active
     directory changes.
@@ -1238,7 +1247,19 @@ class PhotoMetaDataReportDB(PhotoMetaData):
         cache: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self._report_root = report_root
-        self._cache = cache  # stem → row_dict (may be None)
+        self._cache = cache  # unique row key → row_dict (may be None)
+        self._cache_path_index: dict[str, dict[str, Any]] = {}
+        self._cache_relative_index: dict[tuple[str, str], dict[str, Any]] = {}
+        self._cache_stem_index: dict[str, list[dict[str, Any]]] = {}
+        self._cache_scoped_stem_index: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        self._cache_scope_roots: dict[str, str] = {}
+        self._db_index_signature: tuple[str, int, int] | None = None
+        self._db_path_index: dict[str, dict[str, Any]] = {}
+        self._db_relative_index: dict[tuple[str, str], dict[str, Any]] = {}
+        self._db_stem_index: dict[str, list[dict[str, Any]]] = {}
+        self._db_scoped_stem_index: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        self._db_scope_roots: dict[str, str] = {}
+        self._rebuild_cache_indexes()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -1252,9 +1273,16 @@ class PhotoMetaDataReportDB(PhotoMetaData):
         except Exception:
             return os.path.normcase(os.path.normpath(path))
 
-    def _row_candidate_paths(self, row: dict[str, Any]) -> list[str]:
+    def _row_candidate_paths(
+        self,
+        row: dict[str, Any],
+        *,
+        report_root: str | None = None,
+    ) -> list[str]:
         candidates: list[str] = []
-        base_dir = self._report_root or ""
+        base_dir = str((row or {}).get("_report_root_dir") or "").strip()
+        if not base_dir:
+            base_dir = report_root if report_root is not None else (self._report_root or "")
         for key in ("current_path", "_current_path_report_raw", "original_path"):
             text = str((row or {}).get(key) or "").strip()
             if not text:
@@ -1278,9 +1306,18 @@ class PhotoMetaDataReportDB(PhotoMetaData):
                 pass
         return candidates
 
-    def _row_matches_path(self, row: dict[str, Any], path: str) -> bool:
+    def _row_matches_path(
+        self,
+        row: dict[str, Any],
+        path: str,
+        *,
+        report_root: str | None = None,
+    ) -> bool:
         target_key = self._path_key(path)
-        if target_key and any(self._path_key(candidate) == target_key for candidate in self._row_candidate_paths(row)):
+        if target_key and any(
+            self._path_key(candidate) == target_key
+            for candidate in self._row_candidate_paths(row, report_root=report_root)
+        ):
             return True
         has_path_fields = any(
             str((row or {}).get(key) or "").strip()
@@ -1289,20 +1326,175 @@ class PhotoMetaDataReportDB(PhotoMetaData):
         if has_path_fields:
             return False
         stem = Path(path).stem if path else ""
-        return bool(stem and str((row or {}).get("filename") or "").strip() == stem)
+        return bool(
+            stem
+            and str((row or {}).get("filename") or "").strip().casefold() == stem.casefold()
+        )
+
+    def _build_row_indexes(
+        self,
+        rows,
+        *,
+        report_root: str | None = None,
+    ) -> tuple[
+        dict[str, dict[str, Any]],
+        dict[tuple[str, str], dict[str, Any]],
+        dict[str, list[dict[str, Any]]],
+        dict[tuple[str, str], list[dict[str, Any]]],
+        dict[str, str],
+    ]:
+        path_index: dict[str, dict[str, Any]] = {}
+        relative_index: dict[tuple[str, str], dict[str, Any]] = {}
+        stem_index: dict[str, list[dict[str, Any]]] = {}
+        scoped_stem_index: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        scope_roots: dict[str, str] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_root = str(row.get("_report_root_dir") or report_root or "").strip()
+            scope_key = self._path_key(row_root)
+            if scope_key:
+                scope_roots.setdefault(scope_key, os.path.abspath(row_root))
+            stems: set[str] = set()
+            filename = str(row.get("filename") or "").strip()
+            if filename:
+                stems.add(filename.casefold())
+            for candidate in self._row_candidate_paths(row, report_root=row_root):
+                path_key = self._path_key(candidate)
+                if path_key:
+                    path_index.setdefault(path_key, row)
+                if row_root:
+                    try:
+                        relative = os.path.relpath(
+                            os.path.abspath(candidate),
+                            os.path.abspath(row_root),
+                        )
+                        if relative != os.pardir and not relative.startswith(os.pardir + os.sep):
+                            relative_key = os.path.normcase(os.path.normpath(relative))
+                            relative_index.setdefault((scope_key, relative_key), row)
+                    except Exception:
+                        pass
+                candidate_stem = Path(candidate).stem
+                if candidate_stem:
+                    stems.add(candidate_stem.casefold())
+            for stem in stems:
+                stem_index.setdefault(stem, []).append(row)
+                if scope_key:
+                    scoped_stem_index.setdefault((scope_key, stem), []).append(row)
+        return (
+            path_index,
+            relative_index,
+            stem_index,
+            scoped_stem_index,
+            scope_roots,
+        )
+
+    def _rebuild_cache_indexes(self) -> None:
+        if self._cache is None:
+            self._cache_path_index = {}
+            self._cache_relative_index = {}
+            self._cache_stem_index = {}
+            self._cache_scoped_stem_index = {}
+            self._cache_scope_roots = {}
+            return
+        (
+            self._cache_path_index,
+            self._cache_relative_index,
+            self._cache_stem_index,
+            self._cache_scoped_stem_index,
+            self._cache_scope_roots,
+        ) = self._build_row_indexes(self._cache.values(), report_root=self._report_root)
+
+    def _row_from_indexes(
+        self,
+        path: str,
+        path_index: dict[str, dict[str, Any]],
+        relative_index: dict[tuple[str, str], dict[str, Any]],
+        stem_index: dict[str, list[dict[str, Any]]],
+        scoped_stem_index: dict[tuple[str, str], list[dict[str, Any]]],
+        scope_roots: dict[str, str],
+        *,
+        report_root: str | None = None,
+    ) -> dict[str, Any] | None:
+        target_key = self._path_key(path)
+        if target_key:
+            exact = path_index.get(target_key)
+            if isinstance(exact, dict):
+                return exact
+        stem = Path(path).stem.casefold() if path else ""
+        target_abs = os.path.abspath(path) if path else ""
+        matching_scopes: list[tuple[int, str, str]] = []
+        for scope_key, scope_root in scope_roots.items():
+            try:
+                relative = os.path.relpath(target_abs, scope_root)
+            except Exception:
+                continue
+            if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+                continue
+            matching_scopes.append(
+                (
+                    len(scope_root),
+                    scope_key,
+                    os.path.normcase(os.path.normpath(relative)),
+                )
+            )
+        # A nested DB scope takes precedence over any ancestor scope.
+        for _root_length, scope_key, relative_key in sorted(matching_scopes, reverse=True):
+            exact_relative = relative_index.get((scope_key, relative_key))
+            if isinstance(exact_relative, dict):
+                return exact_relative
+            scoped_rows = scoped_stem_index.get((scope_key, stem), ())
+            for row in scoped_rows:
+                if self._row_matches_path(
+                    row,
+                    path,
+                    report_root=scope_roots[scope_key],
+                ):
+                    return row
+            if len(scoped_rows) == 1:
+                return scoped_rows[0]
+        stem_rows = stem_index.get(stem, ())
+        for row in stem_rows:
+            if self._row_matches_path(row, path, report_root=report_root):
+                return row
+        # A filename is UNIQUE inside one report.db.  A cache merged from
+        # multiple DB scopes can contain duplicates, so stem fallback is safe
+        # only when this root-scoped index has exactly one candidate.
+        if len(stem_rows) == 1:
+            return stem_rows[0]
+        return None
+
+    def _ensure_db_indexes(self, root: str, db) -> None:
+        try:
+            db_path = os.path.normpath(str(db.db_path))
+            stat = os.stat(db_path)
+            signature = (self._path_key(db_path), int(stat.st_mtime_ns), int(stat.st_size))
+        except Exception:
+            signature = (self._path_key(root), 0, 0)
+        if signature == self._db_index_signature:
+            return
+        rows = [row for row in db.get_all_photos() if isinstance(row, dict)]
+        (
+            self._db_path_index,
+            self._db_relative_index,
+            self._db_stem_index,
+            self._db_scoped_stem_index,
+            self._db_scope_roots,
+        ) = self._build_row_indexes(rows, report_root=root)
+        self._db_index_signature = signature
 
     def _row_for(self, path: str) -> dict[str, Any] | None:
-        stem = Path(path).stem
-
         # Fast path: in-memory cache
         if self._cache is not None:
-            cached = self._cache.get(stem)
-            if cached is not None and self._row_matches_path(cached, path):
-                return cached
-            for row in self._cache.values():
-                if isinstance(row, dict) and self._row_matches_path(row, path):
-                    return row
-            return None
+            return self._row_from_indexes(
+                path,
+                self._cache_path_index,
+                self._cache_relative_index,
+                self._cache_stem_index,
+                self._cache_scoped_stem_index,
+                self._cache_scope_roots,
+                report_root=self._report_root,
+            )
 
         # Slow path: open DB directly
         root = self._report_root
@@ -1320,17 +1512,25 @@ class PhotoMetaDataReportDB(PhotoMetaData):
             if db is None:
                 return None
             try:
-                row = db.get_photo(stem)
-                if row is not None:
-                    return row
-                for candidate in db.get_all_photos():
-                    if isinstance(candidate, dict) and self._row_matches_path(candidate, path):
-                        return candidate
-                return None
+                self._ensure_db_indexes(root, db)
+                return self._row_from_indexes(
+                    path,
+                    self._db_path_index,
+                    self._db_relative_index,
+                    self._db_stem_index,
+                    self._db_scoped_stem_index,
+                    self._db_scope_roots,
+                    report_root=root,
+                )
             finally:
                 db.close()
         except Exception:
             return None
+
+    def row_for(self, path: str) -> dict[str, Any] | None:
+        """Return a copy of the raw report row resolved by the shared indexes."""
+        row = self._row_for(path)
+        return dict(row) if isinstance(row, dict) else None
 
     def _filename_for_path(self, path: str) -> str:
         row = self._row_for(path)
@@ -1396,12 +1596,20 @@ class PhotoMetaDataReportDB(PhotoMetaData):
     # ------------------------------------------------------------------
 
     def update_cache(self, cache: dict[str, dict[str, Any]] | None) -> None:
-        """Replace the in-memory stem-cache (e.g. after DirectoryScanWorker finishes)."""
+        """Replace the in-memory row cache (e.g. after a scanner finishes)."""
         self._cache = cache
+        self._rebuild_cache_indexes()
 
     def update_report_root(self, report_root: str | None) -> None:
         """Update the report root directory (e.g. after navigating to a new folder)."""
         self._report_root = report_root
+        self._db_index_signature = None
+        self._db_path_index = {}
+        self._db_relative_index = {}
+        self._db_stem_index = {}
+        self._db_scoped_stem_index = {}
+        self._db_scope_roots = {}
+        self._rebuild_cache_indexes()
 
 
 # ---------------------------------------------------------------------------
