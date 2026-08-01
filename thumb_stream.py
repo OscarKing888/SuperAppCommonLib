@@ -20,8 +20,10 @@ from typing import Callable, Generator
 
 from app_common.image_formats import (
     JPEG_IMAGE_EXTENSIONS as _JPEG_EXTENSIONS,
+    PHOTOSHOP_IMAGE_EXTENSIONS as _PHOTOSHOP_EXTENSIONS,
     RAW_IMAGE_EXTENSIONS as _RAW_EXTENSIONS,
 )
+from app_common.psd_composite import load_psd_composite_rgb
 
 THUMB_FAST_DEFAULT_SIZE = 64
 
@@ -39,10 +41,30 @@ except Exception:
     pass
 
 
-def _get_raw_thumbnail_bytes(path: str) -> bytes | None:
-    """从 RAW 文件提取嵌入 JPEG 缩略图字节。"""
+def get_raw_preview_jpeg(path: str) -> bytes | None:
+    """从 RAW 文件提取相机内嵌的 JPEG 预览字节。
+
+    该接口只返回相机已经写入 RAW 的 JPEG，不触发传感器全图解码，适合
+    在后台预览 worker 中优先调用。返回值不包含 Qt 对象，可在 macOS 与
+    Windows 64 位共用。
+    """
     if Path(path).suffix.lower() not in _RAW_EXTENSIONS:
         return None
+    # 优先 rawpy 提取相机内嵌预览。部分 ARW 的 piexif thumbnail 只有
+    # 160x120，若先接受它会让主预览长期停留在极低分辨率。
+    try:
+        import rawpy
+        with rawpy.imread(path) as rp:
+            thumb = rp.extract_thumb()
+        if (
+            thumb is not None
+            and hasattr(rawpy, "ThumbFormat")
+            and thumb.format == rawpy.ThumbFormat.JPEG
+        ):
+            if isinstance(thumb.data, bytes):
+                return thumb.data
+    except Exception:
+        pass
     try:
         import piexif
         data = piexif.load(path)
@@ -51,18 +73,12 @@ def _get_raw_thumbnail_bytes(path: str) -> bytes | None:
             return thumb
     except Exception:
         pass
-    try:
-        import rawpy
-        with rawpy.imread(path) as rp:
-            thumb = rp.extract_thumb()
-        if thumb is None:
-            return None
-        if hasattr(rawpy, "ThumbFormat") and thumb.format == rawpy.ThumbFormat.JPEG:
-            if isinstance(thumb.data, bytes):
-                return thumb.data
-    except Exception:
-        pass
     return None
+
+
+def _get_raw_thumbnail_bytes(path: str) -> bytes | None:
+    """兼容旧调用方的私有别名。"""
+    return get_raw_preview_jpeg(path)
 
 
 def _pil_to_rgb_thumb(img, size: int) -> tuple[bytes, int, int] | None:
@@ -159,12 +175,14 @@ def load_thumbnail_rgb(path: str, size: int) -> tuple[bytes, int, int] | None:
     """
     if not path or not os.path.isfile(path):
         return None
+    ext = Path(path).suffix.lower()
     try:
-        from PIL import Image, ImageOps
+        from PIL import Image
     except ImportError:
+        if ext in _PHOTOSHOP_EXTENSIONS:
+            return load_psd_composite_rgb(path, size)
         return None
     try:
-        ext = Path(path).suffix.lower()
         img = None
         if ext in _RAW_EXTENSIONS:
             raw_data = _get_raw_thumbnail_bytes(path)
@@ -182,6 +200,8 @@ def load_thumbnail_rgb(path: str, size: int) -> tuple[bytes, int, int] | None:
                     pass
         return _pil_to_rgb_thumb(img, size)
     except Exception:
+        if ext in _PHOTOSHOP_EXTENSIONS:
+            return load_psd_composite_rgb(path, size)
         return None
 
 

@@ -2,6 +2,8 @@
 """Thumbnail cache and background loading for app_common.file_browser."""
 from __future__ import annotations
 
+from collections import OrderedDict
+
 from app_common.file_browser._browser_core import *
 
 def _compute_thumb_cache_max_bytes() -> int:
@@ -11,7 +13,7 @@ def _compute_thumb_cache_max_bytes() -> int:
     limit to 25 % of total RAM so the app doesn't starve the OS on small
     machines (e.g. 16 GB system → 4 GB cache; 64 GB system → 16 GB cache).
     """
-    hard_cap = 48 * 1024 * 1024 * 1024  # 16 GB
+    hard_cap = 16 * 1024 * 1024 * 1024
     total_ram = 0
     try:
         import psutil  # optional dependency
@@ -35,15 +37,22 @@ _THUMB_MODEL_APPEND_BUDGET_S = 0.008
 
 
 class ThumbnailMemoryCache:
-    """Thread-safe thumbnail cache with JPEG mip levels, max-size fallback for others, and LRU eviction."""
+    """Thread-safe tier-aware thumbnail cache with O(1) LRU eviction.
+
+    JPEG-like sources retain exact requested mip levels. Other formats retain
+    one largest-satisfied tier: it may serve later smaller requests, but never
+    a larger request, and a later small decode cannot downgrade it.
+    """
 
     def __init__(self, max_bytes: int | None = None) -> None:
         self._lock = threading.RLock()
         self._jpeg_mips: dict[tuple[str, int], QImage] = {}
-        self._base_images: dict[str, QImage] = {}
+        self._base_images: dict[str, tuple[int, QImage]] = {}
         self._bytes: int = 0
-        self._max_bytes = int(max_bytes or _THUMB_CACHE_MAX_BYTES_DEFAULT)
-        self._lru_keys: list[tuple[str, object]] = []  # ("jpeg", (ckey, size)) | ("base", ckey)
+        self._max_bytes = int(
+            _THUMB_CACHE_MAX_BYTES_DEFAULT if max_bytes is None else max_bytes
+        )
+        self._lru_keys: OrderedDict[tuple[str, object], None] = OrderedDict()
 
     def _lru_key_jpeg(self, cache_key: str, requested_size: int) -> tuple[str, tuple[str, int]]:
         return ("jpeg", (cache_key, int(requested_size)))
@@ -51,13 +60,18 @@ class ThumbnailMemoryCache:
     def _lru_key_base(self, cache_key: str) -> tuple[str, str]:
         return ("base", cache_key)
 
+    def _touch_lru(self, key: tuple[str, object]) -> None:
+        self._lru_keys[key] = None
+        self._lru_keys.move_to_end(key)
+
     def _evict_until_under_limit(self) -> None:
         while self._bytes > self._max_bytes and self._lru_keys:
-            key = self._lru_keys.pop(0)
+            key, _unused = self._lru_keys.popitem(last=False)
             if key[0] == "jpeg":
                 img = self._jpeg_mips.pop(key[1], None)
             else:
-                img = self._base_images.pop(key[1], None)
+                entry = self._base_images.pop(key[1], None)
+                img = entry[1] if entry is not None else None
             if img is not None and not img.isNull():
                 self._bytes -= _qimage_num_bytes(img)
 
@@ -78,16 +92,20 @@ class ThumbnailMemoryCache:
             if self._is_jpeg_like(source_path):
                 k = self._lru_key_jpeg(cache_key, requested_size)
                 if k in self._lru_keys:
-                    self._lru_keys.remove(k)
-                    self._lru_keys.append(k)
+                    self._touch_lru(k)
                 cached = self._jpeg_mips.get((cache_key, int(requested_size)))
                 return cached.copy() if cached is not None else None
             k = self._lru_key_base(cache_key)
+            entry = self._base_images.get(cache_key)
+            if entry is None:
+                return None
+            satisfied_tier, base = entry
+            if int(requested_size) > int(satisfied_tier):
+                return None
             if k in self._lru_keys:
-                self._lru_keys.remove(k)
-                self._lru_keys.append(k)
-            base = self._base_images.get(cache_key)
-        if base is None:
+                self._touch_lru(k)
+            base = base.copy()
+        if base.isNull():
             return None
         return _scale_qimage_for_thumb(base, requested_size)
 
@@ -99,16 +117,19 @@ class ThumbnailMemoryCache:
             if self._is_jpeg_like(source_path):
                 jkey = (cache_key, int(requested_size))
                 lru_k = self._lru_key_jpeg(cache_key, requested_size)
-                if lru_k in self._lru_keys:
-                    self._lru_keys.remove(lru_k)
                 self._store_image(self._jpeg_mips, jkey, image)
-                self._lru_keys.append(lru_k)
+                self._touch_lru(lru_k)
             else:
                 lru_k = self._lru_key_base(cache_key)
-                if lru_k in self._lru_keys:
-                    self._lru_keys.remove(lru_k)
-                self._store_image(self._base_images, cache_key, image)
-                self._lru_keys.append(lru_k)
+                existing = self._base_images.get(cache_key)
+                existing_tier = int(existing[0]) if existing is not None else -1
+                if existing is None or int(requested_size) >= existing_tier:
+                    if existing is not None and not existing[1].isNull():
+                        self._bytes -= _qimage_num_bytes(existing[1])
+                    stored = image.copy()
+                    self._base_images[cache_key] = (int(requested_size), stored)
+                    self._bytes += _qimage_num_bytes(stored)
+                self._touch_lru(lru_k)
             self._evict_until_under_limit()
 
     def evict_other_dirs(self, current_dir_norm: str) -> int:
@@ -125,23 +146,23 @@ class ThumbnailMemoryCache:
 
         Returns the number of bytes freed.
         """
-        prefix = current_dir_norm + os.sep  # e.g. "/photos/2024/"
+        # 根目录本身已以分隔符结尾；避免拼成 ``//`` 或 ``C:\\\\`` 后把
+        # 当前目录的全部缓存误判为陈旧项。
+        prefix = current_dir_norm if current_dir_norm.endswith(os.sep) else current_dir_norm + os.sep
         freed = 0
         with self._lock:
             # Collect stale LRU keys in one pass before mutating the dicts.
             stale = [
-                lru_k for lru_k in self._lru_keys
+                lru_k for lru_k in tuple(self._lru_keys)
                 if not (lru_k[1][0] if lru_k[0] == "jpeg" else lru_k[1]).startswith(prefix)
             ]
             for lru_k in stale:
                 if lru_k[0] == "jpeg":
                     img = self._jpeg_mips.pop(lru_k[1], None)
                 else:
-                    img = self._base_images.pop(lru_k[1], None)
-                try:
-                    self._lru_keys.remove(lru_k)
-                except ValueError:
-                    pass
+                    entry = self._base_images.pop(lru_k[1], None)
+                    img = entry[1] if entry is not None else None
+                self._lru_keys.pop(lru_k, None)
                 if img is not None and not img.isNull():
                     nb = _qimage_num_bytes(img)
                     self._bytes -= nb

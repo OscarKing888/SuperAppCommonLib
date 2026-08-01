@@ -686,6 +686,9 @@ try:
     _EventToolTip = QEvent.Type.ToolTip
     _EventWheel = QEvent.Type.Wheel
     _EventMouseButtonPress = QEvent.Type.MouseButtonPress
+    _EventHide = QEvent.Type.Hide
+    _EventFocusOut = QEvent.Type.FocusOut
+    _EventWindowDeactivate = QEvent.Type.WindowDeactivate
 except AttributeError:
     _EventResize = QEvent.Resize  # type: ignore[attr-defined]
     _EventShow = QEvent.Show  # type: ignore[attr-defined]
@@ -694,6 +697,14 @@ except AttributeError:
     _EventToolTip = QEvent.ToolTip  # type: ignore[attr-defined]
     _EventWheel = QEvent.Wheel  # type: ignore[attr-defined]
     _EventMouseButtonPress = QEvent.MouseButtonPress  # type: ignore[attr-defined]
+    _EventHide = QEvent.Hide  # type: ignore[attr-defined]
+    _EventFocusOut = QEvent.FocusOut  # type: ignore[attr-defined]
+    _EventWindowDeactivate = QEvent.WindowDeactivate  # type: ignore[attr-defined]
+
+try:
+    _PreciseTimer = Qt.TimerType.PreciseTimer
+except AttributeError:
+    _PreciseTimer = Qt.PreciseTimer  # type: ignore[attr-defined]
 
 _KeyUp = getattr(Qt.Key, "Key_Up", None) or getattr(Qt, "Key_Up", None)
 _KeyDown = getattr(Qt.Key, "Key_Down", None) or getattr(Qt, "Key_Down", None)

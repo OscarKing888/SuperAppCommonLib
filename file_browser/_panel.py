@@ -38,6 +38,10 @@ class FileListPanel(QWidget):
 
     # 子类可重载为 False 以不创建过滤栏（filter_bar）
     create_filter_bar = True
+    # 应用自主管理的长按方向键回放默认关闭，避免改变 SuperBirdStamp 的原生 Qt 行为。
+    enable_key_navigation_playback = False
+    enable_in_memory_fast_preview = False
+    skip_uncached_fast_preview = False
     # report.db metadata 已停用；文件列表只读取 sidecar 和文件内 EXIF/XMP。
     use_report_db = False
     # 子类可重载为 False，避免使用 .superpicky/cache 下的派生预览图与持久缩略图。
@@ -45,6 +49,8 @@ class FileListPanel(QWidget):
 
     file_selected = pyqtSignal(str)
     file_fast_preview_requested = pyqtSignal(str)
+    file_fast_preview_pixmap_requested = pyqtSignal(str, object, int)
+    metadata_cache_updated = pyqtSignal(object)
     files_loaded = pyqtSignal(object)
     focus_cache_batch_ready = pyqtSignal(object)
     _MODE_LIST  = 0
@@ -92,6 +98,7 @@ class FileListPanel(QWidget):
         self._meta_apply_list_hits: int = 0
         self._meta_apply_needs_filter: bool = False
         self._meta_apply_loader_finished: bool = True
+        self._meta_apply_order_by_path: dict[str, int] = {}
         self._meta_filter_refresh_timer: QTimer | None = None
         self._use_report_db = False
         self._use_preview_cache = bool(getattr(type(self), "use_preview_cache", True))
@@ -126,8 +133,16 @@ class FileListPanel(QWidget):
         self._selection_key_nav_auto_repeat: bool = False
         self._selection_key_nav_hold_active: bool = False
         self._thumb_selection_anchor_row: int = -1
+        self._tree_selection_anchor_row: int = -1
         self._key_navigation_fps: int = get_key_navigation_fps()
         self._key_navigation_last_step_at: float = 0.0
+        self._key_navigation_playback_timer: QTimer | None = None
+        self._key_navigation_playback_active: bool = False
+        self._key_navigation_playback_key = None
+        self._key_navigation_playback_view: str = ""
+        self._key_navigation_playback_modifiers = None
+        self._key_navigation_playback_final_path: str = ""
+        self._key_navigation_playback_advancing: bool = False
         self._combo_key_navigation_fps: QComboBox | None = None
         self._persistent_thumb_cache_worker: PersistentThumbCacheWorker | None = None
         self._persistent_thumb_cache_timer: QTimer | None = None
@@ -146,6 +161,7 @@ class FileListPanel(QWidget):
         self._thumb_profile_last_report_at: float = 0.0
         self._thumb_profile_window_started_at: float = _time.perf_counter()
         self._thumb_profile_ready_received_at: dict[str, float] = {}
+        self._background_shutdown_requested: bool = False
         self._background_shutdown_started: bool = False
         self._probe_phase: str = "init"
         self._probe_phase_started_at: float = _time.perf_counter()
@@ -846,7 +862,7 @@ class FileListPanel(QWidget):
         self._probe_log("phase", previous=previous, previous_ms=previous_ms, **fields)
 
     def _sync_file_browser_probe_timer(self) -> None:
-        enabled = perf_probes_enabled()
+        enabled = perf_probes_enabled() and not self._background_shutdown_requested
         if not enabled:
             if self._probe_heartbeat_timer is not None and self._probe_heartbeat_timer.isActive():
                 self._probe_heartbeat_timer.stop()
@@ -863,6 +879,8 @@ class FileListPanel(QWidget):
         self._probe_log("heartbeat_started")
 
     def _on_file_browser_probe_heartbeat(self) -> None:
+        if self._background_shutdown_requested:
+            return
         if not perf_probes_enabled():
             self._sync_file_browser_probe_timer()
             return
@@ -991,6 +1009,8 @@ class FileListPanel(QWidget):
         report_row_by_path: dict | None = None,
         from_cache: bool = False,
     ) -> None:
+        if self._background_shutdown_requested:
+            return
         apply_t0 = perf_counter()
         self._probe_set_phase(
             "apply_listing",
@@ -1181,6 +1201,9 @@ class FileListPanel(QWidget):
         递归遍历该目录及所有子目录（不进入 . 开头目录）。过滤切换同目录 scope 时可复用当前内存中的
         文件列表和 metadata 缓存，避免重复全量读取。
         """
+        if self._background_shutdown_requested:
+            return
+        self._stop_key_navigation_playback(commit=False)
         load_t0 = perf_counter()
         recursive = True
         same_dir = path == self._current_dir
@@ -1363,6 +1386,8 @@ class FileListPanel(QWidget):
         self._directory_scan_worker = None
 
     def _on_directory_scan_progress(self, path: str, found_files: int, scanned_dirs: int, current_dir: str) -> None:
+        if self._background_shutdown_requested:
+            return
         if path != self._current_dir:
             return
         found_files = max(0, int(found_files))
@@ -1388,6 +1413,8 @@ class FileListPanel(QWidget):
             )
 
     def _on_directory_scan_finished(self, path: str, files: list, report_cache: dict, full_report_cache) -> None:
+        if self._background_shutdown_requested:
+            return
         _log.info("[_on_directory_scan_finished] 收到目录扫描结果 path=%r files=%s report_entries=%s，开始列出文件并查询 EXIF", path, len(files), len(report_cache))
         _log.info("[_on_directory_scan_finished] path=%r _current_dir=%r files=%s report_entries=%s", path, self._current_dir, len(files), len(report_cache))
         if path != self._current_dir:
@@ -1417,6 +1444,8 @@ class FileListPanel(QWidget):
     def _apply_pending_directory_listing_result(self) -> None:
         pending = self._pending_directory_listing_result
         self._pending_directory_listing_result = None
+        if self._background_shutdown_requested:
+            return
         if not pending:
             self._probe_log("apply_listing_timer_fired_empty")
             return
@@ -2463,12 +2492,15 @@ class FileListPanel(QWidget):
 
     def _refresh_metadata_state_for_paths(self, paths: list[str]) -> None:
         unique_paths = self._unique_norm_paths(paths)
+        updates: list[tuple[str, dict]] = []
         for norm_path in unique_paths:
             meta = self._meta_cache.get(norm_path, {})
             if not isinstance(meta, dict):
                 continue
-            self._file_table_model.set_meta_for_path(norm_path, meta)
-            self._apply_thumb_meta_to_path(norm_path, meta)
+            updates.append((norm_path, meta))
+        if updates:
+            self._file_table_model.set_meta_for_paths(updates)
+            self._thumb_list_model.set_meta_for_paths(updates)
 
         if self._tree_widget.isSortingEnabled():
             self._apply_tree_sort(
@@ -2486,6 +2518,9 @@ class FileListPanel(QWidget):
 
         if self._filters_require_rebuild_after_metadata_refresh(unique_paths):
             self._apply_filter()
+
+        if unique_paths:
+            self.metadata_cache_updated.emit(unique_paths)
 
         if self._selected_display_path:
             selected_norm = os.path.normpath(self._selected_display_path)
@@ -3597,6 +3632,8 @@ class FileListPanel(QWidget):
         self._populate_tree_model_batch()
 
     def _populate_tree_model_batch(self) -> None:
+        if self._background_shutdown_requested:
+            return
         if self._view_mode != self._MODE_LIST:
             self._pause_tree_model_population()
             return
@@ -3749,6 +3786,8 @@ class FileListPanel(QWidget):
         self._populate_thumb_model_batch()
 
     def _populate_thumb_model_batch(self) -> None:
+        if self._background_shutdown_requested:
+            return
         total = len(self._thumb_model_pending_paths)
         start = self._thumb_model_pending_index
         if total <= 0 or start >= total:
@@ -4321,6 +4360,19 @@ class FileListPanel(QWidget):
         tree_viewport = tree_widget.viewport() if tree_widget is not None else None
         list_widget = getattr(self, "_list_widget", None)
         list_viewport = list_widget.viewport() if list_widget is not None else None
+        if event is not None:
+            event_type = event.type()
+            if event_type in (_EventFocusOut, _EventWindowDeactivate, _EventHide):
+                # 焦点丢失时系统可能不再投递物理 KeyRelease；把它视作强制
+                # 松键并提交最后一帧，避免列表/quick preview 与信息面板分裂。
+                self._stop_key_navigation_playback(
+                    commit=bool(self._key_navigation_playback_active)
+                )
+            elif (
+                event_type == _EventMouseButtonPress
+                and obj in (tree_widget, tree_viewport, list_widget, list_viewport)
+            ):
+                self._stop_key_navigation_playback(commit=False)
         if event is not None and event.type() == _EventToolTip:
             if obj is tree_viewport and tree_widget is not None:
                 idx = tree_widget.indexAt(event.pos())
@@ -4427,13 +4479,18 @@ class FileListPanel(QWidget):
         ):
             key = event.key()
             if key in (_KeyUp, _KeyDown, _KeyLeft, _KeyRight):
-                if not self._accept_key_navigation_step(event):
-                    return True
+                if not bool(getattr(type(self), "enable_key_navigation_playback", False)):
+                    return super().eventFilter(obj, event)
+                if self._event_has_key_navigation_blocked_modifier(event):
+                    self._stop_key_navigation_playback(commit=False)
+                    return super().eventFilter(obj, event)
                 is_auto_repeat = self._event_is_auto_repeat(event)
-                self._selection_key_nav_auto_repeat = is_auto_repeat
-                self._selection_key_nav_hold_active = is_auto_repeat
                 if is_auto_repeat:
-                    QTimer.singleShot(0, lambda: setattr(self, "_selection_key_nav_auto_repeat", False))
+                    self._start_key_navigation_playback(event, view_name="tree")
+                    return True
+                current_index = tree_widget.currentIndex()
+                self._tree_selection_anchor_row = current_index.row() if current_index.isValid() else -1
+                self._begin_key_navigation_playback(event, view_name="tree")
         if (
             obj is tree_widget
             and event is not None
@@ -4442,8 +4499,15 @@ class FileListPanel(QWidget):
             and tree_widget is not None
         ):
             key = event.key()
-            if key in (_KeyUp, _KeyDown, _KeyLeft, _KeyRight):
-                self._commit_deferred_file_selected()
+            if (
+                key in (_KeyUp, _KeyDown, _KeyLeft, _KeyRight)
+                and bool(getattr(type(self), "enable_key_navigation_playback", False))
+            ):
+                if self._event_is_auto_repeat(event):
+                    return True
+                if self._key_navigation_playback_active and key == self._key_navigation_playback_key:
+                    self._stop_key_navigation_playback(commit=True)
+                    return True
         if (
             obj is list_widget
             and event is not None
@@ -4455,62 +4519,24 @@ class FileListPanel(QWidget):
             key = event.key()
             if key not in (_KeyUp, _KeyDown, _KeyLeft, _KeyRight):
                 return super().eventFilter(obj, event)
-            if not self._accept_key_navigation_step(event):
+            if not bool(getattr(type(self), "enable_key_navigation_playback", False)):
+                return super().eventFilter(obj, event)
+            if self._event_has_key_navigation_blocked_modifier(event):
+                self._stop_key_navigation_playback(commit=False)
+                return super().eventFilter(obj, event)
+            if self._event_is_auto_repeat(event):
+                self._start_key_navigation_playback(event, view_name="thumb")
                 return True
-            viewport = list_widget.viewport()
-            grid = list_widget.gridSize()
-            gw = max(1, grid.width())
-            cols = max(1, viewport.rect().width() // gw)
-            count = self._thumb_row_count()
-            current_index = list_widget.currentIndex()
-            idx = current_index.row() if current_index.isValid() else 0
-            row, col = idx // cols, idx % cols
-            new_idx = -1
-            if key == _KeyUp and row > 0:
-                new_idx = (row - 1) * cols + col
-            elif key == _KeyDown:
-                new_idx = (row + 1) * cols + col
-                if new_idx >= count:
-                    new_idx = -1
-            elif key == _KeyLeft and idx > 0:
-                new_idx = idx - 1
-            elif key == _KeyRight and idx < count - 1:
-                new_idx = idx + 1
-            if new_idx >= 0 and new_idx < count:
-                fast_preview = self._event_is_auto_repeat(event)
-                self._selection_key_nav_hold_active = fast_preview
-                shift = _ShiftModifier and (event.modifiers() & _ShiftModifier)
-                new_index = self._thumb_index_for_row(new_idx)
-                if not new_index.isValid():
-                    return True
-                if shift:
-                    sm = list_widget.selectionModel()
-                    anchor = self._thumb_selection_anchor_row
-                    if anchor < 0 or anchor >= count:
-                        anchor = idx
-                    self._thumb_selection_anchor_row = anchor
-                    lo, hi = min(anchor, new_idx), max(anchor, new_idx)
-                    list_widget.setCurrentIndex(new_index)
-                    list_widget.clearSelection()
-                    for i in range(lo, hi + 1):
-                        it = self._thumb_index_for_row(i)
-                        if it.isValid() and sm is not None:
-                            sm.select(it, _Select)
-                else:
-                    self._thumb_selection_anchor_row = new_idx
-                    list_widget.clearSelection()
-                    list_widget.setCurrentIndex(new_index)
-                    sm = list_widget.selectionModel()
-                    if sm is not None:
-                        sm.select(new_index, _SelectCurrent)
-                path = self._thumb_path_from_index(list_widget.currentIndex())
-                if path:
-                    self._handle_selection_preview_request(
-                        path,
-                        fast_preview=fast_preview,
-                        defer_full=fast_preview,
-                    )
-                return True
+            self._begin_key_navigation_playback(event, view_name="thumb")
+            path = self._advance_key_navigation_step(
+                key,
+                event.modifiers(),
+                view_name="thumb",
+                fast_preview=True,
+            )
+            if path:
+                self._key_navigation_playback_final_path = os.path.normpath(path)
+            return True
         if (
             obj is list_widget
             and event is not None
@@ -4519,8 +4545,15 @@ class FileListPanel(QWidget):
             and list_widget is not None
         ):
             key = event.key()
-            if key in (_KeyUp, _KeyDown, _KeyLeft, _KeyRight):
-                self._commit_deferred_file_selected()
+            if (
+                key in (_KeyUp, _KeyDown, _KeyLeft, _KeyRight)
+                and bool(getattr(type(self), "enable_key_navigation_playback", False))
+            ):
+                if self._event_is_auto_repeat(event):
+                    return True
+                if self._key_navigation_playback_active and key == self._key_navigation_playback_key:
+                    self._stop_key_navigation_playback(commit=True)
+                    return True
         return super().eventFilter(obj, event)
 
     def _ensure_thumb_viewport_timer(self) -> None:
@@ -4642,7 +4675,7 @@ class FileListPanel(QWidget):
         return requested_paths
 
     def _schedule_visible_thumbnail_update(self, *_args) -> None:
-        if self._view_mode != self._MODE_THUMB:
+        if self._background_shutdown_requested or self._view_mode != self._MODE_THUMB:
             return
         self._thumb_profile_add("schedule_calls", 1)
         self._ensure_thumb_viewport_timer()
@@ -4723,7 +4756,7 @@ class FileListPanel(QWidget):
         return paths
 
     def _update_visible_thumbnail_range(self) -> None:
-        if self._view_mode != self._MODE_THUMB:
+        if self._background_shutdown_requested or self._view_mode != self._MODE_THUMB:
             return
         profile_started_at = _time.perf_counter()
         visible_range = self._build_visible_thumbnail_data_source()
@@ -4831,6 +4864,7 @@ class FileListPanel(QWidget):
             self._report_thumb_profile("viewport")
 
     def _set_view_mode(self, mode: int) -> None:
+        self._stop_key_navigation_playback(commit=False)
         if self._view_mode == mode and self._stack.currentIndex() == (0 if mode == self._MODE_LIST else 1):
             self._update_selection_status()
             return
@@ -4895,6 +4929,9 @@ class FileListPanel(QWidget):
         finally:
             combo.blockSignals(False)
 
+    def preview_quick_size(self) -> int:
+        return max(1, int(self._thumb_size or 128))
+
     def _set_key_navigation_fps(self, fps: int, *, persist: bool) -> None:
         try:
             value = int(fps)
@@ -4904,6 +4941,10 @@ class FileListPanel(QWidget):
             value = 24
         self._key_navigation_fps = value
         self._key_navigation_last_step_at = 0.0
+        if self._key_navigation_playback_timer is not None:
+            self._key_navigation_playback_timer.setInterval(
+                max(1, int(round(1000.0 / float(max(1, value)))))
+            )
         self._sync_key_navigation_fps_combo()
         if not persist:
             return
@@ -4925,7 +4966,214 @@ class FileListPanel(QWidget):
             return
         self._set_key_navigation_fps(value, persist=True)
 
+    def _event_has_key_navigation_blocked_modifier(self, event) -> bool:
+        try:
+            modifiers = event.modifiers()
+        except Exception:
+            return False
+        for modifier in (_ControlModifier, _AltModifier, _MetaModifier):
+            if modifier and modifiers & modifier:
+                return True
+        return False
+
+    def _ensure_key_navigation_playback_timer(self) -> None:
+        if self._key_navigation_playback_timer is not None:
+            return
+        timer = QTimer(self)
+        timer.setSingleShot(False)
+        try:
+            timer.setTimerType(_PreciseTimer)
+        except Exception:
+            pass
+        timer.setInterval(max(1, int(round(1000.0 / float(max(1, self._key_navigation_fps))))))
+        timer.timeout.connect(self._on_key_navigation_playback_tick)
+        self._key_navigation_playback_timer = timer
+
+    def _start_key_navigation_playback(self, event, *, view_name: str) -> None:
+        if not bool(getattr(type(self), "enable_key_navigation_playback", False)):
+            return
+        try:
+            key = event.key()
+            modifiers = event.modifiers()
+        except Exception:
+            return
+        if key not in (_KeyUp, _KeyDown, _KeyLeft, _KeyRight):
+            return
+        same_hold = bool(
+            self._key_navigation_playback_active
+            and key == self._key_navigation_playback_key
+            and view_name == self._key_navigation_playback_view
+        )
+        if not same_hold:
+            self._begin_key_navigation_playback(event, view_name=view_name)
+        if not self._key_navigation_playback_active:
+            return
+        self._ensure_key_navigation_playback_timer()
+        # 第一个系统自动重复事件作为长按回放的第一帧；后续系统重复事件
+        # 只会进入上面的 same_hold 分支，由已启动的 PreciseTimer 控制节奏。
+        timer = self._key_navigation_playback_timer
+        if timer is not None and timer.isActive():
+            return
+        self._on_key_navigation_playback_tick()
+        if self._key_navigation_playback_active and timer is not None:
+            timer.start()
+
+    def _begin_key_navigation_playback(self, event, *, view_name: str) -> None:
+        """Arm one physical key hold without advancing an extra frame."""
+        if not bool(getattr(type(self), "enable_key_navigation_playback", False)):
+            return
+        try:
+            key = event.key()
+            modifiers = event.modifiers()
+        except Exception:
+            return
+        if key not in (_KeyUp, _KeyDown, _KeyLeft, _KeyRight):
+            return
+        self._stop_key_navigation_playback(commit=False)
+        self._key_navigation_playback_active = True
+        self._key_navigation_playback_key = key
+        self._key_navigation_playback_view = str(view_name or "")
+        self._key_navigation_playback_modifiers = modifiers
+        self._key_navigation_playback_final_path = ""
+        self._selection_key_nav_hold_active = True
+
+    def _on_key_navigation_playback_tick(self) -> None:
+        if not self._key_navigation_playback_active:
+            return
+        path = self._advance_key_navigation_step(
+            self._key_navigation_playback_key,
+            self._key_navigation_playback_modifiers,
+            view_name=self._key_navigation_playback_view,
+            fast_preview=True,
+        )
+        if path:
+            self._key_navigation_playback_final_path = os.path.normpath(path)
+
+    def _stop_key_navigation_playback(self, *, commit: bool) -> None:
+        timer = self._key_navigation_playback_timer
+        if timer is not None and timer.isActive():
+            timer.stop()
+        was_active = self._key_navigation_playback_active
+        final_path = self._key_navigation_playback_final_path or self._deferred_file_selected_path
+        self._key_navigation_playback_active = False
+        self._key_navigation_playback_key = None
+        self._key_navigation_playback_view = ""
+        self._key_navigation_playback_modifiers = None
+        self._key_navigation_playback_final_path = ""
+        self._key_navigation_playback_advancing = False
+        self._selection_key_nav_auto_repeat = False
+        self._selection_key_nav_hold_active = False
+        if commit and was_active and final_path:
+            self._deferred_file_selected_path = os.path.normpath(final_path)
+            self._commit_deferred_file_selected()
+        else:
+            self._cancel_deferred_file_selected()
+
+    def stop_key_navigation_playback(self, *, commit: bool = False) -> None:
+        """幂等停止应用自有的长按回放；默认不提交全图选择。"""
+        self._stop_key_navigation_playback(commit=bool(commit))
+
+    def _advance_key_navigation_step(
+        self,
+        key,
+        modifiers,
+        *,
+        view_name: str,
+        fast_preview: bool,
+    ) -> str:
+        if view_name == "tree":
+            widget = self._tree_widget
+            model = widget.model()
+            count = int(model.rowCount()) if model is not None else 0
+            current_index = widget.currentIndex()
+            current_row = current_index.row() if current_index.isValid() else 0
+            delta = -1 if key in (_KeyUp, _KeyLeft) else 1
+            new_row = current_row + delta
+            if count <= 0 or new_row < 0 or new_row >= count:
+                return ""
+            column = current_index.column() if current_index.isValid() else 0
+            new_index = model.index(new_row, max(0, column))
+            if not new_index.isValid():
+                return ""
+            selection_model = widget.selectionModel()
+            shift = bool(_ShiftModifier and modifiers and modifiers & _ShiftModifier)
+            self._key_navigation_playback_advancing = bool(fast_preview)
+            try:
+                if shift and selection_model is not None:
+                    anchor = self._tree_selection_anchor_row
+                    if anchor < 0 or anchor >= count:
+                        anchor = current_row
+                    self._tree_selection_anchor_row = anchor
+                    widget.setCurrentIndex(new_index)
+                    widget.clearSelection()
+                    for row in range(min(anchor, new_row), max(anchor, new_row) + 1):
+                        index = model.index(row, max(0, column))
+                        if index.isValid():
+                            selection_model.select(index, _Select)
+                else:
+                    self._tree_selection_anchor_row = new_row
+                    widget.clearSelection()
+                    widget.setCurrentIndex(new_index)
+                    if selection_model is not None:
+                        selection_model.select(new_index, _SelectCurrent)
+            finally:
+                self._key_navigation_playback_advancing = False
+            path = self._tree_path_from_index(widget.currentIndex())
+        else:
+            widget = self._list_widget
+            viewport = widget.viewport()
+            grid = widget.gridSize()
+            cols = max(1, viewport.rect().width() // max(1, grid.width()))
+            count = self._thumb_row_count()
+            current_index = widget.currentIndex()
+            current_row = current_index.row() if current_index.isValid() else 0
+            grid_row, grid_col = divmod(current_row, cols)
+            new_row = -1
+            if key == _KeyUp and grid_row > 0:
+                new_row = (grid_row - 1) * cols + grid_col
+            elif key == _KeyDown:
+                candidate = (grid_row + 1) * cols + grid_col
+                new_row = candidate if candidate < count else -1
+            elif key == _KeyLeft and current_row > 0:
+                new_row = current_row - 1
+            elif key == _KeyRight and current_row < count - 1:
+                new_row = current_row + 1
+            if new_row < 0 or new_row >= count:
+                return ""
+            new_index = self._thumb_index_for_row(new_row)
+            if not new_index.isValid():
+                return ""
+            selection_model = widget.selectionModel()
+            shift = bool(_ShiftModifier and modifiers and modifiers & _ShiftModifier)
+            if shift and selection_model is not None:
+                anchor = self._thumb_selection_anchor_row
+                if anchor < 0 or anchor >= count:
+                    anchor = current_row
+                self._thumb_selection_anchor_row = anchor
+                widget.setCurrentIndex(new_index)
+                widget.clearSelection()
+                for row in range(min(anchor, new_row), max(anchor, new_row) + 1):
+                    index = self._thumb_index_for_row(row)
+                    if index.isValid():
+                        selection_model.select(index, _Select)
+            else:
+                self._thumb_selection_anchor_row = new_row
+                widget.clearSelection()
+                widget.setCurrentIndex(new_index)
+                if selection_model is not None:
+                    selection_model.select(new_index, _SelectCurrent)
+            path = self._thumb_path_from_index(widget.currentIndex())
+        if path:
+            self._handle_selection_preview_request(
+                path,
+                fast_preview=bool(fast_preview),
+                defer_full=bool(fast_preview),
+            )
+            return os.path.normpath(path)
+        return ""
+
     def _accept_key_navigation_step(self, event) -> bool:
+        """兼容外部子类；应用自有回放不再依赖系统 auto-repeat 节流。"""
         try:
             auto_repeat = bool(event.isAutoRepeat())
         except Exception:
@@ -4962,6 +5210,9 @@ class FileListPanel(QWidget):
         size = _THUMB_SIZE_STEPS[max(0, min(len(_THUMB_SIZE_STEPS) - 1, value))]
         self._size_label.setText(f"{size}px")
         if self._thumb_size != size:
+            # 旧档位 worker 的 signal 不携带尺寸；先递增 token、断开并清空
+            # pending，避免把 128px 结果按新的 512px tier 写入模型。
+            self._stop_thumbnail_loader()
             self._thumb_size = size
             self._invalidate_visible_thumbnail_signature()
             if self._view_mode == self._MODE_THUMB:
@@ -4994,6 +5245,8 @@ class FileListPanel(QWidget):
         If *visible_paths* is None the current visible range is used.
         If there is nothing to load the call is a no-op.
         """
+        if self._background_shutdown_requested:
+            return
         _log.debug("[_start_thumbnail_loader] START")
         if self._view_mode != self._MODE_THUMB:
             _log.debug("[_start_thumbnail_loader] skip: not in thumb mode")
@@ -5098,6 +5351,8 @@ class FileListPanel(QWidget):
         self._pending_loaders = [l for l in self._pending_loaders if l.isRunning()]
 
     def _start_metadata_loader(self, paths: list) -> None:
+        if self._background_shutdown_requested:
+            return
         start_t0 = perf_counter()
         self._probe_set_phase("metadata_loader_start", paths=len(paths))
         _log.info(
@@ -5112,7 +5367,7 @@ class FileListPanel(QWidget):
             _log.info("[_start_metadata_loader] no paths, return")
             return
         self._stop_pending_meta_apply()
-        self._begin_meta_apply_session(total)
+        self._begin_meta_apply_session(total, ordered_paths=paths)
         loader = MetadataLoader(
             paths,
             meta_proxy=self._meta_proxy,
@@ -5231,22 +5486,97 @@ class FileListPanel(QWidget):
     def _emit_fast_preview_for_path(self, path: str) -> None:
         if not path:
             return
-        self._selected_display_path = os.path.normpath(path)
-        resolved_path = self._resolve_source_path_for_action(path)
-        preview_path = self.resolve_preview_path(path, prefer_fast_preview=True)
+        norm_path = os.path.normpath(path)
+        self._selected_display_path = norm_path
+        if bool(getattr(self, "enable_in_memory_fast_preview", False)):
+            pixmap = self._current_thumbnail_fast_preview_pixmap(norm_path)
+            if isinstance(pixmap, QPixmap) and not pixmap.isNull():
+                self.file_fast_preview_pixmap_requested.emit(
+                    norm_path,
+                    pixmap,
+                    max(1, int(self._thumb_size or 128)),
+                )
+                return
+
+        preview_path = self.resolve_preview_path(norm_path, prefer_fast_preview=True)
         if (
             preview_path
-            and resolved_path
-            and _path_key(preview_path) == _path_key(resolved_path)
+            and _path_key(preview_path) == _path_key(norm_path)
         ):
             preview_path = ""
+        if preview_path and os.path.isfile(preview_path):
+            self.file_fast_preview_requested.emit(preview_path)
+            return
+
+        if bool(getattr(self, "skip_uncached_fast_preview", False)):
+            self._prioritize_fast_preview_thumbnail(norm_path)
+            return
+
+        resolved_path = self._resolve_source_path_for_action(norm_path)
         if not preview_path or not os.path.isfile(preview_path):
-            preview_path = self._materialize_current_thumbnail_fast_preview(path)
+            preview_path = self._materialize_current_thumbnail_fast_preview(norm_path)
         if (not preview_path or not os.path.isfile(preview_path)) and (
             not resolved_path or not os.path.isfile(resolved_path)
         ):
-            self._request_actual_path_lookup(path)
-        self.file_fast_preview_requested.emit(preview_path or resolved_path or path)
+            self._request_actual_path_lookup(norm_path)
+        self.file_fast_preview_requested.emit(preview_path or resolved_path or norm_path)
+
+    def _current_thumbnail_fast_preview_pixmap(self, path: str):
+        """返回当前缩略图档位已经解码的 pixmap，不触发同步源图解码。"""
+        norm_path = os.path.normpath(path) if path else ""
+        if not norm_path:
+            return None
+        index = self._thumb_index_for_path(norm_path)
+        if index.isValid():
+            try:
+                entry_size = int(self._thumb_list_model.data(index, _ThumbSizeRole) or 0)
+            except Exception:
+                entry_size = 0
+            pixmap = self._thumb_list_model.data(index, _ThumbPixmapRole)
+            if (
+                entry_size == int(self._thumb_size)
+                and isinstance(pixmap, QPixmap)
+                and not pixmap.isNull()
+            ):
+                return pixmap
+        cached = self._thumb_memory_cache.get(norm_path, self._thumb_size)
+        if cached is None or cached.isNull():
+            return None
+        pixmap = QPixmap.fromImage(cached)
+        return pixmap if not pixmap.isNull() else None
+
+    def _prioritize_fast_preview_thumbnail(self, path: str) -> None:
+        """缓存未命中时只提升后台任务优先级，不在 GUI 热路径落盘或解码。"""
+        norm_path = os.path.normpath(path) if path else ""
+        if not norm_path or self._background_shutdown_requested:
+            return
+        loader = self._thumbnail_loader
+        if (
+            loader is not None
+            and loader.isRunning()
+            and int(getattr(loader, "_size", 0) or 0) == int(self._thumb_size)
+        ):
+            loader.promote([norm_path])
+            return
+        if loader is not None and loader.isRunning():
+            # 尺寸切换的旧 worker 完成后，其 finished 信号会按当前档位重新调度。
+            return
+        # 清理已经结束但仍挂在面板上的 loader/signal，再启动单路径高优先级
+        # worker；同时递增 token，使其迟到信号不能污染新档位。
+        self._stop_thumbnail_loader()
+        loader = ThumbnailLoader(
+            self._thumb_size,
+            self._thumb_request_token,
+            report_cache=self._report_full_cache or self._report_cache or {},
+            current_dir=self._current_dir if self._use_preview_cache else "",
+            thumb_cache=self._thumb_memory_cache,
+        )
+        loader.enqueue([norm_path], priority=ThumbnailLoader.PRIORITY_VISIBLE)
+        loader.set_desired_paths([norm_path], [])
+        loader.thumbnail_ready.connect(self._on_thumbnail_ready)
+        loader.finished.connect(self._schedule_visible_thumbnail_update)
+        self._thumbnail_loader = loader
+        loader.start()
 
     def _materialize_current_thumbnail_fast_preview(self, path: str) -> str:
         """把当前缩略图视图中已有的同尺寸缩略图落盘，供方向键快速预览复用。"""
@@ -5301,7 +5631,7 @@ class FileListPanel(QWidget):
         fast_preview: bool = False,
         defer_full: bool = False,
     ) -> None:
-        if not path:
+        if self._background_shutdown_requested or not path:
             return
         if fast_preview:
             self._emit_fast_preview_for_path(path)
@@ -5372,6 +5702,8 @@ class FileListPanel(QWidget):
         self._persistent_thumb_progress.show()
 
     def _schedule_persistent_thumb_cache_build(self, paths: list[str] | None) -> None:
+        if self._background_shutdown_requested:
+            return
         if not self._use_preview_cache:
             self._persistent_thumb_cache_pending_paths = []
             self._persistent_thumb_cache_base_dir = ""
@@ -5411,7 +5743,7 @@ class FileListPanel(QWidget):
         self._start_persistent_thumb_cache_worker()
 
     def _start_persistent_thumb_cache_worker(self) -> None:
-        if self._background_shutdown_started:
+        if self._background_shutdown_requested:
             return
         if not self._file_writes_allowed("生成预览缩略图"):
             self._stop_persistent_thumb_cache_worker()
@@ -5585,10 +5917,36 @@ class FileListPanel(QWidget):
         self._stop_metadata_loader()
         self._stop_actual_path_lookup_workers()
 
-    def _shutdown_background_work(self) -> None:
+    def _request_background_shutdown(self) -> None:
+        """Latch shutdown and stop timers that could create replacement workers."""
+        if self._background_shutdown_requested:
+            return
+        self._background_shutdown_requested = True
+        self._pending_directory_listing_result = None
+        self._stop_key_navigation_playback(commit=False)
+        for timer in (
+            self._thumb_viewport_timer,
+            self._thumb_apply_timer,
+            self._persistent_thumb_cache_timer,
+            self._meta_apply_timer,
+            self._meta_filter_refresh_timer,
+            self._tree_model_populate_timer,
+            self._thumb_model_populate_timer,
+            self._deferred_file_selected_timer,
+            self._probe_heartbeat_timer,
+        ):
+            try:
+                if timer is not None and timer.isActive():
+                    timer.stop()
+            except Exception:
+                pass
+        self._thumb_pending_batch.clear()
+
+    def _shutdown_background_work(self, *, thumb_disk_writer_wait: bool = True) -> None:
         if self._background_shutdown_started:
             return
         self._background_shutdown_started = True
+        self._request_background_shutdown()
 
         directory_worker = self._directory_scan_worker
         lookup_workers = list(self._path_lookup_workers)
@@ -5630,7 +5988,7 @@ class FileListPanel(QWidget):
                 pass
         self._flush_selection_scroll_debug_summary()
         _log_thumb_bottleneck_summary()
-        _shutdown_thumb_disk_writer(wait=True)
+        _shutdown_thumb_disk_writer(wait=bool(thumb_disk_writer_wait))
 
     def closeEvent(self, event) -> None:
         self._shutdown_background_work()
@@ -5652,7 +6010,7 @@ class FileListPanel(QWidget):
         timer.timeout.connect(self._flush_meta_filter_refresh)
         self._meta_filter_refresh_timer = timer
 
-    def _begin_meta_apply_session(self, expected_total: int) -> None:
+    def _begin_meta_apply_session(self, expected_total: int, ordered_paths: list[str] | None = None) -> None:
         self._ensure_meta_apply_timer()
         self._ensure_meta_filter_refresh_timer()
         self._meta_apply_items = []
@@ -5671,6 +6029,11 @@ class FileListPanel(QWidget):
             or self._filter_focus_status
         )
         self._meta_apply_loader_finished = False
+        self._meta_apply_order_by_path = {}
+        for index, path in enumerate(ordered_paths or []):
+            norm_path = os.path.normpath(path) if path else ""
+            if norm_path and norm_path not in self._meta_apply_order_by_path:
+                self._meta_apply_order_by_path[norm_path] = index
         self._set_tree_header_fast_mode(True)
         self._tree_widget.setSortingEnabled(False)
         self._show_meta_progress_status(
@@ -5703,6 +6066,7 @@ class FileListPanel(QWidget):
         self._meta_apply_list_hits = 0
         self._meta_apply_needs_filter = False
         self._meta_apply_loader_finished = True
+        self._meta_apply_order_by_path = {}
         self._set_tree_header_fast_mode(False)
         if sorting_was_disabled:
             self._tree_widget.setSortingEnabled(True)
@@ -5748,22 +6112,21 @@ class FileListPanel(QWidget):
         QTimer.singleShot(0, self._refresh_tree_row_numbers)
 
     def _order_meta_items_by_file_list(self, meta_dict: dict) -> list:
+        if not meta_dict:
+            return []
+        rank = self._meta_apply_order_by_path
+        fallback_base = len(rank) + 1
         ordered: list = []
-        seen: set = set()
-        preferred = self._filtered_files or self._all_files
-        for p in preferred:
-            norm = os.path.normpath(p)
-            if norm in meta_dict:
-                ordered.append((norm, meta_dict[norm]))
-                seen.add(norm)
-        for norm, meta in meta_dict.items():
-            if norm in seen:
+        for offset, (path, meta) in enumerate(meta_dict.items()):
+            norm = os.path.normpath(path) if path else ""
+            if not norm:
                 continue
-            ordered.append((norm, meta))
-        return ordered
+            ordered.append((rank.get(norm, fallback_base + offset), norm, meta))
+        ordered.sort(key=lambda item: (item[0], item[1]))
+        return [(norm, meta) for _rank, norm, meta in ordered]
 
     def _schedule_meta_filter_refresh(self) -> None:
-        if not self._meta_apply_needs_filter:
+        if self._background_shutdown_requested or not self._meta_apply_needs_filter:
             return
         self._ensure_meta_filter_refresh_timer()
         if self._meta_filter_refresh_timer is None or self._meta_filter_refresh_timer.isActive():
@@ -5772,7 +6135,7 @@ class FileListPanel(QWidget):
         self._meta_filter_refresh_timer.start(120)
 
     def _flush_meta_filter_refresh(self) -> None:
-        if not self._meta_apply_needs_filter:
+        if self._background_shutdown_requested or not self._meta_apply_needs_filter:
             return
         perf_log(
             _log,
@@ -5787,7 +6150,7 @@ class FileListPanel(QWidget):
             self._tree_widget.setSortingEnabled(False)
 
     def _enqueue_meta_apply(self, meta_dict: dict) -> None:
-        if not meta_dict:
+        if self._background_shutdown_requested or not meta_dict:
             return
         ordered_batch = self._order_meta_items_by_file_list(meta_dict)
         if not ordered_batch:
@@ -5859,6 +6222,8 @@ class FileListPanel(QWidget):
         self._stop_pending_meta_apply()
 
     def _apply_meta_batch_tick(self) -> None:
+        if self._background_shutdown_requested:
+            return
         total = self._meta_apply_total
         if total <= 0 or self._meta_apply_index >= total:
             if self._meta_apply_timer is not None and self._meta_apply_timer.isActive():
@@ -5877,18 +6242,17 @@ class FileListPanel(QWidget):
                 break
             if (i - start) >= 8 and (_time.perf_counter() - tick_t0) >= budget_s:
                 break
-            norm_path, meta = self._meta_apply_items[i]
-            if self._file_table_model.set_meta_for_path(norm_path, meta):
-                self._meta_apply_tree_hits += 1
-                if _DEBUG_FILE_LIST_LIMIT == 1:
-                    _log.info("[DEBUG][_apply_meta] norm=%r meta=%r", norm_path, meta)
-            if self._view_mode == self._MODE_THUMB:
-                if self._thumb_index_for_path(norm_path).isValid():
-                    self._meta_apply_list_hits += 1
-                    self._apply_thumb_meta_to_path(norm_path, meta)
             i += 1
 
         end = i
+        batch_items = self._meta_apply_items[start:end]
+        if batch_items:
+            self._meta_apply_tree_hits += self._file_table_model.set_meta_for_paths(batch_items)
+            if _DEBUG_FILE_LIST_LIMIT == 1:
+                for norm_path, meta in batch_items:
+                    _log.info("[DEBUG][_apply_meta] norm=%r meta=%r", norm_path, meta)
+            if self._view_mode == self._MODE_THUMB:
+                self._meta_apply_list_hits += self._thumb_list_model.set_meta_for_paths(batch_items)
         self._meta_apply_index = end
         self._show_meta_progress_status(
             "正在读取元数据",
@@ -5923,6 +6287,8 @@ class FileListPanel(QWidget):
 
     # ── Slots ─────────────────────────────────────────────────────────────────
     def _on_thumbnail_ready(self, request_token: int, path: str, qimg) -> None:
+        if self._background_shutdown_requested:
+            return
         if self._view_mode != self._MODE_THUMB:
             return
         if int(request_token) != int(self._thumb_request_token):
@@ -5944,6 +6310,9 @@ class FileListPanel(QWidget):
             self._thumb_apply_timer.start(30)
 
     def _flush_thumb_pending_batch(self) -> None:
+        if self._background_shutdown_requested:
+            self._thumb_pending_batch.clear()
+            return
         if not self._thumb_pending_batch:
             return
         flush_started_at = _time.perf_counter()
@@ -5987,6 +6356,16 @@ class FileListPanel(QWidget):
                 if wait_s > ready_wait_max_s:
                     ready_wait_max_s = wait_s
         changed_rows = self._thumb_list_model.set_pixmaps_for_paths(pixmap_updates)
+        if (
+            bool(getattr(self, "enable_in_memory_fast_preview", False))
+            and self._key_navigation_playback_active
+            and self._selected_display_path
+        ):
+            selected_norm = os.path.normpath(self._selected_display_path)
+            if any(path == selected_norm for path, _pixmap, _size in pixmap_updates):
+                # 键盘热路径的 cache miss 只排后台任务；缩略图抵达后再从
+                # 模型内存直接补发当前帧，不落临时文件也不解码原图。
+                self._emit_fast_preview_for_path(selected_norm)
         for row in changed_rows or sorted(set(update_rows)):
             idx = self._thumb_list_model.index(row, 0)
             rect = self._list_widget.visualRect(idx)
@@ -6024,6 +6403,9 @@ class FileListPanel(QWidget):
 
     def _on_metadata_progress(self, current: int, total: int) -> None:
         """主线程槽：由 progress_updated 信号触发，更新 metadata 总量基线。"""
+        sender = self.sender()
+        if sender is not None and sender is not self._metadata_loader:
+            return
         if total <= 0:
             return
         self._meta_apply_expected_total = max(self._meta_apply_expected_total, int(total))
@@ -6041,11 +6423,18 @@ class FileListPanel(QWidget):
         )
 
     def _on_metadata_batch_ready(self, meta_dict: dict) -> None:
+        sender = self.sender()
+        if sender is not None and sender is not self._metadata_loader:
+            return
         _log.info("[_on_metadata_batch_ready] 收到 metadata 批次 %s 条，增量更新列表与缩略图", len(meta_dict))
         _log.info("[_on_metadata_batch_ready] START entries=%s", len(meta_dict))
         t0 = _time.perf_counter()
         total = len(meta_dict)
         self._meta_cache.update(meta_dict)
+        if meta_dict:
+            self.metadata_cache_updated.emit(
+                [os.path.normpath(path) for path in meta_dict if path]
+            )
         comment_cnt = 0
         tag_cnt = 0
         rating_pos_cnt = 0
@@ -6155,25 +6544,34 @@ class FileListPanel(QWidget):
         )
 
     def _on_tree_item_clicked(self, index) -> None:
+        self._stop_key_navigation_playback(commit=False)
         path = self._tree_path_from_index(index)
         if path:
             self._handle_selection_preview_request(path)
 
     def _on_tree_current_item_changed(self, current, previous) -> None:
         """列表模式下键盘上下/Shift 改变当前项时触发刷新。"""
+        if self._key_navigation_playback_advancing:
+            return
         if current is None or not current.isValid():
             return
         path = self._tree_path_from_index(current)
         if path:
-            fast_preview = bool(self._selection_key_nav_auto_repeat)
+            fast_preview = bool(
+                self._key_navigation_playback_active
+                or self._selection_key_nav_auto_repeat
+            )
             self._selection_key_nav_auto_repeat = False
             self._handle_selection_preview_request(
                 path,
                 fast_preview=fast_preview,
                 defer_full=fast_preview,
             )
+            if self._key_navigation_playback_active:
+                self._key_navigation_playback_final_path = os.path.normpath(path)
 
     def _on_list_item_clicked(self, index) -> None:
+        self._stop_key_navigation_playback(commit=False)
         path = self._thumb_path_from_index(index)
         if path:
             self._handle_selection_preview_request(path)

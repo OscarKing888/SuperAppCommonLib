@@ -490,6 +490,7 @@ class PreviewCanvas(QLabel):
         reset_view: bool = False,
         preserve_view: bool = False,
         preserve_scale: bool = False,
+        log_performance: bool = True,
     ) -> None:
         """Replace the displayed pixmap, optionally preserving the current view."""
         t0 = _time.perf_counter()
@@ -517,14 +518,15 @@ class PreviewCanvas(QLabel):
             self._update_cursor()
             self.update()
             self._emit_display_scale_percent_changed(force=True)
-            perf_log(
-                _log,
-                "[PERF][image_switch][PreviewCanvas.set_source_pixmap] cleared size=%s view_ms=%.1f clear_ms=%.1f total_ms=%.1f",
-                source_size,
-                view_ms,
-                (_time.perf_counter() - clear_t0) * 1000.0,
-                (_time.perf_counter() - t0) * 1000.0,
-            )
+            if log_performance:
+                perf_log(
+                    _log,
+                    "[PERF][image_switch][PreviewCanvas.set_source_pixmap] cleared size=%s view_ms=%.1f clear_ms=%.1f total_ms=%.1f",
+                    source_size,
+                    view_ms,
+                    (_time.perf_counter() - clear_t0) * 1000.0,
+                    (_time.perf_counter() - t0) * 1000.0,
+                )
             return
 
         scale_t0 = _time.perf_counter()
@@ -556,18 +558,19 @@ class PreviewCanvas(QLabel):
         self.update()
         self._emit_display_scale_percent_changed(force=True)
         layout_ms = (_time.perf_counter() - layout_t0) * 1000.0
-        perf_log(
-            _log,
-            "[PERF][image_switch][PreviewCanvas.set_source_pixmap] size=%s reset=%s preserve_view=%s preserve_scale=%s view_ms=%.1f scale_ms=%.1f layout_ms=%.1f total_ms=%.1f",
-            source_size,
-            bool(reset_view),
-            bool(preserve_view),
-            bool(preserve_scale),
-            view_ms,
-            scale_ms,
-            layout_ms,
-            (_time.perf_counter() - t0) * 1000.0,
-        )
+        if log_performance:
+            perf_log(
+                _log,
+                "[PERF][image_switch][PreviewCanvas.set_source_pixmap] size=%s reset=%s preserve_view=%s preserve_scale=%s view_ms=%.1f scale_ms=%.1f layout_ms=%.1f total_ms=%.1f",
+                source_size,
+                bool(reset_view),
+                bool(preserve_view),
+                bool(preserve_scale),
+                view_ms,
+                scale_ms,
+                layout_ms,
+                (_time.perf_counter() - t0) * 1000.0,
+            )
 
     # ------------------------------------------------------------------
     # Runtime overlay registration
@@ -1143,6 +1146,7 @@ class PreviewWithStatusBar(QWidget):
         reset_view: bool = False,
         preserve_view: bool = False,
         preserve_scale: bool = False,
+        log_performance: bool = True,
     ) -> None:
         self._display_pixmap = pixmap
         self._canvas.set_source_pixmap(
@@ -1150,6 +1154,7 @@ class PreviewWithStatusBar(QWidget):
             reset_view=reset_view,
             preserve_view=preserve_view,
             preserve_scale=preserve_scale,
+            log_performance=log_performance,
         )
         self._refresh_status_bar()
 
