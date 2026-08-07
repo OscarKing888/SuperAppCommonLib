@@ -13,6 +13,7 @@
   - `exiftools_win`：Windows 下的 exiftools 工具
 - **file_browser**：文件浏览器，可排序，可过滤，有缩略图模式
 - **focus_calc**：超焦距计算
+- **command_history**：独立 Undo/Redo（`Command` / `CommandHistory` / batch / observer）
 - **preview_canvas**：图片预览组件
 - **report_db**：`慧眼选鸟`报告数据库，用于存储报告信息
 - **send_to_app**：发送/接收文件到与其他应用

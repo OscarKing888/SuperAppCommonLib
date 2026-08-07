@@ -7,6 +7,13 @@ app_common：关于对话框、App 信息条等通用 UI 子库。可整体作�
     from app_common.app_info_bar import AppInfoBar
 """
 
+from app_common.command_history import (
+    BatchCommand,
+    Command,
+    CommandExecuteObserver,
+    CommandHistory,
+    CommandHistoryError,
+)
 from app_common.focus_calc import (
     CameraFocusType,
     extract_focus_box,
@@ -18,6 +25,11 @@ from app_common.focus_calc import (
 )
 
 __all__ = [
+    "BatchCommand",
+    "Command",
+    "CommandExecuteObserver",
+    "CommandHistory",
+    "CommandHistoryError",
     "CameraFocusType",
     "resolve_focus_camera_type",
     "resolve_focus_camera_type_from_metadata",
