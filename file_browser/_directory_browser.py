@@ -8,6 +8,14 @@ from app_common.file_browser._permissions import (
     superpicky_path_write_disabled_tooltip,
     superpicky_root_write_state_for_path,
 )
+from app_common.qt_theme import (
+    BrowserChromeColors,
+    ColorSchemeName,
+    browser_chrome_colors,
+    is_theme_change_event,
+    scheme_from_palette,
+)
+
 
 class DirectoryBrowserWidget(QWidget):
     """
@@ -25,39 +33,28 @@ class DirectoryBrowserWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        toolbar_widget = QWidget()
-        toolbar_widget.setStyleSheet("background: #252525;")
-        toolbar = QHBoxLayout(toolbar_widget)
+        self._toolbar_widget = QWidget()
+        toolbar = QHBoxLayout(self._toolbar_widget)
         toolbar.setContentsMargins(6, 4, 6, 2)
         toolbar.setSpacing(4)
 
-        lbl = QLabel("目录")
-        lbl.setStyleSheet("color: #aaa; font-size: 11px;")
-        toolbar.addWidget(lbl)
+        self._title_label = QLabel("目录")
+        toolbar.addWidget(self._title_label)
         toolbar.addStretch()
 
         self._btn_refresh_tree = QToolButton()
         self._btn_refresh_tree.setText("刷新")
         self._btn_refresh_tree.setToolTip("刷新文件夹树")
         self._btn_refresh_tree.setAutoRaise(True)
-        self._btn_refresh_tree.setStyleSheet(
-            "QToolButton { color: #aaa; padding: 2px 6px; border-radius: 3px; }"
-            "QToolButton:hover { color: #fff; background: #333; }"
-        )
         self._btn_refresh_tree.clicked.connect(self.refresh_directory_tree)
         toolbar.addWidget(self._btn_refresh_tree)
-        layout.addWidget(toolbar_widget)
+        layout.addWidget(self._toolbar_widget)
 
         self._tree = QTreeWidget()
         self._tree.setHeaderHidden(True)
         self._tree.setColumnCount(1)
         self._tree.setAnimated(True)
         self._tree.setIndentation(14)
-        self._tree.setStyleSheet(
-            "QTreeWidget { font-size: 12px; border: none; background: #2a2a2a; }"
-            "QTreeWidget::item:selected { background: #3a5a8a; color: #fff; }"
-            "QTreeWidget::item:hover { background: #333; }"
-        )
         self._tree.itemExpanded.connect(self._on_expanded)
         self._tree.itemClicked.connect(self._on_clicked)
         self._tree.setContextMenuPolicy(_CustomContextMenu)
@@ -66,6 +63,42 @@ class DirectoryBrowserWidget(QWidget):
         layout.addWidget(self._tree)
 
         self._populate_roots()
+        self.apply_theme()
+
+    def apply_theme(self, scheme: ColorSchemeName | BrowserChromeColors | None = None) -> None:
+        """Refresh directory-browser chrome colors for dark/light mode."""
+        if isinstance(scheme, BrowserChromeColors):
+            colors = scheme
+        elif scheme in ("dark", "light"):
+            colors = browser_chrome_colors(scheme)
+        else:
+            # Prefer the widget/app palette already applied by the host app.
+            colors = browser_chrome_colors(scheme_from_palette(self.palette()))
+        self._toolbar_widget.setStyleSheet("background: %s;" % colors.toolbar_bg)
+        self._title_label.setStyleSheet(
+            "color: %s; font-size: 11px;" % colors.title_text
+        )
+        self._btn_refresh_tree.setStyleSheet(
+            "QToolButton { color: %s; padding: 2px 6px; border-radius: 3px; }"
+            "QToolButton:hover { color: %s; background: %s; }"
+            % (colors.button_text, colors.button_hover_text, colors.button_hover_bg)
+        )
+        self._tree.setStyleSheet(
+            "QTreeWidget { font-size: 12px; border: none; background: %s; }"
+            "QTreeWidget::item:selected { background: %s; color: %s; }"
+            "QTreeWidget::item:hover { background: %s; }"
+            % (
+                colors.tree_bg,
+                colors.tree_selected_bg,
+                colors.tree_selected_text,
+                colors.tree_hover_bg,
+            )
+        )
+
+    def changeEvent(self, event) -> None:  # type: ignore[override]
+        super().changeEvent(event)
+        if is_theme_change_event(event):
+            self.apply_theme()
 
     def _populate_roots(self) -> None:
         """添加根节点：主目录 + macOS 外接卷 / Windows 盘符。"""
