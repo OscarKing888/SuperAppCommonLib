@@ -23,8 +23,10 @@ from typing import Callable, Generator
 
 from app_common.image_formats import (
     JPEG_IMAGE_EXTENSIONS as _JPEG_EXTENSIONS,
+    PHOTOSHOP_IMAGE_EXTENSIONS as _PHOTOSHOP_EXTENSIONS,
     RAW_IMAGE_EXTENSIONS as _RAW_EXTENSIONS,
 )
+from app_common.psd_composite import load_psd_composite_rgb
 
 THUMB_FAST_DEFAULT_SIZE = 64
 RAW_PREVIEW_JPEG_TAGS = ("JpgFromRaw", "PreviewImage", "ThumbnailImage")
@@ -264,12 +266,14 @@ def load_thumbnail_rgb(path: str, size: int) -> tuple[bytes, int, int] | None:
     """
     if not path or not os.path.isfile(path):
         return None
+    ext = Path(path).suffix.lower()
     try:
-        from PIL import Image, ImageOps
+        from PIL import Image
     except ImportError:
+        if ext in _PHOTOSHOP_EXTENSIONS:
+            return load_psd_composite_rgb(path, size)
         return None
     try:
-        ext = Path(path).suffix.lower()
         img = None
         if ext in _RAW_EXTENSIONS:
             raw_data = get_raw_preview_jpeg(path)
@@ -286,6 +290,8 @@ def load_thumbnail_rgb(path: str, size: int) -> tuple[bytes, int, int] | None:
                     pass
         return _pil_to_rgb_thumb(img, size)
     except Exception:
+        if ext in _PHOTOSHOP_EXTENSIONS:
+            return load_psd_composite_rgb(path, size)
         return None
 
 
