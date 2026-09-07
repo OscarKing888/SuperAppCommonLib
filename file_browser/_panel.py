@@ -2835,25 +2835,25 @@ class FileListPanel(QWidget):
 
     def _resolve_existing_sized_preview_image_path(self, path: str) -> str:
         norm_path = os.path.normpath(path) if path else ""
-        if not norm_path or not self._use_preview_cache:
+        if not norm_path:
             return ""
-        preview_base_dir = self._report_root_dir or self._current_dir
-        if not preview_base_dir:
-            return ""
-        actual_path = self._get_actual_path_for_display(norm_path)
-        report_cache = self._report_full_cache or self._report_cache or {}
-        source_path = actual_path or norm_path
-        thumb_source = _resolve_thumb_source_path(source_path, report_cache, preview_base_dir)
-        source_stamp = _thumb_source_stamp(source_path, thumb_source)
-        persistent_thumb_path = _existing_persistent_thumb_cache_path_for_file(
-            source_path,
-            preview_base_dir,
-            requested_size=self._thumb_size,
-            source_stamp=source_stamp,
-            candidate_sizes=_effective_persistent_thumb_cache_sizes(self._thumb_size),
-        )
-        if persistent_thumb_path:
-            return persistent_thumb_path
+        source_path = self._resolve_source_path_for_action(norm_path)
+        preview_base_dir = self._report_root_dir or self._current_dir or os.path.dirname(source_path)
+        thumb_source = source_path
+        # SuperViewer may disable derived previews while still caching source thumbnails.
+        if self._use_preview_cache:
+            report_cache = self._report_full_cache or self._report_cache or {}
+            thumb_source = _resolve_thumb_source_path(source_path, report_cache, preview_base_dir)
+            source_stamp = _thumb_source_stamp(source_path, thumb_source)
+            persistent_thumb_path = _existing_persistent_thumb_cache_path_for_file(
+                source_path,
+                preview_base_dir,
+                requested_size=self._thumb_size,
+                source_stamp=source_stamp,
+                candidate_sizes=_effective_persistent_thumb_cache_sizes(self._thumb_size),
+            )
+            if persistent_thumb_path:
+                return persistent_thumb_path
         if thumb_source and os.path.isfile(thumb_source):
             try:
                 thumb_mtime = float(os.path.getmtime(thumb_source))
@@ -2866,13 +2866,14 @@ class FileListPanel(QWidget):
 
     def _resolve_existing_selected_preview_image_path(self, path: str) -> str:
         norm_path = os.path.normpath(path) if path else ""
-        if not norm_path or not self._use_preview_cache:
+        if not norm_path:
             return ""
-        preview_base_dir = self._report_root_dir or self._current_dir
-        if not preview_base_dir:
-            return ""
-        report_cache = self._report_full_cache or self._report_cache or {}
-        preview_target = get_preview_path_for_file(norm_path, preview_base_dir, report_cache)
+        source_path = self._resolve_source_path_for_action(norm_path)
+        preview_target = source_path
+        if self._use_preview_cache:
+            preview_base_dir = self._report_root_dir or self._current_dir or os.path.dirname(source_path)
+            report_cache = self._report_full_cache or self._report_cache or {}
+            preview_target = _resolve_thumb_source_path(source_path, report_cache, preview_base_dir)
         if preview_target and os.path.isfile(preview_target):
             return preview_target
         return ""
@@ -7117,11 +7118,11 @@ class FileListPanel(QWidget):
             act_preview.triggered.connect(lambda checked=False, p=sized_preview_path: reveal_in_file_manager(p))
 
         selected_preview_path = self._resolve_existing_selected_preview_image_path(source_path or "")
-        act_selected_preview = menu.addAction("浏览预览图像")
+        act_selected_preview = menu.addAction("浏览原图像")
         act_selected_preview.setEnabled(bool(selected_preview_path))
         if selected_preview_path:
             _log.info(
-                "[_add_browse_preview_menu_action] source=%r selected_preview=%r",
+                "[_add_browse_preview_menu_action] source=%r selected_src=%r",
                 source_path,
                 selected_preview_path,
             )
@@ -7166,7 +7167,7 @@ class FileListPanel(QWidget):
             _log.info("[_on_tree_context_menu] reveal_path=%r paths=%s", reveal_path, len(paths))
             act_reveal = menu.addAction(label)
             act_reveal.triggered.connect(lambda: reveal_in_file_manager(reveal_path))
-        # self._add_browse_preview_menu_action(menu, primary_path)
+        self._add_browse_preview_menu_action(menu, primary_path)
         # menu.addSeparator()
         # self._add_delete_menu_action(menu, paths)
         _exec_menu(menu, self._tree_widget.viewport().mapToGlobal(pos))
@@ -7387,7 +7388,7 @@ class FileListPanel(QWidget):
             _log.info("[_on_list_context_menu] reveal_path=%r paths=%s", reveal_path, len(paths))
             act_reveal = menu.addAction(label)
             act_reveal.triggered.connect(lambda: reveal_in_file_manager(reveal_path))
-        # self._add_browse_preview_menu_action(menu, primary_path)
+        self._add_browse_preview_menu_action(menu, primary_path)
         # menu.addSeparator()
         # self._add_delete_menu_action(menu, paths)
         _exec_menu(menu, self._list_widget.viewport().mapToGlobal(pos))
