@@ -535,15 +535,26 @@ class PhotoMetaDataXMP(PhotoMetaData):
         except Exception:
             return False
 
-    def read_subjects(self, path: str) -> list[str]:
-        """Read XMP ``dc:subject`` values as an ordered, de-duplicated list."""
+    def read_subjects(self, path: str, *, strict: bool = False) -> list[str]:
+        """Read ordered, de-duplicated XMP subjects.
+
+        Strict reads expose I/O and XML errors instead of treating them as an
+        empty tag set. A missing sidecar still has no subjects in either mode.
+        """
         sidecar_path = self.sidecar_path_for(path)
-        if not sidecar_path.is_file():
-            return []
-        try:
-            root = ET.parse(sidecar_path).getroot()
-        except Exception:
-            return []
+        if strict:
+            try:
+                with sidecar_path.open("rb") as stream:
+                    root = ET.parse(stream).getroot()
+            except FileNotFoundError:
+                return []
+        else:
+            if not sidecar_path.is_file():
+                return []
+            try:
+                root = ET.parse(sidecar_path).getroot()
+            except Exception:
+                return []
 
         values: list[str] = []
         for desc in root.iter(_RDF_DESCRIPTION_TAG):
