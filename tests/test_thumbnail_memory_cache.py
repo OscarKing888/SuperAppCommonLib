@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import ntpath
+import posixpath
 import sys
 from types import SimpleNamespace
 
+import pytest
 from PyQt6.QtGui import QColor, QImage
 
 from app_common.file_browser import _thumbnail
@@ -69,3 +72,77 @@ def test_lru_eviction_keeps_most_recent_entry() -> None:
     assert cache.get("first.png", 128) is None
     assert cache.get("second.png", 128) is not None
     assert cache.stats()["entries"] == 1
+
+
+@pytest.mark.parametrize(
+    ("path_module", "directory", "retained_paths", "evicted_paths"),
+    [
+        pytest.param(
+            ntpath,
+            "C:\\",
+            [r"C:\photo.jpg", r"C:\child\photo.png"],
+            [r"D:\photo.jpg", r"D:\child\photo.png"],
+            id="windows-volume-root",
+        ),
+        pytest.param(
+            ntpath,
+            "\\\\server\\share\\",
+            [r"\\server\share\photo.jpg", r"\\server\share\child\photo.png"],
+            [r"\\server\share2\photo.jpg", r"\\server\share2\child\photo.png"],
+            id="windows-unc-root",
+        ),
+        pytest.param(
+            posixpath,
+            "/",
+            ["/photo.jpg", "/child/photo.png"],
+            [],
+            id="posix-root",
+        ),
+        pytest.param(
+            ntpath,
+            r"C:\photos",
+            [r"C:\photos\photo.jpg", r"C:\photos\child\photo.png"],
+            [r"C:\photos2\photo.jpg", r"C:\photo.png"],
+            id="windows-directory-boundary",
+        ),
+        pytest.param(
+            posixpath,
+            "/photos",
+            ["/photos/photo.jpg", "/photos/child/photo.png"],
+            ["/photos2/photo.jpg", "/photo.png"],
+            id="posix-directory-boundary",
+        ),
+    ],
+)
+def test_evict_other_dirs_preserves_scope_and_byte_counts(
+    monkeypatch, path_module, directory, retained_paths, evicted_paths
+) -> None:
+    # Exercise both path conventions on every host without changing global os.
+    def normalize(path: str) -> str:
+        return path_module.normcase(path_module.normpath(path))
+
+    monkeypatch.setattr(_thumbnail, "os", SimpleNamespace(sep=path_module.sep))
+    monkeypatch.setattr(_thumbnail, "_thumb_cache_key", normalize)
+    cache = ThumbnailMemoryCache(max_bytes=10_000_000)
+    image = _image(32, 24)
+    image_bytes = image.sizeInBytes()
+    for path in retained_paths + evicted_paths:
+        cache.put(path, 128, image)
+
+    before = cache.stats()
+    assert before["entries"] == len(retained_paths) + len(evicted_paths)
+    assert before["bytes"] == before["entries"] * image_bytes
+    freed = cache.evict_other_dirs(normalize(directory))
+
+    assert freed == len(evicted_paths) * image_bytes
+    after = cache.stats()
+    assert after["entries"] == len(retained_paths)
+    assert after["bytes"] == len(retained_paths) * image_bytes
+    assert before["bytes"] - after["bytes"] == freed
+    for path in retained_paths:
+        cached = cache.get(path, 128)
+        assert cached is not None and not cached.isNull()
+    for path in evicted_paths:
+        assert cache.get(path, 128) is None
+    assert cache.evict_other_dirs(normalize(directory)) == 0
+    assert cache.stats() == after

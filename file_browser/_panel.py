@@ -166,6 +166,7 @@ class FileListPanel(QWidget):
         self._thumb_profile_last_report_at: float = 0.0
         self._thumb_profile_window_started_at: float = _time.perf_counter()
         self._thumb_profile_ready_received_at: dict[str, float] = {}
+        self._background_shutdown_requested: bool = False
         self._background_shutdown_started: bool = False
         self._probe_phase: str = "init"
         self._probe_phase_started_at: float = _time.perf_counter()
@@ -845,7 +846,7 @@ class FileListPanel(QWidget):
         self._probe_log("phase", previous=previous, previous_ms=previous_ms, **fields)
 
     def _sync_file_browser_probe_timer(self) -> None:
-        enabled = perf_probes_enabled()
+        enabled = perf_probes_enabled() and not self._background_shutdown_requested
         if not enabled:
             if self._probe_heartbeat_timer is not None and self._probe_heartbeat_timer.isActive():
                 self._probe_heartbeat_timer.stop()
@@ -862,6 +863,8 @@ class FileListPanel(QWidget):
         self._probe_log("heartbeat_started")
 
     def _on_file_browser_probe_heartbeat(self) -> None:
+        if self._background_shutdown_requested:
+            return
         if not perf_probes_enabled():
             self._sync_file_browser_probe_timer()
             return
@@ -1063,6 +1066,8 @@ class FileListPanel(QWidget):
         report_row_by_path: dict | None = None,
         from_cache: bool = False,
     ) -> None:
+        if self._background_shutdown_requested:
+            return
         apply_t0 = perf_counter()
         self._probe_set_phase(
             "apply_listing",
@@ -1270,6 +1275,8 @@ class FileListPanel(QWidget):
         递归遍历该目录及所有子目录（不进入 . 开头目录）。过滤切换同目录 scope 时可复用当前内存中的
         文件列表和 metadata 缓存，避免重复全量读取。
         """
+        if self._background_shutdown_requested:
+            return
         self._stop_key_navigation_playback(commit=False)
         load_t0 = perf_counter()
         recursive = True
@@ -1443,6 +1450,8 @@ class FileListPanel(QWidget):
         self._directory_scan_worker = None
 
     def _on_directory_scan_progress(self, path: str, found_files: int, scanned_dirs: int, current_dir: str) -> None:
+        if self._background_shutdown_requested:
+            return
         if path != self._current_dir:
             return
         found_files = max(0, int(found_files))
@@ -1475,6 +1484,8 @@ class FileListPanel(QWidget):
         full_report_cache,
         report_row_by_path: dict | None = None,
     ) -> None:
+        if self._background_shutdown_requested:
+            return
         _log.info("[_on_directory_scan_finished] 收到目录扫描结果 path=%r files=%s report_entries=%s，开始列出文件并查询 EXIF", path, len(files), len(report_cache))
         _log.info("[_on_directory_scan_finished] path=%r _current_dir=%r files=%s report_entries=%s", path, self._current_dir, len(files), len(report_cache))
         if path != self._current_dir:
@@ -1511,6 +1522,8 @@ class FileListPanel(QWidget):
     def _apply_pending_directory_listing_result(self) -> None:
         pending = self._pending_directory_listing_result
         self._pending_directory_listing_result = None
+        if self._background_shutdown_requested:
+            return
         if not pending:
             self._probe_log("apply_listing_timer_fired_empty")
             return
@@ -3058,6 +3071,8 @@ class FileListPanel(QWidget):
         return self._has_path_mismatch(path)
 
     def _request_actual_path_lookup(self, path: str) -> None:
+        if self._background_shutdown_requested:
+            return
         norm_path = os.path.normpath(path) if path else ""
         if not norm_path or os.path.isfile(norm_path):
             return
@@ -3079,6 +3094,8 @@ class FileListPanel(QWidget):
         worker.start()
 
     def _on_actual_path_lookup_resolved(self, source_path: str, actual_path) -> None:
+        if self._background_shutdown_requested:
+            return
         norm_source = os.path.normpath(source_path) if source_path else ""
         cache_key = _path_key(norm_source) if norm_source else ""
         if cache_key:
@@ -3533,6 +3550,8 @@ class FileListPanel(QWidget):
         self._start_tree_model_population()
 
     def _start_tree_model_population(self, *, resume: bool = False) -> None:
+        if self._background_shutdown_requested:
+            return
         if not resume:
             self._tree_model_pending_paths = list(self._filtered_files)
             self._tree_model_pending_index = 0
@@ -3552,6 +3571,8 @@ class FileListPanel(QWidget):
         self._populate_tree_model_batch()
 
     def _populate_tree_model_batch(self) -> None:
+        if self._background_shutdown_requested:
+            return
         if self._view_mode != self._MODE_LIST:
             self._pause_tree_model_population()
             return
@@ -3683,6 +3704,8 @@ class FileListPanel(QWidget):
         self._invalidate_visible_thumbnail_signature()
 
     def _start_thumb_model_population(self, *, resume: bool = False) -> None:
+        if self._background_shutdown_requested:
+            return
         if not resume:
             self._thumb_model_pending_paths = list(self._filtered_files)
             self._thumb_model_pending_index = 0
@@ -3704,6 +3727,8 @@ class FileListPanel(QWidget):
         self._populate_thumb_model_batch()
 
     def _populate_thumb_model_batch(self) -> None:
+        if self._background_shutdown_requested:
+            return
         total = len(self._thumb_model_pending_paths)
         start = self._thumb_model_pending_index
         if total <= 0 or start >= total:
@@ -4625,6 +4650,8 @@ class FileListPanel(QWidget):
         return requested_paths
 
     def _schedule_visible_thumbnail_update(self, *_args) -> None:
+        if self._background_shutdown_requested:
+            return
         if self._view_mode != self._MODE_THUMB:
             return
         self._thumb_profile_add("schedule_calls", 1)
@@ -4706,6 +4733,8 @@ class FileListPanel(QWidget):
         return paths
 
     def _update_visible_thumbnail_range(self) -> None:
+        if self._background_shutdown_requested:
+            return
         if self._view_mode != self._MODE_THUMB:
             return
         profile_started_at = _time.perf_counter()
@@ -5183,6 +5212,8 @@ class FileListPanel(QWidget):
         If *visible_paths* is None the current visible range is used.
         If there is nothing to load the call is a no-op.
         """
+        if self._background_shutdown_requested:
+            return
         _log.debug("[_start_thumbnail_loader] START")
         if self._view_mode != self._MODE_THUMB:
             _log.debug("[_start_thumbnail_loader] skip: not in thumb mode")
@@ -5300,6 +5331,8 @@ class FileListPanel(QWidget):
         return bool(self._persistent_thumb_cache_pending_paths)
 
     def _start_metadata_loader(self, paths: list) -> None:
+        if self._background_shutdown_requested:
+            return
         start_t0 = perf_counter()
         self._probe_set_phase("metadata_loader_start", paths=len(paths))
         _log.info(
@@ -5424,6 +5457,8 @@ class FileListPanel(QWidget):
         self._selection_key_nav_hold_active = False
 
     def _schedule_deferred_file_selected(self, path: str) -> None:
+        if self._background_shutdown_requested:
+            return
         norm_path = os.path.normpath(path) if path else ""
         if not norm_path:
             return
@@ -5436,6 +5471,8 @@ class FileListPanel(QWidget):
         self._deferred_file_selected_timer.start(_FAST_PREVIEW_COMMIT_DELAY_MS)
 
     def _commit_deferred_file_selected(self) -> None:
+        if self._background_shutdown_requested:
+            return
         if self._deferred_file_selected_timer is not None and self._deferred_file_selected_timer.isActive():
             self._deferred_file_selected_timer.stop()
         path = self._deferred_file_selected_path
@@ -5514,7 +5551,7 @@ class FileListPanel(QWidget):
     def _prioritize_fast_preview_thumbnail(self, path: str) -> None:
         """Prioritize an uncached exact-tier frame without blocking the GUI."""
         norm_path = os.path.normpath(path) if path else ""
-        if not norm_path or self._background_shutdown_started:
+        if not norm_path or self._background_shutdown_requested:
             return
 
         loader = self._thumbnail_loader
@@ -5563,6 +5600,8 @@ class FileListPanel(QWidget):
 
     def _materialize_current_thumbnail_fast_preview(self, path: str) -> str:
         """把当前缩略图视图中已有的同尺寸缩略图落盘，供方向键快速预览复用。"""
+        if self._background_shutdown_requested:
+            return ""
         norm_path = os.path.normpath(path) if path else ""
         if not norm_path or self._view_mode != self._MODE_THUMB:
             return ""
@@ -5753,6 +5792,8 @@ class FileListPanel(QWidget):
         return scoped_paths, missing_paths, scope_dirs
 
     def _schedule_persistent_thumb_cache_build(self, paths: list[str] | None) -> None:
+        if self._background_shutdown_requested:
+            return
         if not self._use_preview_cache:
             self._persistent_thumb_cache_pending_paths = []
             self._persistent_thumb_cache_base_dir = ""
@@ -5824,7 +5865,7 @@ class FileListPanel(QWidget):
         self._persistent_thumb_cache_timer.start(_PERSISTENT_THUMB_CACHE_START_DELAY_MS)
 
     def _start_persistent_thumb_cache_worker(self) -> None:
-        if self._background_shutdown_started:
+        if self._background_shutdown_requested:
             return
         if not self._file_writes_allowed("生成预览缩略图"):
             self._stop_persistent_thumb_cache_worker()
@@ -5921,6 +5962,8 @@ class FileListPanel(QWidget):
         failed: int,
         current_path: str,
     ) -> None:
+        if self._background_shutdown_requested:
+            return
         sender = self.sender()
         if sender is not None and sender is not self._persistent_thumb_cache_worker:
             return
@@ -5943,6 +5986,8 @@ class FileListPanel(QWidget):
         skipped: int,
         failed: int,
     ) -> None:
+        if self._background_shutdown_requested:
+            return
         sender = self.sender()
         if sender is not None and sender is not self._persistent_thumb_cache_worker:
             return
@@ -5999,11 +6044,33 @@ class FileListPanel(QWidget):
         self._stop_metadata_loader()
         self._stop_actual_path_lookup_workers()
 
+    def _request_background_shutdown(self) -> None:
+        """Stop new work immediately; the finalizer still owns worker cleanup."""
+        if self._background_shutdown_requested:
+            return
+        self._background_shutdown_requested = True
+        self._pending_directory_listing_result = None
+        self._stop_key_navigation_playback(commit=False)
+        self._cancel_deferred_file_selected()
+        for timer in (
+            self._thumb_viewport_timer,
+            self._thumb_apply_timer,
+            self._persistent_thumb_cache_timer,
+            self._meta_apply_timer,
+            self._meta_filter_refresh_timer,
+            self._tree_model_populate_timer,
+            self._thumb_model_populate_timer,
+            self._probe_heartbeat_timer,
+        ):
+            if timer is not None and timer.isActive():
+                timer.stop()
+        self._thumb_pending_batch.clear()
+
     def _shutdown_background_work(self) -> None:
         if self._background_shutdown_started:
             return
         self._background_shutdown_started = True
-        self._stop_key_navigation_playback(commit=False)
+        self._request_background_shutdown()
 
         directory_worker = self._directory_scan_worker
         lookup_workers = list(self._path_lookup_workers)
@@ -6184,6 +6251,8 @@ class FileListPanel(QWidget):
         return [(norm, meta) for _rank, norm, meta in ordered]
 
     def _schedule_meta_filter_refresh(self) -> None:
+        if self._background_shutdown_requested:
+            return
         if not self._meta_apply_needs_filter:
             return
         self._ensure_meta_filter_refresh_timer()
@@ -6193,6 +6262,8 @@ class FileListPanel(QWidget):
         self._meta_filter_refresh_timer.start(120)
 
     def _flush_meta_filter_refresh(self) -> None:
+        if self._background_shutdown_requested:
+            return
         if not self._meta_apply_needs_filter:
             return
         perf_log(
@@ -6208,6 +6279,8 @@ class FileListPanel(QWidget):
             self._tree_widget.setSortingEnabled(False)
 
     def _enqueue_meta_apply(self, meta_dict: dict) -> None:
+        if self._background_shutdown_requested:
+            return
         if not meta_dict:
             return
         ordered_batch = self._order_meta_items_by_file_list(meta_dict)
@@ -6288,6 +6361,8 @@ class FileListPanel(QWidget):
         self._stop_pending_meta_apply()
 
     def _apply_meta_batch_tick(self) -> None:
+        if self._background_shutdown_requested:
+            return
         total = self._meta_apply_total
         if total <= 0 or self._meta_apply_index >= total:
             if self._meta_apply_timer is not None and self._meta_apply_timer.isActive():
@@ -6352,6 +6427,8 @@ class FileListPanel(QWidget):
 
     # ── Slots ─────────────────────────────────────────────────────────────────
     def _on_thumbnail_ready(self, request_token: int, path: str, qimg) -> None:
+        if self._background_shutdown_requested:
+            return
         if self._view_mode != self._MODE_THUMB:
             return
         if int(request_token) != int(self._thumb_request_token):
@@ -6373,6 +6450,9 @@ class FileListPanel(QWidget):
             self._thumb_apply_timer.start(30)
 
     def _flush_thumb_pending_batch(self) -> None:
+        if self._background_shutdown_requested:
+            self._thumb_pending_batch.clear()
+            return
         if not self._thumb_pending_batch:
             return
         flush_started_at = _time.perf_counter()
@@ -6451,8 +6531,17 @@ class FileListPanel(QWidget):
                 ),
             )
 
+    def _is_current_metadata_sender(self) -> bool:
+        """Accept direct calls and current-loader signals while work is active."""
+        if self._background_shutdown_requested:
+            return False
+        sender = self.sender()
+        return sender is None or sender is self._metadata_loader
+
     def _on_metadata_progress(self, current: int, total: int) -> None:
         """主线程槽：由 progress_updated 信号触发，更新 metadata 总量基线。"""
+        if not self._is_current_metadata_sender():
+            return
         if total <= 0:
             return
         self._meta_apply_expected_total = max(self._meta_apply_expected_total, int(total))
@@ -6471,6 +6560,8 @@ class FileListPanel(QWidget):
         )
 
     def _on_metadata_batch_ready(self, meta_dict: dict) -> None:
+        if not self._is_current_metadata_sender():
+            return
         _log.info("[_on_metadata_batch_ready] 收到 metadata 批次 %s 条，增量更新列表与缩略图", len(meta_dict))
         _log.info("[_on_metadata_batch_ready] START entries=%s", len(meta_dict))
         t0 = _time.perf_counter()
@@ -6509,6 +6600,8 @@ class FileListPanel(QWidget):
         self._enqueue_meta_apply(meta_dict)
 
     def _on_metadata_focus_cache_batch_ready(self, focus_dict: dict) -> None:
+        if self._background_shutdown_requested:
+            return
         loader = self.sender()
         if loader is not self._metadata_loader:
             return
@@ -6518,6 +6611,8 @@ class FileListPanel(QWidget):
         self.focus_cache_batch_ready.emit(focus_dict)
 
     def _on_metadata_loader_finished(self) -> None:
+        if self._background_shutdown_requested:
+            return
         loader = self.sender()
         if loader is not self._metadata_loader:
             return

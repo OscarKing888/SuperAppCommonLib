@@ -117,6 +117,7 @@ def test_persistent_thumbnail_worker_starts_while_metadata_is_running(monkeypatc
     monkeypatch.setattr(_panel_module, "PersistentThumbCacheWorker", _FakePersistentWorker)
     monkeypatch.setenv("SuperViewer_PERSISTENT_THUMB_WORKERS", "7")
     panel = _panel_module.FileListPanel.__new__(_panel_module.FileListPanel)
+    panel._background_shutdown_requested = False
     panel._background_shutdown_started = False
     panel._file_writes_allowed = lambda *_args, **_kwargs: True
     panel._persistent_thumb_cache_pending_paths = [str(tmp_path / "img.jpg")]

@@ -146,7 +146,8 @@ class ThumbnailMemoryCache:
 
         Returns the number of bytes freed.
         """
-        prefix = current_dir_norm + os.sep  # e.g. "/photos/2024/"
+        # Filesystem roots already end with a separator; keep their cache entries.
+        prefix = current_dir_norm if current_dir_norm.endswith(os.sep) else current_dir_norm + os.sep
         freed = 0
         with self._lock:
             # Collect stale LRU keys in one pass before mutating the dicts.
