@@ -1278,7 +1278,7 @@ class PhotoMetaDataReportDB(PhotoMetaData):
         self._cache_stem_index: dict[str, list[dict[str, Any]]] = {}
         self._cache_scoped_stem_index: dict[tuple[str, str], list[dict[str, Any]]] = {}
         self._cache_scope_roots: dict[str, str] = {}
-        self._db_index_signature: tuple[str, int, int] | None = None
+        self._db_index_signature: tuple[str, int, int, int, int] | None = None
         self._db_path_index: dict[str, dict[str, Any]] = {}
         self._db_relative_index: dict[tuple[str, str], dict[str, Any]] = {}
         self._db_stem_index: dict[str, list[dict[str, Any]]] = {}
@@ -1493,9 +1493,16 @@ class PhotoMetaDataReportDB(PhotoMetaData):
         try:
             db_path = os.path.normpath(str(db.db_path))
             stat = os.stat(db_path)
-            signature = (self._path_key(db_path), int(stat.st_mtime_ns), int(stat.st_size))
+            try:
+                wal_stat = os.stat(db_path + "-wal")
+                wal_signature = (int(wal_stat.st_mtime_ns), int(wal_stat.st_size))
+            except FileNotFoundError:
+                wal_signature = (0, 0)
+            # Read-only consumers do not checkpoint the producer's WAL, so
+            # committed changes can leave the main database stat untouched.
+            signature = (self._path_key(db_path), int(stat.st_mtime_ns), int(stat.st_size), *wal_signature)
         except Exception:
-            signature = (self._path_key(root), 0, 0)
+            signature = (self._path_key(root), 0, 0, 0, 0)
         if signature == self._db_index_signature:
             return
         rows = [row for row in db.get_all_photos() if isinstance(row, dict)]

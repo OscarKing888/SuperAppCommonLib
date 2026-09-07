@@ -16,6 +16,7 @@ import sqlite3
 import time
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional, List, Dict, Any
 from .file_utils import ensure_hidden_directory
 from .log import get_logger
@@ -414,6 +415,8 @@ class ReportDB:
         directory: str,
         create_if_missing: bool = True,
         db_path_override: Optional[str] = None,
+        *,
+        read_only: bool = False,
     ):
         """
         初始化数据库连接。
@@ -422,6 +425,7 @@ class ReportDB:
             directory: 照片目录路径（数据库存储在 .superpicky/ 子目录下）
             create_if_missing: 若 True，确保 .superpicky 存在并创建库；若 False，仅当 report.db 已存在时打开，否则抛出 FileNotFoundError
             db_path_override: 指定现有数据库文件路径；用于兼容非 ``.superpicky`` 布局的只读打开
+            read_only: 只读连接，不创建文件、切换日志模式或升级 Schema
         """
         _log.info("[ReportDB.__init__] directory=%r create_if_missing=%s", directory, create_if_missing)
         self.directory = directory
@@ -432,8 +436,9 @@ class ReportDB:
             self._superpicky_dir = os.path.dirname(self.db_path)
         # 同一连接会被主线程和后台线程复用，需要串行化访问避免事务冲突
         self._lock = threading.RLock()
+        self._read_only = bool(read_only)
 
-        if create_if_missing:
+        if create_if_missing and not self._read_only:
             # 确保 .superpicky 目录存在并隐藏（Windows 下设置 Hidden 属性）
             ensure_hidden_directory(self._superpicky_dir)
         else:
@@ -443,19 +448,26 @@ class ReportDB:
                 )
 
         # 连接数据库
+        connection_path = self.db_path
+        if self._read_only:
+            # mode=ro enforces read-only access while still seeing committed
+            # WAL changes from the producer. immutable=1 would miss live WAL.
+            connection_path = Path(os.path.abspath(self.db_path)).as_uri() + "?mode=ro"
         self._conn = sqlite3.connect(
-            self.db_path,
+            connection_path,
+            uri=self._read_only,
             check_same_thread=False,
             timeout=30.0
         )
         self._conn.row_factory = sqlite3.Row  # 支持按列名访问
 
-        # 启用 WAL 模式和外键
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-
-        # 初始化 Schema
-        self._init_schema()
+        if self._read_only:
+            self._conn.execute("PRAGMA query_only=ON")
+        else:
+            # 创建/写接口才有权设置日志模式并升级 Schema。
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA foreign_keys=ON")
+            self._init_schema()
         _log.info("[ReportDB.__init__] 完成 db_path=%r", self.db_path)
 
     @classmethod
@@ -467,7 +479,7 @@ class ReportDB:
         - ``directory/.superpicky/report.db``
         - ``directory/report.db``
 
-        用于只读加载缓存，不会创建目录或数据库文件。
+        用于只读加载缓存，不会创建目录、数据库文件或升级 Schema。
         """
         db_path = resolve_existing_report_db_path(directory)
         _log.info("[ReportDB.open_if_exists] directory=%r db_path=%r", directory, db_path)
@@ -478,7 +490,7 @@ class ReportDB:
 
     @classmethod
     def open_db_path_if_exists(cls, db_path: str) -> Optional["ReportDB"]:
-        """按明确的数据库文件路径打开已有库，不存在则返回 None。"""
+        """按明确的数据库文件路径只读打开已有库，不存在则返回 None。"""
         if not db_path:
             _log.info("[ReportDB.open_db_path_if_exists] 空路径 返回 None")
             return None
@@ -493,7 +505,7 @@ class ReportDB:
         else:
             directory = parent_dir
         try:
-            db = cls(directory, create_if_missing=False, db_path_override=norm_path)
+            db = cls(directory, create_if_missing=False, db_path_override=norm_path, read_only=True)
             _log.info("[ReportDB.open_db_path_if_exists] 打开成功")
             return db
         except Exception as e:

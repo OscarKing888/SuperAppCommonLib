@@ -276,8 +276,9 @@ def test_report_db_index_reloads_when_db_mtime_changes(tmp_path: Path) -> None:
 
     assert provider.read(str(photo))["rating"] == 1
 
-    db = ReportDB.open_if_exists(str(tmp_path))
-    assert db is not None
+    # The producing application writes explicitly; consumer open_* helpers
+    # are read-only and must not be used to update report.db.
+    db = ReportDB(str(tmp_path))
     try:
         assert db.update_photo("img001", {"rating": 5})
     finally:
