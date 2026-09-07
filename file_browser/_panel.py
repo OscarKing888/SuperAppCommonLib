@@ -7206,6 +7206,7 @@ class FileListPanel(QWidget):
                 touched.append(dest)
             return touched
         except Exception as exc:
+            retained_paths: list[str] = []
             if action == "cut":
                 committed_by_source = {source: dest for source, _tmp, dest in committed}
                 staged_by_source = {source: temp for source, temp, _dest in staged}
@@ -7219,6 +7220,8 @@ class FileListPanel(QWidget):
                         shutil.move(current, source)
                     except Exception as rollback_exc:
                         rollback_errors.append(f"{current!r} -> {source!r}: {rollback_exc}")
+                        if os.path.exists(current):
+                            retained_paths.append(current)
             else:
                 for _source, _temp_path, dest in reversed(committed):
                     try:
@@ -7229,13 +7232,24 @@ class FileListPanel(QWidget):
             for _source, temp_path, _dest in reversed(staged):
                 try:
                     if os.path.exists(temp_path):
+                        if action == "cut":
+                            # A failed restore can leave the only surviving
+                            # original in staging. Keep it for recovery even
+                            # when the source path now contains a partial copy.
+                            if temp_path not in retained_paths:
+                                retained_paths.append(temp_path)
+                            continue
                         os.remove(temp_path)
                 except Exception as rollback_exc:
                     rollback_errors.append(f"remove {temp_path!r}: {rollback_exc}")
-            if rollback_errors:
+            if rollback_errors or retained_paths:
+                recovery_detail = (
+                    "; recoverable files retained at: " + ", ".join(repr(path) for path in retained_paths)
+                    if retained_paths else ""
+                )
                 raise RuntimeError(
                     f"Clipboard bundle failed ({exc}); rollback was incomplete: "
-                    + "; ".join(rollback_errors)
+                    + "; ".join(rollback_errors) + recovery_detail
                 ) from exc
             raise
 

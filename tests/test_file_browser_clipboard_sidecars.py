@@ -221,3 +221,119 @@ def test_url_pairing_is_case_insensitive_for_same_stem(tmp_path: Path) -> None:
 
     assert len(entries) == 1
     assert entries[0]["sidecars"] == [str(xmp)]
+
+
+@pytest.mark.parametrize("restore_failure", ["photo", "sidecar"])
+def test_cut_keeps_recoverable_original_when_rollback_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, restore_failure: str,
+) -> None:
+    source_dir = tmp_path / "source"
+    dest_dir = tmp_path / "dest"
+    source_dir.mkdir()
+    dest_dir.mkdir()
+    photo = source_dir / "sample.jpg"
+    sidecar = source_dir / "sample.xmp"
+    photo.write_bytes(b"only original photo")
+    sidecar.write_bytes(b"only original XMP")
+    failed_source = photo if restore_failure == "photo" else sidecar
+
+    import app_common.file_browser._panel as panel_module
+
+    real_replace = panel_module.os.replace
+    real_move = panel_module.shutil.move
+    commits = 0
+
+    def fail_sidecar_commit(source, dest):
+        nonlocal commits
+        commits += 1
+        if commits == 2:
+            raise OSError("injected sidecar commit failure")
+        return real_replace(source, dest)
+
+    def fail_restore(source, dest):
+        if Path(dest) == failed_source:
+            # Cross-volume restore can create a partial destination before
+            # failing. Its existence must not justify deleting the full copy.
+            Path(dest).write_bytes(b"partial restore")
+            raise OSError("injected restore failure")
+        return real_move(source, dest)
+
+    monkeypatch.setattr(panel_module.os, "replace", fail_sidecar_commit)
+    monkeypatch.setattr(panel_module.shutil, "move", fail_restore)
+    with pytest.raises(RuntimeError, match="recoverable files retained at") as error:
+        FileListPanel._paste_file_bundle_transaction(
+            str(photo), [str(sidecar)], str(dest_dir / photo.name),
+            [str(dest_dir / sidecar.name)], action="cut",
+        )
+
+    survivors = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    for payload in (b"only original photo", b"only original XMP"):
+        assert payload in survivors.values()
+    expected_payload = b"only original photo" if restore_failure == "photo" else b"only original XMP"
+    recovery_path = next(path for path, payload in survivors.items() if payload == expected_payload)
+    assert recovery_path.parent == dest_dir
+    assert repr(str(recovery_path)) in str(error.value)
+    # The temporary staging copy is retained only if that member failed to
+    # restore; a committed member instead remains at its final destination.
+    staging = list(dest_dir.glob("*.sbt-paste-*.tmp"))
+    assert staging == ([recovery_path] if restore_failure == "sidecar" else [])
+
+
+def test_cut_rollback_failure_preserves_existing_destination_and_staged_photo(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    source_dir = tmp_path / "source"
+    dest_dir = tmp_path / "dest"
+    source_dir.mkdir()
+    dest_dir.mkdir()
+    photo = source_dir / "sample.jpg"
+    sidecar = source_dir / "sample.xmp"
+    photo.write_bytes(b"original photo")
+    sidecar.write_bytes(b"source sidecar")
+    existing_sidecar = dest_dir / sidecar.name
+    existing_sidecar.write_bytes(b"pre-existing destination")
+
+    import app_common.file_browser._panel as panel_module
+
+    real_move = panel_module.shutil.move
+
+    def fail_restore(source, dest):
+        if Path(dest) == photo:
+            raise PermissionError("source directory denies restore")
+        return real_move(source, dest)
+
+    monkeypatch.setattr(panel_module.shutil, "move", fail_restore)
+    with pytest.raises(RuntimeError, match="recoverable files retained at") as error:
+        FileListPanel._paste_file_bundle_transaction(
+            str(photo), [str(sidecar)], str(dest_dir / photo.name),
+            [str(existing_sidecar)], action="cut",
+        )
+
+    assert sidecar.read_bytes() == b"source sidecar"
+    assert existing_sidecar.read_bytes() == b"pre-existing destination"
+    recovery_path, = dest_dir.glob("*.sbt-paste-*.tmp")
+    assert recovery_path.read_bytes() == b"original photo"
+    assert repr(str(recovery_path)) in str(error.value)
+
+
+@pytest.mark.parametrize("action", ["copy", "cut"])
+def test_successful_bundle_leaves_no_staging_files(tmp_path: Path, action: str) -> None:
+    source_dir = tmp_path / "source"
+    dest_dir = tmp_path / "dest"
+    source_dir.mkdir()
+    dest_dir.mkdir()
+    photo = source_dir / "sample.jpg"
+    sidecar = source_dir / "sample.xmp"
+    photo.write_bytes(b"photo")
+    sidecar.write_bytes(b"XMP")
+
+    FileListPanel._paste_file_bundle_transaction(
+        str(photo), [str(sidecar)], str(dest_dir / photo.name),
+        [str(dest_dir / sidecar.name)], action=action,
+    )
+
+    assert (dest_dir / photo.name).read_bytes() == b"photo"
+    assert (dest_dir / sidecar.name).read_bytes() == b"XMP"
+    assert photo.exists() == (action == "copy")
+    assert sidecar.exists() == (action == "copy")
+    assert not list(dest_dir.glob("*.sbt-paste-*.tmp"))
