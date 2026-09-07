@@ -28,6 +28,8 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+from .xmp_sidecar import _photo_descriptions
+
 
 # ---------------------------------------------------------------------------
 # Abstract base
@@ -143,6 +145,7 @@ _XMP_SUPERPICKY_BIRD_SPECIES_CN_TAG = f"{{{_SUPERPICKY_NS}}}bird_species_cn"
 _RDF_DESCRIPTION_TAG = f"{{{_RDF_NS}}}Description"
 _RDF_BAG_TAG = f"{{{_RDF_NS}}}Bag"
 _RDF_ALT_TAG = f"{{{_RDF_NS}}}Alt"
+_XML_LANG_ATTR = "{http://www.w3.org/XML/1998/namespace}lang"
 _RDF_LI_TAG = f"{{{_RDF_NS}}}li"
 _RDF_ABOUT_ATTR = f"{{{_RDF_NS}}}about"
 _RDF_RESOURCE_ATTR = f"{{{_RDF_NS}}}resource"
@@ -557,7 +560,7 @@ class PhotoMetaDataXMP(PhotoMetaData):
                 return []
 
         values: list[str] = []
-        for desc in root.iter(_RDF_DESCRIPTION_TAG):
+        for desc in _photo_descriptions(root, path):
             attr_value = desc.attrib.get(_XMP_DC_SUBJECT_TAG)
             if attr_value:
                 values.extend(_normalise_subject_value(attr_value, split_strings=True))
@@ -586,8 +589,8 @@ class PhotoMetaDataXMP(PhotoMetaData):
             if tree is None:
                 return False
             root = tree.getroot()
-            desc = self._ensure_description(root)
-            self._replace_subject_node(desc, clean_subjects)
+            descriptions = self._ensure_descriptions(root, path)
+            self._replace_subject_node(descriptions, clean_subjects)
             sidecar_path.parent.mkdir(parents=True, exist_ok=True)
             ok = self._write_tree_with_report_hydration(
                 path,
@@ -636,8 +639,8 @@ class PhotoMetaDataXMP(PhotoMetaData):
             tree = self._load_or_create_xmp_tree(sidecar_path)
             if tree is None:
                 return False
-            desc = self._ensure_description(tree.getroot())
-            self._replace_alt_text_node(desc, _XMP_DC_DESCRIPTION_TAG, text)
+            descriptions = self._ensure_descriptions(tree.getroot(), path)
+            self._replace_alt_text_node(descriptions, _XMP_DC_DESCRIPTION_TAG, text)
             sidecar_path.parent.mkdir(parents=True, exist_ok=True)
             protected = dict(_protected_report_fields or {})
             protected.setdefault("caption", text)
@@ -667,8 +670,8 @@ class PhotoMetaDataXMP(PhotoMetaData):
             tree = self._load_or_create_xmp_tree(sidecar_path)
             if tree is None:
                 return False
-            desc = self._ensure_description(tree.getroot())
-            self._replace_alt_text_node(desc, _XMP_DC_TITLE_TAG, text)
+            descriptions = self._ensure_descriptions(tree.getroot(), path)
+            self._replace_alt_text_node(descriptions, _XMP_DC_TITLE_TAG, text)
             sidecar_path.parent.mkdir(parents=True, exist_ok=True)
             protected = dict(_protected_report_fields or {})
             protected.setdefault("title", text)
@@ -701,11 +704,11 @@ class PhotoMetaDataXMP(PhotoMetaData):
             tree = self._load_or_create_xmp_tree(sidecar_path)
             if tree is None:
                 return False
-            desc = self._ensure_description(tree.getroot())
+            descriptions = self._ensure_descriptions(tree.getroot(), path)
             if rating is not None:
-                self._replace_text_node(desc, _XMP_RATING_TAG, str(_normalise_rating_value(rating)))
+                self._replace_text_node(descriptions, _XMP_RATING_TAG, str(_normalise_rating_value(rating)))
             if pick is not None:
-                self._replace_text_node(desc, _XMP_DM_PICK_TAG, str(_normalise_pick_value(pick)))
+                self._replace_text_node(descriptions, _XMP_DM_PICK_TAG, str(_normalise_pick_value(pick)))
             sidecar_path.parent.mkdir(parents=True, exist_ok=True)
             protected = dict(_protected_report_fields or {})
             if rating is not None:
@@ -771,13 +774,13 @@ class PhotoMetaDataXMP(PhotoMetaData):
     ) -> bool:
         try:
             root = tree.getroot()
-            for existing_desc in root.iter(_RDF_DESCRIPTION_TAG):
+            for existing_desc in _photo_descriptions(root, path):
                 if self._has_bird_species_marker(existing_desc):
                     return False
             row = PhotoMetaDataReportDB()._row_for(path)
             if not isinstance(row, dict) or not row:
                 return False
-            desc = self._ensure_description(root)
+            desc = self._ensure_descriptions(root, path)[0]
             changed = self._apply_report_row_to_sidecar_desc(
                 desc,
                 row,
@@ -814,7 +817,7 @@ class PhotoMetaDataXMP(PhotoMetaData):
 
         if callable(report_row_to_exiftool_style):
             try:
-                compatible = report_row_to_exiftool_style(row, path)
+                compatible = report_row_to_exiftool_style({**row, **protected}, path)
             except Exception:
                 compatible = {}
             for key, value in compatible.items():
@@ -979,50 +982,61 @@ class PhotoMetaDataXMP(PhotoMetaData):
             return None
 
     @staticmethod
-    def _ensure_description(root: ET.Element) -> ET.Element:
-        desc = root.find(f".//{_RDF_DESCRIPTION_TAG}")
-        if desc is not None:
-            return desc
+    def _ensure_descriptions(root: ET.Element, path: str) -> list[ET.Element]:
+        descriptions = _photo_descriptions(root, path)
+        if descriptions:
+            return descriptions
 
         rdf = root if root.tag == f"{{{_RDF_NS}}}RDF" else root.find(f".//{{{_RDF_NS}}}RDF")
         if rdf is None:
             rdf = ET.SubElement(root, f"{{{_RDF_NS}}}RDF")
-        return ET.SubElement(rdf, _RDF_DESCRIPTION_TAG, {_RDF_ABOUT_ATTR: ""})
+        return [ET.SubElement(rdf, _RDF_DESCRIPTION_TAG, {_RDF_ABOUT_ATTR: ""})]
 
     @staticmethod
-    def _replace_subject_node(desc: ET.Element, subjects: list[str]) -> None:
-        for child in list(desc):
-            if child.tag == _XMP_DC_SUBJECT_TAG:
-                desc.remove(child)
+    def _remove_property(descriptions: list[ET.Element], tag: str) -> None:
+        for desc in descriptions:
+            desc.attrib.pop(tag, None)
+            for child in list(desc):
+                if child.tag == tag:
+                    desc.remove(child)
+
+    @classmethod
+    def _replace_subject_node(cls, descriptions: list[ET.Element], subjects: list[str]) -> None:
+        cls._remove_property(descriptions, _XMP_DC_SUBJECT_TAG)
         if not subjects:
             return
 
-        subject = ET.SubElement(desc, _XMP_DC_SUBJECT_TAG)
+        subject = ET.SubElement(descriptions[0], _XMP_DC_SUBJECT_TAG)
         bag = ET.SubElement(subject, _RDF_BAG_TAG)
         for value in subjects:
             item = ET.SubElement(bag, _RDF_LI_TAG)
             item.text = value
 
-    @staticmethod
-    def _replace_alt_text_node(desc: ET.Element, tag: str, text: str) -> None:
-        for child in list(desc):
-            if child.tag == tag:
-                desc.remove(child)
-        if not text:
+    @classmethod
+    def _replace_alt_text_node(cls, descriptions: list[ET.Element], tag: str, text: str) -> None:
+        translations = []
+        for desc in descriptions:
+            for field in desc.findall(tag):
+                for item in field.findall(f"{_RDF_ALT_TAG}/{_RDF_LI_TAG}"):
+                    if item.get(_XML_LANG_ATTR) not in (None, "", "x-default"):
+                        translations.append(item)
+        cls._remove_property(descriptions, tag)
+        if not text and not translations:
             return
-        element = ET.SubElement(desc, tag)
+        element = ET.SubElement(descriptions[0], tag)
         alt = ET.SubElement(element, _RDF_ALT_TAG)
-        item = ET.SubElement(alt, _RDF_LI_TAG)
+        # Keep an empty default when translations remain, so clearing the UI
+        # text does not make a different language's old value reappear.
+        item = ET.SubElement(alt, _RDF_LI_TAG, {_XML_LANG_ATTR: "x-default"})
         item.text = text
+        alt.extend(translations)
 
-    @staticmethod
-    def _replace_text_node(desc: ET.Element, tag: str, text: str) -> None:
-        for child in list(desc):
-            if child.tag == tag:
-                desc.remove(child)
+    @classmethod
+    def _replace_text_node(cls, descriptions: list[ET.Element], tag: str, text: str) -> None:
+        cls._remove_property(descriptions, tag)
         if text == "":
             return
-        element = ET.SubElement(desc, tag)
+        element = ET.SubElement(descriptions[0], tag)
         element.text = text
 
     @staticmethod

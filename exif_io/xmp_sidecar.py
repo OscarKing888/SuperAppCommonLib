@@ -8,6 +8,9 @@ from __future__ import annotations
 import os
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
+from urllib.request import url2pathname
+from uuid import UUID
 
 from app_common.log import get_logger
 from app_common.perf_probe import elapsed_ms, perf_counter, perf_log
@@ -40,6 +43,7 @@ _NS_PREFIXES: dict[str, str] = {
 }
 
 _RDF_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+_XML_LANG = "{http://www.w3.org/XML/1998/namespace}lang"
 
 _XMP_SUFFIX_CANDIDATES = (".xmp", ".XMP", ".Xmp")
 _DERIVED_EXPORT_DIR_NAMES = {
@@ -229,6 +233,87 @@ def _ns_to_prefix(ns_url: str) -> str:
     return "xmp"
 
 
+def _about_file_path(about: str, base_dir: str) -> str | None:
+    """Resolve a file-valued rdf:about without touching the filesystem."""
+    try:
+        parts = urlsplit(about)
+    except ValueError:
+        return None
+    if parts.query or parts.fragment:
+        return None
+    if parts.scheme.lower() == "file":
+        path = url2pathname(parts.path)
+        if parts.netloc and parts.netloc.lower() != "localhost":
+            path = "//" + parts.netloc + path
+    elif parts.scheme and not (len(parts.scheme) == 1 and about[1:2] == ":"):
+        return None
+    else:
+        path = unquote(about)
+    if not os.path.isabs(path):
+        path = os.path.join(base_dir, path)
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _photo_descriptions(
+    root: ET.Element,
+    image_path: str | None = None,
+    *,
+    sidecar_path: str | None = None,
+) -> list[ET.Element]:
+    """Select photo properties, excluding nested and unrelated RDF resources.
+
+    Empty/omitted about is conventional photo XMP. Explicit file references
+    must identify the photo. Read-only derived-export fallback may also use
+    the original photo identified by the sidecar's directory and stem.
+    """
+    rdf_tag = f"{{{_RDF_NS}}}RDF"
+    rdf = root if root.tag == rdf_tag else root.find(f".//{rdf_tag}")
+    if rdf is None:
+        return []
+    descriptions = rdf.findall(f"{{{_RDF_NS}}}Description")
+    if image_path is None:
+        return descriptions
+    image_norm = os.path.normcase(os.path.abspath(image_path))
+    base_dir = os.path.dirname(image_norm)
+    fallback_stem = None
+    if sidecar_path:
+        sidecar_norm = os.path.normcase(os.path.abspath(sidecar_path))
+        if os.path.splitext(sidecar_norm)[0] != os.path.splitext(image_norm)[0]:
+            fallback_stem = os.path.splitext(sidecar_norm)[0]
+    result = []
+    for desc in descriptions:
+        if f"{{{_RDF_NS}}}nodeID" in desc.attrib:
+            continue
+        about = desc.get(f"{{{_RDF_NS}}}about", "")
+        if not about or _about_file_path(about, base_dir) == image_norm:
+            result.append(desc)
+        elif fallback_stem:
+            referenced = _about_file_path(about, os.path.dirname(fallback_stem))
+            if referenced and os.path.splitext(referenced)[0] == fallback_stem:
+                result.append(desc)
+    if result:
+        return result
+    # Some photo writers identify the primary resource by UUID, not a file
+    # path. Accept an unambiguous UUID subject and all its split descriptions.
+    # Never merge a second UUID into an already identified photo resource.
+    uuid_descriptions: dict[UUID, list[ET.Element]] = {}
+    for desc in descriptions:
+        if f"{{{_RDF_NS}}}nodeID" in desc.attrib:
+            continue
+        about = desc.get(f"{{{_RDF_NS}}}about", "")
+        prefix = "urn:uuid:" if about.lower().startswith("urn:uuid:") else "uuid:"
+        if not about.lower().startswith(prefix):
+            continue
+        try:
+            resource_id = UUID(about[len(prefix):])
+        except ValueError:
+            continue
+        uuid_descriptions.setdefault(resource_id, []).append(desc)
+    if len(uuid_descriptions) == 1:
+        return next(iter(uuid_descriptions.values()))
+    return result
+
+
 def _extract_text_value(element) -> str | None:
     """
     从 XMP 元素中提取文本值。
@@ -241,6 +326,11 @@ def _extract_text_value(element) -> str | None:
         if container is not None:
             items = container.findall(f"{{{rdf_ns}}}li")
             if items:
+                if container_tag == "Alt":
+                    for item in items:
+                        if item.get(_XML_LANG) == "x-default":
+                            # An explicit empty default suppresses old translations.
+                            return (item.text or "").strip()
                 texts = [(item.text or "").strip() for item in items if (item.text or "").strip()]
                 return "; ".join(texts) if texts else None
 
@@ -263,7 +353,7 @@ def _extract_text_value(element) -> str | None:
     return None
 
 
-def read_xmp_file(xmp_path: str) -> list[tuple[str, str, str]]:
+def read_xmp_file(xmp_path: str, *, image_path: str | None = None) -> list[tuple[str, str, str]]:
     """读取一个 XMP 文件，解析所有元数据标签。"""
     try:
         tree = ET.parse(xmp_path)
@@ -274,8 +364,8 @@ def read_xmp_file(xmp_path: str) -> list[tuple[str, str, str]]:
     results: list[tuple[str, str, str]] = []
     rdf_ns = _RDF_NS
 
-    # 遍历所有 rdf:Description 节点（XMP 元数据的载体）
-    for desc in root.iter(f"{{{rdf_ns}}}Description"):
+    # 图片读取只取该资源的顶层属性，避免嵌套/其它资源覆盖照片字段。
+    for desc in _photo_descriptions(root, image_path, sidecar_path=xmp_path):
         # 1. 处理内联属性形式（如 exif:FNumber="28/10"）
         for attr_key, attr_val in desc.attrib.items():
             if not attr_key.startswith("{"):
@@ -299,7 +389,7 @@ def read_xmp_file(xmp_path: str) -> list[tuple[str, str, str]]:
             if ns_url == rdf_ns:
                 continue
             value = _extract_text_value(child)
-            if value:
+            if value is not None:
                 prefix = _ns_to_prefix(ns_url)
                 group = f"XMP-{prefix}"
                 results.append((group, local, value))
@@ -322,4 +412,4 @@ def read_xmp_sidecar(image_path: str) -> list[tuple[str, str, str]]:
     xmp_path = find_xmp_sidecar(image_path)
     if not xmp_path:
         return []
-    return read_xmp_file(xmp_path)
+    return read_xmp_file(xmp_path, image_path=image_path)

@@ -569,7 +569,7 @@ def _batch_read_xmp_sidecar(paths: list) -> dict:
             xmp_path = sidecars_by_norm.get(norm)
             if xmp_path:
                 parse_t0 = perf_counter()
-                xmp_rows = read_xmp_file(xmp_path)
+                xmp_rows = read_xmp_file(xmp_path, image_path=path)
                 file_parse_ms = elapsed_ms(parse_t0)
                 parse_ms += file_parse_ms
                 parsed_files += 1
