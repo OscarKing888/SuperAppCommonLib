@@ -7,6 +7,7 @@ import shutil
 import tempfile
 
 from app_common.perf_probe import elapsed_ms, perf_counter, perf_log, perf_probes_enabled
+from app_common.qt_theme import is_theme_change_event
 from app_common.file_browser._browser_core import *
 from app_common.file_browser._models import *
 from app_common.file_browser._thumbnail import *
@@ -58,6 +59,9 @@ class FileListPanel(QWidget):
     rating_filter_compact_width = 620
 
     def __init__(self, parent=None, *, create_filter_bar: bool | None = None) -> None:
+        self._theme_ready = False
+        self._theme_update_in_progress = False
+        self._styled_widget_palette = None
         super().__init__(parent)
         self._all_files: list = []
         self._filtered_files: list = []
@@ -274,7 +278,7 @@ class FileListPanel(QWidget):
         self._size_slider.valueChanged.connect(self._on_size_slider_changed)
 
         self._size_label = QLabel(f"{_THUMB_SIZE_STEPS[0]}px")
-        self._size_label.setStyleSheet("color: #aaa; font-size: 11px;")
+        self._size_label.setStyleSheet("color: palette(text); font-size: 11px;")
         self._size_label.setFixedWidth(42)
         self._size_label.setToolTip("当前缩略图/快速预览尺寸")
 
@@ -537,7 +541,7 @@ class FileListPanel(QWidget):
         self._persistent_thumb_progress.hide()
 
         self._selection_status_label = QLabel("共 0 张 | 当前未选中")
-        self._selection_status_label.setStyleSheet("color: #aaa; font-size: 12px; padding: 0 4px;")
+        self._selection_status_label.setStyleSheet("color: palette(text); font-size: 12px; padding: 0 4px;")
         self._selection_status_label.setMinimumWidth(220)
 
         status_bar = QHBoxLayout()
@@ -583,6 +587,47 @@ class FileListPanel(QWidget):
         self._install_file_action_shortcut("Q", "reject")
         self._install_file_action_shortcut("`", "pick")
         self._install_file_action_shortcut("~", "pick")
+        self._theme_refresh_timer = QTimer(self)
+        self._theme_refresh_timer.setSingleShot(True)
+        self._theme_refresh_timer.timeout.connect(self._refresh_theme_styles)
+        self._styled_widget_palette = self.palette()
+        self._theme_ready = True
+
+    def _refresh_theme_styles(self) -> None:
+        if (not self._theme_ready or self._theme_update_in_progress
+                or self._background_shutdown_requested):
+            return
+        palette = self.palette()
+        if palette == self._styled_widget_palette:
+            return
+        self._styled_widget_palette = palette
+        self._theme_update_in_progress = True
+        try:
+            # Qt can retain the old palette on widgets with local QSS, even
+            # when that QSS only sets font/padding. Reapply those same styles
+            # so visible and hidden views inherit the new host colors without
+            # resetting their models, selection, thumbnails, or metadata.
+            for widget in (
+                self._tree_widget, self._list_widget, self._filter_edit,
+                self._size_label, self._selection_status_label,
+                self._meta_progress, self._persistent_thumb_progress,
+            ):
+                if widget is not None:
+                    stylesheet = widget.styleSheet()
+                    if stylesheet:
+                        widget.setStyleSheet(stylesheet)
+        finally:
+            self._theme_update_in_progress = False
+
+    def changeEvent(self, event) -> None:  # type: ignore[override]
+        super().changeEvent(event)
+        if (self._theme_ready and not self._theme_update_in_progress
+                and not self._background_shutdown_requested
+                and is_theme_change_event(event)
+                and self.palette() != self._styled_widget_palette):
+            # Wait until Qt finishes propagating the new palette. The owned
+            # timer coalesces duplicate events and is stopped during shutdown.
+            self._theme_refresh_timer.start(0)
 
     def file_writes_allowed(self) -> bool:
         return True
@@ -6053,6 +6098,7 @@ class FileListPanel(QWidget):
         self._stop_key_navigation_playback(commit=False)
         self._cancel_deferred_file_selected()
         for timer in (
+            getattr(self, "_theme_refresh_timer", None),
             self._thumb_viewport_timer,
             self._thumb_apply_timer,
             self._persistent_thumb_cache_timer,
