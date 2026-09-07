@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import abc
 import os
+import shutil
 import tempfile
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable
@@ -211,19 +212,24 @@ _XMP_SIDECAR_WRITE_KEY_ALIASES: dict[str, str] = {
     "exififd:aperturevalue": "XMP-exif:ApertureValue",
     "exif:exposuretime": "XMP-exif:ExposureTime",
     "exififd:exposuretime": "XMP-exif:ExposureTime",
-    "exif:iso": "XMP-exif:PhotographicSensitivity",
-    "exififd:iso": "XMP-exif:PhotographicSensitivity",
+    "exif:iso": "XMP-exif:ISOSpeedRatings",
+    "exififd:iso": "XMP-exif:ISOSpeedRatings",
     "exif:isospeedratings": "XMP-exif:ISOSpeedRatings",
     "exififd:isospeedratings": "XMP-exif:ISOSpeedRatings",
-    "exif:photographicsensitivity": "XMP-exif:PhotographicSensitivity",
-    "exififd:photographicsensitivity": "XMP-exif:PhotographicSensitivity",
+    "exif:photographicsensitivity": "XMP-exif:ISOSpeedRatings",
+    "exififd:photographicsensitivity": "XMP-exif:ISOSpeedRatings",
+    "xmp-exif:iso": "XMP-exif:ISOSpeedRatings",
+    "xmp-exif:photographicsensitivity": "XMP-exif:ISOSpeedRatings",
+    "xmp-exif:isospeedratings": "XMP-exif:ISOSpeedRatings",
     "exif:focallength": "XMP-exif:FocalLength",
     "exififd:focallength": "XMP-exif:FocalLength",
     "exif:focallengthin35mmformat": "XMP-exif:FocalLengthIn35mmFormat",
     "exififd:focallengthin35mmformat": "XMP-exif:FocalLengthIn35mmFormat",
-    "exif:lensmodel": "XMP-aux:LensModel",
-    "exififd:lensmodel": "XMP-aux:LensModel",
-    "composite:lensmodel": "XMP-aux:LensModel",
+    "exif:lensmodel": "XMP-aux:Lens",
+    "exififd:lensmodel": "XMP-aux:Lens",
+    "composite:lensmodel": "XMP-aux:Lens",
+    "xmp-aux:lensmodel": "XMP-aux:Lens",
+    "xmp-aux:lens": "XMP-aux:Lens",
     "composite:shutterspeed": "XMP-exif:ExposureTime",
     "composite:aperture": "XMP-exif:FNumber",
     "composite:focallength": "XMP-exif:FocalLength",
@@ -468,6 +474,23 @@ class PhotoMetaDataXMP(PhotoMetaData):
             else:
                 remaining_fields[write_key] = value
 
+        if remaining_fields:
+            direct_fields = {}
+            if subject_seen:
+                direct_fields["subject"] = subject_values
+            if title_seen:
+                direct_fields["title"] = title_value
+            if description_seen:
+                direct_fields["description"] = description_value
+            if rating_seen:
+                direct_fields["rating"] = rating_value
+            if pick_seen:
+                direct_fields["pick"] = pick_value
+            return self._write_exiftool_fields(
+                path, remaining_fields, direct_fields,
+                protected_report_fields=protected_report_fields,
+            )
+
         success = True
         if subject_seen:
             success = self.write_subjects(
@@ -494,49 +517,100 @@ class PhotoMetaDataXMP(PhotoMetaData):
                 pick=pick_value if pick_seen else None,
                 _protected_report_fields=protected_report_fields,
             ) and success
-        if not remaining_fields:
-            return success
+        return success
 
+    def _write_exiftool_fields(
+        self,
+        path: str,
+        fields: dict[str, Any],
+        direct_fields: dict[str, Any],
+        *,
+        protected_report_fields: dict[str, Any],
+    ) -> bool:
+        """Commit generic assignments only after ExifTool accepts the whole edit."""
+        staged_path: Path | None = None
         try:
+            # Unmapped file/EXIF pseudo-tags must never reach ExifTool: some
+            # (e.g. FileName/Directory) operate on the source rather than XMP.
+            if any(not key.lower().startswith(("xmp-", "xmp:")) for key in fields):
+                return False
             from .exiftool_path import get_exiftool_executable_path
-            from .exiftool_runner import run_exiftool, utf8_safe_exiftool_assignments
+            from .exiftool_runner import run_exiftool_once, utf8_safe_exiftool_assignments
             et = get_exiftool_executable_path()
             if not et:
                 return False
-            xmp_path = str(self.sidecar_path_for(path))
-            # exiftool: write to sidecar only
-            assignments = [f"-{k}={v}" for k, v in remaining_fields.items()]
+            sidecar_path = self.sidecar_path_for(path)
+            exists = sidecar_path.is_file()
+            if exists and self._load_or_create_xmp_tree(sidecar_path) is None:
+                return False
+            sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, staged_name = tempfile.mkstemp(
+                prefix=f".{sidecar_path.name}.", suffix=".xmp", dir=str(sidecar_path.parent),
+            )
+            os.close(fd)
+            staged_path = Path(staged_name)
+            if exists:
+                shutil.copy2(sidecar_path, staged_path)
+            else:
+                staged_path.unlink()  # ExifTool -o requires a new output path.
+            # ExifTool calls the standard XML exif:ISOSpeedRatings property ISO.
+            assignments = [
+                f"-{'XMP-exif:ISO' if key == 'XMP-exif:ISOSpeedRatings' else key}={value}"
+                for key, value in fields.items()
+            ]
             with utf8_safe_exiftool_assignments(assignments) as safe_assignments:
-                # Existing sidecars are edited directly; new sidecars are created from the image.
-                if os.path.isfile(xmp_path):
-                    all_args = [
-                        "-overwrite_original",
-                        "-charset",
-                        "filename=UTF8",
-                        *safe_assignments,
-                        xmp_path,
-                    ]
+                all_args = ["-overwrite_original", "-charset", "filename=UTF8", *safe_assignments]
+                if exists:
+                    all_args.append(str(staged_path))
                 else:
-                    all_args = [
-                        "-overwrite_original",
-                        "-charset",
-                        "filename=UTF8",
-                        *safe_assignments,
-                        "-o",
-                        xmp_path,
-                        os.path.normpath(path),
-                    ]
-                cp = run_exiftool(et, all_args)
-            ok = cp.returncode == 0
-            if ok:
-                self._hydrate_report_db_sidecar_if_needed(
-                    path,
-                    protected_report_fields=protected_report_fields,
+                    all_args.extend(["-o", str(staged_path), os.path.normpath(path)])
+                # A one-shot process yields complete stderr. Stay-open's ready
+                # marker is on stdout and may race assignment warnings.
+                cp = run_exiftool_once(
+                    # UTF-8 stdin arguments also avoid Windows/Perl narrowing
+                    # non-ASCII filenames before filename=UTF8 can decode them.
+                    [et, "-@", "-"], input="\n".join(all_args) + "\n",
+                    capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=120,
                 )
+            if cp.returncode != 0 or any(
+                line.lstrip().lower().startswith(("warning:", "error:"))
+                for line in (cp.stderr or "").splitlines()
+            ):
+                return False
+            tree = self._load_or_create_xmp_tree(staged_path)
+            if tree is None or not staged_path.is_file():
+                return False
+            descriptions = self._ensure_descriptions(tree.getroot(), path)
+            if "XMP-exif:ISOSpeedRatings" in fields:
+                # Old versions wrote a non-standard XML property; it must not
+                # outrank the newly saved standard ISO value when read back.
+                self._remove_property(descriptions, f"{{{_EXIF_NS}}}PhotographicSensitivity")
+                self._remove_property(descriptions, f"{{{_EXIF_NS}}}ISO")
+            if "XMP-aux:Lens" in fields:
+                self._remove_property(descriptions, f"{{{_AUX_NS}}}LensModel")
+            if "subject" in direct_fields:
+                self._replace_subject_node(descriptions, direct_fields["subject"])
+            for key, tag in (("title", _XMP_DC_TITLE_TAG), ("description", _XMP_DC_DESCRIPTION_TAG)):
+                if key in direct_fields:
+                    self._replace_alt_text_node(descriptions, tag, direct_fields[key])
+            for key, tag in (("rating", _XMP_RATING_TAG), ("pick", _XMP_DM_PICK_TAG)):
+                if key in direct_fields:
+                    self._replace_text_node(descriptions, tag, str(direct_fields[key]))
+            ok = self._write_tree_with_report_hydration(
+                path, tree, sidecar_path, protected_report_fields=protected_report_fields,
+            )
+            if ok:
                 self._invalidate_metadata_cache(path)
-            return ok and success
+            return ok
         except Exception:
             return False
+        finally:
+            if staged_path is not None:
+                try:
+                    staged_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def read_subjects(self, path: str, *, strict: bool = False) -> list[str]:
         """Read ordered, de-duplicated XMP subjects.
@@ -861,6 +935,7 @@ class PhotoMetaDataXMP(PhotoMetaData):
             "pick": ("pick",),
             "xmp-tiff:model": ("camera_model",),
             "xmp-aux:lensmodel": ("lens_model",),
+            "xmp-aux:lens": ("lens_model",),
             "xmp-exif:photographicsensitivity": ("iso",),
             "xmp-exif:isospeedratings": ("iso",),
             "xmp-exif:exposuretime": ("shutter_speed",),
