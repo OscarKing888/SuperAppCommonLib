@@ -1,25 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Pythonic undo/redo command history (ICommandX-style inverse commands).
+"""Bounded undo/redo history using commands that return their inverse.
 
-Usage::
-
-    from app_common.command_history import Command, CommandHistory
-
-    class AddOne:
-        def __init__(self, values: list[int]) -> None:
-            self._values = values
-
-        def execute(self) -> "AddOne":
-            self._values.append(1)
-            return RemoveLast(self._values)
-
-    history = CommandHistory()
-    history.add_command(AddOne(values))
-    history.undo()
-    history.redo()
-
-Semantics match Ogre ``ICommandX``: ``execute()`` applies the command and
-returns the inverse command used for undo/redo.
+Commands return ``None`` when they make no change. A command that changes only
+part of its target must raise ``PartialCommandError`` with an inverse for the
+completed changes and a command for the remaining work. Other exceptions mean
+the command made no change and can safely be retried.
 """
 from __future__ import annotations
 
@@ -34,49 +19,90 @@ class CommandHistoryError(Exception):
 
 @runtime_checkable
 class Command(Protocol):
-    """A command that applies itself and returns its inverse."""
+    """Apply an operation and return its inverse, or None for no change."""
 
-    def execute(self) -> Command:
-        """Apply this command; return the inverse command."""
+    def execute(self) -> Command | None:
+        ...
+
+
+class PartialCommandError(CommandHistoryError):
+    """Report completed changes separately from work that still needs a retry."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        inverse: Command | None = None,
+        remaining: Command | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.inverse = inverse
+        self.remaining = remaining
 
 
 @runtime_checkable
 class CommandExecuteObserver(Protocol):
-    """Notified when command history changes (add / undo / redo / clear / end_batch)."""
-
     def on_command_executed(self) -> None:
-        """Called after a history-mutating operation."""
+        ...
 
 
 ObserverLike = CommandExecuteObserver | Callable[[], None]
 
 
 class BatchCommand:
-    """Composite command: execute members in LIFO order, return inverse batch."""
+    """Execute members in LIFO order, preserving completed work on failure."""
 
     def __init__(self, commands: Iterable[Command] | None = None) -> None:
-        self._commands: deque[Command] = deque(commands or ())
+        self._commands = tuple(commands or ())
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(count={len(self._commands)})"
 
     @property
     def commands(self) -> tuple[Command, ...]:
-        return tuple(self._commands)
+        return self._commands
 
-    def execute(self) -> BatchCommand:
-        inverses: deque[Command] = deque()
-        for cmd in reversed(self._commands):
-            inverses.append(cmd.execute())
-        return BatchCommand(inverses)
+    def execute(self) -> BatchCommand | None:
+        inverses: list[Command] = []
+        for index in range(len(self._commands) - 1, -1, -1):
+            cmd = self._commands[index]
+            try:
+                inverse = cmd.execute()
+            except PartialCommandError as exc:
+                if exc.inverse is not None:
+                    inverses.append(exc.inverse)
+                remaining = list(self._commands[:index])
+                if exc.remaining is not None:
+                    remaining.append(exc.remaining)
+                raise PartialCommandError(
+                    str(exc),
+                    inverse=BatchCommand(inverses) if inverses else None,
+                    remaining=BatchCommand(remaining) if remaining else None,
+                ) from exc
+            except Exception as exc:
+                raise PartialCommandError(
+                    str(exc),
+                    inverse=BatchCommand(inverses) if inverses else None,
+                    remaining=BatchCommand(self._commands[:index + 1]),
+                ) from exc
+            if inverse is not None:
+                inverses.append(inverse)
+        return BatchCommand(inverses) if inverses else None
 
 
 class CommandHistory:
-    """Undo/redo history with optional batching and change observers."""
+    """Undo/redo history with batching and at most max_commands per stack.
 
-    def __init__(self) -> None:
-        self._undo: deque[Command] = deque()
-        self._redo: deque[Command] = deque()
+    Partial undo/redo moves the completed subset to the other stack and keeps
+    the unfinished subset at the current stack's top. The error is then raised
+    to the caller for reporting; a subsequent undo/redo retries that subset.
+    """
+
+    def __init__(self, max_commands: int = 100) -> None:
+        if not isinstance(max_commands, int) or max_commands < 1:
+            raise ValueError("max_commands must be a positive integer")
+        self._undo: deque[Command] = deque(maxlen=max_commands)
+        self._redo: deque[Command] = deque(maxlen=max_commands)
         self._batch: deque[Command] = deque()
         self._is_batch_mode = False
         self._observers: list[ObserverLike] = []
@@ -94,41 +120,59 @@ class CommandHistory:
         return self._is_batch_mode
 
     def add_command(self, cmd: Command, execute: bool = True) -> None:
-        if self._is_batch_mode:
-            self._push(self._batch, cmd, execute=execute)
-        else:
-            self._push(self._undo, cmd, execute=execute)
+        try:
+            inverse = cmd.execute() if execute else cmd
+        except PartialCommandError as exc:
+            self._record_inverse(exc.inverse)
+            raise
+        self._record_inverse(inverse)
+
+    def _record_inverse(self, inverse: Command | None) -> None:
+        if inverse is None:
+            return
+        stack = self._batch if self._is_batch_mode else self._undo
+        stack.append(inverse)
         self._redo.clear()
         self._notify()
 
     def undo(self) -> None:
         if self._is_batch_mode:
             self.end_batch()
-            self.undo()
-            return
         if not self._undo:
             raise CommandHistoryError("nothing to undo")
-        cmd = self._undo[-1]
-        self._push(self._redo, cmd, execute=True)
-        self._undo.pop()
-        self._notify()
+        self._move_command(self._undo, self._redo)
 
     def redo(self) -> None:
         if self._is_batch_mode:
-            # Finish an open batch before redo (do not also undo).
             self.end_batch()
         if not self._redo:
             raise CommandHistoryError("nothing to redo")
-        cmd = self._redo[-1]
-        self._push(self._undo, cmd, execute=True)
-        self._redo.pop()
+        self._move_command(self._redo, self._undo)
+
+    def _move_command(self, source: deque[Command], target: deque[Command]) -> None:
+        cmd = source[-1]
+        try:
+            inverse = cmd.execute()
+        except PartialCommandError as exc:
+            if exc.remaining is None:
+                source.pop()
+            else:
+                source[-1] = exc.remaining
+            if exc.inverse is not None:
+                target.append(exc.inverse)
+            self._notify()
+            raise
+        source.pop()
+        if inverse is not None:
+            target.append(inverse)
         self._notify()
 
     def clear(self) -> None:
-        self.end_batch()
-        do_notify = bool(self._undo or self._redo)
+        do_notify = bool(self._undo or self._redo or self._batch)
         self._undo.clear()
         self._redo.clear()
+        self._batch.clear()
+        self._is_batch_mode = False
         if do_notify:
             self._notify()
 
@@ -136,15 +180,11 @@ class CommandHistory:
         self._is_batch_mode = True
 
     def end_batch(self) -> None:
-        if self._batch:
-            batch = BatchCommand(self._batch)
-            self._push(self._undo, batch, execute=False)
-            self._redo.clear()
-            self._batch.clear()
-            self._is_batch_mode = False
-            self._notify()
-            return
         self._is_batch_mode = False
+        if self._batch:
+            self._undo.append(BatchCommand(self._batch))
+            self._batch.clear()
+            self._notify()
 
     def add_observer(self, observer: ObserverLike) -> None:
         if observer in self._observers:
@@ -156,13 +196,6 @@ class CommandHistory:
             self._observers.remove(observer)
         except ValueError as exc:
             raise CommandHistoryError("observer not registered") from exc
-
-    @staticmethod
-    def _push(stack: deque[Command], cmd: Command, execute: bool = True) -> None:
-        if execute:
-            stack.append(cmd.execute())
-        else:
-            stack.append(cmd)
 
     def _notify(self) -> None:
         for observer in list(self._observers):
@@ -179,4 +212,5 @@ __all__ = [
     "CommandExecuteObserver",
     "CommandHistory",
     "CommandHistoryError",
+    "PartialCommandError",
 ]

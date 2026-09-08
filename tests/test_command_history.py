@@ -7,6 +7,7 @@ from app_common.command_history import (
     BatchCommand,
     CommandHistory,
     CommandHistoryError,
+    PartialCommandError,
 )
 
 
@@ -187,3 +188,235 @@ def test_batch_command_execute_returns_inverse_batch() -> None:
     assert isinstance(redo_batch, BatchCommand)
     redo_batch.execute()
     assert values == ["b", "a"]
+
+
+class _SetValuesCommand:
+    def __init__(self, values, desired, failures, attempts=None) -> None:
+        self.values = values
+        self.desired = dict(desired)
+        self.failures = failures
+        self.attempts = attempts if attempts is not None else []
+
+    def execute(self):
+        inverse = {}
+        remaining = {}
+        for key, desired in self.desired.items():
+            self.attempts.append(key)
+            if key in self.failures:
+                remaining[key] = desired
+            elif self.values[key] != desired:
+                inverse[key] = self.values[key]
+                self.values[key] = desired
+        undo = self._with_values(inverse) if inverse else None
+        if remaining:
+            raise PartialCommandError(
+                "write failed", inverse=undo, remaining=self._with_values(remaining)
+            )
+        return undo
+
+    def _with_values(self, desired):
+        return _SetValuesCommand(self.values, desired, self.failures, self.attempts)
+
+
+def test_noop_and_fully_failed_add_preserve_redo_and_observers() -> None:
+    values = {"a": False}
+    failures = set()
+    history = CommandHistory()
+    calls = []
+    history.add_observer(lambda: calls.append(True))
+    history.add_command(_SetValuesCommand(values, {"a": True}, failures))
+    history.undo()
+    assert len(calls) == 2
+
+    history.add_command(_SetValuesCommand(values, {"a": False}, failures))
+    failures.add("a")
+    with pytest.raises(PartialCommandError):
+        history.add_command(_SetValuesCommand(values, {"a": True}, failures))
+    assert len(calls) == 2
+    assert not history.can_undo and history.can_redo
+    failures.clear()
+    history.redo()
+    assert values == {"a": True}
+
+
+def test_partial_add_records_only_completed_changes() -> None:
+    values = dict.fromkeys("abc", False)
+    failures = {"b"}
+    history = CommandHistory()
+    with pytest.raises(PartialCommandError):
+        history.add_command(_SetValuesCommand(values, dict.fromkeys("abc", True), failures))
+    assert values == {"a": True, "b": False, "c": True}
+    assert history.can_undo
+
+    history.undo()
+    assert values == dict.fromkeys("abc", False)
+    assert not history.can_undo
+    history.redo()
+    assert values == {"a": True, "b": False, "c": True}
+
+
+@pytest.mark.parametrize("direction", ["undo", "redo"])
+def test_partial_undo_redo_keeps_failed_subset_for_retry(direction) -> None:
+    values = dict.fromkeys("abc", False)
+    failures = set()
+    attempts = []
+    history = CommandHistory()
+    history.add_command(_SetValuesCommand(values, dict.fromkeys("abc", True), failures, attempts))
+    if direction == "redo":
+        history.undo()
+    failures.add("b")
+    attempts.clear()
+    operation = getattr(history, direction)
+    with pytest.raises(PartialCommandError):
+        operation()
+    desired = direction == "redo"
+    assert values == {"a": desired, "b": not desired, "c": desired}
+    assert history.can_undo and history.can_redo
+    assert attempts == ["a", "b", "c"]
+
+    attempts.clear()
+    with pytest.raises(PartialCommandError):
+        operation()
+    assert attempts == ["b"]
+    assert values == {"a": desired, "b": not desired, "c": desired}
+    failures.clear()
+    operation()
+    assert values == dict.fromkeys("abc", desired)
+
+    reverse = history.undo if direction == "redo" else history.redo
+    reverse()
+    assert values == {"a": desired, "b": not desired, "c": desired}
+    reverse()
+    assert values == dict.fromkeys("abc", not desired)
+
+
+def test_plain_undo_exception_keeps_original_command_for_retry() -> None:
+    values = ["a"]
+    gate = {"fail": True}
+
+    class _FailOnce:
+        def execute(self):
+            if gate["fail"]:
+                raise OSError("temporarily unavailable")
+            return _RemoveLastCommand(values, "a").execute()
+
+    history = CommandHistory()
+    history.add_command(_FailOnce(), execute=False)
+    with pytest.raises(OSError, match="temporarily unavailable"):
+        history.undo()
+    assert values == ["a"]
+    assert history.can_undo and not history.can_redo
+    gate["fail"] = False
+    history.undo()
+    assert values == []
+    history.redo()
+    assert values == ["a"]
+
+
+def test_noop_undo_and_empty_batch_do_not_create_inverse_entries() -> None:
+    values = {"a": False}
+    history = CommandHistory()
+    noop = _SetValuesCommand(values, {"a": False}, set())
+    history.add_command(noop, execute=False)
+    history.undo()
+    assert not history.can_undo and not history.can_redo
+    assert BatchCommand([noop]).execute() is None
+    history.add_command(BatchCommand())
+    assert not history.can_undo
+
+
+def test_noop_batch_preserves_redo() -> None:
+    values = {"a": False}
+    history = CommandHistory()
+    history.add_command(_SetValuesCommand(values, {"a": True}, set()))
+    history.undo()
+    history.begin_batch()
+    history.add_command(_SetValuesCommand(values, {"a": False}, set()))
+    history.end_batch()
+    assert not history.can_undo and history.can_redo
+
+
+def test_default_capacity_keeps_most_recent_100_commands() -> None:
+    values = []
+    history = CommandHistory()
+    for index in range(105):
+        history.add_command(_AppendCommand(values, str(index)))
+    for _ in range(100):
+        history.undo()
+    assert values == [str(index) for index in range(5)]
+    assert not history.can_undo
+    for _ in range(100):
+        history.redo()
+    assert values == [str(index) for index in range(105)]
+    assert not history.can_redo
+
+
+@pytest.mark.parametrize("capacity", [0, -1, 1.5])
+def test_invalid_history_capacity_is_rejected(capacity) -> None:
+    with pytest.raises(ValueError, match="positive integer"):
+        CommandHistory(max_commands=capacity)
+
+
+def test_custom_capacity_retains_newest_commands() -> None:
+    values = []
+    history = CommandHistory(max_commands=2)
+    for item in "abc":
+        history.add_command(_AppendCommand(values, item))
+    history.undo()
+    history.undo()
+    assert values == ["a"]
+    assert not history.can_undo
+    history.redo()
+    history.redo()
+    assert values == ["a", "b", "c"]
+
+
+def test_batch_plain_failure_preserves_completed_inverse_and_retry_order() -> None:
+    values = []
+    gate = {"fail": True}
+
+    class _MaybeAppendB:
+        def execute(self):
+            if gate["fail"]:
+                raise OSError("b unavailable")
+            return _AppendCommand(values, "b").execute()
+
+    history = CommandHistory()
+    batch = BatchCommand([
+        _AppendCommand(values, "a"), _MaybeAppendB(), _AppendCommand(values, "c")
+    ])
+    with pytest.raises(PartialCommandError) as caught:
+        history.add_command(batch)
+    assert values == ["c"]
+    assert history.can_undo
+    gate["fail"] = False
+    history.add_command(caught.value.remaining)
+    assert values == ["c", "b", "a"]
+    history.undo()
+    assert values == ["c"]
+    history.undo()
+    assert values == []
+
+
+def test_nested_partial_batch_preserves_current_and_unexecuted_work() -> None:
+    values = dict.fromkeys("abcd", False)
+    failures = {"c"}
+    attempts = []
+    batch = BatchCommand([
+        _SetValuesCommand(values, {"a": True}, failures, attempts),
+        BatchCommand([
+            _SetValuesCommand(values, {"b": True, "c": True}, failures, attempts),
+            _SetValuesCommand(values, {"d": True}, failures, attempts),
+        ]),
+    ])
+    with pytest.raises(PartialCommandError) as caught:
+        batch.execute()
+    assert attempts == ["d", "b", "c"]
+    assert values == {"a": False, "b": True, "c": False, "d": True}
+    caught.value.inverse.execute()
+    assert attempts == ["d", "b", "c", "b", "d"]
+    assert values == dict.fromkeys("abcd", False)
+    failures.clear()
+    caught.value.remaining.execute()
+    assert attempts == ["d", "b", "c", "b", "d", "c", "a"]
+    assert values == {"a": True, "b": False, "c": True, "d": False}

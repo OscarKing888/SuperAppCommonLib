@@ -276,7 +276,23 @@ def _remove_matching_metadata_aliases(metadata: dict[str, Any], predicate, keep_
             metadata.pop(existing_key, None)
 
 
-def read_json_sidecar(image_path: str | os.PathLike[str]) -> dict[str, Any]:
+def read_json_sidecar(image_path: str | os.PathLike[str], *, strict: bool = False) -> dict[str, Any]:
+    """Read the preferred sidecar; strict reads distinguish damage from absence."""
+    if strict:
+        # Open the same central/legacy candidates directly so an inaccessible
+        # file is not silently treated as a missing sidecar by is_file().
+        for candidate in json_sidecar_candidate_paths_for(image_path):
+            try:
+                with open(candidate, "r", encoding="utf-8-sig") as fh:
+                    payload = json.load(fh)
+            except FileNotFoundError:
+                continue
+            if not isinstance(payload, dict):
+                raise ValueError(f"JSON sidecar must contain an object: {candidate}")
+            if "metadata" in payload and not isinstance(payload["metadata"], dict):
+                raise ValueError(f"JSON sidecar metadata must contain an object: {candidate}")
+            return payload
+        return {}
     sidecar_path = find_json_sidecar(image_path)
     if not sidecar_path:
         return {}

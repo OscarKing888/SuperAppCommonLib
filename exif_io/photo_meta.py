@@ -421,13 +421,26 @@ class PhotoMetaDataXMP(PhotoMetaData):
         except Exception:
             return False
 
-    def read_subjects(self, path: str) -> list[str]:
-        """Read XMP ``dc:subject`` values as an ordered, de-duplicated list."""
+    def read_subjects(self, path: str, *, strict: bool = False) -> list[str]:
+        """Read subjects, optionally rejecting unreadable or malformed XMP."""
         try:
-            from .xmp_sidecar import read_xmp_sidecar
+            from .xmp_sidecar import find_xmp_sidecar, read_xmp_sidecar
+            if strict:
+                # Keep the existing parser/journal merge semantics, but do not
+                # let its forgiving error fallback become a write snapshot.
+                sidecar = find_xmp_sidecar(path)
+                if sidecar:
+                    ET.parse(sidecar)
+                else:
+                    try:
+                        ET.parse(self.sidecar_path_for(path))
+                    except FileNotFoundError:
+                        pass
             rows = read_xmp_sidecar(path)
             self._compact_pending_edits(path, self.sidecar_path_for(path))
         except Exception:
+            if strict:
+                raise
             return []
 
         values: list[str] = []
@@ -796,8 +809,8 @@ class PhotoMetaDataJSON(PhotoMetaData):
         self._invalidate_metadata_cache(path)
         return True
 
-    def read_subjects(self, path: str) -> list[str]:
-        payload = read_json_sidecar(path)
+    def read_subjects(self, path: str, *, strict: bool = False) -> list[str]:
+        payload = read_json_sidecar(path, strict=strict)
         metadata = json_sidecar_metadata(payload)
         for key, value in metadata.items():
             if _is_xmp_subject_key(str(key)):
@@ -807,8 +820,12 @@ class PhotoMetaDataJSON(PhotoMetaData):
         fallback = self._fallback
         if fallback is not None and hasattr(fallback, "read_subjects"):
             try:
+                if strict and isinstance(fallback, (PhotoMetaDataJSON, PhotoMetaDataXMP)):
+                    return list(fallback.read_subjects(path, strict=True))
                 return list(fallback.read_subjects(path))  # type: ignore[attr-defined]
             except Exception:
+                if strict:
+                    raise
                 return []
         return []
 
