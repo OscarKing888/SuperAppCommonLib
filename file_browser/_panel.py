@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import tempfile
 
 from app_common.exif_io.json_sidecar import JSON_SIDECAR_SUFFIX, find_json_sidecar, json_sidecar_path_for
 from app_common.perf_probe import elapsed_ms, perf_counter, perf_log, perf_probes_enabled
@@ -6750,13 +6751,17 @@ class FileListPanel(QWidget):
                     for item in decoded:
                         if not isinstance(item, dict):
                             continue
-                        source = os.path.abspath(str(item.get("source") or ""))
+                        source_text = str(item.get("source") or "").strip()
+                        source = os.path.abspath(source_text) if source_text else ""
                         sidecars = [
                             os.path.abspath(path)
                             for path in self._sidecar_paths_from_clipboard_entry(item)
-                            if path and os.path.isfile(path)
+                            if path
                         ]
-                        if source and os.path.isfile(source):
+                        # Preserve declared members until transaction validation.
+                        # Filtering missing paths here silently turns a cut into
+                        # a different, incomplete clipboard payload.
+                        if source:
                             entries.append({"source": source, "sidecar": sidecars[0] if sidecars else "", "sidecars": sidecars})
                     if entries:
                         return action, entries
@@ -6869,11 +6874,13 @@ class FileListPanel(QWidget):
         dest_dir: str,
         *,
         action: str,
+        reserved_destinations: set[str] | None = None,
     ) -> tuple[str, list[str]]:
         """计算主文件和 sidecar 的目标路径，避免覆盖并保持 sidecar 跟随主文件名。"""
         source = Path(source_path)
         base_stem = source.stem
         suffix = source.suffix
+        reserved = reserved_destinations if reserved_destinations is not None else set()
 
         for i in range(0, 10000):
             if i == 0:
@@ -6891,11 +6898,18 @@ class FileListPanel(QWidget):
             source_conflict = os.path.exists(dest_source) and not (
                 action == "cut" and self._same_file_path(source_path, dest_source)
             )
+            if os.path.normcase(os.path.normpath(dest_source)) in reserved:
+                source_conflict = True
             sidecar_conflict = False
             candidate_keys = {os.path.normcase(os.path.normpath(dest_source))}
             for sidecar_path, dest_sidecar in zip(sidecar_paths, dest_sidecars):
                 key = os.path.normcase(os.path.normpath(dest_sidecar))
                 if key in candidate_keys:
+                    sidecar_conflict = True
+                    break
+                if key in reserved and not (
+                    action == "cut" and self._same_file_path(sidecar_path, dest_sidecar)
+                ):
                     sidecar_conflict = True
                     break
                 candidate_keys.add(key)
@@ -6905,8 +6919,231 @@ class FileListPanel(QWidget):
                     sidecar_conflict = True
                     break
             if not source_conflict and not sidecar_conflict:
+                reserved.update(candidate_keys)
                 return dest_source, dest_sidecars
         raise RuntimeError(f"无法为 {source.name} 生成不冲突的目标文件名。")
+
+    @classmethod
+    def _paste_file_bundle_transaction(
+        cls,
+        source_path: str,
+        sidecar_paths: list[str],
+        dest_source: str,
+        dest_sidecars: list[str],
+        *,
+        action: str,
+    ) -> list[str]:
+        """Copy/move one image and its sidecars as a rollback-safe bundle.
+
+        Every member is first staged in the destination directory.  Only after
+        all staging succeeds are the temporary files published without replacing
+        existing destinations. A failure removes copied output or restores
+        every moved source before the error is reported.
+        """
+        if action not in {"copy", "cut"}:
+            raise ValueError(f"Unsupported clipboard action: {action!r}")
+        if len(sidecar_paths) != len(dest_sidecars):
+            raise ValueError("Sidecar source/destination counts differ.")
+
+        pairs: list[tuple[str, str]] = [
+            (os.path.abspath(source_path), os.path.abspath(dest_source))
+        ]
+        pairs.extend(
+            (os.path.abspath(source), os.path.abspath(dest))
+            for source, dest in zip(sidecar_paths, dest_sidecars)
+        )
+        return cls._paste_path_pairs_transaction(pairs, action=action)
+
+    @staticmethod
+    def _publish_paste_file_without_overwrite(source: str, dest: str) -> None:
+        """Publish a staged file without replacing a concurrent destination.
+
+        Windows rename already refuses existing destinations, including on
+        volumes without hard links. Other platforms use atomic linking, then
+        exclusive copying if linking is unsupported. The caller tracks both
+        the staging path and the destination for rollback.
+        """
+        if os.name == "nt":
+            try:
+                os.rename(source, dest)
+                return
+            except OSError:
+                if os.path.lexists(dest):
+                    raise FileExistsError(dest)
+        try:
+            os.link(source, dest)
+            return
+        except OSError:
+            if os.path.lexists(dest):
+                raise FileExistsError(dest)
+
+        # Opening with "xb" closes the exists-check race on every supported
+        # filesystem; neither link nor this fallback can overwrite a target.
+        output = open(dest, "xb")
+        try:
+            with output:
+                with open(source, "rb") as input_file:
+                    shutil.copyfileobj(input_file, output)
+            shutil.copystat(source, dest)
+        except Exception:
+            os.remove(dest)
+            raise
+
+    @classmethod
+    def _paste_path_pairs_transaction(
+        cls,
+        path_pairs: list[tuple[str, str]],
+        *,
+        action: str,
+    ) -> list[str]:
+        """Stage the whole clipboard and roll back every member on failure."""
+        if action not in {"copy", "cut"}:
+            raise ValueError(f"Unsupported clipboard action: {action!r}")
+        pairs = [
+            (os.path.abspath(source), os.path.abspath(dest))
+            for source, dest in path_pairs
+        ]
+        # Even same-directory cut no-ops must validate every declared member.
+        for source, _dest in pairs:
+            if not os.path.isfile(source):
+                raise FileNotFoundError(source)
+        pairs = [
+            (source, dest)
+            for source, dest in pairs
+            if not cls._same_file_path(source, dest)
+        ]
+        if not pairs:
+            return []
+
+        staged: list[tuple[str, str, str]] = []
+        committed: list[tuple[str, str, str]] = []
+        first_stage_by_source: dict[str, str] = {}
+        moved_staging_paths: set[str] = set()
+        rollback_errors: list[str] = []
+        try:
+            for source, dest in pairs:
+                source_key = os.path.normcase(os.path.normpath(source))
+                previous_stage = first_stage_by_source.get(source_key)
+                owns_source = action == "cut" and previous_stage is None
+                if not previous_stage and not os.path.isfile(source):
+                    raise FileNotFoundError(source)
+                if os.path.lexists(dest):
+                    raise FileExistsError(dest)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                fd, temp_path = tempfile.mkstemp(
+                    prefix=f".{Path(dest).name}.sbt-paste-",
+                    suffix=".tmp",
+                    dir=os.path.dirname(dest),
+                )
+                os.close(fd)
+                # mkstemp reserves a collision-free name.  Remove its empty
+                # placeholder so same-volume cut uses a fast rename instead
+                # of a copy-over-existing fallback on Windows.
+                os.remove(temp_path)
+                try:
+                    if owns_source:
+                        shutil.move(source, temp_path)
+                    else:
+                        # RAW/JPG pairs may share a stem.xmp. Move its original
+                        # once, but give every destination its own full sidecar.
+                        shutil.copy2(previous_stage or source, temp_path)
+                except Exception as stage_exc:
+                    stage_rollback_error = ""
+                    if owns_source and os.path.exists(temp_path):
+                        if os.path.lexists(source):
+                            # The move may have completed before raising, and
+                            # another process may already have recreated source.
+                            # Its existence cannot prove the original survived.
+                            stage_rollback_error = (
+                                f"Cannot restore {temp_path!r}: source path already exists at {source!r}"
+                            )
+                        else:
+                            try:
+                                # A filesystem move may complete and then raise
+                                # (for example while copying metadata). Restore
+                                # the only surviving copy before unwinding.
+                                cls._publish_paste_file_without_overwrite(temp_path, source)
+                                if os.path.exists(temp_path):
+                                    os.remove(temp_path)
+                            except Exception as rollback_exc:
+                                stage_rollback_error = (
+                                    f"{temp_path!r} -> {source!r}: {rollback_exc}"
+                                )
+                    elif os.path.exists(temp_path):
+                        try:
+                            os.remove(temp_path)
+                        except Exception as rollback_exc:
+                            stage_rollback_error = f"remove {temp_path!r}: {rollback_exc}"
+                    elif owns_source and not os.path.exists(source):
+                        stage_rollback_error = (
+                            f"both source and staging path are missing for {source!r}"
+                        )
+                    if stage_rollback_error:
+                        recovery_detail = (
+                            f"; recoverable files retained at: {temp_path!r}"
+                            if os.path.exists(temp_path) else ""
+                        )
+                        raise RuntimeError(
+                            f"Clipboard staging failed ({stage_exc}); rollback was incomplete: "
+                            f"{stage_rollback_error}{recovery_detail}"
+                        ) from stage_exc
+                    raise
+                staged.append((source, temp_path, dest))
+                first_stage_by_source.setdefault(source_key, temp_path)
+                if owns_source:
+                    moved_staging_paths.add(temp_path)
+
+            for source, temp_path, dest in staged:
+                cls._publish_paste_file_without_overwrite(temp_path, dest)
+                committed.append((source, temp_path, dest))
+
+            for _source, temp_path, _dest in staged:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            touched: list[str] = []
+            for source, _temp_path, dest in committed:
+                if action == "cut":
+                    touched.append(source)
+                touched.append(dest)
+            return touched
+        except Exception as exc:
+            retained_paths: list[str] = []
+            if action == "cut":
+                committed_by_stage = {temp: dest for _source, temp, dest in committed}
+                for source, temp_path, _dest in reversed(staged):
+                    if temp_path not in moved_staging_paths:
+                        continue
+                    current = temp_path if os.path.exists(temp_path) else committed_by_stage.get(temp_path)
+                    try:
+                        if not current or not os.path.exists(current):
+                            raise FileNotFoundError(f"Recovery copy missing for {source!r}")
+                        cls._publish_paste_file_without_overwrite(current, source)
+                    except Exception as rollback_exc:
+                        rollback_errors.append(f"{current!r} -> {source!r}: {rollback_exc}")
+                        if current and os.path.exists(current):
+                            retained_paths.append(current)
+            for _source, _temp_path, dest in reversed(committed):
+                try:
+                    if dest not in retained_paths and os.path.exists(dest):
+                        os.remove(dest)
+                except Exception as rollback_exc:
+                    rollback_errors.append(f"remove {dest!r}: {rollback_exc}")
+            for _source, temp_path, _dest in reversed(staged):
+                try:
+                    if temp_path not in retained_paths and os.path.exists(temp_path):
+                        os.remove(temp_path)
+                except Exception as rollback_exc:
+                    rollback_errors.append(f"remove {temp_path!r}: {rollback_exc}")
+            if rollback_errors or retained_paths:
+                recovery_detail = (
+                    "; recoverable files retained at: " + ", ".join(repr(path) for path in retained_paths)
+                    if retained_paths else ""
+                )
+                raise RuntimeError(
+                    f"Clipboard bundle failed ({exc}); rollback was incomplete: "
+                    + "; ".join(rollback_errors) + recovery_detail
+                ) from exc
+            raise
 
     def _paste_clipboard_to_current_dir(self) -> None:
         """将剪贴板中的文件粘贴到当前目录；内部剪切会移动，复制会复制。"""
@@ -6928,45 +7165,33 @@ class FileListPanel(QWidget):
         pasted_sources: list[str] = []
         touched_paths: list[str] = []
         failures: list[str] = []
+        failure_details: list[str] = []
+        paste_plans: list[tuple[str, list[str], str, list[str]]] = []
+        reserved_destinations: set[str] = set()
         for entry in entries:
             source_path = os.path.abspath(str(entry.get("source") or ""))
+            if not source_path or not os.path.isfile(source_path):
+                failures.append(source_path or "(empty)")
+                failure_details.append(f"源文件不存在：{source_path or '(empty)'}")
+                continue
+            # Keep both XMP and JSON sidecars, including the configured
+            # central JSON path. A declared member disappearing must fail the
+            # transaction rather than silently detach metadata from the photo.
             sidecar_paths = [
                 os.path.abspath(path)
                 for path in self._sidecar_paths_from_clipboard_entry(entry)
-                if path and os.path.isfile(path)
+                if path
             ]
-            if not source_path or not os.path.isfile(source_path):
-                failures.append(source_path or "(empty)")
-                continue
             try:
                 dest_source, dest_sidecars = self._unique_paste_destinations(
                     source_path,
                     sidecar_paths,
                     dest_dir,
                     action=action,
+                    reserved_destinations=reserved_destinations,
                 )
-                if action == "cut":
-                    if not self._same_file_path(source_path, dest_source):
-                        shutil.move(source_path, dest_source)
-                        touched_paths.extend([source_path, dest_source])
-                    for sidecar_path, dest_sidecar in zip(sidecar_paths, dest_sidecars):
-                        if not self._same_file_path(sidecar_path, dest_sidecar):
-                            shutil.move(sidecar_path, dest_sidecar)
-                            touched_paths.extend([sidecar_path, dest_sidecar])
-                else:
-                    shutil.copy2(source_path, dest_source)
-                    touched_paths.extend([dest_source])
-                    for sidecar_path, dest_sidecar in zip(sidecar_paths, dest_sidecars):
-                        shutil.copy2(sidecar_path, dest_sidecar)
-                        touched_paths.extend([dest_sidecar])
-                pasted_sources.append(dest_source)
-                _log.info(
-                    "[_paste_clipboard_to_current_dir] action=%r source=%r sidecars=%s dest=%r dest_sidecars=%s",
-                    action,
-                    source_path,
-                    sidecar_paths,
-                    dest_source,
-                    dest_sidecars,
+                paste_plans.append(
+                    (source_path, sidecar_paths, dest_source, dest_sidecars)
                 )
             except Exception as exc:
                 _log.warning(
@@ -6977,7 +7202,47 @@ class FileListPanel(QWidget):
                     exc,
                 )
                 failures.append(source_path)
+                failure_details.append(f"{source_path}\n{exc}")
 
+        # One clipboard payload is one transaction.  Do not leave a cut
+        # payload half-valid when a later entry fails.
+        if paste_plans and not failures:
+            path_pairs: list[tuple[str, str]] = []
+            for source_path, sidecar_paths, dest_source, dest_sidecars in paste_plans:
+                path_pairs.append((source_path, dest_source))
+                path_pairs.extend(zip(sidecar_paths, dest_sidecars))
+            try:
+                touched_paths = self._paste_path_pairs_transaction(
+                    path_pairs,
+                    action=action,
+                )
+                pasted_sources = [plan[2] for plan in paste_plans]
+                for source_path, sidecar_paths, dest_source, dest_sidecars in paste_plans:
+                    _log.info(
+                        "[_paste_clipboard_to_current_dir] action=%r source=%r sidecars=%s dest=%r dest_sidecars=%s",
+                        action,
+                        source_path,
+                        sidecar_paths,
+                        dest_source,
+                        dest_sidecars,
+                    )
+            except Exception as exc:
+                failures = [plan[0] for plan in paste_plans]
+                failure_details.append(str(exc))
+                _log.warning(
+                    "[_paste_clipboard_to_current_dir] action=%r transaction failed entries=%s: %s",
+                    action,
+                    len(paste_plans),
+                    exc,
+                )
+
+        if failures:
+            QMessageBox.warning(
+                self,
+                "粘贴失败",
+                "粘贴未完成。请检查以下详情；列出的恢复副本不会被自动删除。\n\n"
+                + "\n\n".join(failure_details),
+            )
         if touched_paths:
             try:
                 from app_common.exif_io.writer import invalidate_metadata_cache
