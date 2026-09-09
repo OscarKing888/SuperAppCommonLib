@@ -75,6 +75,7 @@ class DirectoryScanWorker(QThread):
 
     scan_finished = pyqtSignal(str, object, object, object, object)  # (path, files_list, selected_report_cache, full_report_cache_or_none, report_row_by_path)
     scan_progress = pyqtSignal(str, int, int, str)  # (path, found_files, scanned_dirs, current_dir)
+    report_scope_progress = pyqtSignal(str, int, int, str)  # (path, processed, total, report_root)
 
     def __init__(
         self,
@@ -93,6 +94,7 @@ class DirectoryScanWorker(QThread):
         self._use_report_db = bool(use_report_db)
 
     def run(self) -> None:
+        started_at = _time.perf_counter()
         _log.info(
             "[DirectoryScanWorker.run] START path=%r recursive=%s report_root=%r use_report_db=%s has_cached_full_report=%s",
             self._path,
@@ -118,6 +120,8 @@ class DirectoryScanWorker(QThread):
                     full_report_cache = {}
                     try:
                         for row in db.get_all_photos():
+                            if self.isInterruptionRequested():
+                                return
                             r = _normalize_report_row_paths(dict(row))
                             stem = r.get("filename")
                             if stem is not None:
@@ -132,6 +136,7 @@ class DirectoryScanWorker(QThread):
             _log.info("[DirectoryScanWorker.run] interrupted after report")
             return
         files: list = []
+        report_loaded_at = _time.perf_counter()
         scanned_dirs = 0
         last_progress_at = 0.0
         last_progress_files = 0
@@ -190,12 +195,16 @@ class DirectoryScanWorker(QThread):
                 # In report mode the DB view is subtree-based even without UI filters,
                 # so actual file supplementation must recurse under the selected dir.
                 actual_files = _collect_image_files_impl(self._path, True)
+                if self.isInterruptionRequested():
+                    return
                 full_cache = full_report_cache or report_cache or {}
                 existing = {_path_key(p) for p in files if p}
                 file_index_by_stem = {Path(p).stem: i for i, p in enumerate(files) if p}
                 supplemented = 0
                 replaced = 0
                 for actual_path in actual_files:
+                    if self.isInterruptionRequested():
+                        return
                     stem = Path(actual_path).stem
                     row = full_cache.get(stem)
                     if not isinstance(row, dict):
@@ -280,13 +289,35 @@ class DirectoryScanWorker(QThread):
                     maybe_emit_progress(self._path, force=True)
             except (PermissionError, OSError) as e:
                 _log.warning("[DirectoryScanWorker.run] scan error: %s", e)
+        scanned_at = _time.perf_counter()
+        maybe_emit_progress(self._path, force=True)
         report_row_by_path: dict = {}
         if self._use_report_db:
+            last_scope_progress_at = 0.0
+            last_scope_progress_counts = None
+
+            def report_scope_progress(processed: int, total: int, report_root: str) -> None:
+                nonlocal last_scope_progress_at, last_scope_progress_counts
+                now = _time.perf_counter()
+                counts = (processed, total)
+                if counts == last_scope_progress_counts:
+                    return
+                if last_scope_progress_counts is not None and processed != total and now - last_scope_progress_at < 0.25:
+                    return
+                last_scope_progress_at = now
+                last_scope_progress_counts = counts
+                self.report_scope_progress.emit(self._path, processed, total, report_root)
+
             try:
+                report_scope_progress(0, len(files), self._path)
                 scoped_cache, scoped_full_cache, scoped_rows_by_path = _build_report_scope_maps_for_files(
                     files,
                     self._path,
+                    should_cancel=self.isInterruptionRequested,
+                    progress_callback=report_scope_progress,
                 )
+                if self.isInterruptionRequested():
+                    return
                 if scoped_rows_by_path:
                     report_cache = scoped_cache
                     full_report_cache = scoped_full_cache
@@ -298,9 +329,17 @@ class DirectoryScanWorker(QThread):
                     len(full_report_cache or {}),
                     len(report_row_by_path or {}),
                 )
+            except _ReportScopeBuildCancelled:
+                _log.info("[DirectoryScanWorker.run] report scope cancelled path=%r", self._path)
+                return
             except Exception as exc:
                 _log.warning("[DirectoryScanWorker.run] build report scopes failed: %s", exc)
-        maybe_emit_progress(self._path, force=True)
+        completed_at = _time.perf_counter()
+        _log.info(
+            "[DirectoryScanWorker.run] timings path=%r files=%s report_load=%.3fs filesystem=%.3fs report_scope=%.3fs total=%.3fs",
+            self._path, len(files), report_loaded_at - started_at,
+            scanned_at - report_loaded_at, completed_at - scanned_at, completed_at - started_at,
+        )
         _log.info("[DirectoryScanWorker.run] 目录扫描完成：列出 %s 个图像文件，report_cache %s 条，即将通知主线程加载 EXIF", len(files), len(report_cache))
         _log.info("[DirectoryScanWorker.run] scan done files=%s", len(files))
         if not self.isInterruptionRequested():

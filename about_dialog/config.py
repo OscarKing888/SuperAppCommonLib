@@ -7,6 +7,10 @@ from __future__ import annotations
 import json
 import os
 
+from app_common.log import get_logger
+
+
+_log = get_logger("about_dialog")
 _DEFAULT_ABOUT = {
     "app_name": "{app_name}",
     "version": "{version}",
@@ -36,7 +40,17 @@ def _load_raw_cfg(path: str) -> dict:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
+    except json.JSONDecodeError as exc:
+        _log.warning(
+            "Invalid JSON in about config %s at line %d column %d: %s",
+            path,
+            exc.lineno,
+            exc.colno,
+            exc.msg,
+        )
+        return {}
+    except OSError as exc:
+        _log.warning("Unable to read about config %s: %s", path, exc)
         return {}
 
 

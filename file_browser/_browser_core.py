@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import concurrent.futures as _futures
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 import hashlib
 import html
@@ -1867,9 +1868,142 @@ def _report_row_matches_path(row: dict, path: str, report_root: str = "") -> boo
     return False
 
 
+class _ReportScopeBuildCancelled(RuntimeError):
+    """A directory scan was superseded while building its report lookup."""
+
+
+def _check_report_scope_cancelled(should_cancel: Callable[[], bool] | None) -> None:
+    if should_cancel is not None and should_cancel():
+        raise _ReportScopeBuildCancelled()
+
+
+class _IndexedReportCache(dict):
+    """A report snapshot with a path index owned by the same directory scope.
+
+    Row metadata may be edited in place; replace a row when changing its path or
+    filename so mapping mutation invalidates the index. No process-global cache
+    retains old directories. Plain dict callers remain supported by the lookup.
+    """
+
+    def __init__(self, cache=(), *, should_cancel=None, progress_callback=None):
+        super().__init__(cache)
+        self._path_rows = None
+        self._pathless_stem_rows = None
+        self._ensure_path_index(should_cancel, progress_callback)
+
+    def _ensure_path_index(self, should_cancel=None, progress_callback=None) -> None:
+        if self._path_rows is not None:
+            return
+        path_rows: dict[str, tuple[int, dict]] = {}
+        pathless_stem_rows: dict[str, tuple[int, dict]] = {}
+        for ordinal, row in enumerate(self.values()):
+            if ordinal % 128 == 0:
+                _check_report_scope_cancelled(should_cancel)
+                if progress_callback is not None:
+                    progress_callback()
+            if not isinstance(row, dict):
+                continue
+            root = str(row.get("_report_root_dir") or "")
+            for candidate in _report_row_candidate_paths(row, root):
+                path_rows.setdefault(_path_key(candidate), (ordinal, row))
+            if not any(str(row.get(key) or "").strip() for key in (
+                "current_path", "_current_path_report_raw", "original_path",
+            )):
+                stem = str(row.get("filename") or "").strip()
+                if stem:
+                    pathless_stem_rows.setdefault(stem, (ordinal, row))
+        _check_report_scope_cancelled(should_cancel)
+        self._pathless_stem_rows = pathless_stem_rows
+        self._path_rows = path_rows
+
+    def _invalidate_path_index(self) -> None:
+        self._path_rows = None
+        self._pathless_stem_rows = None
+
+    def __setitem__(self, key, value) -> None:
+        super().__setitem__(key, value)
+        self._invalidate_path_index()
+
+    def __delitem__(self, key) -> None:
+        super().__delitem__(key)
+        self._invalidate_path_index()
+
+    def clear(self) -> None:
+        super().clear()
+        self._invalidate_path_index()
+
+    def pop(self, key, *default):
+        value = super().pop(key, *default)
+        self._invalidate_path_index()
+        return value
+
+    def popitem(self):
+        value = super().popitem()
+        self._invalidate_path_index()
+        return value
+
+    def setdefault(self, key, default=None):
+        if key not in self:
+            self[key] = default
+        return self[key]
+
+    def update(self, *args, **kwargs) -> None:
+        # Invalidate first: dict.update can partially apply before raising.
+        self._invalidate_path_index()
+        super().update(*args, **kwargs)
+
+    def __ior__(self, other):
+        self.update(other)
+        return self
+
+    def copy(self):
+        # The row objects are shared by a normal dict.copy too. Index maps are
+        # published once and never edited; either copy invalidates only its own
+        # references when its mapping changes, without rebuilding on GUI stores.
+        copied = dict.__new__(_IndexedReportCache)
+        dict.__init__(copied, self)
+        copied._path_rows = self._path_rows
+        copied._pathless_stem_rows = self._pathless_stem_rows
+        return copied
+
+    def row_for_path(self, path: str) -> dict | None:
+        stem = Path(path).stem
+        row = self.get(stem) if stem else None
+        # Preserve the old explicit stem-key preference even when a different
+        # earlier row has the same candidate path.
+        if isinstance(row, dict) and _report_row_matches_path(row, path, str(row.get("_report_root_dir") or "")):
+            return row
+        self._ensure_path_index()
+        path_match = self._path_rows.get(_path_key(path))
+        stem_match = self._pathless_stem_rows.get(stem) if stem else None
+        if path_match is None:
+            return stem_match[1] if stem_match is not None else None
+        if stem_match is not None and stem_match[0] < path_match[0]:
+            return stem_match[1]
+        return path_match[1]
+
+
+def _index_report_cache(
+    report_cache: dict | None,
+    *,
+    should_cancel: Callable[[], bool] | None = None,
+    progress_callback: Callable[[], None] | None = None,
+) -> _IndexedReportCache:
+    if isinstance(report_cache, _IndexedReportCache):
+        report_cache._ensure_path_index(should_cancel, progress_callback)
+        return report_cache
+    return _IndexedReportCache(
+        report_cache or {},
+        should_cancel=should_cancel,
+        progress_callback=progress_callback,
+    )
+
+
 def _report_row_from_cache_for_path(path: str, report_cache: dict | None) -> dict | None:
     if not path or not isinstance(report_cache, dict):
         return None
+    if isinstance(report_cache, _IndexedReportCache):
+        return report_cache.row_for_path(path)
     stem = Path(path).stem
     if stem:
         row = report_cache.get(stem)
@@ -1881,7 +2015,13 @@ def _report_row_from_cache_for_path(path: str, report_cache: dict | None) -> dic
     return None
 
 
-def _load_report_cache_for_root(report_root: str) -> dict[str, dict]:
+def _load_report_cache_for_root(
+    report_root: str,
+    *,
+    should_cancel: Callable[[], bool] | None = None,
+    progress_callback: Callable[[], None] | None = None,
+) -> dict[str, dict]:
+    _check_report_scope_cancelled(should_cancel)
     if not report_root:
         return {}
     db = ReportDB.open_if_exists(report_root)
@@ -1890,6 +2030,10 @@ def _load_report_cache_for_root(report_root: str) -> dict[str, dict]:
     cache: dict[str, dict] = {}
     try:
         for idx, row in enumerate(db.get_all_photos()):
+            if idx % 128 == 0:
+                _check_report_scope_cancelled(should_cancel)
+                if progress_callback is not None:
+                    progress_callback()
             if not isinstance(row, dict):
                 continue
             r = _normalize_report_row_paths(dict(row))
@@ -1904,12 +2048,21 @@ def _load_report_cache_for_root(report_root: str) -> dict[str, dict]:
     return cache
 
 
-def _merge_report_cache_rows(caches_by_root: dict[str, dict[str, dict]]) -> dict[str, dict]:
+def _merge_report_cache_rows(
+    caches_by_root: dict[str, dict[str, dict]],
+    *,
+    should_cancel: Callable[[], bool] | None = None,
+    progress_callback: Callable[[], None] | None = None,
+) -> dict[str, dict]:
     merged: dict[str, dict] = {}
     stem_counts: dict[str, int] = {}
     rows: list[tuple[str, dict]] = []
     for report_root, cache in caches_by_root.items():
         for row in cache.values():
+            if len(rows) % 128 == 0:
+                _check_report_scope_cancelled(should_cancel)
+                if progress_callback is not None:
+                    progress_callback()
             if not isinstance(row, dict):
                 continue
             stem = str(row.get("filename") or "").strip()
@@ -1917,6 +2070,10 @@ def _merge_report_cache_rows(caches_by_root: dict[str, dict[str, dict]]) -> dict
                 stem_counts[stem] = stem_counts.get(stem, 0) + 1
             rows.append((report_root, row))
     for idx, (report_root, row) in enumerate(rows):
+        if idx % 128 == 0:
+            _check_report_scope_cancelled(should_cancel)
+            if progress_callback is not None:
+                progress_callback()
         stem = str(row.get("filename") or "").strip()
         if stem and stem_counts.get(stem, 0) == 1:
             key = stem
@@ -1925,37 +2082,78 @@ def _merge_report_cache_rows(caches_by_root: dict[str, dict[str, dict]]) -> dict
         out = dict(row)
         out.setdefault("_report_root_dir", os.path.normpath(report_root))
         merged[key] = out
-    return merged
+    return _index_report_cache(
+        merged, should_cancel=should_cancel, progress_callback=progress_callback,
+    )
 
 
 def _build_report_scope_maps_for_files(
     files: list[str],
     selected_dir: str | None,
+    *,
+    should_cancel: Callable[[], bool] | None = None,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> tuple[dict[str, dict], dict[str, dict], dict[str, dict]]:
+    """Match a directory snapshot in O(files + report rows), including misses."""
     caches_by_root: dict[str, dict[str, dict]] = {}
+    roots_by_directory: dict[str, str] = {}
     report_row_by_path: dict[str, dict] = {}
+    total = len(files or [])
+    completed = 0
+    progress_dir = str(selected_dir or "")
+
+    def report_progress() -> None:
+        if progress_callback is not None:
+            progress_callback(completed, total, progress_dir)
+
+    _check_report_scope_cancelled(should_cancel)
+    report_progress()
     for raw_path in files or []:
+        _check_report_scope_cancelled(should_cancel)
         norm_path = os.path.normpath(raw_path) if raw_path else ""
+        completed += 1
+        if completed % 128 == 0:
+            report_progress()
         if not norm_path:
             continue
-        report_root = _report_root_dir_for_file(norm_path, selected_dir)
+        parent_dir = os.path.dirname(norm_path)
+        if parent_dir not in roots_by_directory:
+            roots_by_directory[parent_dir] = _report_root_dir_for_file(norm_path, selected_dir)
+        report_root = roots_by_directory[parent_dir]
         if not report_root:
             continue
         cache = caches_by_root.get(report_root)
         if cache is None:
-            cache = _load_report_cache_for_root(report_root)
+            progress_dir = report_root
+            report_progress()
+            cache = _index_report_cache(
+                _load_report_cache_for_root(
+                    report_root, should_cancel=should_cancel, progress_callback=report_progress,
+                ),
+                should_cancel=should_cancel,
+                progress_callback=report_progress,
+            )
             caches_by_root[report_root] = cache
         row = _report_row_from_cache_for_path(norm_path, cache)
         if isinstance(row, dict):
             annotated = dict(row)
             annotated.setdefault("_report_root_dir", os.path.normpath(report_root))
             report_row_by_path[norm_path] = annotated
-    full_report_cache = _merge_report_cache_rows(caches_by_root)
+    full_report_cache = _merge_report_cache_rows(
+        caches_by_root, should_cancel=should_cancel, progress_callback=report_progress,
+    )
     selected_report_cache: dict[str, dict] = {}
-    for row in report_row_by_path.values():
+    for idx, row in enumerate(report_row_by_path.values()):
+        if idx % 128 == 0:
+            _check_report_scope_cancelled(should_cancel)
         stem = str(row.get("filename") or "").strip()
         if stem and stem not in selected_report_cache:
             selected_report_cache[stem] = row
+    selected_report_cache = _index_report_cache(
+        selected_report_cache, should_cancel=should_cancel, progress_callback=report_progress,
+    )
+    _check_report_scope_cancelled(should_cancel)
+    report_progress()
     return selected_report_cache, full_report_cache, report_row_by_path
 
 

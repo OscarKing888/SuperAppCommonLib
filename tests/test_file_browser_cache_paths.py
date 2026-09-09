@@ -1,6 +1,9 @@
 from pathlib import Path
 
 from PIL import Image
+import pytest
+
+from app_common.file_browser import _browser_core as browser_core
 
 from app_common.file_browser._browser_core import (
     _build_report_scope_maps_for_files,
@@ -255,3 +258,184 @@ def test_persistent_thumb_worker_builds_tasks_for_multiple_cache_scopes(tmp_path
         day1 / ".superpicky" / "thumb_cache" / "128",
         day2 / ".superpicky" / "thumb_cache" / "128",
     }
+
+
+def test_indexed_report_lookup_preserves_path_matching_and_stem_priority(tmp_path: Path) -> None:
+    root = tmp_path / "中文目录"
+    current = root / "当前" / "重复.ARW"
+    sidecar = root / "当前" / "重复.xmp"
+    original = root / "原始" / "重复.ARW"
+    other = root / "另一组" / "重复.ARW"
+    earlier_same_path = {"filename": "other", "current_path": str(current)}
+    preferred = browser_core._normalize_report_row_paths({
+        "filename": "重复",
+        "current_path": "当前\\重复.xmp",
+        "original_path": "原始/重复.ARW",
+        "_report_root_dir": str(root),
+    })
+    other_row = {"filename": "重复", "current_path": str(other)}
+    pathless = {"filename": "无路径", "bird_species_cn": "白鹭"}
+    stale = {"filename": "陈旧", "current_path": str(root / "旧目录" / "陈旧.HIF")}
+    cache = {
+        "first": earlier_same_path,
+        "重复": preferred,
+        "重复\0second": other_row,
+        "pathless": pathless,
+        "陈旧": stale,
+        "invalid": None,
+    }
+    indexed = browser_core._index_report_cache(cache)
+    for path, expected in (
+        (current, preferred),
+        (sidecar, preferred),
+        (original, preferred),
+        (other, other_row),
+        (root / "无路径.jpg", pathless),
+        (root / "新目录" / "陈旧.HIF", None),
+        (root / "missing.jpg", None),
+    ):
+        assert _report_row_from_cache_for_path(str(path), cache) is expected
+        assert _report_row_from_cache_for_path(str(path), indexed) is expected
+    assert preferred["_current_path_report_raw"].endswith("重复.xmp")
+    assert preferred["current_path"].endswith("重复.ARW")
+
+
+@pytest.mark.parametrize("pathless_first", [True, False])
+def test_indexed_report_lookup_retains_first_matching_row_order(
+    tmp_path: Path, pathless_first: bool,
+) -> None:
+    photo = tmp_path / "IMG0001.jpg"
+    path_row = {"filename": "IMG0001", "current_path": str(photo)}
+    pathless_row = {"filename": "IMG0001"}
+    rows = [pathless_row, path_row] if pathless_first else [path_row, pathless_row]
+    # Duplicate stems receive suffixed keys, so the insertion-order fallback
+    # decides between a full-path hit and a pathless legacy row.
+    cache = {f"IMG0001\0{index}": row for index, row in enumerate(rows)}
+    indexed = browser_core._index_report_cache(cache)
+    assert _report_row_from_cache_for_path(str(photo), indexed) is rows[0]
+
+
+def test_indexed_report_lookup_invalidates_replaced_and_removed_rows(tmp_path: Path) -> None:
+    old_photo = tmp_path / "before.jpg"
+    new_photo = tmp_path / "after.jpg"
+    old_row = {"filename": "old", "current_path": str(old_photo)}
+    new_row = {"filename": "new", "current_path": str(new_photo)}
+    cache = browser_core._index_report_cache({"row": old_row})
+    cache["row"] = new_row
+    assert _report_row_from_cache_for_path(str(old_photo), cache) is None
+    assert _report_row_from_cache_for_path(str(new_photo), cache) is new_row
+    cache.pop("row")
+    assert _report_row_from_cache_for_path(str(new_photo), cache) is None
+    cache.update({"row": old_row})
+    assert _report_row_from_cache_for_path(str(old_photo), cache) is old_row
+    cache.clear()
+    assert _report_row_from_cache_for_path(str(old_photo), cache) is None
+
+
+def test_indexed_report_cache_copy_preserves_snapshot_without_reindexing(tmp_path: Path, monkeypatch) -> None:
+    photo = tmp_path / "photo.jpg"
+    row = {"filename": "photo", "current_path": str(photo)}
+    cache = browser_core._index_report_cache({"row": row})
+    original_candidates = browser_core._report_row_candidate_paths
+
+    def unexpected_reindex(*args):
+        raise AssertionError("copy must reuse the published index")
+
+    monkeypatch.setattr(browser_core, "_report_row_candidate_paths", unexpected_reindex)
+    copied = cache.copy()
+    assert copied is not cache and copied == cache
+    assert _report_row_from_cache_for_path(str(photo), copied) is row
+    monkeypatch.setattr(browser_core, "_report_row_candidate_paths", original_candidates)
+    copied.clear()
+    assert _report_row_from_cache_for_path(str(photo), copied) is None
+    assert _report_row_from_cache_for_path(str(photo), cache) is row
+    copied = cache.copy()
+    cache.clear()
+    assert _report_row_from_cache_for_path(str(photo), cache) is None
+    assert _report_row_from_cache_for_path(str(photo), copied) is row
+
+
+def test_report_scope_missing_paths_are_linear_and_reuse_index(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "report"
+    count = 600
+    files = [str(root / "new" / f"DSC{index:05d}.HIF") for index in range(count)]
+    cache = {
+        f"DSC{index:05d}": {
+            "filename": f"DSC{index:05d}",
+            "current_path": f"old/DSC{index:05d}.HIF",
+            "_report_root_dir": str(root),
+        }
+        for index in range(count)
+    }
+    root_lookups = []
+    loads = []
+    candidate_calls = []
+    original_candidates = browser_core._report_row_candidate_paths
+
+    def find_root(path, selected_dir):
+        root_lookups.append(path)
+        return str(root)
+
+    def load_cache(report_root, **kwargs):
+        loads.append(report_root)
+        return cache
+
+    def counted_candidates(row, report_root):
+        candidate_calls.append(row)
+        return original_candidates(row, report_root)
+
+    monkeypatch.setattr(browser_core, "_report_root_dir_for_file", find_root)
+    monkeypatch.setattr(browser_core, "_load_report_cache_for_root", load_cache)
+    monkeypatch.setattr(browser_core, "_report_row_candidate_paths", counted_candidates)
+    progress = []
+    selected, full, by_path = _build_report_scope_maps_for_files(
+        files, str(root), progress_callback=lambda *args: progress.append(args),
+    )
+    assert not selected and not by_path
+    assert len(full) == count
+    assert len(root_lookups) == len(loads) == 1
+    # One index per root, one merged index, and at most one stem candidate per
+    # file. Previously these stale paths compared every file with every row.
+    assert len(candidate_calls) <= 3 * count
+    assert progress[0][:2] == (0, count)
+    assert progress[-1][:2] == (count, count)
+    calls_after_build = len(candidate_calls)
+    for index in range(count):
+        assert _report_row_from_cache_for_path(str(root / f"unknown{index}.HIF"), full) is None
+    assert len(candidate_calls) == calls_after_build
+
+
+def test_report_scope_build_can_cancel_during_indexing(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "report"
+    rows = {
+        str(index): {"filename": str(index), "current_path": str(root / f"{index}.jpg")}
+        for index in range(1000)
+    }
+    candidate_calls = []
+    original_candidates = browser_core._report_row_candidate_paths
+
+    def counted_candidates(row, report_root):
+        candidate_calls.append(row)
+        return original_candidates(row, report_root)
+
+    monkeypatch.setattr(browser_core, "_report_root_dir_for_file", lambda *args: str(root))
+    monkeypatch.setattr(browser_core, "_load_report_cache_for_root", lambda *args, **kwargs: rows)
+    monkeypatch.setattr(browser_core, "_report_row_candidate_paths", counted_candidates)
+    with pytest.raises(browser_core._ReportScopeBuildCancelled):
+        _build_report_scope_maps_for_files(
+            [str(root / "missing.jpg")],
+            str(root),
+            should_cancel=lambda: len(candidate_calls) >= 5,
+        )
+    assert 5 <= len(candidate_calls) <= 128
+
+
+def test_report_scope_build_cancelled_before_work_does_not_load(tmp_path: Path, monkeypatch) -> None:
+    def unexpected_load(*args, **kwargs):
+        raise AssertionError("cancelled scan must not load a report")
+
+    monkeypatch.setattr(browser_core, "_load_report_cache_for_root", unexpected_load)
+    with pytest.raises(browser_core._ReportScopeBuildCancelled):
+        _build_report_scope_maps_for_files(
+            [str(tmp_path / "photo.jpg")], str(tmp_path), should_cancel=lambda: True,
+        )

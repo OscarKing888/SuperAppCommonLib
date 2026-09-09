@@ -75,6 +75,8 @@ class FileListPanel(QWidget):
         self._thumbnail_loader: ThumbnailLoader | None = None
         self._metadata_loader:  MetadataLoader  | None = None
         self._directory_scan_worker: DirectoryScanWorker | None = None
+        self._directory_scan_workers: set[DirectoryScanWorker] = set()
+        self._directory_scan_request_id = 0
         self._pending_directory_listing_result: tuple | None = None
         self._file_table_model = FileTableModel(self)
         self._file_table_proxy = FileTableSortProxyModel(self)
@@ -964,7 +966,7 @@ class FileListPanel(QWidget):
     ) -> None:
         self._directory_scope_cache[bool(recursive)] = {
             "files": list(files),
-            "report_cache": dict(report_cache or {}),
+            "report_cache": _index_report_cache(report_cache or {}).copy(),
             "report_row_by_path": dict(report_row_by_path or {}),
         }
 
@@ -979,7 +981,7 @@ class FileListPanel(QWidget):
             return None
         return {
             "files": list(files),
-            "report_cache": dict(report_cache),
+            "report_cache": _index_report_cache(report_cache).copy(),
             "report_row_by_path": dict(report_row_by_path),
         }
 
@@ -1146,10 +1148,10 @@ class FileListPanel(QWidget):
                 report_row_by_path,
             )
         self._probe_log("apply_listing.report_mode", elapsed_ms=elapsed_ms(step_t0), use_report_db=bool(self._use_report_db))
+        if self._use_report_db and full_report_cache is not None:
+            self._report_full_cache = _index_report_cache(full_report_cache)
         if self._report_root_dir:
             self._report_full_root_dir = self._report_root_dir
-            if full_report_cache is not None:
-                self._report_full_cache = full_report_cache
             _log.info(
                 "[_apply_directory_listing_result] full report cache root=%r entries=%s",
                 self._report_full_root_dir,
@@ -1186,7 +1188,7 @@ class FileListPanel(QWidget):
             files = limited_files
             self._probe_log("apply_listing.debug_limit", elapsed_ms=elapsed_ms(step_t0), files=len(files))
         step_t0 = perf_counter()
-        self._report_cache = dict(report_cache or {})
+        self._report_cache = _index_report_cache(report_cache or {}).copy()
         if report_row_by_path is None:
             report_row_by_path = {}
             row_cache_for_path_map = self._report_full_cache or self._report_cache or {}
@@ -1471,31 +1473,68 @@ class FileListPanel(QWidget):
             use_report_db=self._use_report_db,
             parent=self,
         )
+        self._directory_scan_workers.add(self._directory_scan_worker)
         self._directory_scan_worker.scan_progress.connect(self._on_directory_scan_progress)
+        self._directory_scan_worker.report_scope_progress.connect(self._on_report_scope_progress)
         self._directory_scan_worker.scan_finished.connect(self._on_directory_scan_finished)
+        self._directory_scan_worker.finished.connect(self._on_directory_scan_thread_finished)
         self._directory_scan_worker.start()
         self._probe_set_phase("directory_scan_running", path=path, elapsed_ms=elapsed_ms(load_t0))
         _log.info("[load_directory] END worker.started")
 
     def _stop_directory_scan_worker(self) -> None:
+        self._directory_scan_request_id += 1
         self._pending_directory_listing_result = None
-        if self._directory_scan_worker is None:
+        worker = self._directory_scan_worker
+        if worker is None:
             _log.debug("[_stop_directory_scan_worker] no worker")
             return
         _log.info("[_stop_directory_scan_worker] disconnecting and interrupting")
-        try:
-            self._directory_scan_worker.scan_finished.disconnect(self._on_directory_scan_finished)
-        except Exception:
-            pass
-        try:
-            self._directory_scan_worker.scan_progress.disconnect(self._on_directory_scan_progress)
-        except Exception:
-            pass
-        self._directory_scan_worker.requestInterruption()
         self._directory_scan_worker = None
+        for signal, slot in (
+            (worker.scan_finished, self._on_directory_scan_finished),
+            (worker.scan_progress, self._on_directory_scan_progress),
+            (worker.report_scope_progress, self._on_report_scope_progress),
+        ):
+            try:
+                signal.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+        worker.requestInterruption()
+        # Cancellation never waits on the GUI thread. The retained set keeps
+        # every old scan alive until its own queued QThread.finished arrives.
+
+    def _on_directory_scan_thread_finished(self) -> None:
+        worker = self.sender()
+        if worker not in self._directory_scan_workers:
+            return
+        self._directory_scan_workers.remove(worker)
+        if worker is self._directory_scan_worker:
+            self._directory_scan_worker = None
+        worker.deleteLater()
+
+    def has_pending_directory_scans(self) -> bool:
+        """Include native-complete scans whose queued finished is unhandled."""
+        return bool(self._directory_scan_workers)
+
+    def _is_current_directory_scan_sender(self) -> bool:
+        sender = self.sender()
+        return sender is None or sender is self._directory_scan_worker
+
+    def _on_report_scope_progress(self, path: str, processed: int, total: int, current_dir: str) -> None:
+        if self._background_shutdown_requested or not self._is_current_directory_scan_sender():
+            return
+        if path != self._current_dir:
+            return
+        self._show_meta_progress_status(
+            f"正在匹配报告... {max(0, int(processed))}/{max(0, int(total))}", busy=True,
+        )
+        self._probe_log(
+            "report_scope_progress", processed=processed, total=total, current_dir=current_dir,
+        )
 
     def _on_directory_scan_progress(self, path: str, found_files: int, scanned_dirs: int, current_dir: str) -> None:
-        if self._background_shutdown_requested:
+        if self._background_shutdown_requested or not self._is_current_directory_scan_sender():
             return
         if path != self._current_dir:
             return
@@ -1531,6 +1570,8 @@ class FileListPanel(QWidget):
     ) -> None:
         if self._background_shutdown_requested:
             return
+        if not self._is_current_directory_scan_sender():
+            return
         _log.info("[_on_directory_scan_finished] 收到目录扫描结果 path=%r files=%s report_entries=%s，开始列出文件并查询 EXIF", path, len(files), len(report_cache))
         _log.info("[_on_directory_scan_finished] path=%r _current_dir=%r files=%s report_entries=%s", path, self._current_dir, len(files), len(report_cache))
         if path != self._current_dir:
@@ -1551,7 +1592,6 @@ class FileListPanel(QWidget):
             len(report_cache),
         )
         self._show_meta_progress_status("正在准备生成缩略图...", busy=True)
-        self._directory_scan_worker = None
         self._probe_set_phase("apply_listing_queued", files=len(files))
         self._pending_directory_listing_result = (
             path,
@@ -1560,6 +1600,7 @@ class FileListPanel(QWidget):
             full_report_cache,
             recursive,
             report_row_by_path or {},
+            self._directory_scan_request_id,
         )
         QTimer.singleShot(0, self._apply_pending_directory_listing_result)
         _log.info("[_on_directory_scan_finished] END")
@@ -1572,8 +1613,10 @@ class FileListPanel(QWidget):
         if not pending:
             self._probe_log("apply_listing_timer_fired_empty")
             return
+        if len(pending) >= 7 and pending[6] != self._directory_scan_request_id:
+            return
         if len(pending) >= 6:
-            path, files, report_cache, full_report_cache, recursive, report_row_by_path = pending
+            path, files, report_cache, full_report_cache, recursive, report_row_by_path = pending[:6]
         else:
             path, files, report_cache, full_report_cache, recursive = pending
             report_row_by_path = {}
@@ -6094,6 +6137,7 @@ class FileListPanel(QWidget):
         if self._background_shutdown_requested:
             return
         self._background_shutdown_requested = True
+        self._stop_directory_scan_worker()
         self._pending_directory_listing_result = None
         self._stop_key_navigation_playback(commit=False)
         self._cancel_deferred_file_selected()
@@ -6131,6 +6175,7 @@ class FileListPanel(QWidget):
             if worker is not None
         ]
         active_threads.extend(lookup_workers)
+        active_threads.extend(self._directory_scan_workers)
         active_threads.extend(self._pending_loaders)
 
         self._pause_thumb_model_population()
@@ -7606,11 +7651,11 @@ class FileListPanel(QWidget):
         def filtered(cache):
             if not isinstance(cache, dict):
                 return cache
-            return {
+            return _index_report_cache({
                 key: row
                 for key, row in cache.items()
                 if not self._report_row_is_tombstoned(row)
-            }
+            })
 
         self._report_full_cache = filtered(self._report_full_cache)
         self._report_cache = filtered(self._report_cache) or {}
@@ -7652,11 +7697,11 @@ class FileListPanel(QWidget):
         def filtered_cache(cache):
             if not isinstance(cache, dict):
                 return cache
-            return {
+            return _index_report_cache({
                 key: row
                 for key, row in cache.items()
                 if not self._report_row_is_tombstoned(row)
-            }
+            })
 
         allowed_paths = {_path_key(path) for path in filtered_files if path}
         filtered_path_rows = {
