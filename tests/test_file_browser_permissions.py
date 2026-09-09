@@ -3,7 +3,18 @@ from __future__ import annotations
 import stat
 from pathlib import Path
 
+import pytest
+
 from app_common.file_browser import _permissions as perms
+
+
+@pytest.fixture(autouse=True)
+def _isolate_permission_state(monkeypatch):
+    # Refresh helpers mutate process-wide permission state. Restore every field
+    # so a denied temporary library cannot block a later GUI test with a dialog.
+    for name, value in vars(perms).copy().items():
+        if name.startswith("CURRENT_SUPERPICKY_"):
+            monkeypatch.setattr(perms, name, value)
 
 
 class _DummyAction:

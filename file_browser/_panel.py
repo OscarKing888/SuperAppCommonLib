@@ -74,6 +74,8 @@ class FileListPanel(QWidget):
         self._thumbnail_loader: ThumbnailLoader | None = None
         self._metadata_loader:  MetadataLoader  | None = None
         self._directory_scan_worker: DirectoryScanWorker | None = None
+        self._directory_scan_workers: set[DirectoryScanWorker] = set()
+        self._directory_scan_request_id = 0
         self._pending_directory_listing_result: tuple | None = None
         self._file_table_model = FileTableModel(self)
         self._file_table_proxy = FileTableSortProxyModel(self)
@@ -1363,31 +1365,54 @@ class FileListPanel(QWidget):
             use_report_db=self._use_report_db,
             parent=self,
         )
+        self._directory_scan_workers.add(self._directory_scan_worker)
         self._directory_scan_worker.scan_progress.connect(self._on_directory_scan_progress)
         self._directory_scan_worker.scan_finished.connect(self._on_directory_scan_finished)
+        self._directory_scan_worker.finished.connect(self._on_directory_scan_thread_finished)
         self._directory_scan_worker.start()
         self._probe_set_phase("directory_scan_running", path=path, elapsed_ms=elapsed_ms(load_t0))
         _log.info("[load_directory] END worker.started")
 
     def _stop_directory_scan_worker(self) -> None:
+        self._directory_scan_request_id += 1
         self._pending_directory_listing_result = None
-        if self._directory_scan_worker is None:
+        worker = self._directory_scan_worker
+        if worker is None:
             _log.debug("[_stop_directory_scan_worker] no worker")
             return
         _log.info("[_stop_directory_scan_worker] disconnecting and interrupting")
-        try:
-            self._directory_scan_worker.scan_finished.disconnect(self._on_directory_scan_finished)
-        except Exception:
-            pass
-        try:
-            self._directory_scan_worker.scan_progress.disconnect(self._on_directory_scan_progress)
-        except Exception:
-            pass
-        self._directory_scan_worker.requestInterruption()
         self._directory_scan_worker = None
+        for signal, slot in (
+            (worker.scan_finished, self._on_directory_scan_finished),
+            (worker.scan_progress, self._on_directory_scan_progress),
+        ):
+            try:
+                signal.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+        worker.requestInterruption()
+        # Retain canceled scans until their queued QThread.finished is handled;
+        # switching directories must not wait for old filesystem I/O.
+
+    def _on_directory_scan_thread_finished(self) -> None:
+        worker = self.sender()
+        if worker not in self._directory_scan_workers:
+            return
+        self._directory_scan_workers.remove(worker)
+        if worker is self._directory_scan_worker:
+            self._directory_scan_worker = None
+        worker.deleteLater()
+
+    def has_pending_directory_scans(self) -> bool:
+        """Include stopped scans whose queued finished cleanup is unhandled."""
+        return bool(self._directory_scan_workers)
+
+    def _is_current_directory_scan_sender(self) -> bool:
+        sender = self.sender()
+        return sender is None or sender is self._directory_scan_worker
 
     def _on_directory_scan_progress(self, path: str, found_files: int, scanned_dirs: int, current_dir: str) -> None:
-        if self._background_shutdown_requested:
+        if self._background_shutdown_requested or not self._is_current_directory_scan_sender():
             return
         if path != self._current_dir:
             return
@@ -1414,7 +1439,7 @@ class FileListPanel(QWidget):
             )
 
     def _on_directory_scan_finished(self, path: str, files: list, report_cache: dict, full_report_cache) -> None:
-        if self._background_shutdown_requested:
+        if self._background_shutdown_requested or not self._is_current_directory_scan_sender():
             return
         _log.info("[_on_directory_scan_finished] 收到目录扫描结果 path=%r files=%s report_entries=%s，开始列出文件并查询 EXIF", path, len(files), len(report_cache))
         _log.info("[_on_directory_scan_finished] path=%r _current_dir=%r files=%s report_entries=%s", path, self._current_dir, len(files), len(report_cache))
@@ -1436,9 +1461,11 @@ class FileListPanel(QWidget):
             len(report_cache),
         )
         self._show_meta_progress_status("正在准备生成缩略图...", busy=True)
-        self._directory_scan_worker = None
         self._probe_set_phase("apply_listing_queued", files=len(files))
-        self._pending_directory_listing_result = (path, files, report_cache, full_report_cache, recursive)
+        self._pending_directory_listing_result = (
+            path, files, report_cache, full_report_cache, recursive,
+            self._directory_scan_request_id,
+        )
         QTimer.singleShot(0, self._apply_pending_directory_listing_result)
         _log.info("[_on_directory_scan_finished] END")
 
@@ -1450,7 +1477,9 @@ class FileListPanel(QWidget):
         if not pending:
             self._probe_log("apply_listing_timer_fired_empty")
             return
-        path, files, report_cache, full_report_cache, recursive = pending
+        if len(pending) >= 6 and pending[5] != self._directory_scan_request_id:
+            return
+        path, files, report_cache, full_report_cache, recursive = pending[:5]
         self._probe_set_phase("apply_listing_timer_fired", path=path, files=len(files))
         self._apply_directory_listing_result(
             path,
@@ -5924,6 +5953,7 @@ class FileListPanel(QWidget):
         if self._background_shutdown_requested:
             return
         self._background_shutdown_requested = True
+        self._stop_directory_scan_worker()
         self._pending_directory_listing_result = None
         self._stop_key_navigation_playback(commit=False)
         for timer in (
@@ -5963,6 +5993,7 @@ class FileListPanel(QWidget):
             if worker is not None
         ]
         active_threads.extend(lookup_workers)
+        active_threads.extend(self._directory_scan_workers)
         active_threads.extend(self._pending_loaders)
 
         self._pause_thumb_model_population()
