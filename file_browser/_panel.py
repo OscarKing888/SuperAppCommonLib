@@ -956,6 +956,13 @@ class FileListPanel(QWidget):
             bool(self._filter_focus_status)
         )
 
+    def _sync_burst_group_display(self) -> bool:
+        """过滤模式下不显示连拍分组底框；无过滤时列表 / 缩略图都显示。返回是否显示。"""
+        enabled = not self._has_any_filter()
+        self._file_table_model.set_burst_group_display_enabled(enabled)
+        self._thumb_list_model.set_burst_group_display_enabled(enabled)
+        return enabled
+
     def _store_directory_scope_cache(
         self,
         *,
@@ -3907,6 +3914,7 @@ class FileListPanel(QWidget):
         rebuild_t0 = perf_counter()
         self._probe_set_phase("rebuild_views", mode=self._view_mode, stop_loaders=bool(stop_loaders))
         self._thumb_selection_anchor_row = -1
+        self._sync_burst_group_display()
         if stop_loaders:
             stop_t0 = perf_counter()
             self._stop_all_loaders()
@@ -4016,6 +4024,8 @@ class FileListPanel(QWidget):
         compute_t0 = perf_counter()
         filtered = self._compute_filtered_files()
         compute_ms = elapsed_ms(compute_t0)
+        # 过滤条件可能变化而可见集合不变（例如条件命中全部文件），底框开关要在提前返回前同步。
+        self._sync_burst_group_display()
         old_filtered = list(self._filtered_files)
         self._filtered_files = filtered
         _log.info(

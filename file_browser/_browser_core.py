@@ -41,7 +41,7 @@ try:
     from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal, QRect, QTimer, QUrl, QMimeData, QPoint, QEvent, QAbstractListModel, QAbstractTableModel, QModelIndex, QItemSelectionModel, QSortFilterProxyModel
     from PyQt6.QtGui import (
         QPixmap, QImage, QFont, QColor, QIcon, QPainter, QBrush, QPen,
-        QKeySequence, QShortcut,
+        QPainterPath, QKeySequence, QShortcut,
     )
 except ImportError:
     from PyQt5.QtWidgets import (
@@ -55,7 +55,7 @@ except ImportError:
     from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal, QRect, QTimer, QUrl, QMimeData, QPoint, QEvent, QAbstractListModel, QAbstractTableModel, QModelIndex, QItemSelectionModel, QSortFilterProxyModel
     from PyQt5.QtGui import (
         QPixmap, QImage, QFont, QColor, QIcon, QPainter, QBrush, QPen,
-        QKeySequence,
+        QPainterPath, QKeySequence,
     )
 
 from app_common.exif_io import (
@@ -206,6 +206,10 @@ try:
     _NoPen = Qt.PenStyle.NoPen
 except AttributeError:
     _NoPen = Qt.NoPen  # type: ignore[attr-defined]
+try:
+    _WindingFill = Qt.FillRule.WindingFill
+except AttributeError:
+    _WindingFill = Qt.WindingFill  # type: ignore[attr-defined]
 
 try:
     _LeftButton = Qt.MouseButton.LeftButton
@@ -239,6 +243,59 @@ _ThumbSizeRole = int(_UserRole) + 21
 _MetaSpeciesCnRole = int(_UserRole) + 22
 _MetaBurstTextRole = int(_UserRole) + 23
 _MetaFocusBoxRole = int(_UserRole) + 24
+# 连拍分组底框：None 或 (配色序号 0/1, 是否组内首张, 是否组内末张)
+_MetaBurstGroupRole = int(_UserRole) + 25
+
+# 连拍分组底框配色（两种颜色交替使用），半透明以兼容深/浅色主题
+_BURST_GROUP_COLORS: tuple[str, str] = ("#3d8bfd", "#f5a623")
+_BURST_GROUP_MIN_MEMBERS = 2
+_BURST_GROUP_LIST_ALPHA = 64
+_BURST_GROUP_THUMB_ALPHA = 60
+
+
+def _burst_group_color(color_index: int, alpha: int) -> "QColor":
+    color = QColor(_BURST_GROUP_COLORS[int(color_index) % len(_BURST_GROUP_COLORS)])
+    color.setAlpha(max(0, min(255, int(alpha))))
+    return color
+
+
+def _burst_group_key(path: str, burst_id: int | None) -> tuple[str, int] | None:
+    """连拍分组键：同目录 + 同 burst_id。不同目录各自的 report.db 可能重复使用 burst_id。"""
+    if burst_id is None:
+        return None
+    try:
+        parent = os.path.normcase(os.path.dirname(os.path.normpath(path)))
+    except Exception:
+        parent = ""
+    return (parent, int(burst_id))
+
+
+def _compute_burst_group_rows(
+    keys: "list[tuple[str, int] | None]",
+) -> "list[tuple[int, bool, bool] | None]":
+    """按模型行序计算每行的连拍分组显示信息。
+
+    返回列表与 keys 等长；元素为 None（不在可显示连拍组内）或
+    (配色序号, 是否首张, 是否末张)。只有成员数 >= _BURST_GROUP_MIN_MEMBERS 的组
+    才显示，配色序号按可显示组首次出现的顺序 0/1 交替。
+    """
+    rows_by_key: dict[tuple[str, int], list[int]] = {}
+    for row, key in enumerate(keys):
+        if key is None:
+            continue
+        rows_by_key.setdefault(key, []).append(row)
+    result: list[tuple[int, bool, bool] | None] = [None] * len(keys)
+    ordinal = 0
+    for key, rows in rows_by_key.items():
+        if len(rows) < _BURST_GROUP_MIN_MEMBERS:
+            continue
+        color_index = ordinal % len(_BURST_GROUP_COLORS)
+        ordinal += 1
+        first_row = rows[0]
+        last_row = rows[-1]
+        for row in rows:
+            result[row] = (color_index, row == first_row, row == last_row)
+    return result
 
 _TREE_COL_SEQ = -1
 

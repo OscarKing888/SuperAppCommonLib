@@ -204,9 +204,55 @@ class FileTableEntry:
     burst_position: int | None = None
     burst_id: int | None = None
     burst_text: str = ""
+    # 连拍分组底框信息，见 _compute_burst_group_rows()；由模型惰性重算。
+    burst_group: tuple[int, bool, bool] | None = None
 
 
-class FileTableModel(QAbstractTableModel):
+class _BurstGroupMixin:
+    """列表 / 缩略图模型共享的连拍分组底框状态。
+
+    分组按模型行序惰性计算（脏标记），过滤激活时由面板关闭显示。
+    """
+
+    _entries: list
+    _burst_groups_dirty: bool = True
+    _burst_group_display_enabled: bool = True
+
+    def burst_group_display_enabled(self) -> bool:
+        return bool(self._burst_group_display_enabled)
+
+    def set_burst_group_display_enabled(self, enabled: bool) -> bool:
+        enabled = bool(enabled)
+        if enabled == self._burst_group_display_enabled:
+            return False
+        self._burst_group_display_enabled = enabled
+        self._emit_burst_group_changed_all()
+        return True
+
+    def _mark_burst_groups_dirty(self) -> None:
+        self._burst_groups_dirty = True
+
+    def _ensure_burst_groups(self) -> None:
+        if not self._burst_groups_dirty:
+            return
+        self._burst_groups_dirty = False
+        keys = [_burst_group_key(entry.path, entry.burst_id) for entry in self._entries]
+        for entry, group in zip(self._entries, _compute_burst_group_rows(keys)):
+            entry.burst_group = group
+
+    def burst_group_for_row(self, row: int) -> tuple[int, bool, bool] | None:
+        if not self._burst_group_display_enabled:
+            return None
+        if row < 0 or row >= len(self._entries):
+            return None
+        self._ensure_burst_groups()
+        return self._entries[row].burst_group
+
+    def _emit_burst_group_changed_all(self) -> None:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+
+class FileTableModel(_BurstGroupMixin, QAbstractTableModel):
     """Flat file-list model for the list view."""
 
     def __init__(self, parent=None) -> None:
@@ -215,6 +261,17 @@ class FileTableModel(QAbstractTableModel):
         self._row_by_path: dict[str, int] = {}
         self._tooltip_fn = None
         self._mismatch_fn = None
+        self._burst_groups_dirty = True
+        self._burst_group_display_enabled = True
+
+    def _emit_burst_group_changed_all(self) -> None:
+        if not self._entries:
+            return
+        self.dataChanged.emit(
+            self.index(0, 0),
+            self.index(len(self._entries) - 1, self.columnCount() - 1),
+            [_BackgroundRole],
+        )
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         if parent.isValid():
@@ -420,12 +477,18 @@ class FileTableModel(QAbstractTableModel):
             if column == _TREE_COL_FOCUS:
                 return _focus_status_brush(entry.focus_status)
             return None
+        if role == _BackgroundRole:
+            group = self.burst_group_for_row(row)
+            if group is None:
+                return None
+            return QBrush(_burst_group_color(group[0], _BURST_GROUP_LIST_ALPHA))
         return None
 
     def clear(self) -> None:
         self.beginResetModel()
         self._entries = []
         self._row_by_path = {}
+        self._mark_burst_groups_dirty()
         self.endResetModel()
 
     def append_paths(
@@ -454,6 +517,7 @@ class FileTableModel(QAbstractTableModel):
         self._entries.extend(new_entries)
         for offset, entry in enumerate(new_entries):
             self._row_by_path[os.path.normpath(entry.path)] = start_row + offset
+        self._mark_burst_groups_dirty()
         self.endInsertRows()
         return len(new_entries)
 
@@ -480,6 +544,7 @@ class FileTableModel(QAbstractTableModel):
         self.beginResetModel()
         self._entries = entries
         self._row_by_path = row_by_path
+        self._mark_burst_groups_dirty()
         self.endResetModel()
 
     def row_for_path(self, path: str) -> int | None:
@@ -516,16 +581,24 @@ class FileTableModel(QAbstractTableModel):
         if not updates:
             return 0
         changed_rows: list[int] = []
+        burst_changed = False
         for path, meta in updates:
             row = self.row_for_path(path)
             if row is None:
                 continue
             entry = self._entries[row]
+            old_burst_id = entry.burst_id
             self._apply_meta_to_entry(entry, meta)
             entry.tooltip = _append_burst_tooltip(entry.base_tooltip, entry.burst_text)
+            if entry.burst_id != old_burst_id:
+                burst_changed = True
             changed_rows.append(row)
         if not changed_rows:
             return 0
+        if burst_changed:
+            # 连拍 id 变化会影响同组其它行的底框（成员数 / 首末张 / 配色序号），整表刷新背景。
+            self._mark_burst_groups_dirty()
+            self._emit_burst_group_changed_all()
         changed_rows = sorted(set(changed_rows))
         roles = [_DisplayRole, _SortRole, _ForegroundRole, _BackgroundRole, _ToolTipRole]
         first_meta_column = min(
@@ -759,11 +832,12 @@ class ThumbnailListEntry:
     burst_position: int | None = None
     burst_id: int | None = None
     burst_text: str = ""
+    burst_group: tuple[int, bool, bool] | None = None
     pixmap: QPixmap | None = None
     thumb_size: int = 0
 
 
-class ThumbnailListModel(QAbstractListModel):
+class ThumbnailListModel(_BurstGroupMixin, QAbstractListModel):
     """Thumbnail view model backed by explicit entry data instead of widget items."""
 
     def __init__(self, parent=None) -> None:
@@ -772,6 +846,17 @@ class ThumbnailListModel(QAbstractListModel):
         self._row_by_path: dict[str, int] = {}
         self._tooltip_fn = None
         self._mismatch_fn = None
+        self._burst_groups_dirty = True
+        self._burst_group_display_enabled = True
+
+    def _emit_burst_group_changed_all(self) -> None:
+        if not self._entries:
+            return
+        self.dataChanged.emit(
+            self.index(0, 0),
+            self.index(len(self._entries) - 1, 0),
+            [_MetaBurstGroupRole],
+        )
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         if parent.isValid():
@@ -812,6 +897,8 @@ class ThumbnailListModel(QAbstractListModel):
             return entry.species_cn
         if role == _MetaBurstTextRole:
             return entry.burst_text
+        if role == _MetaBurstGroupRole:
+            return self.burst_group_for_row(row)
         if role == _ThumbPixmapRole:
             return entry.pixmap
         if role == _ThumbSizeRole:
@@ -873,6 +960,7 @@ class ThumbnailListModel(QAbstractListModel):
         self.beginResetModel()
         self._entries = []
         self._row_by_path = {}
+        self._mark_burst_groups_dirty()
         self.endResetModel()
 
     def append_paths(
@@ -901,6 +989,7 @@ class ThumbnailListModel(QAbstractListModel):
         self._entries.extend(new_entries)
         for offset, entry in enumerate(new_entries):
             self._row_by_path[os.path.normpath(entry.path)] = start_row + offset
+        self._mark_burst_groups_dirty()
         self.endInsertRows()
         return len(new_entries)
 
@@ -927,6 +1016,7 @@ class ThumbnailListModel(QAbstractListModel):
         self.beginResetModel()
         self._entries = entries
         self._row_by_path = row_by_path
+        self._mark_burst_groups_dirty()
         self.endResetModel()
 
     def row_for_path(self, path: str) -> int | None:
@@ -999,12 +1089,22 @@ class ThumbnailListModel(QAbstractListModel):
             or entry.burst_id != new_burst_id
             or entry.burst_text != new_burst_text
         ):
+            burst_id_changed = entry.burst_id != new_burst_id
             entry.burst_position = new_burst_position
             entry.burst_id = new_burst_id
             entry.burst_text = new_burst_text
             entry.tooltip = _append_burst_tooltip(entry.base_tooltip, new_burst_text)
             changed_roles.extend([_MetaBurstTextRole, _ToolTipRole])
+            if burst_id_changed:
+                changed_roles.append(_MetaBurstGroupRole)
         return changed_roles
+
+    def _refresh_burst_groups_if_changed(self, changed_roles: list[int]) -> None:
+        if _MetaBurstGroupRole not in changed_roles:
+            return
+        # 连拍 id 变化会影响同组其它项的底框（成员数 / 首末张 / 配色序号），整表刷新。
+        self._mark_burst_groups_dirty()
+        self._emit_burst_group_changed_all()
 
     def set_meta_for_path(self, path: str, meta: dict | None) -> bool:
         row = self.row_for_path(path)
@@ -1014,6 +1114,7 @@ class ThumbnailListModel(QAbstractListModel):
         changed_roles = self._set_meta_on_entry(entry, meta)
         if not changed_roles:
             return False
+        self._refresh_burst_groups_if_changed(changed_roles)
         idx = self.index(row, 0)
         self.dataChanged.emit(idx, idx, list(dict.fromkeys(changed_roles + [_DisplayRole])))
         return True
@@ -1034,6 +1135,7 @@ class ThumbnailListModel(QAbstractListModel):
             all_roles.extend(changed_roles)
         if not changed_rows:
             return 0
+        self._refresh_burst_groups_if_changed(all_roles)
         changed_rows = sorted(set(changed_rows))
         roles = list(dict.fromkeys(all_roles + [_DisplayRole]))
         range_start = changed_rows[0]
@@ -1178,6 +1280,44 @@ class ThumbViewportRange:
         )
 
 
+def _paint_burst_group_band(painter: QPainter, rect: QRect, group) -> None:
+    """在缩略图单元格底层绘制连拍分组底框。
+
+    单元格在网格内相互紧贴，逐格填充即可连成一条横向色带；组内首张左侧、末张右侧
+    使用圆角并留出边距，中间格填满以保持色带连续。换行处色带自然断开。
+    """
+    color_index, is_first, is_last = int(group[0]), bool(group[1]), bool(group[2])
+    band = QRect(rect).adjusted(0, 2, 0, -2)
+    inset = 3
+    if is_first:
+        band.adjust(inset, 0, 0, 0)
+    if is_last:
+        band.adjust(0, 0, -inset, 0)
+    if band.width() <= 0 or band.height() <= 0:
+        return
+    radius = max(4, min(10, band.height() // 8))
+    # 半透明填充必须一次性绘制，避免圆角矩形与补角矩形重叠处叠色出现接缝，
+    # 因此用 WindingFill 路径合并后再填充。
+    path = QPainterPath()
+    path.setFillRule(_WindingFill)
+    if is_first or is_last:
+        path.addRoundedRect(float(band.left()), float(band.top()), float(band.width()), float(band.height()), float(radius), float(radius))
+        half_w = band.width() // 2
+        if is_first and not is_last:
+            path.addRect(float(band.left() + half_w), float(band.top()), float(band.width() - half_w), float(band.height()))
+        elif is_last and not is_first:
+            path.addRect(float(band.left()), float(band.top()), float(half_w), float(band.height()))
+    else:
+        path.addRect(float(band.left()), float(band.top()), float(band.width()), float(band.height()))
+    painter.save()
+    try:
+        painter.setPen(_NoPen)
+        painter.setBrush(QBrush(_burst_group_color(color_index, _BURST_GROUP_THUMB_ALPHA)))
+        painter.drawPath(path)
+    finally:
+        painter.restore()
+
+
 class ThumbnailItemDelegate(QStyledItemDelegate):
     """Custom thumbnail delegate with aspect-fit preview and lightweight badges."""
 
@@ -1204,15 +1344,22 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
         pixmap = index.data(_ThumbPixmapRole)
         if not isinstance(pixmap, QPixmap):
             pixmap = None
+        burst_group = index.data(_MetaBurstGroupRole)
+        if not (isinstance(burst_group, (tuple, list)) and len(burst_group) >= 3):
+            burst_group = None
 
         painter.save()
         try:
-            if selected:
-                painter.fillRect(opt.rect, opt.palette.highlight())
-            elif hovered:
-                painter.fillRect(opt.rect, QColor(255, 255, 255, 16))
-
             painter.setRenderHint(_PainterAntialiasing)
+            if burst_group is not None:
+                _paint_burst_group_band(painter, opt.rect, burst_group)
+            # 有连拍底框时，选中 / 悬停高亮略微内缩，让同组底框在选中项四周仍可见。
+            state_rect = opt.rect.adjusted(4, 4, -4, -4) if burst_group is not None else opt.rect
+            if selected:
+                painter.fillRect(state_rect, opt.palette.highlight())
+            elif hovered:
+                painter.fillRect(state_rect, QColor(255, 255, 255, 16))
+
             cell = opt.rect.adjusted(6, 6, -6, -6)
             fm = painter.fontMetrics()
             name_height = fm.lineSpacing() + 6
