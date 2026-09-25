@@ -7,6 +7,8 @@ import pytest
 
 from app_common.file_browser._work_pool import BrowserWorkPool, VISIBLE, PREFETCH, PERSISTENT, METADATA
 from app_common.exif_io import exiftool_runner as runner
+from app_common.file_browser._work_action import MetadataReadAction, ThumbnailAction, PersistentThumbnailAction
+from app_common.file_browser._work_policy import WorkKind
 
 
 def test_thumbnail_priority_and_two_reserved_metadata_workers():
@@ -14,12 +16,14 @@ def test_thumbnail_priority_and_two_reserved_metadata_workers():
     blocked = threading.Event()
     started = threading.Barrier(2)
     meta_started = threading.Barrier(3)
+    meta_release = threading.Event()
     seen = []
     def slow_thumb():
         started.wait(timeout=2)
         blocked.wait(3)
     def metadata():
         meta_started.wait(timeout=2)
+        meta_release.wait(3)
         return 'metadata'
     try:
         old = [pool.submit(slow_thumb, priority=PERSISTENT) for _ in range(1)]
@@ -30,13 +34,15 @@ def test_thumbnail_priority_and_two_reserved_metadata_workers():
         meta = [pool.submit(metadata, priority=METADATA) for _ in range(2)]
         # Both metadata workers progress while every thumbnail worker is blocked.
         meta_started.wait(timeout=2)
-        assert [f.result(timeout=2) for f in meta] == ['metadata', 'metadata']
         assert pool.snapshot()['thumbnail_active'] == 1
         blocked.set()
         wait(old + low + [visible, prefetch], timeout=3)
         assert seen[0] == 'visible'
         assert seen.index('prefetch') < seen.index('background')
+        meta_release.set()
+        assert [f.result(timeout=2) for f in meta] == ['metadata', 'metadata']
     finally:
+        meta_release.set()
         blocked.set()
         assert pool.shutdown(timeout=3)
 
@@ -55,7 +61,8 @@ def test_metadata_does_not_take_viewport_capacity_before_thumbnail_timer():
         queued_meta = pool.submit(lambda: 'later metadata')
         frame = pool.submit(lambda: 'frame', priority=VISIBLE)
         assert frame.result(timeout=1) == 'frame'
-        assert not queued_meta.done()
+        # The last thumbnail completed: capacity is now lent automatically.
+        assert queued_meta.result(timeout=1) == 'later metadata'
     finally:
         release.set()
         assert pool.shutdown(timeout=3)
@@ -260,3 +267,139 @@ def test_real_worker_sessions_read_chinese_sidecar_without_modifying_original(tm
     finally:
         assert pool.shutdown(timeout=3)
         runner.close_exiftool_process()
+
+
+def test_all_threads_execute_both_actions_and_capacity_rebalances_without_gui():
+    pool = BrowserWorkPool(4, 2)
+    condition = threading.Condition()
+    entered = {'metadata': set(), 'thumbnail': set(), 'return': set(), 'initial': set()}
+    release_meta = threading.Event()
+    release_thumb = [threading.Event() for _ in range(4)]
+    release_return = threading.Event()
+    initial_thumb_release = threading.Event()
+
+    def block(kind, release):
+        with condition:
+            entered[kind].add(threading.get_ident())
+            condition.notify_all()
+        assert release.wait(5)
+
+    def await_count(kind, count):
+        with condition:
+            assert condition.wait_for(lambda: len(entered[kind]) == count, timeout=3)
+
+    metadata_source = pool.begin_producer(WorkKind.METADATA)
+    thumbnail_source = pool.begin_producer(WorkKind.THUMBNAIL)
+    try:
+        thumbnails = [pool.submit_action(
+            PersistentThumbnailAction(lambda task, stop: block('initial', initial_thumb_release), i),
+            kind=WorkKind.THUMBNAIL, priority=PERSISTENT) for i in range(2)]
+        metadata = [pool.submit_action(
+            MetadataReadAction(lambda paths: block('metadata', release_meta), [i]),
+            kind=WorkKind.METADATA) for i in range(4)]
+        await_count('metadata', 2)
+        await_count('initial', 2)
+        assert pool.snapshot()['thumbnail_active'] == 2
+        # Finish thumbnail work, without a GUI progress callback or mode change.
+        initial_thumb_release.set()
+        for future in thumbnails:
+            future.result(timeout=2)
+        pool.end_producer(WorkKind.THUMBNAIL, thumbnail_source)
+        await_count('metadata', 4)
+        assert pool.snapshot()['metadata_active'] == 4
+
+        # New thumbnails take the next freed slots; once metadata ends all four
+        # workers, including the previous metadata reservation, execute thumbnails.
+        thumbnail_source = pool.begin_producer(WorkKind.THUMBNAIL)
+        thumbnails = [pool.submit_action(
+            ThumbnailAction(lambda path, emit, **kw: block('thumbnail', release_thumb[path]),
+                            i, None, allow_progressive=False),
+            kind=WorkKind.THUMBNAIL, priority=VISIBLE) for i in range(4)]
+        release_meta.set()
+        for future in metadata:
+            future.result(timeout=2)
+        pool.end_producer(WorkKind.METADATA, metadata_source)
+        await_count('thumbnail', 4)
+        assert entered['metadata'] == entered['thumbnail']
+
+        # Metadata arriving while all lanes are borrowed regains its minimum
+        # two slots as running thumbnails finish, without replacing any thread.
+        metadata_source = pool.begin_producer(WorkKind.METADATA)
+        returned = [pool.submit_action(
+            MetadataReadAction(lambda paths: block('return', release_return), [i]),
+            kind=WorkKind.METADATA) for i in range(2)]
+        release_thumb[0].set()
+        release_thumb[1].set()
+        await_count('return', 2)
+        assert pool.snapshot()['metadata_active'] == 2
+        assert pool.snapshot()['thumbnail_active'] == 2
+        assert len(pool._threads) == 4
+    finally:
+        initial_thumb_release.set()
+        release_meta.set()
+        release_return.set()
+        for event in release_thumb:
+            event.set()
+        pool.end_producer(WorkKind.METADATA, metadata_source)
+        pool.end_producer(WorkKind.THUMBNAIL, thumbnail_source)
+        assert pool.shutdown(timeout=3)
+
+
+@pytest.mark.parametrize('persistent', [False, True])
+def test_real_coordinators_lend_all_capacity_before_qt_progress_is_delivered(monkeypatch, tmp_path, persistent):
+    from PyQt6.QtWidgets import QApplication
+    from app_common.file_browser._workers import MetadataLoader
+    from app_common.file_browser._thumbnail import ThumbnailLoader, PersistentThumbCacheWorker
+    global _APP
+    _APP = QApplication.instance() or QApplication([])
+    pool = BrowserWorkPool(4, 2)
+    (tmp_path / '.superpicky').mkdir()
+    paths = [str(tmp_path / name) for name in ('first.jpg', 'second.jpg')]
+    thumb = (PersistentThumbCacheWorker(paths, str(tmp_path), work_pool=pool)
+             if persistent else ThumbnailLoader(128, 1, work_pool=pool))
+    meta = MetadataLoader([str(i) for i in range(32)], object(), work_pool=pool)
+    release_thumb = threading.Event()
+    release_meta = threading.Event()
+    condition = threading.Condition()
+    active_meta = set()
+    progress = []
+
+    def read(paths):
+        with condition:
+            active_meta.add(threading.get_ident())
+            condition.notify_all()
+        release_meta.wait(5)
+        return {}, {}, len(paths)
+
+    monkeypatch.setattr(meta, '_read_parse_chunk', read)
+    if persistent:
+        def generate(task, stop):
+            release_thumb.wait(5)
+            return task.source_path, 1, 0, 0
+        monkeypatch.setattr(thumb, '_process_task', generate)
+        thumb.progress_updated.connect(lambda *args: progress.append(args))
+    else:
+        monkeypatch.setattr(thumb, '_load_single', lambda *args, **kw: release_thumb.wait(5))
+        thumb.thumbnail_ready.connect(lambda *args: progress.append(args))
+        thumb.enqueue(paths)
+    meta.progress_updated.connect(lambda *args: progress.append(args))
+    thumb.start()
+    meta.start()
+    try:
+        with condition:
+            assert condition.wait_for(lambda: len(active_meta) == 2, timeout=2)
+        release_thumb.set()
+        # Deliberately do not process Qt events. The coordinator releases demand
+        # itself, so all four real pool threads must start reading metadata.
+        with condition:
+            assert condition.wait_for(lambda: len(active_meta) == 4, timeout=2)
+        assert not progress
+        if persistent:
+            assert thumb.isRunning()  # Idle coordinator must not retain capacity.
+    finally:
+        release_thumb.set()
+        release_meta.set()
+        thumb.stop()
+        meta.stop()
+        assert thumb.wait(3000) and meta.wait(3000)
+        assert pool.shutdown(timeout=3)

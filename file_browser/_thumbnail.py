@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections import OrderedDict
 from app_common.video import is_video
 from app_common.file_browser._work_pool import VISIBLE, PREFETCH, PERSISTENT, BrowserPoolClosed
+from app_common.file_browser._work_action import ThumbnailAction, PersistentThumbnailAction
+from app_common.file_browser._work_policy import WorkKind
 
 from app_common.file_browser._browser_core import *
 
@@ -232,7 +234,7 @@ class ThumbnailLoader(QThread):
         self._executor: _futures.ThreadPoolExecutor | None = None
         self._max_workers = _thumbnail_loader_worker_count()
         if work_pool is not None:
-            self._max_workers = work_pool.thumbnail_workers
+            self._max_workers = work_pool.max_workers
         self._batch_size = _thumbnail_loader_batch_size(self._max_workers)
 
         # Priority queue: items are (priority, seq, path)
@@ -601,9 +603,11 @@ class ThumbnailLoader(QThread):
 
     def _run_shared(self):
         pending = {}
+        producer = None
         def stopped():
             return self._stop_flag or self.isInterruptionRequested()
         try:
+            producer = self._work_pool.begin_producer(WorkKind.THUMBNAIL)
             while not stopped():
                 for future, (priority, path) in list(pending.items()):
                     with self._queue_lock:
@@ -641,11 +645,12 @@ class ThumbnailLoader(QThread):
                         if path in self._loaded or path not in self._desired_paths:
                             continue
                         self._loaded.add(path)
-                    future = self._work_pool.submit(
-                        self._load_single, path, self.thumbnail_ready.emit,
-                        allow_progressive=priority == self.PRIORITY_VISIBLE,
-                        priority=VISIBLE if priority == self.PRIORITY_VISIBLE else PREFETCH,
-                        cancelled=lambda p=path: stopped() or not self.wants_path(p))
+                    future = self._work_pool.submit_action(
+                        ThumbnailAction(self._load_single, path, self.thumbnail_ready.emit,
+                                        allow_progressive=priority == self.PRIORITY_VISIBLE,
+                                        cancelled=lambda p=path: stopped() or not self.wants_path(p)),
+                        kind=WorkKind.THUMBNAIL,
+                        priority=VISIBLE if priority == self.PRIORITY_VISIBLE else PREFETCH)
                     pending[future] = (priority, path)
                 if not pending:
                     if self._task_queue.empty():
@@ -660,6 +665,7 @@ class ThumbnailLoader(QThread):
                 self._work_pool.cancel(future)
             while any(not f.done() for f in pending):
                 _futures.wait([f for f in pending if not f.done()], timeout=0.05)
+            self._work_pool.end_producer(WorkKind.THUMBNAIL, producer)
 
     def run(self) -> None:
         if self._work_pool is not None:
@@ -841,7 +847,7 @@ class PersistentThumbCacheWorker(QThread):
         self._focus_current_path = ""
         self._worker_count = max(1, int(worker_count or _persistent_thumb_cache_worker_count()))
         if work_pool is not None:
-            self._worker_count = min(self._worker_count, work_pool.thumbnail_workers)
+            self._worker_count = work_pool.max_workers
         self._stop_event = threading.Event()
         self.enqueue_paths(
             paths,
@@ -1063,16 +1069,16 @@ class PersistentThumbCacheWorker(QThread):
     def _run_shared(self):
         pending = {}
         last_emit_at = 0.0
+        producer = None
         def cancelled(task):
             with self._queue_lock:
                 return self._stop_event.is_set() or task.key not in self._focus_keys
-        class StopToken:
-            def __init__(self, task):
-                self.task = task
-            def is_set(self):
-                return cancelled(self.task)
         try:
             while not self._stop_event.is_set() and not self.isInterruptionRequested():
+                with self._queue_lock:
+                    unfinished = len(self._focus_done_keys) < len(self._focus_keys)
+                if unfinished and producer is None:
+                    producer = self._work_pool.begin_producer(WorkKind.THUMBNAIL)
                 for future, task in list(pending.items()):
                     if cancelled(task) and not future.running():
                         self._work_pool.cancel(future)
@@ -1102,13 +1108,17 @@ class PersistentThumbCacheWorker(QThread):
                         with self._queue_lock:
                             self._inflight_keys.discard(task.key)
                         continue
-                    future = self._work_pool.submit(self._process_task, task, StopToken(task),
-                                                    priority=PERSISTENT, cancelled=lambda t=task: cancelled(t))
+                    future = self._work_pool.submit_action(
+                        PersistentThumbnailAction(self._process_task, task,
+                                                  cancelled=lambda t=task: cancelled(t)),
+                        kind=WorkKind.THUMBNAIL, priority=PERSISTENT)
                     pending[future] = task
                 if pending:
                     _futures.wait([f for f in pending if not f.done()], timeout=0.025,
                                   return_when=_futures.FIRST_COMPLETED)
                 else:
+                    self._work_pool.end_producer(WorkKind.THUMBNAIL, producer)
+                    producer = None
                     self._wake_event.wait(0.05)
                     self._wake_event.clear()
         except BrowserPoolClosed:
@@ -1121,6 +1131,7 @@ class PersistentThumbCacheWorker(QThread):
                 _futures.wait([f for f in pending if not f.done()], timeout=0.05)
             with self._queue_lock:
                 snapshot = self._focus_snapshot_locked()
+            self._work_pool.end_producer(WorkKind.THUMBNAIL, producer)
             self.finished_summary.emit(*snapshot[:5])
 
     def run(self) -> None:

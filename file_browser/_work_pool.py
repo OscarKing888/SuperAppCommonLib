@@ -9,6 +9,8 @@ import itertools
 import threading
 import time
 
+from app_common.file_browser._work_action import WorkerAction, CallableAction
+from app_common.file_browser._work_policy import BrowserWorkPolicy, WorkKind
 from app_common.log import get_logger
 from app_common.exif_io.exiftool_runner import exiftool_worker_session, exiftool_read_request
 
@@ -28,20 +30,16 @@ class _Job:
     priority: int
     sequence: int
     future: Future = field(compare=False)
-    function: object = field(compare=False)
-    args: tuple = field(compare=False)
-    kwargs: dict = field(compare=False)
-    cancelled: object = field(compare=False)
+    action: WorkerAction = field(compare=False)
     queued_at: float = field(default_factory=time.monotonic, compare=False)
 
 
 class BrowserWorkPool:
-    """Reserved metadata capacity plus priority thumbnail lanes.
+    """Homogeneous action executors; policy owns priorities and concurrency quotas.
 
-    In thumbnail mode metadata is capped at its reservation, so an early metadata
-    submission cannot occupy all lanes before the viewport timer runs. Without thumbnail demand
-    metadata can borrow every lane. Coordinators submit bounded windows of jobs;
-    they do not own or shut down this pool.
+    Coordinators keep a demand lease while producing bounded windows of actions.
+    Completing/releasing the last action wakes every idle worker immediately;
+    redistribution does not wait for a GUI progress callback.
     """
     def __init__(self, max_workers: int, metadata_workers: int = 2):
         self.metadata_workers = max(2, int(metadata_workers))
@@ -53,13 +51,16 @@ class BrowserWorkPool:
         self._sequence = itertools.count()
         self._closed = False
         self._thumbnail_mode = True
+        self._seen = {'metadata': False, 'thumbnail': False}
+        self._producers = {'metadata': set(), 'thumbnail': set()}
+        self._policy = BrowserWorkPolicy(self.max_workers, self.metadata_workers)
         self._threads = []
         self._owner = threading.get_ident()
         self._completed = 0
         self._max_queue_ms = 0.0
         self._max_run_ms = 0.0
         for index in range(self.max_workers):
-            worker = threading.Thread(target=self._run, args=(index < self.metadata_workers,),
+            worker = threading.Thread(target=self._run,
                                       name=f'browser-worker-{index + 1}', daemon=True)
             self._threads.append(worker)
             worker.start()
@@ -68,19 +69,47 @@ class BrowserWorkPool:
 
     def set_thumbnail_mode(self, enabled: bool):
         with self._condition:
+            if enabled and not self._thumbnail_mode:
+                self._seen['thumbnail'] = False
             self._thumbnail_mode = bool(enabled)
             self._condition.notify_all()
 
-    def submit(self, function, *args, priority=METADATA, cancelled=lambda: False, **kwargs):
+    def begin_producer(self, kind: WorkKind):
+        kind = WorkKind(kind)
+        token = object()
+        with self._condition:
+            if self._closed:
+                raise BrowserPoolClosed('Browser worker pool is closed')
+            self._producers[kind].add(token)
+            self._condition.notify_all()
+        return token
+
+    def end_producer(self, kind: WorkKind, token):
+        if token is None:
+            return
+        with self._condition:
+            self._producers[kind].discard(token)
+            self._seen[kind] = True
+            self._condition.notify_all()
+
+    def submit_action(self, action: WorkerAction, *, kind: WorkKind, priority=METADATA):
+        if not isinstance(action, WorkerAction):
+            raise TypeError('Expected WorkerAction')
+        kind = WorkKind(kind)
         future = Future()
         with self._condition:
             if self._closed:
                 raise BrowserPoolClosed('Browser worker pool is closed')
-            kind = 'metadata' if priority == METADATA else 'thumbnail'
-            heapq.heappush(self._queues[kind], _Job(priority, next(self._sequence), future,
-                                                   function, args, kwargs, cancelled))
+            self._seen[kind] = True
+            heapq.heappush(self._queues[kind], _Job(priority, next(self._sequence), future, action))
             self._condition.notify_all()
         return future
+
+    def submit(self, function, *args, priority=METADATA, cancelled=lambda: False, **kwargs):
+        # Compatibility adapter; production browser coordinators submit concrete actions.
+        return self.submit_action(CallableAction(function, *args, cancelled=cancelled, **kwargs),
+                                  kind=WorkKind.METADATA if priority == METADATA else WorkKind.THUMBNAIL,
+                                  priority=priority)
 
     @staticmethod
     def _cancel(future):
@@ -109,7 +138,7 @@ class BrowserWorkPool:
             for kind, queue in self._queues.items():
                 kept = []
                 for job in queue:
-                    if job.future.cancelled() or job.cancelled():
+                    if job.future.cancelled() or job.action.is_cancelled():
                         self._cancel(job.future)
                     else:
                         kept.append(job)
@@ -117,42 +146,44 @@ class BrowserWorkPool:
                 self._queues[kind] = kept
             self._condition.notify_all()
 
-    def _take(self, reserved):
+    def _demand(self, kind):
+        # Initial hints reserve capacity before delayed producers submit their first job.
+        initial = not self._seen[kind] and (kind == 'metadata' or self._thumbnail_mode)
+        return bool(initial or self._producers[kind] or self._queues[kind] or self._active[kind])
+
+    def _take(self):
         while True:
             if self._closed:
                 return None, None
-            meta_allowed = not self._thumbnail_mode or self._active['metadata'] < self.metadata_workers
-            kinds = ('metadata',) if reserved else (('thumbnail',) if self._thumbnail_mode else ('thumbnail', 'metadata'))
-            for kind in kinds:
-                if kind == 'metadata' and not meta_allowed:
+            for queue in self._queues.values():
+                while queue and (queue[0].future.cancelled() or queue[0].action.is_cancelled()):
+                    self._cancel(heapq.heappop(queue).future)
+            kind = self._policy.choose(self._active, self._queues,
+                                       thumbnail_demand=self._demand('thumbnail'),
+                                       metadata_demand=self._demand('metadata'))
+            if kind is not None:
+                job = heapq.heappop(self._queues[kind])
+                if not job.future.set_running_or_notify_cancel():
                     continue
-                queue = self._queues[kind]
-                while queue:
-                    job = heapq.heappop(queue)
-                    if job.cancelled() or job.future.cancelled():
-                        self._cancel(job.future)
-                        continue
-                    if not job.future.set_running_or_notify_cancel():
-                        continue
-                    self._active[kind] += 1
-                    return kind, job
+                self._active[kind] += 1
+                return kind, job
             self._condition.wait(0.05)
 
-    def _run(self, reserved):
+    def _run(self):
         # An ExifTool session belongs to one actual pool thread, not one batch.
         # Threads can therefore read concurrently and reuse their own process.
         with exiftool_worker_session():
             while True:
                 with self._condition:
-                    kind, job = self._take(reserved)
+                    kind, job = self._take()
                 if job is None:
                     return
                 started = time.monotonic()
                 wait_ms = (started - job.queued_at) * 1000
                 try:
-                    context = exiftool_read_request(lambda: self._closed or job.cancelled(), timeout=20)
+                    context = exiftool_read_request(lambda: self._closed or job.action.is_cancelled(), timeout=20)
                     with context:
-                        value = job.function(*job.args, **job.kwargs)
+                        value = job.action.execute()
                     job.future.set_result(value)
                 except BaseException as exc:
                     job.future.set_exception(exc)
@@ -172,6 +203,7 @@ class BrowserWorkPool:
             return dict(total=self.max_workers, metadata_reserved=self.metadata_workers,
                         metadata_active=self._active['metadata'], thumbnail_active=self._active['thumbnail'],
                         metadata_queued=len(self._queues['metadata']), thumbnail_queued=len(self._queues['thumbnail']),
+                        metadata_demand=self._demand('metadata'), thumbnail_demand=self._demand('thumbnail'),
                         completed=self._completed, max_queue_ms=self._max_queue_ms, max_run_ms=self._max_run_ms)
 
     def request_shutdown(self):

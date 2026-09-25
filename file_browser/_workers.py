@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from app_common.video import VIDEO_EXTENSIONS, is_video, probe_video
 from app_common.file_browser._work_pool import METADATA, BrowserPoolClosed
+from app_common.file_browser._work_action import MetadataReadAction
+from app_common.file_browser._work_policy import WorkKind
 
 import concurrent.futures as _futures
 import threading
@@ -516,15 +518,18 @@ class MetadataLoader(QThread):
         processed = 0
         exhausted = False
         started = perf_counter()
+        producer = None
         try:
+            producer = self._work_pool.begin_producer(WorkKind.METADATA)
             while not self._stopped() and (pending or not exhausted):
                 while not exhausted and not self._stopped() and len(pending) < self._work_pool.max_workers:
                     chunk = next(chunks, None)
                     if chunk is None:
                         exhausted = True
                         break
-                    future = self._work_pool.submit(self._read_parse_chunk, chunk,
-                                                    priority=METADATA, cancelled=self._stopped)
+                    future = self._work_pool.submit_action(
+                        MetadataReadAction(self._read_parse_chunk, chunk, cancelled=self._stopped),
+                        kind=WorkKind.METADATA, priority=METADATA)
                     pending[future] = len(chunk)
                 done = [future for future in pending if future.done()]
                 if not done:
@@ -550,6 +555,7 @@ class MetadataLoader(QThread):
             # QThread 的 finished 必须晚于本任务所有 pool 回调结束。
             while any(not future.done() for future in pending):
                 _futures.wait([f for f in pending if not f.done()], timeout=0.05)
+            self._work_pool.end_producer(WorkKind.METADATA, producer)
             _log.info('[metadata.pool] finished processed=%s/%s elapsed_ms=%.1f pool=%s',
                       processed, len(self._paths), elapsed_ms(started), self._work_pool.snapshot())
 

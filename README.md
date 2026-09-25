@@ -36,7 +36,11 @@ submodule 使用。共享代码改动必须同时保持两个应用的行为兼�
 - 持久缩略图层级为 `128/256/512/1024/2048`。SuperViewer 显式启用
   `FileListPanel.use_unified_worker_pool`：视口、预取、持久缩略图与元数据复用
   一个有界 `BrowserWorkPool`；缩略图按上述顺序优先，至少保留 2 个元数据
-  worker，无缩略图需求时可借用空闲 worker。SuperBirdStamp 默认保持原调度。
+  并发额度；缩略图结束后元数据可使用全部 worker，元数据结束后缩略图也可
+  使用全部 worker。总线程数固定，任务分配动态变化。动作继承
+  `WorkerAction.execute()`，所有线程均能执行所有动作；`BrowserWorkPolicy`
+  单独管理优先级与额度。生产者释放需求后直接唤醒空闲线程，不依赖 GUI
+  进度回调。SuperBirdStamp 默认保持原调度。
   `SuperViewer_METADATA_WORKERS`、`SuperViewer_PERSISTENT_THUMB_WORKERS`
   继续覆盖预算；统一池总量为 `max(thumbnail_loader_workers,
   max(2, metadata_loader_workers) + persistent_thumb_workers)`，不叠加三个池。
