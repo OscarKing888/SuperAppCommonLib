@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 from app_common.file_browser._browser_core import *
+from app_common.video import is_video, format_duration
+
+_VIDEO_HEADERS = ("时长", "视频分辨率", "帧率", "视频编码")
+_VideoInfoRole = int(_UserRole) + 26
 
 
 def _metadata_rating_value(meta: dict | None) -> int:
@@ -205,6 +209,7 @@ class FileTableEntry:
     burst_id: int | None = None
     burst_text: str = ""
     # 连拍分组底框信息，见 _compute_burst_group_rows()；由模型惰性重算。
+    video_info: dict | None = None
     burst_group: tuple[int, bool, bool] | None = None
 
 
@@ -257,6 +262,7 @@ class FileTableModel(_BurstGroupMixin, QAbstractTableModel):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self._video_columns = bool(getattr(parent, "include_videos", False))
         self._entries: list[FileTableEntry] = []
         self._row_by_path: dict[str, int] = {}
         self._tooltip_fn = None
@@ -281,7 +287,7 @@ class FileTableModel(_BurstGroupMixin, QAbstractTableModel):
     def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
         if parent.isValid():
             return 0
-        return len(_FILE_TABLE_HEADERS)
+        return len(_FILE_TABLE_HEADERS) + (len(_VIDEO_HEADERS) if self._video_columns else 0)
 
     def headerData(self, section: int, orientation, role: int = int(_DisplayRole)):
         if role != _DisplayRole:
@@ -290,8 +296,9 @@ class FileTableModel(_BurstGroupMixin, QAbstractTableModel):
             horizontal = Qt.Orientation.Horizontal
         except AttributeError:
             horizontal = Qt.Horizontal  # type: ignore[attr-defined]
-        if orientation == horizontal and 0 <= section < len(_FILE_TABLE_HEADERS):
-            return _FILE_TABLE_HEADERS[section]
+        headers = tuple(_FILE_TABLE_HEADERS) + (_VIDEO_HEADERS if self._video_columns else ())
+        if orientation == horizontal and 0 <= section < len(headers):
+            return headers[section]
         return None
 
     def flags(self, index: QModelIndex):
@@ -301,6 +308,7 @@ class FileTableModel(_BurstGroupMixin, QAbstractTableModel):
 
     def _apply_meta_to_entry(self, entry: FileTableEntry, meta: dict | None) -> None:
         meta = meta or {}
+        entry.video_info = meta.get("video_info")
         entry.comment = _metadata_comment_from_meta(meta)
         entry.species = _metadata_species_text(meta)
         entry.tags = _metadata_tags_from_meta(meta)
@@ -363,6 +371,11 @@ class FileTableModel(_BurstGroupMixin, QAbstractTableModel):
         return entry.mismatch
 
     def _sort_value(self, entry: FileTableEntry, column: int):
+        if column >= len(_FILE_TABLE_HEADERS):
+            info = entry.video_info or {}
+            values = (info.get('duration', -1), (info.get('width') or 0) * (info.get('height') or 0),
+                      info.get('fps', -1), info.get('video_codec', '').lower())
+            return values[column - len(_FILE_TABLE_HEADERS)]
         if column == _TREE_COL_NAME:
             return entry.name.lower()
         if column == _TREE_COL_SPECIES:
@@ -417,8 +430,16 @@ class FileTableModel(_BurstGroupMixin, QAbstractTableModel):
         return ""
 
     def _display_value(self, entry: FileTableEntry, row: int, column: int) -> str:
+        if column >= len(_FILE_TABLE_HEADERS):
+            info = entry.video_info or {}
+            if not is_video(entry.path):
+                return ''
+            values = (format_duration(info.get('duration')),
+                      f"{info['width']} × {info['height']}" if info.get('width') and info.get('height') else '—',
+                      f"{info['fps']:g}" if info.get('fps') else '—', info.get('video_codec') or '—')
+            return values[column - len(_FILE_TABLE_HEADERS)]
         if column == _TREE_COL_NAME:
-            return entry.name
+            return ("▶ " if is_video(entry.path) else "") + entry.name
         if column == _TREE_COL_SPECIES:
             return entry.species
         if column == _TREE_COL_BURST:
@@ -832,6 +853,7 @@ class ThumbnailListEntry:
     burst_position: int | None = None
     burst_id: int | None = None
     burst_text: str = ""
+    video_info: dict | None = None
     burst_group: tuple[int, bool, bool] | None = None
     pixmap: QPixmap | None = None
     thumb_size: int = 0
@@ -875,6 +897,8 @@ class ThumbnailListModel(_BurstGroupMixin, QAbstractListModel):
         if row < 0 or row >= len(self._entries):
             return None
         entry = self._entries[row]
+        if role == _VideoInfoRole:
+            return entry.video_info
         if role == _DisplayRole:
             return entry.name
         if role == _UserRole:
@@ -930,6 +954,7 @@ class ThumbnailListModel(_BurstGroupMixin, QAbstractListModel):
             focus_status=_metadata_focus_status_text(meta),
             focus_box=_metadata_focus_box(meta),
             species_cn=str(meta.get("bird_species_cn", "")),
+            video_info=meta.get("video_info"),
             burst_position=burst_position,
             burst_id=burst_id,
             burst_text=burst_text,
@@ -1058,6 +1083,10 @@ class ThumbnailListModel(_BurstGroupMixin, QAbstractListModel):
     def _set_meta_on_entry(self, entry: ThumbnailListEntry, meta: dict | None) -> list[int]:
         meta = meta or {}
         changed_roles: list[int] = []
+        video_info = meta.get('video_info')
+        if entry.video_info != video_info:
+            entry.video_info = video_info
+            changed_roles.append(_VideoInfoRole)
         new_color = str(meta.get("color", ""))
         if entry.color != new_color:
             entry.color = new_color
@@ -1388,6 +1417,15 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
                     draw_h,
                 )
                 painter.drawPixmap(draw_rect, pixmap)
+
+            if is_video(index.data(_UserRole)):
+                # 独立角标，不改变原始封面或照片的星级/精选覆盖层。
+                badge = QRect(thumb_rect.left() + 4, thumb_rect.bottom() - 23, min(90, thumb_rect.width() - 8), 20)
+                painter.fillRect(badge, QColor(0, 0, 0, 190))
+                painter.setPen(QColor(255, 255, 255))
+                info = index.data(_VideoInfoRole) or {}
+                label = format_duration(info['duration']) if 'duration' in info else Path(index.data(_UserRole)).suffix[1:].upper()
+                painter.drawText(badge, _AlignCenter, "▶ " + label)
 
             def draw_badge(text: str, bg: QColor, fg: QColor, *, left: bool) -> None:
                 f2 = QFont(opt.font)

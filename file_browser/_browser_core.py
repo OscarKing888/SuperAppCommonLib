@@ -2215,6 +2215,9 @@ def _build_report_scope_maps_for_files(
 
 
 def _resolve_thumb_source_path(path: str, report_cache: dict | None, current_dir: str | None) -> str:
+    from app_common.video import is_video
+    if is_video(path):
+        return path
     norm_path = os.path.normpath(path)
     stem = Path(norm_path).stem
     if stem and isinstance(report_cache, dict):
@@ -2531,7 +2534,7 @@ def _get_raw_thumbnail(path: str) -> bytes | None:
     return None
 
 
-def _load_thumbnail_image(path: str, size: int, selected_dir: str | None = None) -> "QImage | None":
+def _load_thumbnail_image(path: str, size: int, selected_dir: str | None = None, *, cancelled=lambda: False) -> "QImage | None":
     """
     线程安全的缩略图生成，返回 QImage（不使用 QPixmap）。
     先查磁盘缓存；未命中则调用 thumb_stream.load_thumbnail_rgb 解码，再异步写入磁盘缓存。
@@ -2545,7 +2548,8 @@ def _load_thumbnail_image(path: str, size: int, selected_dir: str | None = None)
         disk_cached = _read_thumb_from_disk_cache(path, mtime, size, selected_dir)
         if disk_cached is not None and not disk_cached.isNull():
             return disk_cached
-        result = thumb_stream.load_thumbnail_rgb(path, size)
+        from app_common.video import is_video, video_thumbnail_rgb
+        result = video_thumbnail_rgb(path, size, cancelled=cancelled) if is_video(path) else thumb_stream.load_thumbnail_rgb(path, size)
         if result is None:
             return None
         data, w, h = result

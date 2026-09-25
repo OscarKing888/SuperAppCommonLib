@@ -2,6 +2,8 @@
 """Background workers for app_common.file_browser."""
 from __future__ import annotations
 
+from app_common.video import VIDEO_EXTENSIONS, is_video, probe_video
+
 import concurrent.futures as _futures
 import threading
 
@@ -85,6 +87,7 @@ class DirectoryScanWorker(QThread):
         report_cache_full: dict | None = None,
         use_report_db: bool = False,
         parent=None,
+        include_videos: bool = False,
     ) -> None:
         super().__init__(parent)
         self._path = path
@@ -92,6 +95,7 @@ class DirectoryScanWorker(QThread):
         self._report_root = report_root
         self._report_cache_full = report_cache_full
         self._use_report_db = bool(use_report_db)
+        self._include_videos = bool(include_videos)
 
     def run(self) -> None:
         started_at = _time.perf_counter()
@@ -334,13 +338,31 @@ class DirectoryScanWorker(QThread):
                 return
             except Exception as exc:
                 _log.warning("[DirectoryScanWorker.run] build report scopes failed: %s", exc)
+        if self._include_videos:
+            existing = {_path_key(p) for p in files}
+            # Report-backed photo views are subtree scopes even without recursive UI mode.
+            recursive = self._recursive or bool(report_source_available and self._report_root)
+            for root, dirs, names in os.walk(self._path):
+                if self.isInterruptionRequested():
+                    return
+                dirs[:] = [d for d in dirs if not d.startswith('.')]
+                for name in names:
+                    if not is_apple_double_metadata_file(name) and name.lower().endswith(VIDEO_EXTENSIONS):
+                        candidate = os.path.join(root, name)
+                        if _path_key(candidate) not in existing:
+                            files.append(candidate)
+                            existing.add(_path_key(candidate))
+                maybe_emit_progress(root)
+                if not recursive:
+                    break
+            files.sort(key=lambda p: str(p).lower())
         completed_at = _time.perf_counter()
         _log.info(
             "[DirectoryScanWorker.run] timings path=%r files=%s report_load=%.3fs filesystem=%.3fs report_scope=%.3fs total=%.3fs",
             self._path, len(files), report_loaded_at - started_at,
             scanned_at - report_loaded_at, completed_at - scanned_at, completed_at - started_at,
         )
-        _log.info("[DirectoryScanWorker.run] 目录扫描完成：列出 %s 个图像文件，report_cache %s 条，即将通知主线程加载 EXIF", len(files), len(report_cache))
+        _log.info("[DirectoryScanWorker.run] 目录扫描完成：列出 %s 个媒体文件，report_cache %s 条，即将通知主线程加载 EXIF", len(files), len(report_cache))
         _log.info("[DirectoryScanWorker.run] scan done files=%s", len(files))
         if not self.isInterruptionRequested():
             self.scan_finished.emit(self._path, files, report_cache, full_report_cache, report_row_by_path)
@@ -575,6 +597,17 @@ class MetadataLoader(QThread):
             return {}, {}, 0
         chunk_t0 = perf_counter()
         batch = self._read_metadata_batch(chunk)
+        for path in chunk:
+            if self._stopped():
+                return {}, {}, 0
+            if is_video(path):
+                try:
+                    info = probe_video(path, cancelled=self._stopped)
+                    batch.setdefault(os.path.normpath(path), {})["video_info"] = info
+                except Exception as exc:
+                    _log.warning("Video metadata failed path=%r: %s", path, exc)
+                    batch.setdefault(os.path.normpath(path), {})["video_info"] = {}
+
         read_ms = elapsed_ms(chunk_t0)
         focus_t0 = perf_counter()
         focus_batch = self._build_focus_cache_batch(chunk) if self._should_prefetch_focus_cache() else {}
@@ -1052,6 +1085,8 @@ class MetadataLoader(QThread):
             "focus_status": focus_status,
             "focus_box_checked": True,
         }
+        if "video_info" in rec:
+            meta["video_info"] = rec["video_info"]
         if focus_box is not None:
             meta["focus_box"] = focus_box
         if burst_id is not None:

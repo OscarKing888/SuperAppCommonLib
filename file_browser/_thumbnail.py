@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from app_common.video import is_video
 
 from app_common.file_browser._browser_core import *
 
@@ -566,7 +567,10 @@ class ThumbnailLoader(QThread):
 
         # ── 3. Other formats: single-shot load (handles disk cache internally) ─
         else:
-            qimg = _load_thumbnail_image(load_target_path, load_size, self._current_dir)
+            if is_video(load_target_path):
+                qimg = _load_thumbnail_image(load_target_path, load_size, self._current_dir, cancelled=stopped)
+            else:
+                qimg = _load_thumbnail_image(load_target_path, load_size, self._current_dir)
             if qimg is None or qimg.isNull() or stopped():
                 return
             if cache is not None:
@@ -915,7 +919,11 @@ class PersistentThumbCacheWorker(QThread):
             return source_path, 0, 1, 0
         if stop_event.is_set():
             return source_path, 0, 0, 1
-        base_image = _load_thumbnail_image(load_target_path, max(missing_sizes), task.current_dir)
+        if is_video(load_target_path):
+            base_image = _load_thumbnail_image(load_target_path, max(missing_sizes), task.current_dir,
+                                               cancelled=stop_event.is_set)
+        else:
+            base_image = _load_thumbnail_image(load_target_path, max(missing_sizes), task.current_dir)
         if base_image is None or base_image.isNull():
             return source_path, 0, 0, 1
         wrote_any = False

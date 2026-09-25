@@ -44,6 +44,8 @@ class FileListPanel(QWidget):
     skip_uncached_fast_preview = False
     # report.db is optional read-only fallback.  Subclasses may disable it.
     use_report_db = True
+    # 视频发现仅由 Viewer 启用；BirdStamp 保留纯图片工作流。
+    include_videos = False
     # 子类可重载为 False，避免使用 .superpicky/cache 下的派生预览图与持久缩略图。
     use_preview_cache = True
 
@@ -443,6 +445,10 @@ class FileListPanel(QWidget):
         self._tree_widget.selectionModel().selectionChanged.connect(self._on_view_selection_changed)
         for col in range(len(_FILE_TABLE_HEADERS)):
             hdr.setSectionResizeMode(col, _ResizeInteractive)
+        if self.include_videos:
+            for col in range(len(_FILE_TABLE_HEADERS), self._file_table_model.columnCount()):
+                hdr.setSectionResizeMode(col, _ResizeInteractive)
+                self._tree_widget.setColumnWidth(col, 110)
         self._tree_widget.setColumnWidth(_TREE_COL_NAME, 7 * _TREE_COL_CHAR_PX)
         self._tree_widget.setColumnWidth(_TREE_COL_SPECIES, 4 * _TREE_COL_CHAR_PX)
         self._tree_widget.setColumnWidth(_TREE_COL_BURST, 3 * _TREE_COL_CHAR_PX)
@@ -823,9 +829,10 @@ class FileListPanel(QWidget):
                 current_row = self._filtered_files.index(os.path.normpath(self._selected_display_path)) + 1
             except ValueError:
                 current_row = None
-        parts = [f"共 {total} 张"]
+        unit = "项" if getattr(self, "include_videos", False) else "张"
+        parts = [f"共 {total} {unit}"]
         if selected_count > 1:
-            parts.append(f"已选 {selected_count} 张")
+            parts.append(f"已选 {selected_count} {unit}")
         if current_row is not None and total > 0:
             parts.append(f"当前 {current_row}/{total}")
         else:
@@ -1478,6 +1485,7 @@ class FileListPanel(QWidget):
             self._report_root_dir,
             self._report_full_cache if self._report_root_dir and self._report_full_root_dir == self._report_root_dir else None,
             use_report_db=self._use_report_db,
+            include_videos=self.include_videos,
             parent=self,
         )
         self._directory_scan_workers.add(self._directory_scan_worker)
