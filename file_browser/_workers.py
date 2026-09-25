@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from app_common.video import VIDEO_EXTENSIONS, is_video, probe_video
+from app_common.file_browser._work_pool import METADATA, BrowserPoolClosed
 
 import concurrent.futures as _futures
 import threading
@@ -474,8 +475,10 @@ class MetadataLoader(QThread):
         worker_count: int | None = None,
         selected_dir: str | None = None,
         parent=None,
+        work_pool=None,
     ) -> None:
         super().__init__(parent)
+        self._work_pool = work_pool
         self._paths = list(paths)
         self._meta_proxy = meta_proxy
         self._selected_dir = str(selected_dir or "") or None
@@ -499,11 +502,61 @@ class MetadataLoader(QThread):
     def stop(self) -> None:
         self._stop_flag = True
         self.requestInterruption()
+        if self._work_pool is not None:
+            self._work_pool.cancel_pending()
 
     def _stopped(self) -> bool:
         return self._stop_flag or self.isInterruptionRequested()
 
+    def _run_shared(self):
+        # 单个慢文件最多拖住这一小批，其他线程持续提交增量结果。
+        chunk_size = min(8, _metadata_chunk_size_for_worker_count(len(self._paths), self._work_pool.max_workers))
+        chunks = iter(self._paths[i:i + chunk_size] for i in range(0, len(self._paths), chunk_size))
+        pending = {}
+        processed = 0
+        exhausted = False
+        started = perf_counter()
+        try:
+            while not self._stopped() and (pending or not exhausted):
+                while not exhausted and not self._stopped() and len(pending) < self._work_pool.max_workers:
+                    chunk = next(chunks, None)
+                    if chunk is None:
+                        exhausted = True
+                        break
+                    future = self._work_pool.submit(self._read_parse_chunk, chunk,
+                                                    priority=METADATA, cancelled=self._stopped)
+                    pending[future] = len(chunk)
+                done = [future for future in pending if future.done()]
+                if not done:
+                    _futures.wait(pending, timeout=0.05, return_when=_futures.FIRST_COMPLETED)
+                    continue
+                for future in done:
+                    count = pending.pop(future)
+                    if future.cancelled() or self._stopped():
+                        continue
+                    try:
+                        batch, focus, count = future.result()
+                    except Exception:
+                        _log.exception('[metadata.pool] chunk failed')
+                        batch, focus = {}, {}
+                    self._emit_metadata_chunk(batch, focus)
+                    processed += count
+                    self.progress_updated.emit(processed, len(self._paths))
+        except BrowserPoolClosed:
+            self._stop_flag = True
+        finally:
+            for future in pending:
+                self._work_pool.cancel(future)
+            # QThread 的 finished 必须晚于本任务所有 pool 回调结束。
+            while any(not future.done() for future in pending):
+                _futures.wait([f for f in pending if not f.done()], timeout=0.05)
+            _log.info('[metadata.pool] finished processed=%s/%s elapsed_ms=%.1f pool=%s',
+                      processed, len(self._paths), elapsed_ms(started), self._work_pool.snapshot())
+
     def run(self) -> None:
+        if self._work_pool is not None:
+            self._run_shared()
+            return
         if not self._paths or self._stop_flag:
             _log.debug("[MetadataLoader.run] no paths or stopped")
             return
@@ -650,10 +703,10 @@ class MetadataLoader(QThread):
 
     def _emit_metadata_chunk(self, parsed_batch: dict, focus_batch: dict) -> None:
         if focus_batch and not self._stopped():
-            _log.info("[MetadataLoader.run] emit focus_cache_batch_ready batch=%s", len(focus_batch))
+            _log.debug("[MetadataLoader.run] emit focus_cache_batch_ready batch=%s", len(focus_batch))
             self.focus_cache_batch_ready.emit(focus_batch)
         if parsed_batch and not self._stopped():
-            _log.info("[MetadataLoader.run] emit metadata_batch_ready batch=%s", len(parsed_batch))
+            _log.debug("[MetadataLoader.run] emit metadata_batch_ready batch=%s", len(parsed_batch))
             self.metadata_batch_ready.emit(parsed_batch)
 
     def _should_prefetch_focus_cache(self) -> bool:

@@ -27,6 +27,12 @@ EXIF/XMP 配置、ExifTool 路径、元数据读取与 XMP sidecar 写入。内�
   丢弃失步进程，下一条命令自动重启；应用退出必须调用
   `close_exiftool_process()`（同时注册了 `atexit` 兜底）。
 
+浏览器统一池通过 `exiftool_worker_session()` 为每个实际 worker 懒创建并复用
+读取进程，通过 `exiftool_read_request()` 限制单次读取为 20 秒并传递任务取消。
+二进制 RAW 预览的单次进程同样响应取消/超时，退出时 kill + reap；worker 退出
+会关闭自己的 stay-open 进程。普通 UI/CLI 及写入仍使用原共享会话。
+`close_exiftool_process()` 同时关闭注册的读取会话。
+
 ## 依赖
 
 - piexif

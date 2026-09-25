@@ -49,7 +49,46 @@ def run_exiftool_once(cmd: Sequence[str], **kwargs: Any) -> subprocess.Completed
     """Run a one-off ExifTool command with the project's hidden-window policy."""
     merged = hidden_subprocess_kwargs()
     merged.update(kwargs)
-    return subprocess.run(list(cmd), **merged)
+    request = getattr(_worker_local, 'request', None)
+    if request is None:
+        return subprocess.run(list(cmd), **merged)
+    cancelled, default_timeout = request
+    timeout = merged.pop('timeout', None)
+    if timeout is None:
+        timeout = default_timeout
+    check = merged.pop('check', False)
+    payload = merged.pop('input', None)
+    if merged.pop('capture_output', False):
+        merged['stdout'] = subprocess.PIPE
+        merged['stderr'] = subprocess.PIPE
+    if payload is not None:
+        merged['stdin'] = subprocess.PIPE
+    else:
+        merged.setdefault('stdin', subprocess.DEVNULL)
+    if cancelled.is_set():
+        raise subprocess.CalledProcessError(1, list(cmd), stderr='ExifTool command cancelled')
+    deadline = _monotonic() + float(timeout)
+    with subprocess.Popen(list(cmd), **merged) as process:
+        try:
+            while True:
+                if cancelled.is_set():
+                    raise subprocess.CalledProcessError(1, list(cmd), stderr='ExifTool command cancelled')
+                remaining = deadline - _monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(list(cmd), timeout)
+                try:
+                    out, err = process.communicate(input=payload, timeout=min(.1, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    payload = None
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+    result = subprocess.CompletedProcess(list(cmd), process.returncode, out, err)
+    if check:
+        result.check_returncode()
+    return result
 
 
 class _StayOpenExifTool:
@@ -375,6 +414,48 @@ _manager_lock = threading.RLock()
 _manager: _StayOpenExifTool | None = None
 
 
+# Browser read sessions are local to bounded worker threads. The global session
+# remains the compatibility path for UI/CLI reads and metadata writes.
+_worker_local = threading.local()
+_read_sessions: set[_StayOpenExifTool] = set()
+
+
+@contextmanager
+def exiftool_worker_session():
+    previous = getattr(_worker_local, 'session', None)
+    if previous is not None:
+        yield
+        return
+    sessions = {}
+    _worker_local.session = sessions
+    try:
+        yield
+    finally:
+        _worker_local.session = None
+        for manager in sessions.values():
+            manager.close()
+            with _manager_lock:
+                _read_sessions.discard(manager)
+
+
+class _ReadCancellation:
+    def __init__(self, callback):
+        self.callback = callback
+
+    def is_set(self):
+        return bool(self.callback())
+
+
+@contextmanager
+def exiftool_read_request(cancelled, *, timeout=20):
+    previous = getattr(_worker_local, 'request', None)
+    _worker_local.request = (_ReadCancellation(cancelled), timeout)
+    try:
+        yield
+    finally:
+        _worker_local.request = previous
+
+
 def run_exiftool(
     executable_path: str,
     args: Sequence[str],
@@ -391,6 +472,18 @@ def run_exiftool(
     process is discarded to keep protocol framing synchronized, and the next
     command transparently starts a fresh process.
     """
+    sessions = getattr(_worker_local, 'session', None)
+    request = getattr(_worker_local, 'request', None)
+    if sessions is not None and request is not None:
+        manager = sessions.get(str(executable_path))
+        if manager is None:
+            manager = _StayOpenExifTool(str(executable_path))
+            sessions[str(executable_path)] = manager
+            with _manager_lock:
+                _read_sessions.add(manager)
+        return manager.execute(args, text=text, encoding=encoding, errors=errors,
+                               timeout=timeout if timeout is not None else request[1],
+                               cancel_event=cancel_event if cancel_event is not None else request[0])
     global _manager
     with _manager_lock:
         if _manager is None or _manager.executable_path != str(executable_path):
@@ -414,8 +507,11 @@ def close_exiftool_process() -> None:
     with _manager_lock:
         manager = _manager
         _manager = None
+        read_sessions = tuple(_read_sessions)
     if manager is not None:
         manager.close()
+    for session in read_sessions:
+        session.close()
 
 
 atexit.register(close_exiftool_process)

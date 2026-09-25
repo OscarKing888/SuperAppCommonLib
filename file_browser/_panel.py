@@ -12,6 +12,7 @@ from app_common.file_browser._browser_core import *
 from app_common.file_browser._models import *
 from app_common.file_browser._thumbnail import *
 from app_common.file_browser._workers import *
+from app_common.file_browser._work_pool import BrowserWorkPool
 
 _FILE_CLIPBOARD_ACTION_MIME = "application/x-superbirdtools-file-action"
 _FILE_CLIPBOARD_ENTRIES_MIME = "application/x-superbirdtools-file-entries"
@@ -46,6 +47,7 @@ class FileListPanel(QWidget):
     use_report_db = True
     # 视频发现仅由 Viewer 启用；BirdStamp 保留纯图片工作流。
     include_videos = False
+    use_unified_worker_pool = False
     # 子类可重载为 False，避免使用 .superpicky/cache 下的派生预览图与持久缩略图。
     use_preview_cache = True
 
@@ -65,6 +67,8 @@ class FileListPanel(QWidget):
         self._theme_update_in_progress = False
         self._styled_widget_palette = None
         super().__init__(parent)
+        self._browser_work_pool = None
+        self._live_pool_loaders = set()
         self._all_files: list = []
         self._filtered_files: list = []
         self._current_dir = ""
@@ -849,6 +853,15 @@ class FileListPanel(QWidget):
         worker_count: int | None = None,
     ) -> None:
         suffix = f" ({max(1, int(worker_count))}线程)" if worker_count else ""
+        pool = self.__dict__.get('_browser_work_pool')
+        if pool is not None:
+            state = pool.snapshot()
+            suffix = f" ({state['metadata_active']}线程 / 保留{state['metadata_reserved']})"
+            self._meta_progress.setToolTip(
+                f"共享线程池: {state['total']}\n元数据活跃: {state['metadata_active']}\n"
+                f"元数据排队: {state['metadata_queued']}\n缩略图活跃: {state['thumbnail_active']}\n"
+                f"缩略图排队: {state['thumbnail_queued']}"
+            )
         if busy:
             self._meta_progress.setRange(0, 0)
             self._meta_progress.setFormat(f"{text}{suffix}")
@@ -4949,6 +4962,8 @@ class FileListPanel(QWidget):
             self._report_thumb_profile("viewport")
 
     def _set_view_mode(self, mode: int) -> None:
+        if self._browser_work_pool is not None:
+            self._browser_work_pool.set_thumbnail_mode(mode == self._MODE_THUMB)
         self._stop_key_navigation_playback(commit=False)
         if self._view_mode == mode and self._stack.currentIndex() == (0 if mode == self._MODE_LIST else 1):
             self._update_selection_status()
@@ -5384,6 +5399,7 @@ class FileListPanel(QWidget):
             report_cache=self._report_full_cache or self._report_cache or {},
             current_dir=preview_base_dir,
             thumb_cache=self._thumb_memory_cache,
+            work_pool=self._get_browser_work_pool(),
         )
         if requested_visible:
             loader.enqueue(requested_visible, priority=ThumbnailLoader.PRIORITY_VISIBLE)
@@ -5394,6 +5410,7 @@ class FileListPanel(QWidget):
         loader.thumbnail_ready.connect(self._on_thumbnail_ready)
         loader.finished.connect(self._schedule_visible_thumbnail_update)
         self._thumbnail_loader = loader
+        self._own_pool_loader(loader)
         loader.start()
         _log.debug("[_start_thumbnail_loader] END loader.started")
 
@@ -5425,7 +5442,8 @@ class FileListPanel(QWidget):
             return True
         worker = self._persistent_thumb_cache_worker
         if worker is not None and worker.isRunning():
-            return True
+            if not self.use_unified_worker_pool or self._persistent_thumb_cache_done < self._persistent_thumb_cache_total:
+                return True
         return False
 
     def _thumbnail_work_active_or_pending(self) -> bool:
@@ -5435,6 +5453,39 @@ class FileListPanel(QWidget):
         if timer is not None and timer.isActive():
             return True
         return bool(self._persistent_thumb_cache_pending_paths)
+
+    def _sync_shared_pool_budget(self):
+        pool = self.__dict__.get('_browser_work_pool')
+        if pool is None or self._background_shutdown_requested:
+            return
+        viewport_pending = self._thumb_viewport_timer is not None and self._thumb_viewport_timer.isActive()
+        thumbnail_demand = viewport_pending or self._thumbnail_work_active_or_pending()
+        pool.set_thumbnail_mode(self._view_mode == self._MODE_THUMB and thumbnail_demand)
+
+    def _get_browser_work_pool(self):
+        if not self.use_unified_worker_pool:
+            return None
+        if self._browser_work_pool is None:
+            metadata = max(2, _metadata_loader_worker_count())
+            total = max(_thumbnail_loader_worker_count(), metadata + _persistent_thumb_cache_worker_count())
+            self._browser_work_pool = BrowserWorkPool(total, metadata)
+        self._browser_work_pool.set_thumbnail_mode(self._view_mode == self._MODE_THUMB)
+        return self._browser_work_pool
+
+    def _own_pool_loader(self, loader):
+        if not self.use_unified_worker_pool:
+            return
+        self._live_pool_loaders.add(loader)
+        loader.finished.connect(lambda owned=loader: self._live_pool_loaders.discard(owned))
+
+    def _request_worker_pool_shutdown(self):
+        pool = self._browser_work_pool
+        if pool is not None:
+            pool.request_shutdown()
+
+    def has_pending_pool_work(self):
+        pool = self._browser_work_pool
+        return bool(self._live_pool_loaders or (pool is not None and not pool.is_finished()))
 
     def _start_metadata_loader(self, paths: list) -> None:
         if self._background_shutdown_requested:
@@ -5455,12 +5506,16 @@ class FileListPanel(QWidget):
         self._stop_pending_meta_apply()
         # Persistent thumbnail work is scheduled before metadata starts.  Count
         # pending work as active so metadata keeps its reserved CPU budget and
-        # both independent worker pools may run concurrently.
+        # thumbnails and metadata can progress concurrently.
         thumbnail_work_active = self._thumbnail_work_active_or_pending()
         self._metadata_loader_workers = min(
             max(1, total),
             _metadata_loader_worker_count_for_thumbnail_state(thumbnail_work_active),
         )
+        pool = self._get_browser_work_pool()
+        self._sync_shared_pool_budget()
+        if pool is not None:
+            self._metadata_loader_workers = min(total, pool.metadata_workers if thumbnail_work_active else pool.max_workers)
         self._begin_meta_apply_session(total, ordered_paths=paths)
         loader = MetadataLoader(
             paths,
@@ -5470,12 +5525,14 @@ class FileListPanel(QWidget):
             report_rows_by_path=self._report_row_by_path,
             worker_count=self._metadata_loader_workers,
             selected_dir=self._current_dir,
+            work_pool=pool,
         )
         loader.progress_updated.connect(self._on_metadata_progress)
         loader.metadata_batch_ready.connect(self._on_metadata_batch_ready)
         loader.focus_cache_batch_ready.connect(self._on_metadata_focus_cache_batch_ready)
         loader.finished.connect(self._on_metadata_loader_finished)
         self._metadata_loader = loader
+        self._own_pool_loader(loader)
         loader.start()
         self._probe_set_phase("metadata_loader_running", paths=len(paths), elapsed_ms=elapsed_ms(start_t0))
         _log.info(
@@ -5675,12 +5732,14 @@ class FileListPanel(QWidget):
                 report_cache=self._report_full_cache or self._report_cache or {},
                 current_dir=self._current_dir if self._use_preview_cache else "",
                 thumb_cache=self._thumb_memory_cache,
+                work_pool=self._get_browser_work_pool(),
             )
             loader.enqueue([norm_path], priority=ThumbnailLoader.PRIORITY_VISIBLE)
             loader.set_desired_paths([norm_path], [])
             loader.thumbnail_ready.connect(self._on_thumbnail_ready)
             loader.finished.connect(self._schedule_visible_thumbnail_update)
             self._thumbnail_loader = loader
+            self._own_pool_loader(loader)
             loader.start()
 
         persistent_worker = self._persistent_thumb_cache_worker
@@ -5802,6 +5861,8 @@ class FileListPanel(QWidget):
         done = min(max(0, int(self._persistent_thumb_cache_done)), total)
         status_text = self._persistent_thumb_cache_status_text or "生成预览缩略图"
         worker_count = _persistent_thumb_cache_worker_count()
+        if self.__dict__.get("_browser_work_pool") is not None:
+            worker_count = self._browser_work_pool.snapshot()["thumbnail_active"]
         worker_suffix = f" ({worker_count}线程)"
         if status_text.startswith("正在"):
             self._persistent_thumb_progress.setRange(0, 0)
@@ -6018,10 +6079,12 @@ class FileListPanel(QWidget):
             sizes=_effective_persistent_thumb_cache_sizes(self._thumb_size),
             worker_count=_persistent_thumb_cache_worker_count(),
             parent=self,
+            work_pool=self._get_browser_work_pool(),
         )
         worker.progress_updated.connect(self._on_persistent_thumb_cache_progress)
         worker.finished_summary.connect(self._on_persistent_thumb_cache_finished)
         self._persistent_thumb_cache_worker = worker
+        self._own_pool_loader(worker)
         worker.start()
         _log.info(
             "[_start_persistent_thumb_cache_worker] dir=%r total=%s sizes=%s workers=%s",
@@ -6080,6 +6143,7 @@ class FileListPanel(QWidget):
         self._persistent_thumb_cache_skipped = max(0, int(skipped))
         self._persistent_thumb_cache_failed = max(0, int(failed))
         self._persistent_thumb_cache_current_path = os.path.normpath(current_path) if current_path else ""
+        self._sync_shared_pool_budget()
         self._update_persistent_thumb_progress_widget()
         if self._persistent_thumb_cache_total > 0 and self._persistent_thumb_cache_done >= self._persistent_thumb_cache_total:
             QTimer.singleShot(1500, self._hide_persistent_thumb_progress_if_idle)
@@ -6201,6 +6265,7 @@ class FileListPanel(QWidget):
         self._stop_all_loaders()
         self._stop_persistent_thumb_cache_worker()
         self._stop_directory_scan_worker()
+        self._request_worker_pool_shutdown()
 
         wait_threads = []
         seen: set[int] = set()
@@ -6219,6 +6284,8 @@ class FileListPanel(QWidget):
                     worker.wait(2500)
             except Exception:
                 pass
+        if self._browser_work_pool is not None:
+            self._browser_work_pool.shutdown()
         self._flush_selection_scroll_debug_summary()
         _log_thumb_bottleneck_summary()
         _shutdown_thumb_disk_writer(wait=True)
@@ -6654,6 +6721,9 @@ class FileListPanel(QWidget):
         if total <= 0:
             return
         self._meta_apply_expected_total = max(self._meta_apply_expected_total, int(total))
+        if self._browser_work_pool is not None:
+            self._sync_shared_pool_budget()
+            self._metadata_loader_workers = self._browser_work_pool.snapshot()["metadata_active"]
         self._show_meta_progress_status(
             "正在读取元数据",
             value=self._meta_apply_index,
@@ -6671,8 +6741,8 @@ class FileListPanel(QWidget):
     def _on_metadata_batch_ready(self, meta_dict: dict) -> None:
         if not self._is_current_metadata_sender():
             return
-        _log.info("[_on_metadata_batch_ready] 收到 metadata 批次 %s 条，增量更新列表与缩略图", len(meta_dict))
-        _log.info("[_on_metadata_batch_ready] START entries=%s", len(meta_dict))
+        _log.debug("[_on_metadata_batch_ready] 收到 metadata 批次 %s 条，增量更新列表与缩略图", len(meta_dict))
+        _log.debug("[_on_metadata_batch_ready] START entries=%s", len(meta_dict))
         t0 = _time.perf_counter()
         total = len(meta_dict)
         self._meta_cache.update(meta_dict)
@@ -6716,7 +6786,7 @@ class FileListPanel(QWidget):
             return
         if not focus_dict:
             return
-        _log.info("[_on_metadata_focus_cache_batch_ready] 收到 focus 批次 %s 条", len(focus_dict))
+        _log.debug("[_on_metadata_focus_cache_batch_ready] 收到 focus 批次 %s 条", len(focus_dict))
         self.focus_cache_batch_ready.emit(focus_dict)
 
     def _on_metadata_loader_finished(self) -> None:

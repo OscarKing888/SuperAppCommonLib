@@ -532,6 +532,11 @@ def _batch_read_exiftool(et_path: str, paths: list, extra_tags: list | None) -> 
             encoding="utf-8",
             errors="replace",
         )
+        if cp.returncode != 0:
+            detail = str(cp.stderr or '').strip()
+            if 'cancelled' not in detail.lower():
+                _log.warning('[metadata.exiftool] batch failed paths=%s first=%r: %s',
+                             len(paths), paths[0] if paths else '', detail[:500])
         if cp.returncode == 0 and (cp.stdout or "").strip():
             records = json.loads(cp.stdout)
             paths_norm = {os.path.normpath(p) for p in paths}

@@ -33,9 +33,13 @@ submodule 使用。共享代码改动必须同时保持两个应用的行为兼�
 - `report.db` 缓存按完整路径、root-relative 路径和 root-scoped 唯一 stem
   建索引；直接 DB 索引按 DB 路径、mtime 与大小失效。删除只添加当前会话的
   精确 path/scope tombstone，不删除数据库行。
-- 持久缩略图层级为 `128/256/512/1024/2048`。元数据与持久缩略图使用独立
-  worker pool，可并发运行；可分别用 `SuperViewer_METADATA_WORKERS` 和
-  `SuperViewer_PERSISTENT_THUMB_WORKERS` 覆盖。
+- 持久缩略图层级为 `128/256/512/1024/2048`。SuperViewer 显式启用
+  `FileListPanel.use_unified_worker_pool`：视口、预取、持久缩略图与元数据复用
+  一个有界 `BrowserWorkPool`；缩略图按上述顺序优先，至少保留 2 个元数据
+  worker，无缩略图需求时可借用空闲 worker。SuperBirdStamp 默认保持原调度。
+  `SuperViewer_METADATA_WORKERS`、`SuperViewer_PERSISTENT_THUMB_WORKERS`
+  继续覆盖预算；统一池总量为 `max(thumbnail_loader_workers,
+  max(2, metadata_loader_workers) + persistent_thumb_workers)`，不叠加三个池。
 - 非 JPEG 内存缩略图记录已满足的最大请求层级，较小缓存不能命中或覆盖之后
   的较大请求。内存预算自适应，硬上限为 16 GiB。
 - 应用驱动的按键连播默认关闭，由 SuperViewer 显式启用；SuperBirdStamp
