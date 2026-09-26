@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from app_common.image_formats import RAW_IMAGE_EXTENSIONS
+from app_common.exif_io.tiff_reader import read_tiff_exif_tags
 
 try:
     import exifread
@@ -58,7 +59,10 @@ def read_raw_embedded_focus_metadata(path: str | Path) -> dict[str, object]:
         return {}
     try:
         with open(path, "rb") as handle:
-            tags = exifread.process_file(handle, details=True, extract_thumbnail=False)
+            tags = read_tiff_exif_tags(handle)
+            if tags is None:
+                handle.seek(0)
+                tags = exifread.process_file(handle, details=True, extract_thumbnail=False)
     except Exception:
         return {}
     if not isinstance(tags, dict) or not tags:

@@ -598,7 +598,7 @@ class FileTableModel(_BurstGroupMixin, QAbstractTableModel):
     def set_meta_for_path(self, path: str, meta: dict | None) -> bool:
         return bool(self.set_meta_for_paths([(path, meta)]))
 
-    def set_meta_for_paths(self, updates: list[tuple[str, dict | None]]) -> int:
+    def set_meta_for_paths(self, updates: list[tuple[str, dict | None]], *, notify_burst_groups: bool = True) -> int:
         if not updates:
             return 0
         changed_rows: list[int] = []
@@ -619,7 +619,8 @@ class FileTableModel(_BurstGroupMixin, QAbstractTableModel):
         if burst_changed:
             # 连拍 id 变化会影响同组其它行的底框（成员数 / 首末张 / 配色序号），整表刷新背景。
             self._mark_burst_groups_dirty()
-            self._emit_burst_group_changed_all()
+            if notify_burst_groups:
+                self._emit_burst_group_changed_all()
         changed_rows = sorted(set(changed_rows))
         roles = [_DisplayRole, _SortRole, _ForegroundRole, _BackgroundRole, _ToolTipRole]
         first_meta_column = min(
@@ -1128,12 +1129,13 @@ class ThumbnailListModel(_BurstGroupMixin, QAbstractListModel):
                 changed_roles.append(_MetaBurstGroupRole)
         return changed_roles
 
-    def _refresh_burst_groups_if_changed(self, changed_roles: list[int]) -> None:
+    def _refresh_burst_groups_if_changed(self, changed_roles: list[int], *, notify: bool = True) -> None:
         if _MetaBurstGroupRole not in changed_roles:
             return
         # 连拍 id 变化会影响同组其它项的底框（成员数 / 首末张 / 配色序号），整表刷新。
         self._mark_burst_groups_dirty()
-        self._emit_burst_group_changed_all()
+        if notify:
+            self._emit_burst_group_changed_all()
 
     def set_meta_for_path(self, path: str, meta: dict | None) -> bool:
         row = self.row_for_path(path)
@@ -1148,7 +1150,7 @@ class ThumbnailListModel(_BurstGroupMixin, QAbstractListModel):
         self.dataChanged.emit(idx, idx, list(dict.fromkeys(changed_roles + [_DisplayRole])))
         return True
 
-    def set_meta_for_paths(self, updates: list[tuple[str, dict | None]]) -> int:
+    def set_meta_for_paths(self, updates: list[tuple[str, dict | None]], *, notify_burst_groups: bool = True) -> int:
         if not updates:
             return 0
         changed_rows: list[int] = []
@@ -1164,7 +1166,7 @@ class ThumbnailListModel(_BurstGroupMixin, QAbstractListModel):
             all_roles.extend(changed_roles)
         if not changed_rows:
             return 0
-        self._refresh_burst_groups_if_changed(all_roles)
+        self._refresh_burst_groups_if_changed(all_roles, notify=notify_burst_groups)
         changed_rows = sorted(set(changed_rows))
         roles = list(dict.fromkeys(all_roles + [_DisplayRole]))
         range_start = changed_rows[0]

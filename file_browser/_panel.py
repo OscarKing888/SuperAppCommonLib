@@ -6479,8 +6479,8 @@ class FileListPanel(QWidget):
             self._meta_apply_expected_total,
         )
         self._schedule_meta_filter_refresh()
-        if self._meta_apply_timer is not None and not self._meta_apply_timer.isActive():
-            self._apply_meta_batch_tick()
+        # 批次信号只入队；同一轮到达的多个小批交给定时器合并。
+        # 槽内立即更新会连续触发整表连拍背景刷新，饿死绘制和输入事件。
         if (
             self._meta_apply_timer is not None
             and self._meta_apply_index < self._meta_apply_total
@@ -6562,12 +6562,19 @@ class FileListPanel(QWidget):
         end = i
         batch_items = self._meta_apply_items[start:end]
         if batch_items:
-            self._meta_apply_tree_hits += self._file_table_model.set_meta_for_paths(batch_items)
+            # 分组仍按完整模型惰性重算；底色变化只需重绘可见区域。
+            # 避免每个小批次的整表 dataChanged 经过排序代理遍历数千行。
+            self._meta_apply_tree_hits += self._file_table_model.set_meta_for_paths(
+                batch_items, notify_burst_groups=False)
             if _DEBUG_FILE_LIST_LIMIT == 1:
                 for norm_path, meta in batch_items:
                     _log.info("[DEBUG][_apply_meta] norm=%r meta=%r", norm_path, meta)
             if self._view_mode == self._MODE_THUMB:
-                self._meta_apply_list_hits += self._thumb_list_model.set_meta_for_paths(batch_items)
+                self._meta_apply_list_hits += self._thumb_list_model.set_meta_for_paths(
+                    batch_items, notify_burst_groups=False)
+                self._list_widget.viewport().update()
+            else:
+                self._tree_widget.viewport().update()
         self._meta_apply_index = end
         self._show_meta_progress_status(
             "正在读取元数据",

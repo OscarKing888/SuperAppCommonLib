@@ -41,6 +41,33 @@ def _connect_metadata(emitter, panel) -> None:
     )
 
 
+def test_metadata_bursts_coalesce_before_model_updates(panel, monkeypatch):
+    updates = []
+    monkeypatch.setattr(panel._file_table_model, "set_meta_for_paths", lambda items, **kw: updates.append(list(items)) or len(items))
+    panel._view_mode = panel._MODE_LIST
+    paths = [f"中文/photo-{i}.jpg" for i in range(24)]
+    panel._begin_meta_apply_session(len(paths), ordered_paths=paths)
+    for start in range(0, len(paths), 8):
+        panel._enqueue_meta_apply({p: {"rating": 4} for p in paths[start:start + 8]})
+    assert updates == []  # Incoming signals must yield before touching models.
+    assert panel._meta_apply_timer.isActive()
+    _APP.processEvents()
+    assert len(updates) == 1
+    assert [p for p, _ in updates[0]] == paths
+    assert panel._meta_apply_index == len(paths)
+    panel._stop_pending_meta_apply()
+
+
+def test_directory_change_cancels_deferred_metadata_apply(panel, monkeypatch):
+    updates = []
+    monkeypatch.setattr(panel._file_table_model, "set_meta_for_paths", updates.append)
+    panel._begin_meta_apply_session(1)
+    panel._enqueue_meta_apply({"old/photo.jpg": {"rating": 5}})
+    panel._stop_pending_meta_apply()
+    _APP.processEvents()
+    assert updates == []
+
+
 @pytest.mark.parametrize("disconnect_old_loader", [False, True])
 def test_queued_metadata_from_previous_directory_is_ignored(
     panel, monkeypatch, disconnect_old_loader

@@ -1,5 +1,6 @@
 """连拍分组底框：列表 / 缩略图模型分组、配色交替、过滤模式关闭、缩略图色带绘制。"""
 import os
+import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -47,6 +48,25 @@ def _burst_meta(paths: list[str], burst_ids: list[int | None]) -> dict:
         else:
             meta[path] = {"burst_id": burst_id, "burst_position": index + 1}
     return meta
+
+
+@pytest.mark.parametrize("model_class", [FileTableModel, ThumbnailListModel])
+def test_batched_burst_repaint_keeps_other_groups_current_without_global_signal(model_class):
+    paths = _paths("a.jpg", "b.jpg", "c.jpg", "d.jpg")
+    model = model_class()
+    model.rebuild(paths, meta_cache=_burst_meta(paths, [8, None, 9, 9]),
+                  tooltip_fn=_tooltip, mismatch_fn=_mismatch)
+    assert model.burst_group_for_row(2)[0] == 0
+    emitted = []
+    model.dataChanged.connect(lambda tl, br, roles: emitted.append((tl.row(), br.row())))
+    model.set_meta_for_paths([(paths[1], {"burst_id": 8, "burst_position": 2})],
+                             notify_burst_groups=False)
+    assert emitted == [(1, 1)]
+    assert model.burst_group_for_row(0) == (0, True, False)
+    assert model.burst_group_for_row(1) == (0, False, True)
+    # First group gaining its second member changes the later group's color.
+    assert model.burst_group_for_row(2) == (1, True, False)
+    assert model.burst_group_for_row(3) == (1, False, True)
 
 
 def test_compute_burst_group_rows_alternates_colors_and_skips_singletons() -> None:

@@ -28,6 +28,7 @@ from app_common.image_formats import (
     RAW_IMAGE_EXTENSIONS,
 )
 from app_common.log import get_logger
+from app_common.exif_io.tiff_reader import read_tiff_exif_tags
 
 try:
     import exifread
@@ -186,7 +187,10 @@ def _read_exifread_tags_from_file(path: str) -> dict | None:
         return None
     try:
         with open(path, "rb") as handle:
-            tags = exifread.process_file(handle, details=True, extract_thumbnail=False)
+            tags = read_tiff_exif_tags(handle)
+            if tags is None:
+                handle.seek(0)
+                tags = exifread.process_file(handle, details=True, extract_thumbnail=False)
     except Exception:
         return None
     return tags if isinstance(tags, dict) and tags else None
