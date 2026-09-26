@@ -31,6 +31,12 @@ from app_common.psd_composite import load_psd_composite_rgb
 THUMB_FAST_DEFAULT_SIZE = 64
 RAW_PREVIEW_JPEG_TAGS = ("JpgFromRaw", "PreviewImage", "ThumbnailImage")
 
+# LibRaw（rawpy）在进程内选出的内嵌 JPEG 长边达到此值时直接采用，不再为每张
+# RAW 启动 ExifTool 进程（M2 Max 实测约 110 ms/次，rawpy 同等结果 <1 ms）。
+# 低于此值（例如只拿到 160x120 EXIF 缩略图）时仍按 ExifTool 标签顺序补查，
+# 保持“高清相机预览优先于小缩略图”的既有语义。
+RAW_INPROCESS_PREVIEW_MIN_LONG_EDGE = 1600
+
 # Chunk size for progressive JPEG feeding.  64 KB gives ~10–80 feed iterations
 # for typical camera JPEGs (2–5 MB), providing 2–5 visible intermediate frames
 # for progressive-encoded files.
@@ -45,21 +51,53 @@ except Exception:
     pass
 
 
-def _get_raw_thumbnail_bytes(path: str) -> bytes | None:
-    """从 RAW 文件提取嵌入 JPEG 缩略图字节。"""
-    if Path(path).suffix.lower() not in _RAW_EXTENSIONS:
-        return None
-    # Prefer rawpy's camera embedded JPEG.  piexif often exposes only a tiny
-    # 160x120 EXIF thumbnail for ARW files, which is too small for preview.
+def _rawpy_imread_source(path: str):
+    """rawpy.imread 的输入：Windows 非 ASCII 路径改用文件对象，避免 LibRaw 窄字符打开失败。"""
+    if sys.platform.startswith("win") and any(ord(c) > 127 for c in path):
+        return open(path, "rb")
+    return None
+
+
+def _extract_raw_embedded_jpeg_inprocess(path: str) -> bytes | None:
+    """用 LibRaw 在进程内取出相机内嵌 JPEG（不解马赛克、不启动子进程）。"""
     try:
         import rawpy
-        with rawpy.imread(path) as rp:
+    except Exception:
+        return None
+    handle = None
+    try:
+        handle = _rawpy_imread_source(path)
+        with rawpy.imread(handle if handle is not None else path) as rp:
             thumb = rp.extract_thumb()
         if thumb is not None and hasattr(rawpy, "ThumbFormat") and thumb.format == rawpy.ThumbFormat.JPEG:
-            if isinstance(thumb.data, bytes):
-                return thumb.data
+            data = thumb.data
+            if isinstance(data, (bytes, bytearray)) and len(data) > 100 and bytes(data[:2]) == b"\xff\xd8":
+                return bytes(data)
     except Exception:
         pass
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
+    return None
+
+
+def _jpeg_long_edge(data: bytes | None) -> int:
+    """只读 JPEG 头取长边；失败返回 0。"""
+    if not data:
+        return 0
+    try:
+        from PIL import Image
+
+        with Image.open(_io.BytesIO(data)) as img:
+            return max(int(img.size[0]), int(img.size[1]))
+    except Exception:
+        return 0
+
+
+def _get_piexif_thumbnail_bytes(path: str) -> bytes | None:
     try:
         import piexif
         data = piexif.load(path)
@@ -69,6 +107,15 @@ def _get_raw_thumbnail_bytes(path: str) -> bytes | None:
     except Exception:
         pass
     return None
+
+
+def _get_raw_thumbnail_bytes(path: str) -> bytes | None:
+    """从 RAW 文件提取嵌入 JPEG 缩略图字节（rawpy 优先，piexif 小缩略图兜底）。"""
+    if Path(path).suffix.lower() not in _RAW_EXTENSIONS:
+        return None
+    # piexif often exposes only a tiny 160x120 EXIF thumbnail for ARW files,
+    # which is too small for preview; rawpy returns the camera preview.
+    return _extract_raw_embedded_jpeg_inprocess(path) or _get_piexif_thumbnail_bytes(path)
 
 
 def _run_exiftool_binary_tag(path: str, tag: str) -> bytes | None:
@@ -122,14 +169,25 @@ def _run_exiftool_binary_tag(path: str, tag: str) -> bytes | None:
 
 
 def get_raw_preview_jpeg(path: str) -> bytes | None:
-    """从 RAW 文件提取适合预览/缩略图的内嵌 JPEG，优先使用高清 JpgFromRaw。"""
+    """从 RAW 文件提取适合预览/缩略图的内嵌 JPEG，优先使用最高清的相机预览。
+
+    先用 LibRaw 在进程内提取；长边达到 RAW_INPROCESS_PREVIEW_MIN_LONG_EDGE
+    即直接返回。否则按 JpgFromRaw → PreviewImage → ThumbnailImage 调用 ExifTool，
+    取两者中更大的一张；都没有时才用 piexif 的小缩略图。
+    """
     if Path(path).suffix.lower() not in _RAW_EXTENSIONS:
         return None
+    inprocess = _extract_raw_embedded_jpeg_inprocess(path)
+    inprocess_edge = _jpeg_long_edge(inprocess)
+    if inprocess is not None and inprocess_edge >= RAW_INPROCESS_PREVIEW_MIN_LONG_EDGE:
+        return inprocess
     for tag in RAW_PREVIEW_JPEG_TAGS:
         data = _run_exiftool_binary_tag(path, tag)
         if data:
+            if inprocess is not None and inprocess_edge > _jpeg_long_edge(data):
+                return inprocess
             return data
-    return _get_raw_thumbnail_bytes(path)
+    return inprocess or _get_piexif_thumbnail_bytes(path)
 
 
 def _pil_to_rgb_thumb(img, size: int) -> tuple[bytes, int, int] | None:
