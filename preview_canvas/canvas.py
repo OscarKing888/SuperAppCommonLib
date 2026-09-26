@@ -45,13 +45,13 @@ from app_common.log import get_logger
 from app_common.perf_probe import perf_log
 
 try:
-    from PyQt6.QtCore import QPointF, QRectF, Qt, pyqtSignal
-    from PyQt6.QtGui import QColor, QPainter, QPen, QPixmap
+    from PyQt6.QtCore import QPointF, QRect, QRectF, Qt, pyqtSignal
+    from PyQt6.QtGui import QBrush, QColor, QPainter, QPen, QPixmap
     from PyQt6.QtWidgets import QLabel, QVBoxLayout, QWidget
     _QRect_or_QRectF = "QRect | QRectF"
 except ImportError:
-    from PyQt5.QtCore import QPointF, QRectF, Qt, pyqtSignal  # type: ignore[no-reattr]
-    from PyQt5.QtGui import QColor, QPainter, QPen, QPixmap  # type: ignore[no-reattr]
+    from PyQt5.QtCore import QPointF, QRect, QRectF, Qt, pyqtSignal  # type: ignore[no-reattr]
+    from PyQt5.QtGui import QBrush, QColor, QPainter, QPen, QPixmap  # type: ignore[no-reattr]
     from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget  # type: ignore[no-reattr]
     _QRect_or_QRectF = "QRect | QRectF"
 
@@ -271,26 +271,48 @@ def draw_checker_background(
 
     Alternating light/dark cells make transparent areas clearly visible.
     Safe to call with either ``QRect`` or ``QRectF``.
+
+    Implemented as one ``fillRect`` with a cached 2x2-cell texture brush whose
+    origin is the rect's top-left corner, so the pattern is pixel-identical to
+    filling every cell individually (which cost ~17k Python calls per paint for a
+    1200x900 canvas).
     """
     x0 = int(rect.x())
     y0 = int(rect.y())
-    x1 = x0 + int(rect.width())
-    y1 = y0 + int(rect.height())
+    width = int(rect.width())
+    height = int(rect.height())
+    if width <= 0 or height <= 0:
+        return
+    cell = max(1, int(cell))
+    brush = _checker_brush(cell)
+    painter.save()
+    try:
+        painter.setBrushOrigin(x0, y0)
+        painter.fillRect(QRect(x0, y0, width, height), brush)
+    finally:
+        painter.restore()
+
+
+_CHECKER_BRUSHES: "dict[int, QBrush]" = {}
+
+
+def _checker_brush(cell: int) -> "QBrush":
+    brush = _CHECKER_BRUSHES.get(cell)
+    if brush is not None:
+        return brush
     light = QColor(203, 203, 203)
     dark = QColor(153, 153, 153)
-    ri = 0
-    row = y0
-    while row < y1:
-        row_h = min(cell, y1 - row)
-        ci = 0
-        col = x0
-        while col < x1:
-            col_w = min(cell, x1 - col)
-            painter.fillRect(col, row, col_w, row_h, light if (ri + ci) % 2 == 0 else dark)
-            col += cell
-            ci += 1
-        row += cell
-        ri += 1
+    tile = QPixmap(cell * 2, cell * 2)
+    tile.fill(light)
+    tile_painter = QPainter(tile)
+    try:
+        tile_painter.fillRect(cell, 0, cell, cell, dark)
+        tile_painter.fillRect(0, cell, cell, cell, dark)
+    finally:
+        tile_painter.end()
+    brush = QBrush(tile)
+    _CHECKER_BRUSHES[cell] = brush
+    return brush
 
 
 # ---------------------------------------------------------------------------
