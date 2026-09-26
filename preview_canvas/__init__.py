@@ -12,6 +12,9 @@ PreviewCanvas
     * Call ``register_overlay_layer(fn)`` to add runtime overlay callables
       without subclassing.
 
+FocusCenteredPreviewCanvas
+    Opt-in focus-centered viewport, preserving relative zoom across preview upgrades.
+
 PreviewWithStatusBar
     Composite: canvas + status bar below (原始分辨率 / 裁切后分辨率).
     Subclass override ``_get_status_segments()`` to extend status content (open/closed).
@@ -32,6 +35,7 @@ Example::
     canvas.set_show_focus_box(True)
     canvas.set_focus_box((0.3, 0.4, 0.7, 0.6))
 """
+from app_common.preview_canvas.focus_centered import FocusCenteredPreviewCanvas
 from app_common.preview_canvas.canvas import (
     PREVIEW_COMPOSITION_GRID_LINE_WIDTHS,
     PREVIEW_COMPOSITION_GRID_MODES,
@@ -53,6 +57,7 @@ __all__ = [
     "PREVIEW_COMPOSITION_GRID_MODES",
     "PREVIEW_SCALE_PRESET_PERCENTS",
     "PreviewCanvas",
+    "FocusCenteredPreviewCanvas",
     "PreviewOverlayState",
     "PreviewOverlayOptions",
     "PreviewWithStatusBar",

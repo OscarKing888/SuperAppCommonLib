@@ -14,7 +14,7 @@ submodule 使用。共享代码改动必须同时保持两个应用的行为兼�
   - `exiftools_win`：Windows 下的 exiftools 工具
 - **file_browser**：可排序/过滤的列表与缩略图浏览器
 - **focus_calc**：超焦距计算
-- **preview_canvas**：图片预览组件
+- **preview_canvas**：图片预览组件；`FocusCenteredPreviewCanvas` 为 Viewer/BirdStamp 提供可选的焦点居中视口，共用缩放、叠加和导出基础能力
 - **report_db**：`慧眼选鸟`报告数据库兼容层；应用内仅作为只读 fallback/hydration
 - **send_to_app**：发送/接收文件到与其他应用
 - **ui_style**：UI 样式
