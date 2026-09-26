@@ -190,6 +190,41 @@ def get_raw_preview_jpeg(path: str) -> bytes | None:
     return inprocess or _get_piexif_thumbnail_bytes(path)
 
 
+def draft_box_for_long_edge(width: int, height: int, long_edge: int) -> tuple[int, int]:
+    """JPEG draft 的请求框：长边为 long_edge、按原宽高比缩放。
+
+    Pillow draft 只在结果的宽和高都不小于请求框时才缩小。正方形框 (n, n) 会让
+    横图在大档位（例如 2048）上完全失去 DCT 缩放，所以必须按宽高比计算。
+    """
+    width = max(1, int(width))
+    height = max(1, int(height))
+    long_edge = max(1, int(long_edge))
+    if max(width, height) <= long_edge:
+        return (width, height)
+    scale = long_edge / float(max(width, height))
+    return (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
+
+
+def _apply_jpeg_draft(img, long_edge: int) -> None:
+    """对未加载的 JPEG 请求 DCT 缩放解码，结果长边不小于 long_edge。"""
+    try:
+        if getattr(img, "format", None) != "JPEG":
+            return
+        width, height = img.size
+        img.draft("RGB", draft_box_for_long_edge(width, height, long_edge))
+    except Exception:
+        pass
+
+
+def _exif_transpose_in_place(img) -> None:
+    try:
+        from PIL import ImageOps
+
+        ImageOps.exif_transpose(img, in_place=True)
+    except Exception:
+        pass
+
+
 def _pil_to_rgb_thumb(img, size: int) -> tuple[bytes, int, int] | None:
     """PIL Image 缩放到不超过 size，转为 RGB 字节 (data, w, h)。使用 LANCZOS 以获得最终高质量。"""
     try:
@@ -197,11 +232,10 @@ def _pil_to_rgb_thumb(img, size: int) -> tuple[bytes, int, int] | None:
     except ImportError:
         return None
     try:
-        try:
-            img = ImageOps.exif_transpose(img)
-        except Exception:
-            pass
+        # 先缩小再按 EXIF 旋转：旋转只作用在缩略图上，不再复制整幅原图。
+        # 缩放框是正方形，旋转前后的结果尺寸一致。
         img.thumbnail((size, size), Image.LANCZOS)
+        _exif_transpose_in_place(img)
         if img.mode == "P":
             img = img.convert("RGBA")
         if img.mode in ("RGBA", "LA"):
@@ -229,11 +263,8 @@ def _pil_to_rgb_thumb_bilinear(img, size: int) -> tuple[bytes, int, int] | None:
     except ImportError:
         return None
     try:
-        try:
-            img = ImageOps.exif_transpose(img)
-        except Exception:
-            pass
         img.thumbnail((size, size), Image.BILINEAR)
+        _exif_transpose_in_place(img)
         if img.mode == "P":
             img = img.convert("RGBA")
         if img.mode in ("RGBA", "LA"):
@@ -288,6 +319,7 @@ def _load_thumbnail_rgb_from_jpeg_bytes(data: bytes | None, size: int) -> tuple[
     try:
         from PIL import Image
         with Image.open(_io.BytesIO(data)) as img:
+            _apply_jpeg_draft(img, size)
             return _pil_to_rgb_thumb(img, size)
     except Exception:
         return None
@@ -307,10 +339,7 @@ def load_thumbnail_rgb_fast(path: str, max_size: int = THUMB_FAST_DEFAULT_SIZE) 
     try:
         from PIL import Image
         img = Image.open(path)
-        try:
-            img.draft("RGB", (max_size, max_size))
-        except Exception:
-            pass
+        _apply_jpeg_draft(img, max_size)
         return _pil_to_rgb_thumb(img, max_size)
     except Exception:
         return None
@@ -342,10 +371,7 @@ def load_thumbnail_rgb(path: str, size: int) -> tuple[bytes, int, int] | None:
         if img is None:
             img = Image.open(path)
             if ext in _JPEG_EXTENSIONS:
-                try:
-                    img.draft("RGB", (size, size))
-                except Exception:
-                    pass
+                _apply_jpeg_draft(img, size)
         return _pil_to_rgb_thumb(img, size)
     except Exception:
         if ext in _PHOTOSHOP_EXTENSIONS:
@@ -487,16 +513,26 @@ def iter_thumbnail_rgb_progressive(
     except Exception:
         pass  # fall through to finalise
 
-    # ── Finalise: decode the full JPEG again for the cacheable final frame ───
+    # ── Finalise: reuse the parser's completed full-resolution image ────────
+    # The feed loop has already decoded the whole stream; decoding the file a
+    # second time only to shrink it doubled the cost of progressive JPEGs.
+    final_image = None
     try:
-        parser.close()
+        final_image = parser.close()
     except Exception:
-        pass
+        final_image = None
 
-    if jpeg_bytes is not None:
-        result = _load_thumbnail_rgb_from_jpeg_bytes(jpeg_bytes, size)
-    else:
-        result = load_thumbnail_rgb(path, size)
+    result = None
+    if final_image is not None:
+        try:
+            result = _pil_to_rgb_thumb(final_image, size)
+        except Exception:
+            result = None
+    if result is None:
+        if jpeg_bytes is not None:
+            result = _load_thumbnail_rgb_from_jpeg_bytes(jpeg_bytes, size)
+        else:
+            result = load_thumbnail_rgb(path, size)
     if result:
         yield result
     elif not has_intermediate:

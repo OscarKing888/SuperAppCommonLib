@@ -146,3 +146,18 @@ def test_evict_other_dirs_preserves_scope_and_byte_counts(
         assert cache.get(path, 128) is None
     assert cache.evict_other_dirs(normalize(directory)) == 0
     assert cache.stats() == after
+
+
+def test_cache_hits_share_pixels_and_caller_writes_do_not_leak_into_cache() -> None:
+    cache = ThumbnailMemoryCache(max_bytes=64 * 1024 * 1024)
+    source = _image(256, 170, "#336699")
+    cache.put("shared.jpg", 256, source)
+
+    first = cache.get("shared.jpg", 256)
+    second = cache.get("shared.jpg", 256)
+    assert first is not None and second is not None
+    assert first.cacheKey() == second.cacheKey()  # implicitly shared, no deep copy per hit
+
+    first.fill(QColor("#ff0000"))  # copy-on-write detaches only the caller's image
+    third = cache.get("shared.jpg", 256)
+    assert third.pixelColor(0, 0).name() == "#336699"

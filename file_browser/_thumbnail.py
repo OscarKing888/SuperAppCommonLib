@@ -98,7 +98,9 @@ class ThumbnailMemoryCache:
                 if k in self._lru_keys:
                     self._touch_lru(k)
                 cached = self._jpeg_mips.get((cache_key, int(requested_size)))
-                return cached.copy() if cached is not None else None
+                # 存入时已深拷贝成自有像素；读取返回隐式共享副本（写时复制、引用计数线程安全），
+                # 调用方修改只会分离自己的副本，不再为每次命中复制整张缩略图。
+                return QImage(cached) if cached is not None else None
             k = self._lru_key_base(cache_key)
             entry = self._base_images.get(cache_key)
             if entry is None:
@@ -108,7 +110,7 @@ class ThumbnailMemoryCache:
                 return None
             if k in self._lru_keys:
                 self._touch_lru(k)
-            base = base.copy()
+            base = QImage(base)
         if base.isNull():
             return None
         return _scale_qimage_for_thumb(base, requested_size)
