@@ -1,7 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-从 about.cfg 或外部配置文件加载"关于"信息及配套图片列表。
-"""
+"""从 UTF-8 about.cfg 加载信息和图片；覆盖层的相对路径始终属于该配置。"""
 from __future__ import annotations
 
 import json
@@ -9,159 +7,98 @@ import os
 
 from app_common.log import get_logger
 
-
 _log = get_logger("about_dialog")
-_DEFAULT_ABOUT = {
-    "app_name": "{app_name}",
-    "version": "{version}",
-    "作者": "徒步追鸟(osk.ch)"
-}
+_DEFAULT_ABOUT = {"app_name": "{app_name}", "version": "{version}", "作者": "追鸟奇遇记(osk.ch)"}
 
 
 def _sanitize(s: str) -> str:
-    """清理用于界面显示的字符串。"""
-    if not s or not isinstance(s, str):
+    if not isinstance(s, str):
         return ""
-    result = []
-    for c in s:
-        code = ord(c)
-        if code == 0:
-            result.append(" ")
-        elif code < 32 and c not in "\t\n\r":
-            result.append(" ")
-        else:
-            result.append(c)
-    return "".join(result).strip()
+    return "".join(" " if ord(c) < 32 and c not in "\t\n\r" else c for c in s).strip()
 
 
 def _load_raw_cfg(path: str) -> dict:
-    """读取 JSON 配置文件，返回顶层字典；失败时返回空字典。"""
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
+        with open(path, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+        if isinstance(data, dict):
+            return data
+        _log.warning("About config %s must contain a JSON object", path)
     except json.JSONDecodeError as exc:
-        _log.warning(
-            "Invalid JSON in about config %s at line %d column %d: %s",
-            path,
-            exc.lineno,
-            exc.colno,
-            exc.msg,
-        )
-        return {}
-    except OSError as exc:
+        _log.warning("Invalid JSON in about config %s at line %d column %d: %s", path, exc.lineno, exc.colno, exc.msg)
+    except (OSError, UnicodeError) as exc:
         _log.warning("Unable to read about config %s: %s", path, exc)
-        return {}
-
-
-def _load_about_from_file(path: str) -> dict:
-    out = {}
-    data = _load_raw_cfg(path)
-    about = data.get("about") if isinstance(data.get("about"), dict) else {}
-    for k, v in about.items():
-        if isinstance(v, str) and v.strip():
-            out[k] = _sanitize(v)
-    return out
-
-
-def _load_images_from_file(path: str, base_dir: str | None = None) -> list[dict]:
-    """从配置文件中读取 images 列表，解析并返回规范化的图片项列表。
-
-    每个图片项字段：
-      - path (str): 图片文件路径（相对于 base_dir 或绝对路径）
-      - label (str): 图片下方的说明文字（可为空）
-      - size (int): 显示宽度（像素），默认 120
-      - url (str): 点击后打开的链接（可为空）
-    """
-    data = _load_raw_cfg(path)
-    raw_list = data.get("images")
-    if not isinstance(raw_list, list):
-        return []
-    _base = base_dir or os.path.dirname(os.path.abspath(path))
-    result: list[dict] = []
-    for item in raw_list:
-        if not isinstance(item, dict):
-            continue
-        raw_path = item.get("path", "")
-        if not raw_path or not isinstance(raw_path, str):
-            continue
-        resolved = raw_path if os.path.isabs(raw_path) else os.path.normpath(os.path.join(_base, raw_path))
-        if not os.path.isfile(resolved):
-            continue
-        result.append({
-            "path": resolved,
-            "label": _sanitize(str(item.get("label", ""))),
-            "size": max(32, int(item.get("size", 120))),
-            "url": _sanitize(str(item.get("url", ""))),
-        })
-    return result
+    return {}
 
 
 def _module_cfg_path() -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "about.cfg")
 
 
+def _config_layers(override_path, override_paths):
+    for path in (_module_cfg_path(), override_path, *override_paths):
+        if path and os.path.isfile(path):
+            yield os.fspath(path), _load_raw_cfg(path)
+
+
 def _apply_substitutions(info: dict, subs: dict[str, str]) -> dict:
-    """将 info 中所有字符串值内的 ``{key}`` 占位符替换为 subs 中对应的值。"""
-    if not subs:
-        return info
-    result: dict = {}
-    for k, v in info.items():
-        if isinstance(v, str):
-            for placeholder, replacement in subs.items():
-                v = v.replace(f"{{{placeholder}}}", replacement)
-        result[k] = v
+    result = dict(info)
+    for key, value in result.items():
+        for placeholder, replacement in subs.items():
+            value = value.replace(f"{{{placeholder}}}", replacement)
+        result[key] = value
     return result
 
 
-def load_about_images(
-    override_path: str | None = None,
-    *,
-    base_dir: str | None = None,
-) -> list[dict]:
-    """加载关于对话框中要展示的图片列表（如二维码、网站图片等）。
+def _normalize_images(raw_list: list, path: str, base_dir: str | None = None) -> list[dict]:
+    base = base_dir or os.path.dirname(os.path.abspath(path))
+    result = []
+    for item in raw_list:
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str) or not item["path"].strip():
+            continue
+        raw_path = item["path"]
+        resolved = raw_path if os.path.isabs(raw_path) else os.path.normpath(os.path.join(base, raw_path))
+        if not os.path.isfile(resolved):
+            _log.warning("About image from %s does not exist: %s", path, resolved)
+            continue
+        try:
+            size = max(32, min(2048, int(item.get("size", 120))))
+        except (TypeError, ValueError, OverflowError):
+            _log.warning("Invalid about image size in %s for %s; using 120", path, raw_path)
+            size = 120
+        result.append({"path": resolved, "label": _sanitize(item.get("label", "")),
+                       "size": size, "url": _sanitize(item.get("url", ""))})
+    return result
 
-    优先读取模块内 about.cfg，若提供 override_path 且文件存在则用其 images 替换。
-    路径解析：相对路径以所在配置文件目录为基准；也可通过 base_dir 显式指定。
 
-    :param override_path: 可选，外部配置文件路径
-    :param base_dir: 可选，相对路径的解析基准目录（默认为配置文件所在目录）
-    :return: 图片项列表，每项含 path / label / size / url
+def load_about_images(override_path: str | None = None, *, base_dir: str | None = None,
+                      override_paths=()) -> list[dict]:
+    """按模块默认、应用、额外覆盖层顺序读取 images。
+
+    缺少 images 时继承；显式 [] 时清空。坏图片不会恢复成其它配置的二维码。
+    base_dir 仅兼容调用方对 override_path 的显式指定，不影响默认层/额外层。
     """
-    images = _load_images_from_file(_module_cfg_path(), base_dir=base_dir)
-    if override_path and os.path.isfile(override_path):
-        override_images = _load_images_from_file(override_path, base_dir=base_dir)
-        if override_images:
-            images = override_images
+    images = []
+    for path, data in _config_layers(override_path, override_paths):
+        raw_list = data.get("images")
+        if isinstance(raw_list, list):
+            base = base_dir if override_path and path == os.fspath(override_path) else None
+            images = _normalize_images(raw_list, path, base)
     return images
 
 
-def load_about_info(
-    override_path: str | None = None,
-    *,
-    app_name: str | None = None,
-    version: str | None = None,
-) -> dict:
-    """
-    加载"关于"信息：以模块内 about.cfg 为默认，若提供 override_path 且文件存在则用其 about 覆盖/补充。
-    最后将 ``{app_name}`` / ``{version}`` 占位符替换为传入的实际值。
-
-    :param override_path: 可选，外部配置文件路径（JSON，含 "about" 键）
-    :param app_name: 应用名称，替换 cfg 中的 ``{app_name}`` 占位符
-    :param version: 版本字符串，替换 cfg 中的 ``{version}`` 占位符
-    :return: 关于信息字典，至少包含 app_name、version 等
-    """
-    base = _load_about_from_file(_module_cfg_path())
-    for key, val in _DEFAULT_ABOUT.items():
-        if key not in base:
-            base[key] = val
-    if override_path and os.path.isfile(override_path):
-        over = _load_about_from_file(override_path)
-        for k, v in over.items():
-            base[k] = v
-    subs: dict[str, str] = {}
-    if app_name:
+def load_about_info(override_path: str | None = None, *, app_name: str | None = None,
+                    version: str | None = None, override_paths=()) -> dict:
+    """按相同覆盖顺序加载信息，最后替换名称/版本占位符。空字段可隐藏默认项。"""
+    info = dict(_DEFAULT_ABOUT)
+    for _, data in _config_layers(override_path, override_paths):
+        about = data.get("about")
+        if isinstance(about, dict):
+            info.update({_sanitize(k): _sanitize(v) for k, v in about.items()
+                         if isinstance(k, str) and k.strip() and isinstance(v, str)})
+    subs = {}
+    if app_name is not None:
         subs["app_name"] = app_name
-    if version:
+    if version is not None:
         subs["version"] = version
-    return _apply_substitutions(base, subs)
+    return _apply_substitutions(info, subs)

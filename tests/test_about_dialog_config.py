@@ -58,3 +58,35 @@ def test_invalid_about_json_logs_the_parse_location(tmp_path, monkeypatch) -> No
     assert warnings
     assert str(cfg_path) in warnings[0]
     assert "line 1 column" in warnings[0]
+
+
+def test_image_overrides_distinguish_missing_empty_and_invalid(tmp_path, monkeypatch):
+    from PIL import Image
+
+    default = tmp_path / 'default'
+    application = tmp_path / 'application'
+    user = tmp_path / 'user'
+    for directory in (default, application, user):
+        directory.mkdir()
+        Image.new('RGB', (64, 64), 'white').save(directory / 'qr.png')
+        (directory / 'about.cfg').write_text(json.dumps({
+            'images': [{'path': 'qr.png', 'size': 256}]
+        }), encoding='utf-8')
+    monkeypatch.setattr(config, '_module_cfg_path', lambda: str(default / 'about.cfg'))
+    app_cfg, user_cfg = application / 'about.cfg', user / 'about.cfg'
+    load = lambda: config.load_about_images(app_cfg, override_paths=(user_cfg,))
+    assert Path(load()[0]['path']).parent == user
+    user_cfg.write_text('{"about":{"作者":"自定义"}}', encoding='utf-8')
+    assert Path(load()[0]['path']).parent == application
+    user_cfg.write_text('{"images":[]}', encoding='utf-8')
+    assert load() == []
+    user_cfg.write_text('{"images":[{"path":"missing.png"}]}', encoding='utf-8')
+    assert load() == []
+    user_cfg.write_text('{"images":[{"path":"qr.png","size":"bad"}]}', encoding='utf-8')
+    assert load()[0]['size'] == 120
+
+
+def test_about_info_empty_value_hides_inherited_field(tmp_path):
+    path = tmp_path / 'about.cfg'
+    path.write_text('{"about":{"作者":""}}', encoding='utf-8')
+    assert config.load_about_info(path)['作者'] == ''

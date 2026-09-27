@@ -9,7 +9,7 @@
     show_about_dialog(parent, info, logo_path="...", images=images)
 """
 
-from .dialog import show_about_dialog
+from .dialog import AboutDialog, show_about_dialog
 from .config import load_about_info, load_about_images
 
-__all__ = ["show_about_dialog", "load_about_info", "load_about_images"]
+__all__ = ["AboutDialog", "show_about_dialog", "load_about_info", "load_about_images"]
