@@ -90,10 +90,18 @@ def test_ancestor_superpicky_without_report_is_not_reused_with_selected_policy(t
 
 
 def test_volume_root_depth_rule_for_ancestor_superpicky() -> None:
+    assert _path_depth_from_volume_root("F:\\") == 0
     assert _path_depth_from_volume_root(r"F:\A") == 1
     assert _path_depth_from_volume_root(r"F:\A\B\C") == 3
+    assert _path_depth_from_volume_root("F:/A/B/../C") == 2
+    assert _path_depth_from_volume_root(r"\\server\share\A\B") == 2
     assert _is_within_volume_root_depth(r"F:\A\B\C")
     assert not _is_within_volume_root_depth(r"F:\A\B\C\D")
+
+
+def test_native_path_depth_from_filesystem_root(tmp_path: Path) -> None:
+    assert _path_depth_from_volume_root(str(tmp_path)) == len(tmp_path.parts) - 1
+    assert _path_depth_from_volume_root(tmp_path.anchor) == 0
 
 
 def test_cache_paths_do_not_create_or_target_missing_superpicky(tmp_path: Path) -> None:

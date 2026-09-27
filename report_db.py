@@ -25,7 +25,7 @@ _log = get_logger("report_db")
 
 
 # Schema 版本，用于未来升级
-SCHEMA_VERSION = "8"
+SCHEMA_VERSION = "10"
 
 # 所有列定义（有序），用于 CREATE TABLE 和数据验证
 PHOTO_COLUMNS = [
@@ -44,6 +44,7 @@ PHOTO_COLUMNS = [
     # Compatibility: current SuperPicky report_db no longer creates this
     # column, but old processed folders and SBT XMP logic still read it.
     ("pick",          "INTEGER", 0),          # -1=reject, 0=none, 1=pick
+    ("picked",        "INTEGER", 0),          # 慧眼选鸟精选结果：0/1；与旧 pick 分开保留
     ("focus_status",  "TEXT", None),           # BEST/GOOD/BAD/WORST
     ("focus_x",       "REAL", None),
     ("focus_y",       "REAL", None),
@@ -93,8 +94,8 @@ PHOTO_COLUMNS = [
     ("burst_id",         "INTEGER", None),
     ("burst_position",   "INTEGER", None),
 
-    # V6: 懂鸟罕见指数 (0-10，越大越罕见)
-    # V6: BirdID rarity index (0-10, higher = rarer)
+    # V6 遗留字段：新版慧眼选鸟不再写入，罕见度使用 gbif_rarity_100。
+    # V6 legacy field; current SuperPicky uses gbif_rarity_100 instead.
     ("rarity_index",     "REAL", None),
 
     # V7: IUCN 红色名录保护级别 (LC/NT/VU/EN/CR/CR(PE)/CR(PEW)/EW/EX/DD/NE)
@@ -104,6 +105,14 @@ PHOTO_COLUMNS = [
     # V8: GBIF 全球罕见度 (0-100 分制，越大越罕见，CC0+CC-BY 4.0 子集派生)
     # V8: GBIF-derived global rarity score (0-100, higher = rarer)
     ("gbif_rarity_100",  "REAL", None),
+
+    # V9: 鸟种颜值，与照片美学评分 adj_topiq/nima_score 含义不同。
+    ("aesthetic_index",  "REAL", None),
+
+    # V10: 待确定候选鸟种，不能当作已确认 bird_species_* 使用。
+    ("alt_species_cn",   "TEXT", None),
+    ("alt_species_en",   "TEXT", None),
+    ("alt_confidence",   "REAL", None),
     
     ("created_at",    "TEXT", None),
     ("updated_at",    "TEXT", None),
@@ -249,6 +258,25 @@ def get_preview_path_for_file(path: str, current_dir: str, report_cache: Dict[st
     return path
 
 
+def report_pick_value(row: Dict[str, Any]) -> Optional[int]:
+    """只读解析新版 picked / 旧版 pick；负星级保留排除语义。"""
+    try:
+        if float(row.get("rating")) < 0:
+            return -1
+    except (TypeError, ValueError):
+        pass
+    for column_name in ("picked", "pick"):
+        value = row.get(column_name)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        try:
+            lower_bound = 0 if column_name == "picked" else -1
+            return max(lower_bound, min(1, int(float(value))))
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return None
+
+
 def report_row_to_exiftool_style(row: Dict[str, Any], source_file: str) -> Dict[str, Any]:
     """
     将 ReportDB 的一行（photos 表记录）转为 exiftool -G1 风格的平坦字典，
@@ -327,17 +355,12 @@ def report_row_to_exiftool_style(row: Dict[str, Any], source_file: str) -> Dict[
                 out["XMP-xmp:Rating"] = max(0, min(5, rv))
         except (TypeError, ValueError):
             pass
-    pick_value = row.get("pick")
+    pick_value = report_pick_value(row)
     if pick_value is not None:
-        try:
-            pv = max(-1, min(1, int(float(str(pick_value)))))
-            if pv != 0:
-                out["XMP-xmpDM:pick"] = pv
-                out["XMP-xmpDM:Pick"] = pv
-                out["XMP-xmp:Pick"] = pv
-                out["XMP:Pick"] = pv
-        except (TypeError, ValueError):
-            pass
+        out["XMP-xmpDM:pick"] = pick_value
+        out["XMP-xmpDM:Pick"] = pick_value
+        out["XMP-xmp:Pick"] = pick_value
+        out["XMP:Pick"] = pick_value
 
     # 相机与镜头
     _set("IFD0:Model", row.get("camera_model"))

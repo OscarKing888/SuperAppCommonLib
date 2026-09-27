@@ -20,13 +20,14 @@ from dataclasses import dataclass, field
 import hashlib
 import html
 import io as _io
+import ntpath
 import os
 import queue as _queue
 import sys
 import threading
 import time as _time
 import unicodedata
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 # ── Qt 导入 ───────────────────────────────────────────────────────────────────
 try:
@@ -1454,6 +1455,10 @@ def _path_depth_from_volume_root(path: str) -> int:
     if not path:
         return 0
     try:
+        # 跨平台读取 Windows 路径时按盘符/共享根计算，不能拼到 macOS 工作目录下。
+        windows_path = PureWindowsPath(ntpath.normpath(path))
+        if windows_path.is_absolute():
+            return len(windows_path.parts) - 1
         norm = os.path.normpath(os.path.abspath(path))
         root = _volume_root_for_path(norm)
         if not root:

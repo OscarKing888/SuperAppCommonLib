@@ -93,12 +93,15 @@ def _all_photo_column_values(stem: str) -> dict:
         "birdid_confidence",
         "rarity_index",
         "gbif_rarity_100",
+        "aesthetic_index",
+        "alt_confidence",
     }
     int_columns = {
         "has_bird",
         "is_flying",
         "rating",
         "pick",
+        "picked",
         "iso",
         "focal_length_35mm",
         "burst_id",

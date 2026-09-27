@@ -142,6 +142,11 @@ _XMP_DC_DESCRIPTION_TAG = f"{{{_DC_NS}}}description"
 _XMP_RATING_TAG = f"{{{_XMP_NS}}}Rating"
 _XMP_PICK_TAG = f"{{{_XMP_NS}}}Pick"
 _XMP_DM_PICK_TAG = f"{{{_XMP_DM_NS}}}pick"
+_XMP_PICK_XML_TAGS = tuple(
+    f"{{{namespace}}}{name}"
+    for namespace in (_XMP_DM_NS, _XMP_NS)
+    for name in ("pick", "Pick", "PickLabel", "picklabel")
+)
 _XMP_SUPERPICKY_BIRD_SPECIES_CN_TAG = f"{{{_SUPERPICKY_NS}}}bird_species_cn"
 _RDF_DESCRIPTION_TAG = f"{{{_RDF_NS}}}Description"
 _RDF_BAG_TAG = f"{{{_RDF_NS}}}Bag"
@@ -903,6 +908,11 @@ class PhotoMetaDataXMP(PhotoMetaData):
     @classmethod
     def _set_xmp_field_if_missing(cls, desc: ET.Element, key: str, value: Any) -> bool:
         write_key = _xmp_sidecar_write_key(key)
+        if _is_xmp_pick_key(write_key):
+            # 所有 Pick 别名写到同一标准属性，防止补全字段覆盖手工清除/排除。
+            if any(cls._element_or_attr_has_text(desc, tag) for tag in _XMP_PICK_XML_TAGS):
+                return False
+            return cls._set_text_node_if_missing(desc, _XMP_DM_PICK_TAG, str(value))
         if _is_xmp_title_key(write_key):
             return cls._set_alt_text_node_if_missing(desc, _XMP_DC_TITLE_TAG, str(value))
         if _is_xmp_description_key(write_key):
@@ -1108,6 +1118,10 @@ class PhotoMetaDataXMP(PhotoMetaData):
 
     @classmethod
     def _replace_text_node(cls, descriptions: list[ET.Element], tag: str, text: str) -> None:
+        if tag == _XMP_DM_PICK_TAG:
+            # 旧 sidecar 可能含不同大小写/命名空间的 Pick；编辑后只保留当前值。
+            for alias_tag in _XMP_PICK_XML_TAGS:
+                cls._remove_property(descriptions, alias_tag)
         cls._remove_property(descriptions, tag)
         if text == "":
             return
