@@ -358,7 +358,9 @@ class DirectoryScanWorker(QThread):
                 maybe_emit_progress(root)
                 if not recursive:
                     break
-            files.sort(key=lambda p: str(p).lower())
+        # 分类目录不参与文件名主排序，保留相机文件名的拍摄顺序；同名时才按路径区分。
+        # 照片扫描和视频补充共用此顺序，缩略图视图直接沿用扫描结果。
+        files.sort(key=lambda p: (Path(p).name.lower(), str(p).lower(), str(p)))
         completed_at = _time.perf_counter()
         _log.info(
             "[DirectoryScanWorker.run] timings path=%r files=%s report_load=%.3fs filesystem=%.3fs report_scope=%.3fs total=%.3fs",
