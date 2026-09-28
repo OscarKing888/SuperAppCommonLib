@@ -13,6 +13,11 @@ EXIF/XMP 配置、ExifTool 路径、元数据读取与 XMP sidecar 写入。内�
 - **xmp_sidecar.py**：XMP 读取；提供宽松读取 resolver 和严格生命周期 resolver
 - **exiftools_mac/**、**exiftools_win/**：平台 exiftool 可执行文件
 
+Windows 的 `exiftool.exe` 是启动器，必须连同相邻的
+`exiftool_files/lib/Image/ExifTool.pm` 及整个 `lib/` 模块树一起打包；
+只复制 EXE、Perl 运行时和 `exiftool.pl` 无法启动。当前库与脚本同为 13.49；
+库来自上游 `exiftool/exiftool` 的 `13.49` 标签（提交 `6f6df9d`）。
+
 ## 写入与进程约束
 
 - `find_xmp_sidecar()` 可为读取匹配 DxO 派生文件名和父目录来源。

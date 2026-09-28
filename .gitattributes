@@ -1,0 +1,2 @@
+# Preserve upstream ExifTool module files as distributed, including blank EOF lines.
+exif_io/exiftools_win/exiftool_files/lib/** -whitespace
