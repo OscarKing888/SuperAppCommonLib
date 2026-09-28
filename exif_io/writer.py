@@ -14,7 +14,7 @@ import threading
 import piexif
 
 from app_common.exif_io.exiftool_path import get_exiftool_executable_path
-from app_common.exif_io.exiftool_runner import run_exiftool
+from app_common.exif_io.exiftool_runner import run_exiftool, run_exiftool_once
 from app_common.exif_io.json_sidecar import json_sidecar_to_flat_dict, read_json_sidecar
 from app_common.log import get_logger
 
@@ -161,7 +161,7 @@ def run_exiftool_json(path: str) -> list[dict]:
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
                     f.write(path_norm + "\n")
                 cmd = [exiftool_path, "-charset", "filename=UTF8", "-j", "-G1", "-@", argfile_path]
-                cp = subprocess.run(cmd, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
+                cp = run_exiftool_once(cmd, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
             finally:
                 try:
                     os.unlink(argfile_path)
@@ -169,7 +169,7 @@ def run_exiftool_json(path: str) -> list[dict]:
                     pass
         else:
             cmd = [exiftool_path, "-j", "-G1", path_norm]
-            cp = subprocess.run(cmd, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            cp = run_exiftool_once(cmd, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
         if cp.returncode != 0 or not (cp.stdout or "").strip():
             return []
         out = json.loads(cp.stdout)
@@ -201,7 +201,7 @@ def run_exiftool_assignments(path: str, assignments: list[str]) -> None:
                 # 加 -m 后会降级为 warning 并完成写入。
                 cmd.append("-m")
             cmd.extend(["-@", argfile_path])
-            return subprocess.run(
+            return run_exiftool_once(
                 cmd,
                 check=False,
                 capture_output=True,

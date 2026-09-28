@@ -398,14 +398,14 @@ class PhotoMetaDataXMP(PhotoMetaData):
             # exiftool: write to sidecar only
             assignments = [f"-{k}={v}" for k, v in remaining_fields.items()]
             # We write to the sidecar by passing the image path and using -o
-            import subprocess
+            from .exiftool_runner import run_exiftool_once
             all_args = assignments + [f"-o={xmp_path}", os.path.normpath(path)]
             fd, argfile = tempfile.mkstemp(suffix=".args", prefix="et_xmp_")
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
                     for a in all_args:
                         f.write(a + "\n")
-                cp = subprocess.run(
+                cp = run_exiftool_once(
                     [et, "-@", argfile],
                     capture_output=True, check=False,
                 )
