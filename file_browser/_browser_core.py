@@ -89,6 +89,7 @@ from app_common.superviewer_user_options import (
     get_persistent_thumb_workers,
     get_runtime_user_options,
     get_thumbnail_loader_workers,
+    get_metadata_loader_workers,
     save_user_options,
 )
 from app_common.ui_style.styles import COLORS
@@ -986,6 +987,10 @@ def _persistent_thumb_cache_worker_count() -> int:
     return max(1, get_persistent_thumb_workers())
 
 
+def _metadata_loader_worker_count() -> int:
+    return max(1, get_metadata_loader_workers())
+
+
 def _persistent_thumb_cache_dirname(size: int) -> str:
     return str(int(size))
 
@@ -1022,6 +1027,20 @@ def _superpicky_cache_root_dir(current_dir: str | None) -> str:
     if not superpicky_dir:
         return ""
     return os.path.dirname(superpicky_dir)
+
+
+def _meta_disk_cache_db_path_for_file(path: str, selected_dir: str | None = None) -> str:
+    """Cache file-derived metadata in the photo's nearest library scope."""
+    superpicky_dir = _find_superpicky_dir(os.path.dirname(os.path.abspath(path))) if path else ""
+    if superpicky_dir:
+        cache_dir = os.path.join(superpicky_dir, "meta_cache")
+    elif sys.platform.startswith("win"):
+        cache_dir = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+                                 "SuperViewer", "meta_cache")
+    else:
+        cache_dir = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+                                 "SuperViewer", "meta_cache")
+    return os.path.join(cache_dir, "meta_cache.db")
 
 
 def _preview_cache_target_for_file(path: str, current_dir: str | None) -> str:

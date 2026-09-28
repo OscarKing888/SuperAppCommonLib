@@ -13,8 +13,10 @@ KEY_PERF_PROBES_ENABLED = "perf_probes_enabled"
 
 _OPTIONS_LOCK = threading.RLock()
 _DEFAULT_CPU_COUNT = max(1, os.cpu_count() or 1)
+_DEFAULT_METADATA_WORKERS = max(1, min(8, _DEFAULT_CPU_COUNT // 4 or 1))
 _DEFAULT_OPTIONS = {
     "thumbnail_loader_workers": _DEFAULT_CPU_COUNT,
+    "metadata_loader_workers": _DEFAULT_METADATA_WORKERS,
     "persistent_thumb_workers": _DEFAULT_CPU_COUNT,
     "persistent_thumb_max_size": 128,
     "key_navigation_fps": 24,
@@ -47,6 +49,12 @@ def normalize_user_options(data: dict | None) -> dict[str, int]:
     except Exception:
         value = normalized["thumbnail_loader_workers"]
     normalized["thumbnail_loader_workers"] = max(1, value)
+
+    try:
+        value = int(source.get("metadata_loader_workers", normalized["metadata_loader_workers"]) or 0)
+    except Exception:
+        value = normalized["metadata_loader_workers"]
+    normalized["metadata_loader_workers"] = max(1, value)
 
     try:
         value = int(source.get("persistent_thumb_workers", normalized["persistent_thumb_workers"]) or 0)
@@ -125,6 +133,11 @@ def get_runtime_user_options() -> dict[str, int]:
 def get_thumbnail_loader_workers() -> int:
     with _OPTIONS_LOCK:
         return int(_RUNTIME_OPTIONS["thumbnail_loader_workers"])
+
+
+def get_metadata_loader_workers() -> int:
+    with _OPTIONS_LOCK:
+        return int(_RUNTIME_OPTIONS["metadata_loader_workers"])
 
 
 def get_persistent_thumb_workers() -> int:

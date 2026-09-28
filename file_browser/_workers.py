@@ -2,6 +2,20 @@
 """Background workers for app_common.file_browser."""
 from __future__ import annotations
 
+import concurrent.futures as _futures
+import os
+import time
+
+from app_common.exif_io import meta_disk_cache
+from app_common.exif_io.fast_reader import fast_read_browser_metadata
+from app_common.exif_io.writer import (
+    _apply_browser_metadata_aliases,
+    _batch_read_json_sidecar,
+    _batch_read_xmp_sidecar,
+)
+from app_common.file_browser._work_action import MetadataReadAction
+from app_common.file_browser._work_policy import WorkKind
+from app_common.file_browser._work_pool import BrowserPoolClosed, METADATA
 from app_common.file_browser._browser_core import *
 
 class DirectoryScanWorker(QThread):
@@ -302,6 +316,9 @@ class MetadataLoader(QThread):
         focus_source_paths: dict[str, str] | None = None,
         metadata_tags: list[str] | None = None,
         parent=None,
+        worker_count: int | None = None,
+        selected_dir: str | None = None,
+        work_pool=None,
     ) -> None:
         super().__init__(parent)
         self._paths = list(paths)
@@ -313,12 +330,89 @@ class MetadataLoader(QThread):
         }
         self._metadata_tags = list(metadata_tags or [])
         self._stop_flag = False
+        self._worker_count = max(1, int(worker_count or 1))
+        self._selected_dir = selected_dir
+        self._work_pool = work_pool
 
     def stop(self) -> None:
         self._stop_flag = True
         self.requestInterruption()
+        if self._work_pool is not None:
+            self._work_pool.cancel_pending()
+
+    def _stopped(self) -> bool:
+        return self._stop_flag or self.isInterruptionRequested()
+
+    def _read_parse_chunk(self, chunk: list[str]) -> tuple[dict, dict, int]:
+        batch = self._read_metadata_batch(chunk)
+        focus_batch = self._build_focus_cache_batch(chunk) if self._should_prefetch_focus_cache() else {}
+        parsed_batch: dict = {}
+        for norm_path, flat in batch.items():
+            if self._stopped():
+                break
+            meta = self._parse_rec(flat)
+            species_cn = str(flat.get("bird_species_cn") or "").strip()
+            if species_cn:
+                meta["bird_species_cn"] = species_cn
+            parsed_batch[norm_path] = meta
+        return parsed_batch, focus_batch, len(chunk)
+
+    def _emit_metadata_chunk(self, parsed_batch: dict, focus_batch: dict) -> None:
+        if self._stopped():
+            return
+        if focus_batch:
+            self.focus_cache_batch_ready.emit(focus_batch)
+        if parsed_batch:
+            self.metadata_batch_ready.emit(parsed_batch)
+
+    def _run_shared(self) -> None:
+        chunk_size = min(8, max(1, (len(self._paths) + self._work_pool.max_workers - 1)
+                                // self._work_pool.max_workers))
+        chunks = iter(self._paths[i:i + chunk_size] for i in range(0, len(self._paths), chunk_size))
+        pending: dict = {}
+        producer = None
+        exhausted = False
+        processed = 0
+        try:
+            producer = self._work_pool.begin_producer(WorkKind.METADATA)
+            while not self._stopped() and (pending or not exhausted):
+                while not exhausted and not self._stopped() and len(pending) < self._work_pool.max_workers:
+                    chunk = next(chunks, None)
+                    if chunk is None:
+                        exhausted = True
+                        break
+                    future = self._work_pool.submit_action(
+                        MetadataReadAction(self._read_parse_chunk, chunk, cancelled=self._stopped),
+                        kind=WorkKind.METADATA, priority=METADATA)
+                    pending[future] = len(chunk)
+                done = [future for future in pending if future.done()]
+                if not done:
+                    _futures.wait(pending, timeout=0.05, return_when=_futures.FIRST_COMPLETED)
+                    continue
+                for future in done:
+                    count = pending.pop(future)
+                    if future.cancelled() or self._stopped():
+                        continue
+                    try:
+                        parsed, focus, count = future.result()
+                    except Exception:
+                        parsed, focus = {}, {}
+                    self._emit_metadata_chunk(parsed, focus)
+                    processed += count
+                    self.progress_updated.emit(processed, len(self._paths))
+        except BrowserPoolClosed:
+            self._stop_flag = True
+        finally:
+            for future in pending:
+                self._work_pool.cancel(future)
+            while any(not future.done() for future in pending):
+                _futures.wait([future for future in pending if not future.done()], timeout=0.05)
+            self._work_pool.end_producer(WorkKind.METADATA, producer)
 
     def run(self) -> None:
+        if self._work_pool is not None:
+            self._run_shared()
+            return
         if not self._paths or self._stop_flag:
             _log.debug("[MetadataLoader.run] no paths or stopped")
             return
@@ -372,17 +466,64 @@ class MetadataLoader(QThread):
     def _read_metadata_batch(self, paths: list[str]) -> dict[str, dict]:
         norm_paths = [os.path.normpath(p) for p in paths]
         result: dict[str, dict] = {norm: {"SourceFile": norm} for norm in norm_paths}
+        stats: dict[str, tuple[float, int]] = {}
+        db_by_path: dict[str, str] = {}
+        by_db: dict[str, dict[str, tuple[float, int]]] = {}
+        for path in paths:
+            norm = os.path.normpath(path)
+            try:
+                stat = os.stat(path)
+                stats[norm] = (stat.st_mtime, stat.st_size)
+                db = _meta_disk_cache_db_path_for_file(path, self._selected_dir)
+                db_by_path[norm] = db
+                by_db.setdefault(db, {})[norm] = stats[norm]
+            except OSError:
+                continue
+
+        cached: dict[str, dict] = {}
+        for db, entries in by_db.items():
+            cached.update(meta_disk_cache.get_many(db, entries))
+        for norm, rec in cached.items():
+            if norm in result:
+                result[norm].update(rec)
+
+        uncached = [path for path in paths if os.path.normpath(path) not in cached]
+        fast_records, fallback_paths = fast_read_browser_metadata(uncached)
+        for norm, rec in fast_records.items():
+            if norm in result:
+                result[norm].update(rec)
+        store_by_db: dict[str, dict[str, tuple[float, int, dict]]] = {}
+        for norm, rec in fast_records.items():
+            if norm in stats and norm in db_by_path:
+                mtime, size = stats[norm]
+                store_by_db.setdefault(db_by_path[norm], {})[norm] = (mtime, size, rec)
+        for db, entries in store_by_db.items():
+            meta_disk_cache.put_many(db, entries)
+
         try:
             raw_batch = read_batch_metadata(
-                paths,
+                fallback_paths,
                 tags=self._metadata_tags or None,
-                use_cache=not bool(self._metadata_tags),
-            )
+                use_cache=False,
+            ) if fallback_paths else {}
             for norm_path, flat in raw_batch.items():
                 if norm_path in result and flat:
                     result[norm_path].update(flat)
         except Exception as exc:
             _log.warning("[MetadataLoader._read_metadata_batch] read_batch_metadata failed: %s", exc)
+
+        # Sidecars are deliberately outside the file-derived disk cache. Always
+        # reread them, including valid empty values and the central JSON path.
+        for reader in (_batch_read_xmp_sidecar, _batch_read_json_sidecar):
+            try:
+                sidecars = reader(paths)
+            except Exception as exc:
+                _log.warning("[MetadataLoader._read_metadata_batch] sidecar read failed: %s", exc)
+                continue
+            for norm_path, flat in sidecars.items():
+                if norm_path in result and flat:
+                    result[norm_path].update(flat)
+                    _apply_browser_metadata_aliases(result[norm_path])
         return result
 
     def _parse_rec(self, rec: dict) -> dict:

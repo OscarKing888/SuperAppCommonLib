@@ -14,6 +14,7 @@ import threading
 import piexif
 
 from app_common.exif_io.exiftool_path import get_exiftool_executable_path
+from app_common.exif_io.exiftool_runner import run_exiftool
 from app_common.exif_io.json_sidecar import json_sidecar_to_flat_dict, read_json_sidecar
 from app_common.log import get_logger
 
@@ -543,18 +544,9 @@ def _batch_read_exiftool(et_path: str, paths: list, extra_tags: list | None) -> 
     tag_args += (extra_tags if extra_tags is not None else DEFAULT_METADATA_TAGS)
     all_args = tag_args + [os.path.normpath(p) for p in paths]
 
-    fd, argfile = tempfile.mkstemp(suffix=".args", prefix="et_bm_")
     result: dict = {}
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            for a in all_args:
-                f.write(a + "\n")
-        fd = -1
-        cp = subprocess.run(
-            [et_path, "-@", argfile],
-            check=False, capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-        )
+        cp = run_exiftool(et_path, all_args, text=True, encoding="utf-8", errors="replace")
         if cp.returncode == 0 and (cp.stdout or "").strip():
             records = json.loads(cp.stdout)
             paths_norm = {os.path.normpath(p) for p in paths}
@@ -565,13 +557,6 @@ def _batch_read_exiftool(et_path: str, paths: list, extra_tags: list | None) -> 
                     result[src] = rec
     except Exception:
         pass
-    finally:
-        try:
-            if fd >= 0:
-                os.close(fd)
-            os.unlink(argfile)
-        except Exception:
-            pass
     return result
 
 

@@ -24,6 +24,8 @@ from app_common.file_browser._permissions import (
 from app_common.file_browser._models import *
 from app_common.file_browser._thumbnail import *
 from app_common.file_browser._workers import *
+from app_common.file_browser._work_pool import BrowserWorkPool
+from app_common.file_browser._work_policy import WorkKind
 
 _FILE_CLIPBOARD_ACTION_MIME = "application/x-superbirdtools-file-action"
 _FILE_CLIPBOARD_ENTRIES_MIME = "application/x-superbirdtools-file-entries"
@@ -47,12 +49,14 @@ class FileListPanel(QWidget):
     use_report_db = False
     # 子类可重载为 False，避免使用 .superpicky/cache 下的派生预览图与持久缩略图。
     use_preview_cache = True
+    use_unified_worker_pool = False
 
     file_selected = pyqtSignal(str)
     file_fast_preview_requested = pyqtSignal(str)
     file_fast_preview_pixmap_requested = pyqtSignal(str, object, int)
     metadata_cache_updated = pyqtSignal(object)
     files_loaded = pyqtSignal(object)
+    display_files_changed = pyqtSignal(object)
     focus_cache_batch_ready = pyqtSignal(object)
     _MODE_LIST  = 0
     _MODE_THUMB = 1
@@ -63,6 +67,8 @@ class FileListPanel(QWidget):
     def __init__(self, parent=None, *, create_filter_bar: bool | None = None) -> None:
         super().__init__(parent)
         self._all_files: list = []
+        self._browser_work_pool: BrowserWorkPool | None = None
+        self._live_pool_loaders: set = set()
         self._filtered_files: list = []
         self._current_dir = ""
         self._report_root_dir: str | None = None  # 当前使用的 report 根目录（含 .superpicky 的目录）
@@ -115,6 +121,8 @@ class FileListPanel(QWidget):
         self._tree_model_populate_started_at: float = 0.0
         self._copied_species_payload: dict | None = None
         self._pending_selection_paths: list | None = None  # 接收到的文件列表，目录加载完成后等同多选
+        self._pending_selection_automatic: bool = False
+        self._emitting_automatic_selection: bool = False
         self._pending_selection_current_path: str = ""
         self._thumb_memory_cache = ThumbnailMemoryCache()
         self._pending_selection_current_path: str = ""
@@ -1144,6 +1152,10 @@ class FileListPanel(QWidget):
                 "[_apply_directory_listing_result] metadata already cached for all files total=%s",
                 len(self._all_files),
             )
+            pool = self._get_browser_work_pool()
+            if pool is not None:
+                token = pool.begin_producer(WorkKind.METADATA)
+                pool.end_producer(WorkKind.METADATA, token)
         self._probe_log("apply_listing.done", elapsed_ms=elapsed_ms(apply_t0), meta_uncached=len(uncached_meta_paths))
 
     def _refresh_filter_scope(self) -> None:
@@ -1648,15 +1660,18 @@ class FileListPanel(QWidget):
         current_path: str | None = None,
         *,
         apply_immediately: bool = True,
+        automatic: bool = False,
     ) -> None:
         """设置「待选路径」：下次目录加载完成后将列表中匹配的项多选并视为当前选中（与目录内多选同等）。若当前已打开该目录且列表已加载，则立即应用。"""
         if not paths:
             self._pending_selection_paths = None
+            self._pending_selection_automatic = False
             self._pending_selection_current_path = ""
             return
         normalized = [os.path.normpath(os.path.abspath(str(p))) for p in paths if p]
         if not normalized:
             self._pending_selection_paths = None
+            self._pending_selection_automatic = False
             self._pending_selection_current_path = ""
             return
         normalized_keys = {os.path.normcase(p) for p in normalized}
@@ -1664,6 +1679,7 @@ class FileListPanel(QWidget):
         if os.path.normcase(preferred_current) not in normalized_keys:
             preferred_current = normalized[0]
         self._pending_selection_current_path = preferred_current
+        self._pending_selection_automatic = bool(automatic)
         if (
             apply_immediately
             and self._current_dir
@@ -1757,7 +1773,7 @@ class FileListPanel(QWidget):
                 )
                 self._scroll_path_into_view(current_target, prefer_active=False)
             self._schedule_selection_visibility_restore(current_target, reason="apply_pending_selection")
-            self._emit_file_selected_for_path(current_target)
+            self._emit_file_selected_for_path(current_target, automatic=self._pending_selection_automatic)
         self._update_selection_status()
 
     def _select_first_file_if_needed(self, *, reason: str = "") -> None:
@@ -1778,7 +1794,8 @@ class FileListPanel(QWidget):
             index = self._thumb_index_for_path(target)
 
         if not index.isValid():
-            self.set_pending_selection([target], current_path=target, apply_immediately=False)
+            self.set_pending_selection([target], current_path=target,
+                                       apply_immediately=False, automatic=True)
             _log.info("[_select_first_file_if_needed] pending reason=%s target=%r", reason, target)
             return
 
@@ -1803,7 +1820,7 @@ class FileListPanel(QWidget):
             reason=reason,
         )
         self._schedule_selection_visibility_restore(target, reason=f"select_first:{reason}")
-        self._emit_file_selected_for_path(target)
+        self._emit_file_selected_for_path(target, automatic=True)
 
     def _record_selection_scroll_debug(self, event: str, path: str = "", **fields) -> None:
         """缓存选中/滚动诊断信息，退出时统一汇总输出，避免运行中刷屏。"""
@@ -3920,6 +3937,7 @@ class FileListPanel(QWidget):
         self._cancel_thumb_model_population()
         filter_t0 = perf_counter()
         self._filtered_files = self._compute_filtered_files()
+        self.display_files_changed.emit(list(self._filtered_files))
         self._probe_log(
             "rebuild_views.compute_filtered",
             elapsed_ms=elapsed_ms(filter_t0),
@@ -5346,6 +5364,7 @@ class FileListPanel(QWidget):
             report_cache=self._report_cache,
             current_dir=preview_base_dir,
             thumb_cache=self._thumb_memory_cache,
+            work_pool=self._get_browser_work_pool(),
         )
         if requested_visible:
             loader.enqueue(requested_visible, priority=ThumbnailLoader.PRIORITY_VISIBLE)
@@ -5356,6 +5375,7 @@ class FileListPanel(QWidget):
         loader.thumbnail_ready.connect(self._on_thumbnail_ready)
         loader.finished.connect(self._schedule_visible_thumbnail_update)
         self._thumbnail_loader = loader
+        self._own_pool_loader(loader)
         loader.start()
         _log.debug("[_start_thumbnail_loader] END loader.started")
 
@@ -5381,6 +5401,31 @@ class FileListPanel(QWidget):
         self._thumb_profile_ready_received_at.clear()
         self._pending_loaders = [l for l in self._pending_loaders if l.isRunning()]
 
+    def _get_browser_work_pool(self):
+        if not self.use_unified_worker_pool:
+            return None
+        if self._browser_work_pool is None:
+            metadata = max(2, _metadata_loader_worker_count())
+            total = max(_thumbnail_loader_worker_count(),
+                        metadata + _persistent_thumb_cache_worker_count())
+            self._browser_work_pool = BrowserWorkPool(total, metadata)
+        self._browser_work_pool.set_thumbnail_mode(self._view_mode == self._MODE_THUMB)
+        return self._browser_work_pool
+
+    def _own_pool_loader(self, loader) -> None:
+        if not self.use_unified_worker_pool:
+            return
+        self._live_pool_loaders.add(loader)
+        loader.finished.connect(lambda owned=loader: self._live_pool_loaders.discard(owned))
+
+    def _request_worker_pool_shutdown(self) -> None:
+        if self._browser_work_pool is not None:
+            self._browser_work_pool.request_shutdown()
+
+    def has_pending_pool_work(self) -> bool:
+        pool = self._browser_work_pool
+        return bool(self._live_pool_loaders or (pool is not None and not pool.is_finished()))
+
     def _start_metadata_loader(self, paths: list) -> None:
         if self._background_shutdown_requested:
             return
@@ -5404,12 +5449,16 @@ class FileListPanel(QWidget):
             meta_proxy=self._meta_proxy,
             focus_source_paths=self._build_metadata_focus_source_paths(paths),
             metadata_tags=_SUPERBIRDSTAMP_BROWSER_METADATA_TAGS,
+            worker_count=_metadata_loader_worker_count(),
+            selected_dir=self._current_dir,
+            work_pool=self._get_browser_work_pool(),
         )
         loader.progress_updated.connect(self._on_metadata_progress)
         loader.metadata_batch_ready.connect(self._on_metadata_batch_ready)
         loader.focus_cache_batch_ready.connect(self._on_metadata_focus_cache_batch_ready)
         loader.finished.connect(self._on_metadata_loader_finished)
         self._metadata_loader = loader
+        self._own_pool_loader(loader)
         loader.start()
         self._probe_set_phase("metadata_loader_running", paths=len(paths), elapsed_ms=elapsed_ms(start_t0))
         _log.info("[_start_metadata_loader] MetadataLoader started via PhotoMetaDataProxy")
@@ -5601,12 +5650,14 @@ class FileListPanel(QWidget):
             report_cache=self._report_full_cache or self._report_cache or {},
             current_dir=self._current_dir if self._use_preview_cache else "",
             thumb_cache=self._thumb_memory_cache,
+            work_pool=self._get_browser_work_pool(),
         )
         loader.enqueue([norm_path], priority=ThumbnailLoader.PRIORITY_VISIBLE)
         loader.set_desired_paths([norm_path], [])
         loader.thumbnail_ready.connect(self._on_thumbnail_ready)
         loader.finished.connect(self._schedule_visible_thumbnail_update)
         self._thumbnail_loader = loader
+        self._own_pool_loader(loader)
         loader.start()
 
     def _materialize_current_thumbnail_fast_preview(self, path: str) -> str:
@@ -5821,10 +5872,12 @@ class FileListPanel(QWidget):
             sizes=_effective_persistent_thumb_cache_sizes(self._thumb_size),
             worker_count=_persistent_thumb_cache_worker_count(),
             parent=self,
+            work_pool=self._get_browser_work_pool(),
         )
         worker.progress_updated.connect(self._on_persistent_thumb_cache_progress)
         worker.finished_summary.connect(self._on_persistent_thumb_cache_finished)
         self._persistent_thumb_cache_worker = worker
+        self._own_pool_loader(worker)
         worker.start()
         _log.info(
             "[_start_persistent_thumb_cache_worker] dir=%r total=%s sizes=%s workers=%s",
@@ -6001,6 +6054,7 @@ class FileListPanel(QWidget):
         self._stop_all_loaders()
         self._stop_persistent_thumb_cache_worker()
         self._stop_directory_scan_worker()
+        self._request_worker_pool_shutdown()
 
         wait_threads = []
         seen: set[int] = set()
@@ -6019,6 +6073,8 @@ class FileListPanel(QWidget):
                     worker.wait(2500)
             except Exception:
                 pass
+        if self._browser_work_pool is not None:
+            self._browser_work_pool.shutdown()
         self._flush_selection_scroll_debug_summary()
         _log_thumb_bottleneck_summary()
         _shutdown_thumb_disk_writer(wait=bool(thumb_disk_writer_wait))
@@ -6530,7 +6586,7 @@ class FileListPanel(QWidget):
         if self._meta_apply_index >= self._meta_apply_total:
             self._finish_meta_apply()
 
-    def _emit_file_selected_for_path(self, path: str) -> None:
+    def _emit_file_selected_for_path(self, path: str, *, automatic: bool = False) -> None:
         """更新当前显示路径并发出 file_selected，供点击与键盘选择共用。"""
         t0 = _time.perf_counter()
         probe_t0 = perf_counter()
@@ -6552,7 +6608,11 @@ class FileListPanel(QWidget):
             os.path.isfile(resolved_path) if resolved_path else False,
         )
         emit_t0 = _time.perf_counter()
-        self.file_selected.emit(resolved_path or path)
+        self._emitting_automatic_selection = bool(automatic)
+        try:
+            self.file_selected.emit(resolved_path or path)
+        finally:
+            self._emitting_automatic_selection = False
         emit_ms = (_time.perf_counter() - emit_t0) * 1000.0
         perf_log(
             _log,

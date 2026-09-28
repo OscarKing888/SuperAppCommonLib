@@ -14,6 +14,7 @@ from typing import Any
 from PIL import ExifTags, Image
 
 from app_common.exif_io.exiftool_path import get_exiftool_executable_path
+from app_common.exif_io.exiftool_runner import run_exiftool
 from app_common.exif_io.json_sidecar import json_sidecar_to_flat_dict, read_json_sidecar
 
 try:
@@ -255,7 +256,6 @@ def _batch_read_exiftool_full(
     result: dict[str, dict[str, Any]] = {}
     for chunk in _chunked(paths, chunk_size):
         cmd = [
-            et_path,
             "-j",
             "-G1",
             "-n",
@@ -268,13 +268,8 @@ def _batch_read_exiftool_full(
             *[os.path.normpath(str(p)) for p in chunk],
         ]
         try:
-            cp = subprocess.run(
-                cmd,
-                capture_output=True,
-                check=False,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+            cp = run_exiftool(
+                et_path, cmd, text=True, encoding="utf-8", errors="replace"
             )
         except (FileNotFoundError, OSError):
             break

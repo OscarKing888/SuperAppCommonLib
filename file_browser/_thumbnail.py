@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from collections import OrderedDict
 
+from app_common.file_browser._work_action import ThumbnailAction, PersistentThumbnailAction
+from app_common.file_browser._work_policy import WorkKind
+from app_common.file_browser._work_pool import VISIBLE, PREFETCH, PERSISTENT, BrowserPoolClosed
 from app_common.file_browser._browser_core import *
 
 def _compute_thumb_cache_max_bytes() -> int:
@@ -218,8 +221,10 @@ class ThumbnailLoader(QThread):
         current_dir: str | None = None,
         thumb_cache: ThumbnailMemoryCache | None = None,
         parent=None,
+        work_pool=None,
     ) -> None:
         super().__init__(parent)
+        self._work_pool = work_pool
         self._size = int(size)
         self._request_token = int(request_token)
         self._report_cache = report_cache or {}
@@ -447,6 +452,8 @@ class ThumbnailLoader(QThread):
     def stop(self) -> None:
         self._stop_flag = True
         self.requestInterruption()
+        if self._work_pool is not None:
+            self._work_pool.cancel_pending()
         with self._queue_lock:
             self._desired_paths.clear()
 
@@ -582,7 +589,80 @@ class ThumbnailLoader(QThread):
                 single_shot=True,
             )
 
+    def _run_shared(self) -> None:
+        pending: dict = {}
+        producer = None
+
+        def stopped() -> bool:
+            return self._stop_flag or self.isInterruptionRequested()
+
+        try:
+            producer = self._work_pool.begin_producer(WorkKind.THUMBNAIL)
+            while not stopped():
+                for future, (priority, path) in list(pending.items()):
+                    with self._queue_lock:
+                        desired = self.PRIORITY_VISIBLE if path in self._visible_paths else self.PRIORITY_PREFETCH
+                        visible_waiting = bool(self._task_queue.queue and
+                                               self._task_queue.queue[0][0] == self.PRIORITY_VISIBLE)
+                    if desired != priority:
+                        self._work_pool.reprioritize(
+                            future, VISIBLE if desired == self.PRIORITY_VISIBLE else PREFETCH)
+                        pending[future] = (desired, path)
+                        priority = desired
+                    if not future.done() and not future.running() and (
+                        not self.wants_path(path) or
+                        (priority != self.PRIORITY_VISIBLE and visible_waiting)
+                    ):
+                        self._work_pool.cancel(future)
+                    if not future.done():
+                        continue
+                    pending.pop(future)
+                    if future.cancelled():
+                        with self._queue_lock:
+                            self._loaded.discard(path)
+                        if self.wants_path(path):
+                            self.enqueue([path], priority=priority)
+                    else:
+                        try:
+                            future.result()
+                        except Exception:
+                            _log.exception("[thumbnail.pool] decode failed path=%r", path)
+                while len(pending) < self._max_workers and not stopped():
+                    with self._queue_lock:
+                        try:
+                            priority, _, path = self._task_queue.get_nowait()
+                        except _queue.Empty:
+                            break
+                        self._queued.discard(path)
+                        if path in self._loaded or path not in self._desired_paths:
+                            continue
+                        self._loaded.add(path)
+                    future = self._work_pool.submit_action(
+                        ThumbnailAction(self._load_single, path, self.thumbnail_ready.emit,
+                                        allow_progressive=priority == self.PRIORITY_VISIBLE,
+                                        cancelled=lambda p=path: stopped() or not self.wants_path(p)),
+                        kind=WorkKind.THUMBNAIL,
+                        priority=VISIBLE if priority == self.PRIORITY_VISIBLE else PREFETCH)
+                    pending[future] = (priority, path)
+                if not pending:
+                    if self._task_queue.empty():
+                        break
+                else:
+                    _futures.wait([future for future in pending if not future.done()],
+                                  timeout=0.025, return_when=_futures.FIRST_COMPLETED)
+        except BrowserPoolClosed:
+            self._stop_flag = True
+        finally:
+            for future in pending:
+                self._work_pool.cancel(future)
+            while any(not future.done() for future in pending):
+                _futures.wait([future for future in pending if not future.done()], timeout=0.05)
+            self._work_pool.end_producer(WorkKind.THUMBNAIL, producer)
+
     def run(self) -> None:
+        if self._work_pool is not None:
+            self._run_shared()
+            return
         if self._task_queue.empty():
             return
         if self._profile_enabled:
@@ -739,8 +819,10 @@ class PersistentThumbCacheWorker(QThread):
         sizes: list[int] | tuple[int, ...] | None = None,
         worker_count: int | None = None,
         parent=None,
+        work_pool=None,
     ) -> None:
         super().__init__(parent)
+        self._work_pool = work_pool
         self._task_queue: _queue.PriorityQueue = _queue.PriorityQueue()
         self._queue_lock = threading.RLock()
         self._wake_event = threading.Event()
@@ -768,6 +850,8 @@ class PersistentThumbCacheWorker(QThread):
         self._stop_event.set()
         self._wake_event.set()
         self.requestInterruption()
+        if self._work_pool is not None:
+            self._work_pool.cancel_pending()
 
     @staticmethod
     def _normalize_sizes(sizes: list[int] | tuple[int, ...] | None) -> tuple[int, ...]:
@@ -947,7 +1031,83 @@ class PersistentThumbCacheWorker(QThread):
                 self._focus_current_path = os.path.normpath(current_path) if current_path else ""
             return self._focus_snapshot_locked()
 
+    def _run_shared(self) -> None:
+        pending: dict = {}
+        producer = None
+        last_emit_at = 0.0
+
+        def cancelled(task: PersistentThumbCacheTask) -> bool:
+            return self._stop_event.is_set() or self.isInterruptionRequested()
+
+        def emit_progress(snapshot, force=False) -> None:
+            nonlocal last_emit_at
+            now = _time.perf_counter()
+            done, total, generated, skipped, failed, current_path = snapshot
+            if not force and done < total and done != 1 and done % 8 != 0 and now - last_emit_at < .15:
+                return
+            last_emit_at = now
+            self.progress_updated.emit(done, total, generated, skipped, failed, current_path)
+
+        try:
+            while not self._stop_event.is_set() and not self.isInterruptionRequested():
+                with self._queue_lock:
+                    unfinished = (not self._task_queue.empty() or bool(self._inflight_keys))
+                if unfinished and producer is None:
+                    producer = self._work_pool.begin_producer(WorkKind.THUMBNAIL)
+                for future, task in list(pending.items()):
+                    if cancelled(task) and not future.running():
+                        self._work_pool.cancel(future)
+                    if not future.done():
+                        continue
+                    pending.pop(future)
+                    if future.cancelled() or cancelled(task):
+                        with self._queue_lock:
+                            self._inflight_keys.discard(task.key)
+                        continue
+                    try:
+                        path, generated, skipped, failed = future.result()
+                    except Exception:
+                        _log.exception("[persistent.pool] decode failed path=%r", task.source_path)
+                        path, generated, skipped, failed = task.source_path, 0, 0, 1
+                    emit_progress(self._complete_task(task, generated, skipped, failed, path))
+                while len(pending) < self._worker_count and not self._stop_event.is_set():
+                    with self._queue_lock:
+                        task = self._pop_next_task_locked()
+                    if task is None:
+                        break
+                    future = self._work_pool.submit_action(
+                        PersistentThumbnailAction(self._process_task, task,
+                                                  cancelled=lambda t=task: cancelled(t)),
+                        kind=WorkKind.THUMBNAIL, priority=PERSISTENT)
+                    pending[future] = task
+                with self._queue_lock:
+                    complete = self._task_queue.empty() and not self._inflight_keys
+                if complete and not pending and producer is not None:
+                    self._work_pool.end_producer(WorkKind.THUMBNAIL, producer)
+                    producer = None
+                if pending:
+                    _futures.wait([future for future in pending if not future.done()],
+                                  timeout=0.05, return_when=_futures.FIRST_COMPLETED)
+                else:
+                    self._wake_event.wait(0.10)
+                    self._wake_event.clear()
+        except BrowserPoolClosed:
+            self._stop_event.set()
+        finally:
+            for future in pending:
+                self._work_pool.cancel(future)
+            while any(not future.done() for future in pending):
+                _futures.wait([future for future in pending if not future.done()], timeout=0.05)
+            self._work_pool.end_producer(WorkKind.THUMBNAIL, producer)
+            with self._queue_lock:
+                snapshot = self._focus_snapshot_locked()
+            emit_progress(snapshot, force=True)
+            self.finished_summary.emit(*snapshot[:5])
+
     def run(self) -> None:
+        if self._work_pool is not None:
+            self._run_shared()
+            return
         started_at = _time.perf_counter()
         last_emit_at = 0.0
 
