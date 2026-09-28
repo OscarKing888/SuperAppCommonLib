@@ -225,33 +225,37 @@ class _StayOpenExifTool:
             self._proc = None
         if proc is None:
             return
+        # A wedged child may stop reading stdin.  Writing the stay-open exit
+        # command here can block forever before the bounded wait below starts.
+        # Shutdown cancels outstanding reads, so terminate the child directly.
         try:
-            if proc.stdin is not None:
-                proc.stdin.write(b"-stay_open\nFalse\n")
-                proc.stdin.flush()
+            proc.terminate()
         except Exception:
             pass
         self._finish_process(proc)
 
     def _finish_process(self, proc: subprocess.Popen[bytes]) -> None:
+        stopped = False
         try:
-            proc.wait(timeout=3)
+            proc.wait(timeout=1)
+            stopped = True
         except subprocess.TimeoutExpired:
             try:
-                proc.terminate()
-                proc.wait(timeout=2)
+                proc.kill()
+                proc.wait(timeout=1)
+                stopped = True
             except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+                pass
         finally:
-            for pipe in (proc.stdin, proc.stdout, proc.stderr):
-                try:
-                    if pipe is not None:
-                        pipe.close()
-                except Exception:
-                    pass
+            # Closing a stream while another thread is blocked in readline()
+            # can wait on its IO lock.  A dead child releases those readers.
+            if stopped:
+                for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                    try:
+                        if pipe is not None:
+                            pipe.close()
+                    except Exception:
+                        pass
 
     def _abort_process(self, proc: subprocess.Popen[bytes] | None) -> None:
         if proc is None:

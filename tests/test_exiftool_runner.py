@@ -64,12 +64,16 @@ def test_run_exiftool_uses_stay_open_protocol(monkeypatch) -> None:
             self.stdin = _PipeIn()
             self.stdout = _PipeOut([b'{"SourceFile":"a.jpg"}\n', b"{ready1}\n"])
             self.stderr = _PipeOut([])
+            self.terminated = False
 
         def poll(self) -> None:
             return None
 
         def wait(self, timeout: int | float | None = None) -> int:
             return 0
+
+        def terminate(self) -> None:
+            self.terminated = True
 
     fake_proc = _FakeProc()
     popen_calls: list[list[str]] = []
@@ -90,7 +94,44 @@ def test_run_exiftool_uses_stay_open_protocol(monkeypatch) -> None:
     finally:
         exiftool_runner.close_exiftool_process()
 
-    assert b"-stay_open\nFalse\n" in fake_proc.stdin.data
+    assert fake_proc.terminated
+
+
+def test_close_does_not_write_to_blocked_exiftool_stdin(monkeypatch) -> None:
+    class _BlockedStdin:
+        def __init__(self) -> None:
+            self.write_called = False
+
+        def write(self, _payload: bytes) -> None:
+            self.write_called = True
+            raise AssertionError("shutdown must not write to ExifTool stdin")
+
+        def close(self) -> None:
+            pass
+
+    class _FakeProc:
+        def __init__(self) -> None:
+            self.stdin = _BlockedStdin()
+            self.stdout = None
+            self.stderr = None
+            self.terminated = False
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def wait(self, timeout=None) -> int:
+            assert self.terminated
+            return 0
+
+    proc = _FakeProc()
+    manager = exiftool_runner._StayOpenExifTool("exiftool.exe")
+    manager._proc = proc
+
+    manager.close()
+    manager.close()
+
+    assert proc.terminated
+    assert not proc.stdin.write_called
 
 
 def test_stay_open_timeout_kills_process_and_next_command_restarts(monkeypatch) -> None:

@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from PIL import ExifTags, Image
 
@@ -249,10 +249,13 @@ def _batch_read_exiftool_full(
     et_path: str,
     paths: list[Path],
     chunk_size: int = 128,
+    cancelled: Callable[[], bool] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """全量读取：exiftool -j -G1 -n -a -u -api largefilesupport=1，返回 {normpath: rec}。"""
     result: dict[str, dict[str, Any]] = {}
     for chunk in _chunked(paths, chunk_size):
+        if cancelled is not None and cancelled():
+            break
         cmd = [
             "-j",
             "-G1",
@@ -298,6 +301,8 @@ def extract_many(
     paths: list[Path],
     mode: str = "auto",
     chunk_size: int = 128,
+    *,
+    cancelled: Callable[[], bool] | None = None,
 ) -> dict[Path, dict[str, Any]]:
     """
     批量读取完整 EXIF（exiftool 全量 + Pillow 回退）。
@@ -319,7 +324,7 @@ def extract_many(
                 resolved_list.append(res)
         except Exception:
             continue
-    if not resolved_list:
+    if not resolved_list or (cancelled is not None and cancelled()):
         return {}
 
     et_path = get_exiftool_executable_path()
@@ -330,8 +335,12 @@ def extract_many(
     out: dict[Path, dict[str, Any]] = {}
 
     if use_exiftool:
-        raw = _batch_read_exiftool_full(et_path, resolved_list, chunk_size=chunk_size)
+        raw = _batch_read_exiftool_full(
+            et_path, resolved_list, chunk_size=chunk_size, cancelled=cancelled,
+        )
         for p in resolved_list:
+            if cancelled is not None and cancelled():
+                break
             norm = os.path.normpath(str(p))
             if norm in raw:
                 out[p] = raw[norm]
@@ -339,6 +348,8 @@ def extract_many(
                 out[p] = extract_pillow_metadata(p)
     else:
         for p in resolved_list:
+            if cancelled is not None and cancelled():
+                break
             out[p] = extract_pillow_metadata(p)
 
     return out
@@ -348,12 +359,14 @@ def extract_many_with_xmp_priority(
     paths: list[Path],
     mode: str = "auto",
     chunk_size: int = 128,
+    *,
+    cancelled: Callable[[], bool] | None = None,
 ) -> dict[Path, dict[str, Any]]:
     """
     批量读取元数据：先读内嵌 EXIF（exiftool/Pillow），再用 sidecar XMP 覆盖同语义字段。
     返回键为 path.resolve(strict=False) 的字典，适合 GUI/CLI 直接喂给 normalize。
     """
-    base_map = extract_many(paths, mode=mode, chunk_size=chunk_size)
+    base_map = extract_many(paths, mode=mode, chunk_size=chunk_size, cancelled=cancelled)
     if not base_map:
         return {}
 
@@ -364,6 +377,8 @@ def extract_many_with_xmp_priority(
 
     out: dict[Path, dict[str, Any]] = {}
     for resolved_path, base_rec in base_map.items():
+        if cancelled is not None and cancelled():
+            break
         merged = dict(base_rec or {})
         merged.setdefault("SourceFile", str(resolved_path))
         if callable(read_xmp_sidecar):
