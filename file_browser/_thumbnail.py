@@ -240,6 +240,7 @@ class ThumbnailLoader(QThread):
         self._queued:  set[str] = set()   # paths currently sitting in the queue
         self._loaded:  set[str] = set()   # paths already submitted to executor
         self._desired_paths: set[str] = set()
+        self._visible_paths: set[str] = set()
         self._seq = 0                      # monotonic counter for stable FIFO within same priority
         self._queue_lock = threading.Lock()
         self._profile_lock = threading.Lock()
@@ -338,9 +339,11 @@ class ThumbnailLoader(QThread):
         visible_paths: list[str] | None = None,
         prefetch_paths: list[str] | None = None,
     ) -> None:
-        desired = set(self._normalize_unique_paths(visible_paths))
+        visible = set(self._normalize_unique_paths(visible_paths))
+        desired = set(visible)
         desired.update(self._normalize_unique_paths(prefetch_paths))
         with self._queue_lock:
+            self._visible_paths = visible
             self._desired_paths = desired
 
     def replace_pending(
@@ -362,6 +365,7 @@ class ThumbnailLoader(QThread):
         with self._queue_lock:
             self._task_queue = _queue.PriorityQueue()
             self._queued.clear()
+            self._visible_paths = visible_set
             self._desired_paths = desired
             for norm in visible_norms:
                 if norm in self._loaded:
@@ -415,6 +419,8 @@ class ThumbnailLoader(QThread):
                 self._task_queue.put_nowait((priority, self._seq, norm))
                 self._queued.add(norm)
                 self._desired_paths.add(norm)
+                if priority == self.PRIORITY_VISIBLE:
+                    self._visible_paths.add(norm)
                 added += 1
         if self._profile_enabled and added > 0:
             with self._profile_lock:
@@ -440,6 +446,7 @@ class ThumbnailLoader(QThread):
                 if norm in self._loaded:
                     continue
                 self._desired_paths.add(norm)
+                self._visible_paths.add(norm)
                 self._seq += 1
                 self._task_queue.put_nowait((self.PRIORITY_VISIBLE, self._seq, norm))
                 self._queued.add(norm)  # idempotent; may already be present
@@ -456,6 +463,7 @@ class ThumbnailLoader(QThread):
             self._work_pool.cancel_pending()
         with self._queue_lock:
             self._desired_paths.clear()
+            self._visible_paths.clear()
 
     def _load_single(self, path: str, emit_fn, *, allow_progressive: bool) -> None:
         """Decode one image progressively, calling emit_fn(path, QImage) for every
