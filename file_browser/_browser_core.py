@@ -26,6 +26,7 @@ import threading
 import time as _time
 import unicodedata
 from pathlib import Path
+from typing import Callable
 
 # ── Qt 导入 ───────────────────────────────────────────────────────────────────
 try:
@@ -94,10 +95,15 @@ from app_common.superviewer_user_options import (
 )
 from app_common.ui_style.styles import COLORS
 from app_common import thumb_stream
-from app_common.image_formats import IMAGE_EXTENSIONS, RAW_EXTENSIONS
+from app_common.image_formats import HEIF_EXTENSIONS, IMAGE_EXTENSIONS, RAW_EXTENSIONS
 from app_common.file_browser._permissions import superpicky_root_writable
 
 _log = get_logger("file_browser")
+
+# A single large HEIF thumbnail decode can allocate hundreds of MB.  The
+# browser has many thumbnail workers, including workers from a previous folder,
+# so cap HEIF decodes across every loader and the persistent cache builder.
+_HEIF_THUMB_DECODE_SLOTS = threading.BoundedSemaphore(2)
 
 # ── Qt 兼容常量 ────────────────────────────────────────────────────────────────
 try:
@@ -1555,7 +1561,9 @@ def _get_raw_thumbnail(path: str) -> bytes | None:
     return None
 
 
-def _load_thumbnail_image(path: str, size: int) -> "QImage | None":
+def _load_thumbnail_image(
+    path: str, size: int, *, cancelled: Callable[[], bool] | None = None,
+) -> "QImage | None":
     """
     线程安全的缩略图生成，返回 QImage（不使用 QPixmap）。
     先查磁盘缓存；未命中则调用 thumb_stream.load_thumbnail_rgb 解码，再异步写入磁盘缓存。
@@ -1569,7 +1577,22 @@ def _load_thumbnail_image(path: str, size: int) -> "QImage | None":
         disk_cached = _read_thumb_from_disk_cache(path, mtime, size)
         if disk_cached is not None and not disk_cached.isNull():
             return disk_cached
-        result = thumb_stream.load_thumbnail_rgb(path, size)
+        if cancelled is not None and cancelled():
+            return None
+        heif = Path(path).suffix.lower() in HEIF_EXTENSIONS
+        if heif:
+            while not _HEIF_THUMB_DECODE_SLOTS.acquire(timeout=0.05):
+                if cancelled is not None and cancelled():
+                    return None
+        try:
+            if cancelled is not None and cancelled():
+                return None
+            result = thumb_stream.load_thumbnail_rgb(path, size)
+        finally:
+            if heif:
+                _HEIF_THUMB_DECODE_SLOTS.release()
+        if cancelled is not None and cancelled():
+            return None
         if result is None:
             return None
         data, w, h = result

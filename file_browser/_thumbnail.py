@@ -539,7 +539,10 @@ class ThumbnailLoader(QThread):
 
             # Progressive decode – emit each frame as it arrives
             if not allow_progressive:
-                qimg = _load_thumbnail_image(load_target_path, load_size)
+                qimg = _load_thumbnail_image(
+                    load_target_path, load_size,
+                    cancelled=lambda: stopped() or not self.wants_path(path_to_load),
+                )
                 if qimg is None or qimg.isNull() or stopped():
                     return
                 if cache is not None:
@@ -581,7 +584,10 @@ class ThumbnailLoader(QThread):
 
         # ── 3. Other formats: single-shot load (handles disk cache internally) ─
         else:
-            qimg = _load_thumbnail_image(load_target_path, load_size)
+            qimg = _load_thumbnail_image(
+                load_target_path, load_size,
+                cancelled=lambda: stopped() or not self.wants_path(path_to_load),
+            )
             if qimg is None or qimg.isNull() or stopped():
                 return
             if cache is not None:
@@ -993,7 +999,9 @@ class PersistentThumbCacheWorker(QThread):
             return source_path, 0, 1, 0
         if stop_event.is_set():
             return source_path, 0, 0, 1
-        base_image = _load_thumbnail_image(load_target_path, max(missing_sizes))
+        base_image = _load_thumbnail_image(
+            load_target_path, max(missing_sizes), cancelled=stop_event.is_set,
+        )
         if base_image is None or base_image.isNull():
             return source_path, 0, 0, 1
         wrote_any = False
