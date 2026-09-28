@@ -17,6 +17,10 @@ Windows 的 `exiftool.exe` 是启动器，必须连同相邻的
 `exiftool_files/lib/Image/ExifTool.pm` 及整个 `lib/` 模块树一起打包；
 只复制 EXE、Perl 运行时和 `exiftool.pl` 无法启动。当前库与脚本同为 13.49；
 库来自上游 `exiftool/exiftool` 的 `13.49` 标签（提交 `6f6df9d`）。
+`lib/` 还必须包含随同一 Strawberry Perl 运行时分发的核心模块（如
+`strict.pm`）；构建前运行 `exiftool.exe -ver` 可验证启动器和模块树。
+Windows 合并构建将共享文件放在 `dist/SuperViewer/_internal`，
+SuperBirdStamp 从相邻的该目录查找 ExifTool。
 
 ## 写入与进程约束
 

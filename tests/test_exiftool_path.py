@@ -75,6 +75,20 @@ def test_get_exiftool_executable_path_finds_frozen_windows_bundle(tmp_path) -> N
         assert exiftool_path.get_exiftool_executable_path() == str(bundled)
 
 
+def test_get_exiftool_executable_path_finds_merged_windows_bundle(tmp_path) -> None:
+    meipass = tmp_path / "SuperBirdStamp" / "_internal"
+    shared = tmp_path / "SuperViewer" / "_internal" / "app_common" / "exif_io" / "exiftools_win" / "exiftool.exe"
+    with (
+        patch.dict(exiftool_path.os.environ, {}, clear=True),
+        patch.object(exiftool_path.sys, "platform", "win32"),
+        patch.object(exiftool_path.sys, "frozen", True, create=True),
+        patch.object(exiftool_path.sys, "_MEIPASS", str(meipass), create=True),
+        patch.object(exiftool_path, "_module_dir", return_value=str(meipass / "app_common" / "exif_io")),
+        patch.object(exiftool_path, "_is_usable_exiftool", side_effect=lambda path: path == str(shared)),
+    ):
+        assert exiftool_path.get_exiftool_executable_path() == str(shared)
+
+
 def test_get_exiftool_executable_path_uses_adjacent_superpicky_fallback_on_windows(tmp_path) -> None:
     module_dir = str(tmp_path / "SBT" / "SuperBirdTools" / "app_common" / "exif_io")
     sibling_exiftool = str(tmp_path / "SuperPicky" / "exiftools_win" / "exiftool.exe")

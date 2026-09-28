@@ -122,6 +122,13 @@ def get_exiftool_executable_path() -> str | None:
         meipass = getattr(sys, "_MEIPASS", None)
         if meipass:
             search_dirs.append(meipass)
+            if sys.platform.startswith("win"):
+                # The merged Windows build keeps shared data in SuperViewer.
+                # BirdStamp's _MEIPASS points at its own _internal directory.
+                dist_root = os.path.dirname(os.path.dirname(os.path.abspath(meipass)))
+                search_dirs.append(os.path.join(
+                    dist_root, "SuperViewer", "_internal", "app_common", "exif_io",
+                ))
         if sys.platform == "darwin":
             # .app 内可能在 Contents/Resources
             app_res = os.path.abspath(os.path.join(_module_dir(), "..", "..", "Resources"))
