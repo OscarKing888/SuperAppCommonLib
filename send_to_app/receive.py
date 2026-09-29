@@ -981,11 +981,11 @@ class SingleInstanceReceiver:
                             "total_files": total,
                         },
                     )
-                    emit_progress("received", current, total)
                     if not done:
                         done.append(1)
                     close_connection()
 
+                emit_progress("received", current, total)
                 if current <= 0:
                     finalize_transfer()
                     return
