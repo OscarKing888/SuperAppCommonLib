@@ -34,7 +34,6 @@ def load_exif_settings(override_path: str | None = None) -> dict:
                     "exif_tag_label_chinese",
                     "exif_tag_hidden",
                     "exif_tag_names_zh",
-                    "hyperfocal_coc_mm",
                     "exif_tag_name_token_map_zh",
                 ):
                     if k in data:
