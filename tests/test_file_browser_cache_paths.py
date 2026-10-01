@@ -78,15 +78,65 @@ def test_per_file_cache_scope_uses_child_superpicky_dirs(tmp_path: Path) -> None
     assert path1.name == path2.name == "IMG0001.jpg.thumb.jpg"
 
 
-def test_ancestor_superpicky_without_report_is_not_reused_with_selected_policy(tmp_path: Path) -> None:
-    root = tmp_path / "library"
-    nested = root / "deep" / "set"
-    (root / ".superpicky").mkdir(parents=True)
-    nested.mkdir(parents=True)
-    photo = nested / "IMG0001.jpg"
+@pytest.mark.parametrize("levels", [0, 1, 4, 5, 6, 7])
+def test_cache_scope_reuses_nearest_ancestor_without_report_with_six_level_limit(tmp_path, levels):
+    root = tmp_path / "海湾森林公园"
+    nested = root.joinpath(*(f"子目录{i}" for i in range(levels)))
+    scope = root / ".superpicky"
+    scope.mkdir(parents=True)
+    nested.mkdir(parents=True, exist_ok=True)
+    photo = nested / "鸟.jpg"
+    expected = str(scope) if levels <= 6 else ""
 
-    assert _find_cache_superpicky_dir_for_file(str(photo), str(nested)) == ""
-    assert _persistent_thumb_cache_path_for_file(str(photo), str(nested), 128, selected_dir=str(nested)) == ""
+    # 选择根、叶或无关目录都不改变同一照片的缓存归属。
+    for selected in (root, nested, tmp_path / "other", None):
+        selected_path = str(selected) if selected is not None else None
+        assert _find_cache_superpicky_dir_for_file(str(photo), selected_path) == expected
+    for selected in (root, nested):
+        target = _persistent_thumb_cache_path_for_file(
+            str(photo), str(selected), 256, selected_dir=str(selected))
+        if expected:
+            assert Path(target).parent == scope / "thumb_cache" / "256"
+            assert Path(target).name == "__".join(photo.relative_to(root).parts) + ".thumb.jpg"
+            assert Path(_preview_cache_target_for_file(str(photo), str(selected))).parent == scope / "cache" / "temp_preview"
+        else:
+            assert target == ""
+    assert not (scope / "report.db").exists()
+    assert list(scope.iterdir()) == []  # 查找不能创建缓存或数据库。
+
+
+def test_cache_scope_prefers_nearest_cache_only_root_over_report_root(tmp_path):
+    root = tmp_path / "library"
+    scope = root / ".superpicky"
+    scope.mkdir(parents=True)
+    (scope / "report.db").touch()
+    nearer = root / "day" / ".superpicky"
+    nearer.mkdir(parents=True)
+    photo = root / "day" / "birds" / "burst" / "a.jpg"
+    assert _find_cache_superpicky_dir_for_file(str(photo), str(root)) == str(nearer)
+    # 纯缓存目录不会被当作报告数据库目录。
+    assert browser_core._find_report_superpicky_dir_for_file(str(photo), str(root)) == str(scope)
+
+
+@pytest.mark.parametrize("root", [r"F:\照片", r"\\server\share\照片"])
+def test_cache_scope_windows_drive_and_unc_paths(monkeypatch, root):
+    import ntpath
+    from types import SimpleNamespace
+
+    scope = ntpath.join(root, ".superpicky")
+    checked = []
+    def isdir(path):
+        checked.append(path)
+        return path == scope
+
+    paths = SimpleNamespace(**vars(ntpath))
+    paths.isdir = isdir
+    # 在 macOS 上也运行 Windows 的实际路径运算；仅磁盘存在性使用替身。
+    monkeypatch.setattr(browser_core, "os", SimpleNamespace(path=paths))
+    directory = ntpath.join(root, "一", "二", "三", "四", "五", "六")
+    assert _find_cache_superpicky_dir_for_file(ntpath.join(directory, "鸟.jpg"), directory) == scope
+    assert len(checked) == 7
+    assert _find_cache_superpicky_dir_for_file(ntpath.join(directory, "七", "鸟.jpg"), root) == ""
 
 
 def test_volume_root_depth_rule_for_ancestor_superpicky() -> None:

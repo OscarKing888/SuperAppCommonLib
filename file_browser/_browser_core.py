@@ -1506,8 +1506,7 @@ def _iter_superpicky_dirs_upward(current_dir: str, max_levels: int | None = 6):
 def _find_superpicky_dir(current_dir: str, max_levels: int | None = 6) -> str:
     """向上查找最近的现有 .superpicky 目录；找不到时返回空字符串。
 
-    缓存写入方只应在用户已经有 .superpicky 的目录树内创建 cache 子目录，
-    不应为了缓存主动创建新的 .superpicky 根目录。
+    这里只查找，不创建目录；缺失时由调用方按应用策略询问或自动创建。
     """
     if not current_dir:
         return ""
@@ -1542,15 +1541,10 @@ def _superpicky_scope_allowed_for_selected_dir(
 def _find_cache_superpicky_dir_for_file(path: str, selected_dir: str | None = None) -> str:
     if not path:
         return ""
+    # 缓存归属只由源文件决定：本目录及向上六层内最近的 .superpicky。
+    # selected_dir 保留接口兼容；不套用报告数据库的存在性和目录深度限制。
     current_dir = os.path.dirname(os.path.normpath(os.path.abspath(path)))
-    for superpicky_dir in _iter_superpicky_dirs_upward(current_dir):
-        if _superpicky_scope_allowed_for_selected_dir(
-            superpicky_dir,
-            selected_dir,
-            require_report_db_for_ancestor=True,
-        ):
-            return superpicky_dir
-    return ""
+    return _find_superpicky_dir(current_dir, max_levels=6)
 
 
 def _find_report_superpicky_dir_for_file(path: str, selected_dir: str | None = None) -> str:

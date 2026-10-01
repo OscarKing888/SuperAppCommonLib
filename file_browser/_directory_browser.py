@@ -464,6 +464,12 @@ class DirectoryBrowserWidget(QWidget):
         if not path:
             return
         menu = QMenu(self)
+        act_copy_path = menu.addAction("复制完整路径")
+        act_copy_path.triggered.connect(
+            lambda checked=False, p=path: QApplication.clipboard().setText(
+                os.path.normpath(os.path.abspath(p))
+            )
+        )
         label = "在Finder中显示" if sys.platform == "darwin" else "在资源管理器中显示"
         act = menu.addAction(label)
         act.triggered.connect(lambda: reveal_in_file_manager(path))
