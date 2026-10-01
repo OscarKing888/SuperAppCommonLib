@@ -12,6 +12,23 @@ except ImportError:  # pragma: no cover - PyQt5 compatibility
     from PyQt5.QtWidgets import QApplication, QToolButton
 
 
+# 紧凑过滤徽章复用选中态，保留自己的圆角、尺寸及未选中颜色。
+TOGGLE_CHECKED_STYLE = """
+QToolButton:checked {
+    background-color: #1769c2;
+    color: #ffffff;
+    border-color: #70b7ff;
+}
+QToolButton:checked:hover { background-color: #2079d8; }
+QToolButton:checked:pressed { background-color: #105399; }
+QToolButton:checked:focus { border: 1px dashed #ffffff; }
+QToolButton:checked:disabled {
+    background-color: #425c78;
+    color: #c0cbd6;
+    border-color: #637c96;
+}
+"""
+
 TOGGLE_BUTTON_STYLE = """
 QToolButton {
     background-color: palette(button);
@@ -22,26 +39,13 @@ QToolButton {
 }
 QToolButton:hover:!checked { background-color: palette(midlight); border-color: #579de6; }
 QToolButton:pressed:!checked { background-color: palette(mid); }
-QToolButton:checked {
-    background-color: #1769c2;
-    color: #ffffff;
-    border-color: #70b7ff;
-}
-QToolButton:checked:hover { background-color: #2079d8; }
-QToolButton:checked:pressed { background-color: #105399; }
 QToolButton:focus { border: 1px dashed #579de6; }
-QToolButton:checked:focus { border: 1px dashed #ffffff; }
 QToolButton:disabled {
     background-color: palette(button);
     color: palette(mid);
     border-color: palette(mid);
 }
-QToolButton:checked:disabled {
-    background-color: #425c78;
-    color: #c0cbd6;
-    border-color: #637c96;
-}
-"""
+""" + TOGGLE_CHECKED_STYLE
 
 
 class _ToggleIconEngine(QIconEngine):
@@ -105,4 +109,4 @@ class ToggleToolButton(QToolButton):
         super().setIcon(QIcon(_ToggleIconEngine(icon)) if not icon.isNull() else icon)
 
 
-__all__ = ["ToggleToolButton"]
+__all__ = ["ToggleToolButton", "TOGGLE_CHECKED_STYLE"]
