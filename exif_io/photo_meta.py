@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import abc
 import os
+import re
 import shutil
 import tempfile
 import xml.etree.ElementTree as ET
@@ -282,6 +283,23 @@ def _xmp_group_tag_to_xml_tag(key: str) -> str:
     return f"{{{ns}}}{tag_name.strip()}"
 
 
+_SUPERPICKY_FIELD_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _superpicky_field_name(write_key: str) -> str | None:
+    """Return the property name of an ``XMP-superpicky:<name>`` key.
+
+    ``None`` means the key is not in the private namespace; ``""`` means it is
+    but the name is not a safe XML local name and must be rejected.
+    """
+    text = str(write_key or "").strip()
+    group, sep, name = text.partition(":")
+    if not sep or group.strip().lower() != "xmp-superpicky":
+        return None
+    name = name.strip()
+    return name if _SUPERPICKY_FIELD_NAME_RE.match(name) else ""
+
+
 def _metadata_value_has_content(value: Any) -> bool:
     return value is not None and (not isinstance(value, str) or bool(value.strip()))
 
@@ -456,12 +474,19 @@ class PhotoMetaDataXMP(PhotoMetaData):
         rating_value = 0
         pick_seen = False
         pick_value = 0
+        superpicky_values: dict[str, str] = {}
         remaining_fields: dict[str, Any] = {}
         for key, value in fields.items():
             write_key = _xmp_sidecar_write_key(key)
             if not write_key:
                 continue
-            if _is_xmp_subject_key(write_key):
+            superpicky_name = _superpicky_field_name(write_key)
+            if superpicky_name is not None:
+                # ExifTool has no definition for the private namespace; edit the XML directly.
+                if not superpicky_name:
+                    return False
+                superpicky_values[superpicky_name] = "" if value is None else str(value)
+            elif _is_xmp_subject_key(write_key):
                 subject_seen = True
                 subject_values.extend(_normalise_subject_value(value, split_strings=True))
             elif _is_xmp_title_key(write_key):
@@ -491,6 +516,8 @@ class PhotoMetaDataXMP(PhotoMetaData):
                 direct_fields["rating"] = rating_value
             if pick_seen:
                 direct_fields["pick"] = pick_value
+            if superpicky_values:
+                direct_fields["superpicky"] = superpicky_values
             return self._write_exiftool_fields(
                 path, remaining_fields, direct_fields,
                 protected_report_fields=protected_report_fields,
@@ -520,6 +547,12 @@ class PhotoMetaDataXMP(PhotoMetaData):
                 path,
                 rating=rating_value if rating_seen else None,
                 pick=pick_value if pick_seen else None,
+                _protected_report_fields=protected_report_fields,
+            ) and success
+        if superpicky_values:
+            success = self.write_superpicky_fields(
+                path,
+                superpicky_values,
                 _protected_report_fields=protected_report_fields,
             ) and success
         return success
@@ -602,6 +635,8 @@ class PhotoMetaDataXMP(PhotoMetaData):
             for key, tag in (("rating", _XMP_RATING_TAG), ("pick", _XMP_DM_PICK_TAG)):
                 if key in direct_fields:
                     self._replace_text_node(descriptions, tag, str(direct_fields[key]))
+            for name, text in (direct_fields.get("superpicky") or {}).items():
+                self._replace_text_node(descriptions, f"{{{_SUPERPICKY_NS}}}{name}", text)
             ok = self._write_tree_with_report_hydration(
                 path, tree, sidecar_path, protected_report_fields=protected_report_fields,
             )
@@ -794,6 +829,46 @@ class PhotoMetaDataXMP(PhotoMetaData):
                 protected.setdefault("rating", _normalise_rating_value(rating))
             if pick is not None:
                 protected.setdefault("pick", _normalise_pick_value(pick))
+            ok = self._write_tree_with_report_hydration(
+                path,
+                tree,
+                sidecar_path,
+                protected_report_fields=protected,
+            )
+            if ok:
+                self._invalidate_metadata_cache(path)
+            return ok
+        except Exception:
+            return False
+
+    def write_superpicky_fields(
+        self,
+        path: str,
+        values: dict[str, Any],
+        *,
+        _protected_report_fields: dict[str, Any] | None = None,
+    ) -> bool:
+        """Write ``XMP-superpicky:<name>`` text properties; an empty value removes the property."""
+        if not values:
+            return True
+        cleaned: dict[str, str] = {}
+        for name, value in values.items():
+            field_name = _superpicky_field_name(f"XMP-superpicky:{name}")
+            if not field_name:
+                return False
+            cleaned[field_name] = "" if value is None else str(value)
+        sidecar_path = self.sidecar_path_for(path)
+        try:
+            tree = self._load_or_create_xmp_tree(sidecar_path)
+            if tree is None:
+                return False
+            descriptions = self._ensure_descriptions(tree.getroot(), path)
+            for name, text in cleaned.items():
+                self._replace_text_node(descriptions, f"{{{_SUPERPICKY_NS}}}{name}", text)
+            sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+            protected = dict(_protected_report_fields or {})
+            for name, text in cleaned.items():
+                protected.setdefault(name, text)
             ok = self._write_tree_with_report_hydration(
                 path,
                 tree,

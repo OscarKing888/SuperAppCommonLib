@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import traceback
 import tempfile
 
 from app_common.perf_probe import elapsed_ms, perf_counter, perf_log, perf_probes_enabled
@@ -468,6 +469,7 @@ class FileListPanel(QWidget):
         self._tree_widget.setColumnWidth(_TREE_COL_LENS, 18 * _TREE_COL_CHAR_PX)
         self._tree_widget.setColumnWidth(_TREE_COL_CAPTURE_TIME, 7 * _TREE_COL_CHAR_PX)
         self._tree_widget.setColumnWidth(_TREE_COL_SHARP, 4 * _TREE_COL_CHAR_PX)
+        self._tree_widget.setColumnWidth(_TREE_COL_BIRD_SHARP, 6 * _TREE_COL_CHAR_PX)
         self._tree_widget.setColumnWidth(_TREE_COL_AESTHETIC, 2 * _TREE_COL_CHAR_PX)
         self._tree_widget.setColumnWidth(_TREE_COL_FOCUS, 2 * _TREE_COL_CHAR_PX)
         
@@ -4444,6 +4446,11 @@ class FileListPanel(QWidget):
                 except Exception:
                     sort_value = (1, text.lower())
             item.setData(column, _SortRole, sort_value)
+        bird_sharp = _metadata_bird_sharpness(meta)
+        item.setText(_TREE_COL_BIRD_SHARP, bird_sharp.text() if bird_sharp is not None else "")
+        bird_brush = _bird_sharp_brush(bird_sharp)
+        item.setForeground(_TREE_COL_BIRD_SHARP, bird_brush if bird_brush is not None else QBrush())
+        item.setData(_TREE_COL_BIRD_SHARP, _SortRole, _bird_sharp_sort_value(bird_sharp))
 
     # ── 视图模式切换 ────────────────────────────────────────────────────────────
     def _view_uses_pixel_scroll(self, view) -> bool:
@@ -7754,6 +7761,14 @@ class FileListPanel(QWidget):
                 lambda checked=False, p=selected_preview_path: reveal_in_file_manager(p)
             )
 
+    def add_file_context_menu_extender(self, callback) -> None:
+        """Register ``callback(menu: QMenu, paths: list[str])`` for the file list/thumbnail context menu."""
+        extenders = getattr(self, "_file_context_menu_extenders", None)
+        if extenders is None:
+            extenders = self._file_context_menu_extenders = []
+        if callable(callback) and callback not in extenders:
+            extenders.append(callback)
+
     def _show_file_context_menu(
         self,
         viewport,
@@ -7785,6 +7800,11 @@ class FileListPanel(QWidget):
 
         self._add_rating_menu_actions(menu, menu_paths)
         self._add_photo_tag_menu_actions(menu, menu_paths)
+        for extender in list(getattr(self, "_file_context_menu_extenders", ())):
+            try:
+                extender(menu, list(menu_paths))
+            except Exception:
+                _log.error("[%s] file context menu extender failed: %s", log_prefix, traceback.format_exc())
         menu.addSeparator()
 
         self._add_send_to_external_app_actions(menu, menu_paths)

@@ -2,6 +2,8 @@
 """Directory browser widget implementation for app_common.file_browser."""
 from __future__ import annotations
 
+import traceback
+
 from app_common.file_browser._browser_core import *
 from app_common.qt_theme import (
     BrowserChromeColors,
@@ -54,6 +56,8 @@ class DirectoryBrowserWidget(QWidget):
         self._tree.itemClicked.connect(self._on_clicked)
         self._tree.setContextMenuPolicy(_CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._on_dir_context_menu)
+        # 宿主应用（如 SuperViewer）向目录右键菜单追加动作：callback(menu, directory_path)
+        self._context_menu_extenders: list = []
         self._tree.installEventFilter(self)
         layout.addWidget(self._tree)
 
@@ -456,6 +460,11 @@ class DirectoryBrowserWidget(QWidget):
         self.directory_selected.emit(target_path)
         return True
 
+    def add_context_menu_extender(self, callback) -> None:
+        """Register ``callback(menu: QMenu, directory_path: str)`` for the directory context menu."""
+        if callable(callback) and callback not in self._context_menu_extenders:
+            self._context_menu_extenders.append(callback)
+
     def _on_dir_context_menu(self, pos) -> None:
         item = self._tree.itemAt(pos)
         if item is None:
@@ -478,4 +487,11 @@ class DirectoryBrowserWidget(QWidget):
         act_remove_empty.triggered.connect(
             lambda checked=False, p=path, it=item: self._trash_empty_subdirectories(p, it)
         )
+        if self._context_menu_extenders:
+            menu.addSeparator()
+            for extender in list(self._context_menu_extenders):
+                try:
+                    extender(menu, os.path.normpath(path))
+                except Exception:
+                    _log.error("[DirectoryBrowser] context menu extender failed path=%r: %s", path, traceback.format_exc())
         _exec_menu(menu, self._tree.viewport().mapToGlobal(pos))

@@ -219,6 +219,7 @@ class FileTableEntry:
     lens_model: str = ""
     capture_time: str = ""
     sharpness: str = ""
+    bird_sharp: BirdSharpnessDisplay | None = None
     aesthetic: str = ""
     focus_status: str = ""
     burst_position: int | None = None
@@ -345,6 +346,7 @@ class FileTableModel(_BurstGroupMixin, QAbstractTableModel):
         entry.lens_model = _metadata_lens_model_text(meta)
         entry.capture_time = _metadata_capture_time_text(meta)
         entry.sharpness = _metadata_sharpness_text(meta)
+        entry.bird_sharp = _metadata_bird_sharpness(meta)
         entry.aesthetic = _metadata_aesthetic_text(meta)
         entry.focus_status = _metadata_focus_status_text(meta)
         entry.burst_position, entry.burst_id = _metadata_burst_values(meta)
@@ -436,6 +438,8 @@ class FileTableModel(_BurstGroupMixin, QAbstractTableModel):
                 return (0, float(entry.sharpness))
             except Exception:
                 return (1, entry.sharpness.lower())
+        if column == _TREE_COL_BIRD_SHARP:
+            return _bird_sharp_sort_value(entry.bird_sharp)
         if column == _TREE_COL_AESTHETIC:
             try:
                 return (0, float(entry.aesthetic))
@@ -486,6 +490,8 @@ class FileTableModel(_BurstGroupMixin, QAbstractTableModel):
             return entry.capture_time
         if column == _TREE_COL_SHARP:
             return entry.sharpness
+        if column == _TREE_COL_BIRD_SHARP:
+            return entry.bird_sharp.text() if entry.bird_sharp is not None else ""
         if column == _TREE_COL_AESTHETIC:
             return entry.aesthetic
         if column == _TREE_COL_FOCUS:
@@ -513,6 +519,8 @@ class FileTableModel(_BurstGroupMixin, QAbstractTableModel):
                 return QBrush(QColor("#c0392b"))
             if column == _TREE_COL_FOCUS:
                 return _focus_status_brush(entry.focus_status)
+            if column == _TREE_COL_BIRD_SHARP:
+                return _bird_sharp_brush(entry.bird_sharp)
             return None
         if role == _BackgroundRole:
             group = self.burst_group_for_row(row)
@@ -645,6 +653,7 @@ class FileTableModel(_BurstGroupMixin, QAbstractTableModel):
             _TREE_COL_FOCUS,
             _TREE_COL_STAR,
             _TREE_COL_SHARP,
+            _TREE_COL_BIRD_SHARP,
             _TREE_COL_AESTHETIC,
             _TREE_COL_SHUTTER,
             _TREE_COL_APERTURE,
@@ -870,6 +879,7 @@ class ThumbnailListEntry:
     burst_position: int | None = None
     burst_id: int | None = None
     burst_text: str = ""
+    bird_sharp: BirdSharpnessDisplay | None = None
     video_info: dict | None = None
     burst_group: tuple[int, bool, bool] | None = None
     pixmap: QPixmap | None = None
@@ -921,9 +931,15 @@ class ThumbnailListModel(_BurstGroupMixin, QAbstractListModel):
         if role == _UserRole:
             return entry.path
         if role == _ToolTipRole:
-            return self._resolve_tooltip(entry)
+            tooltip = self._resolve_tooltip(entry)
+            if entry.bird_sharp is not None:
+                bird_line = f"鸟清晰度：{entry.bird_sharp.text()}"
+                tooltip = f"{tooltip}\n{bird_line}" if tooltip else bird_line
+            return tooltip
         if role == _ForegroundRole:
             return QBrush(QColor("#c0392b")) if self._resolve_mismatch(entry) else None
+        if role == _MetaBirdSharpRole:
+            return entry.bird_sharp
         if role == _MetaColorRole:
             return entry.color
         if role == _MetaRatingRole:
@@ -975,6 +991,7 @@ class ThumbnailListModel(_BurstGroupMixin, QAbstractListModel):
             burst_position=burst_position,
             burst_id=burst_id,
             burst_text=burst_text,
+            bird_sharp=_metadata_bird_sharpness(meta),
         )
 
     def _resolve_tooltip(self, entry: ThumbnailListEntry) -> str:
@@ -1128,6 +1145,10 @@ class ThumbnailListModel(_BurstGroupMixin, QAbstractListModel):
         if entry.species_cn != new_species_cn:
             entry.species_cn = new_species_cn
             changed_roles.append(_MetaSpeciesCnRole)
+        new_bird_sharp = _metadata_bird_sharpness(meta)
+        if entry.bird_sharp != new_bird_sharp:
+            entry.bird_sharp = new_bird_sharp
+            changed_roles.extend([_MetaBirdSharpRole, _ToolTipRole])
         new_burst_position, new_burst_id = _metadata_burst_values(meta)
         new_burst_text = _format_burst_text(new_burst_position, new_burst_id)
         if (
@@ -1511,6 +1532,9 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
         focus_status = _focus_status_to_display(str(index.data(_MetaFocusRole) or ""))
         focus_box = index.data(_MetaFocusBoxRole)
         species_cn = str(index.data(_MetaSpeciesCnRole) or "").strip()
+        bird_sharp = index.data(_MetaBirdSharpRole)
+        if not isinstance(bird_sharp, BirdSharpnessDisplay):
+            bird_sharp = None
         color_label = str(index.data(_MetaColorRole) or "")
         pixmap = index.data(_ThumbPixmapRole)
         if not isinstance(pixmap, QPixmap):
@@ -1691,6 +1715,12 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
                     focus_color = QColor(_focus_status_text_color(focus_status))
                     x += _paint_thumb_dot_tag(
                         painter, x, cy, focus_color, "" if small else focus_status, max_right=text_right,
+                    ) + 6
+                bird_style = bird_sharp.style if bird_sharp is not None else None
+                if bird_style is not None and x + 9 <= text_right:
+                    x += _paint_thumb_dot_tag(
+                        painter, x, cy, QColor(bird_style.color), "" if small else bird_sharp.label,
+                        max_right=text_right,
                     ) + 6
                 if label_hex and x + 9 <= text_right:
                     label_text = _COLOR_LABEL_COLORS.get(color_label, ("", ""))[1]

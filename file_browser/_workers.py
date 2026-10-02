@@ -1154,6 +1154,7 @@ class MetadataLoader(QThread):
             meta["burst_id"] = burst_id
         if burst_position is not None:
             meta["burst_position"] = burst_position
+        meta.update(_bird_sharpness_browser_meta_fields(rec))
         return meta
 
     def _resolve_focus_source_path(self, display_path: str) -> str:

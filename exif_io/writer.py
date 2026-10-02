@@ -434,6 +434,15 @@ def _apply_browser_metadata_aliases(rec: dict) -> None:
     if country is not None and not has_value(rec.get("XMP:Country")):
         rec["XMP:Country"] = country
 
+    # 锐度/美学：sidecar 只有 photoshop:City/State 时补齐 XMP:City/State，
+    # 否则合并 report.db 时其 XMP:City（旧 adj_sharpness）会抢先于 sidecar 新值。
+    city = first("XMP:City", "XMP-photoshop:City")
+    if city is not None and not has_value(rec.get("XMP:City")):
+        rec["XMP:City"] = city
+    state = first("XMP:State", "XMP-photoshop:State")
+    if state is not None and not has_value(rec.get("XMP:State")):
+        rec["XMP:State"] = state
+
     title = first("XMP-dc:Title", "XMP-dc:title")
     if title is not None and not has_value(rec.get("XMP-dc:Title")):
         rec["XMP-dc:Title"] = title

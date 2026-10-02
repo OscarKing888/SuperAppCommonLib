@@ -68,6 +68,11 @@ from app_common.exif_io import (
     run_exiftool_assignments,
 )
 from app_common.exif_io.photo_meta import PhotoMetaDataProxy, PhotoMetaDataReportDB, extract_exposure_settings
+from app_common.bird_sharpness_fields import (
+    BirdSharpnessDisplay,
+    bird_sharpness_from_meta as _metadata_bird_sharpness,
+    browser_meta_fields as _bird_sharpness_browser_meta_fields,
+)
 from app_common.focus_calc import (
     extract_focus_box_for_display,
     resolve_focus_camera_type_from_metadata,
@@ -246,6 +251,8 @@ _MetaBurstTextRole = int(_UserRole) + 23
 _MetaFocusBoxRole = int(_UserRole) + 24
 # 连拍分组底框：None 或 (配色序号 0/1, 是否组内首张, 是否组内末张)
 _MetaBurstGroupRole = int(_UserRole) + 25
+# 鸟清晰度检测结果：None 或 BirdSharpnessDisplay（见 app_common.bird_sharpness_fields）
+_MetaBirdSharpRole = int(_UserRole) + 27  # +26 为 _models._VideoInfoRole
 
 # 连拍分组底框配色（两种颜色交替使用），半透明以兼容深/浅色主题
 _BURST_GROUP_COLORS: tuple[str, str] = ("#3d8bfd", "#f5a623")
@@ -310,6 +317,7 @@ _FILE_TABLE_COLUMNS = [
     ("FOCUS", "对焦"),
     ("STAR", "星级"),
     ("SHARP", "锐度"),
+    ("BIRD_SHARP", "鸟清晰"),
     ("AESTHETIC", "美学"),
     ("SHUTTER", "快门"),
     ("APERTURE", "光圈"),
@@ -340,6 +348,7 @@ _TREE_COL_CAMERA = _FILE_TABLE_COLUMN_INDEX["CAMERA"]
 _TREE_COL_LENS = _FILE_TABLE_COLUMN_INDEX["LENS"]
 _TREE_COL_CAPTURE_TIME = _FILE_TABLE_COLUMN_INDEX["CAPTURE_TIME"]
 _TREE_COL_SHARP = _FILE_TABLE_COLUMN_INDEX["SHARP"]
+_TREE_COL_BIRD_SHARP = _FILE_TABLE_COLUMN_INDEX["BIRD_SHARP"]
 _TREE_COL_AESTHETIC = _FILE_TABLE_COLUMN_INDEX["AESTHETIC"]
 _TREE_COL_TITLE = _TREE_COL_COMMENT
 _TREE_COL_COLOR = _TREE_COL_TAGS
@@ -995,6 +1004,18 @@ def _focus_status_brush(raw: str) -> "QBrush | None":
     if not status:
         return None
     return QBrush(QColor(_focus_status_text_color(status)))
+
+
+def _bird_sharp_brush(display: BirdSharpnessDisplay | None) -> "QBrush | None":
+    style = display.style if display is not None else None
+    return QBrush(QColor(style.color)) if style is not None else None
+
+
+def _bird_sharp_sort_value(display: BirdSharpnessDisplay | None) -> tuple:
+    # 未检测的排在最后；已检测按 清晰→可用→失焦→运动模糊→无鸟眼→无鸟，同级按模糊半径。
+    if display is None:
+        return (1, 0, 0.0)
+    return (0, *display.sort_key())
 
 
 def _qcolor_rgba_css(color_value: str, alpha: int) -> str:
