@@ -2,8 +2,24 @@
 """Qt item models and delegates for app_common.file_browser."""
 from __future__ import annotations
 
+import math
+
 from app_common.file_browser._browser_core import *
 from app_common.video import is_video, format_duration
+
+try:
+    from PyQt6.QtCore import QPointF, QRectF
+except ImportError:
+    from PyQt5.QtCore import QPointF, QRectF
+
+try:
+    _RoundCap = Qt.PenCapStyle.RoundCap
+    _RoundJoin = Qt.PenJoinStyle.RoundJoin
+    _AlignLeftVCenter = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+except AttributeError:
+    _RoundCap = Qt.RoundCap  # type: ignore[attr-defined]
+    _RoundJoin = Qt.RoundJoin  # type: ignore[attr-defined]
+    _AlignLeftVCenter = Qt.AlignLeft | Qt.AlignVCenter  # type: ignore[attr-defined]
 
 _VIDEO_HEADERS = ("时长", "视频分辨率", "帧率", "视频编码")
 _VideoInfoRole = int(_UserRole) + 26
@@ -1349,8 +1365,131 @@ def _paint_burst_group_band(painter: QPainter, rect: QRect, group) -> None:
         painter.restore()
 
 
+# ── 缩略图卡片：底部信息条 + 图上空间相关标记 ─────────────────────────────────
+# 星级/精选/对焦等级/色标固定画在卡片底部信息条（从缩略槽底部切出，单元格尺寸不变），
+# 横图时正好占用文件名上方的留白，竖图位置一致；图片上只保留与画面位置相关的信息。
+_THUMB_FOOTER_HEIGHT = 22
+_THUMB_FOOTER_HEIGHT_SMALL = 18
+_THUMB_SMALL_CELL_WIDTH = 200          # 小于该宽度（128px 档）隐藏文字类信息
+_THUMB_CARD_BG = "#2d2d2d"
+_THUMB_CARD_BORDER = "#464646"
+_THUMB_FOOTER_BG = "#1f1f1f"
+_THUMB_STAR_ON_COLOR = "#ffc53d"       # 亮金：深色信息条上高对比
+_THUMB_STAR_OFF_ALPHA = 46             # 空星：白色低透明度
+_THUMB_PICK_COLOR = COLORS["success"]
+_THUMB_REJECT_COLOR = COLORS["error"]
+_THUMB_REJECT_DIM_ALPHA = 120          # 排除照片压暗
+_THUMB_SPECIES_COLOR = "#86efac"
+_THUMB_FOCUS_BOX_DEFAULT_COLOR = "#00ff00"
+_THUMB_STAR_OUTER_RATIO = (1.0, 0.45)
+
+
+def _thumb_star_path(cx: float, cy: float, r: float) -> QPainterPath:
+    path = QPainterPath()
+    for i in range(10):
+        ang = -math.pi / 2 + i * math.pi / 5
+        rr = r * _THUMB_STAR_OUTER_RATIO[i % 2]
+        x = cx + rr * math.cos(ang)
+        y = cy + rr * math.sin(ang)
+        if i == 0:
+            path.moveTo(x, y)
+        else:
+            path.lineTo(x, y)
+    path.closeSubpath()
+    return path
+
+
+def _thumb_stars_width(r: float, gap: float, slots: int = 5) -> float:
+    return slots * (r * 2 + gap) - gap
+
+
+def _paint_thumb_stars(painter: QPainter, x: float, cy: float, r: float, rating: int, gap: float) -> None:
+    """从 x 起绘制 5 格矢量星，前 rating 个点亮（不依赖字体字形，跨平台一致）。"""
+    on = QColor(_THUMB_STAR_ON_COLOR)
+    off = QColor(255, 255, 255, _THUMB_STAR_OFF_ALPHA)
+    painter.setPen(_NoPen)
+    step = r * 2 + gap
+    for i in range(5):
+        painter.setBrush(QBrush(on if i < rating else off))
+        painter.drawPath(_thumb_star_path(x + r + i * step, cy, r))
+
+
+def _paint_thumb_pick_chip(painter: QPainter, x: float, cy: float, d: float, pick: int) -> None:
+    """精选=绿底白勾，排除=红底白叉（矢量绘制，替代跨平台渲染不一致的 emoji）。"""
+    painter.setPen(_NoPen)
+    painter.setBrush(QBrush(QColor(_THUMB_PICK_COLOR if pick == 1 else _THUMB_REJECT_COLOR)))
+    painter.drawEllipse(QRectF(x, cy - d / 2.0, d, d))
+    pen = QPen(QColor("#ffffff"))
+    pen.setWidthF(max(1.4, d / 9.0))
+    pen.setCapStyle(_RoundCap)
+    pen.setJoinStyle(_RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(QBrush())
+    cx = x + d / 2.0
+    s = d * 0.22
+    if pick == 1:
+        path = QPainterPath()
+        path.moveTo(cx - s * 1.1, cy)
+        path.lineTo(cx - s * 0.25, cy + s * 0.9)
+        path.lineTo(cx + s * 1.2, cy - s * 0.8)
+        painter.drawPath(path)
+    else:
+        painter.drawLine(QPointF(cx - s, cy - s), QPointF(cx + s, cy + s))
+        painter.drawLine(QPointF(cx - s, cy + s), QPointF(cx + s, cy - s))
+
+
+def _paint_thumb_dot_tag(
+    painter: QPainter, x: float, cy: float, color: QColor, text: str, *, max_right: float,
+) -> float:
+    """绘制「圆点 + 彩色文字」标签，返回占用宽度；text 为空时只画圆点。"""
+    painter.setPen(_NoPen)
+    painter.setBrush(QBrush(color))
+    painter.drawEllipse(QPointF(x + 4.0, cy), 3.5, 3.5)
+    if not text:
+        return 9.0
+    fm = painter.fontMetrics()
+    text_x = x + 11.0
+    avail = int(max_right - text_x)
+    if avail <= 0:
+        return 9.0
+    shown = fm.elidedText(text, _ElideRight, avail)
+    painter.setPen(color)
+    painter.drawText(QRectF(text_x, cy - fm.height() / 2.0, avail, fm.height()), _AlignLeftVCenter, shown)
+    return 11.0 + _font_text_width(fm, shown)
+
+
+def _font_text_width(fm, text: str) -> int:
+    try:
+        return fm.horizontalAdvance(text)
+    except AttributeError:
+        return fm.width(text)
+
+
+def _paint_thumb_pill(painter: QPainter, rect: QRectF, alpha: int, *, border: bool) -> None:
+    painter.setBrush(QBrush(QColor(0, 0, 0, alpha)))
+    if border:
+        painter.setPen(QColor(255, 255, 255, 40))
+    else:
+        painter.setPen(_NoPen)
+    radius = rect.height() / 2.0
+    painter.drawRoundedRect(rect, radius, radius)
+
+
+def _paint_thumb_footer(painter: QPainter, card: QRect, footer_h: int) -> QRectF:
+    """在卡片底部绘制信息条底色（下圆角、上直角），返回信息条矩形。"""
+    footer = QRectF(card.left() + 1, card.bottom() - footer_h + 1, card.width() - 2, footer_h - 1)
+    path = QPainterPath()
+    path.setFillRule(_WindingFill)
+    path.addRoundedRect(footer, 5.0, 5.0)
+    path.addRect(QRectF(footer.left(), footer.top(), footer.width(), min(6.0, footer.height())))
+    painter.setPen(_NoPen)
+    painter.setBrush(QBrush(QColor(_THUMB_FOOTER_BG)))
+    painter.drawPath(path)
+    return footer
+
+
 class ThumbnailItemDelegate(QStyledItemDelegate):
-    """Custom thumbnail delegate with aspect-fit preview and lightweight badges."""
+    """Custom thumbnail delegate: aspect-fit preview card with a fixed metadata footer."""
 
     def sizeHint(self, option, index):
         widget = option.widget
@@ -1369,15 +1508,24 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
         burst_text = str(index.data(_MetaBurstTextRole) or "")
         rating = index.data(_MetaRatingRole)
         pick = index.data(_MetaPickRole)
-        focus_status = str(index.data(_MetaFocusRole) or "")
+        focus_status = _focus_status_to_display(str(index.data(_MetaFocusRole) or ""))
         focus_box = index.data(_MetaFocusBoxRole)
         species_cn = str(index.data(_MetaSpeciesCnRole) or "").strip()
+        color_label = str(index.data(_MetaColorRole) or "")
         pixmap = index.data(_ThumbPixmapRole)
         if not isinstance(pixmap, QPixmap):
             pixmap = None
         burst_group = index.data(_MetaBurstGroupRole)
         if not (isinstance(burst_group, (tuple, list)) and len(burst_group) >= 3):
             burst_group = None
+        try:
+            rating_value = max(0, min(5, int(rating or 0)))
+        except Exception:
+            rating_value = 0
+        try:
+            pick_value = int(pick or 0)
+        except Exception:
+            pick_value = 0
 
         painter.save()
         try:
@@ -1392,19 +1540,25 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
                 painter.fillRect(state_rect, QColor(255, 255, 255, 16))
 
             cell = opt.rect.adjusted(6, 6, -6, -6)
+            small = opt.rect.width() < _THUMB_SMALL_CELL_WIDTH
             fm = painter.fontMetrics()
             name_height = fm.lineSpacing() + 6
-            thumb_rect = QRect(
+            card = QRect(
                 cell.left(),
                 cell.top(),
                 cell.width(),
                 max(24, cell.height() - name_height - 6),
             )
+            footer_h = _THUMB_FOOTER_HEIGHT_SMALL if small else _THUMB_FOOTER_HEIGHT
+            if card.height() - footer_h < 24:
+                footer_h = 0
+            thumb_rect = QRect(card.left(), card.top(), card.width(), card.height() - footer_h)
             draw_rect = QRect(thumb_rect)
 
-            painter.setBrush(QBrush(QColor(45, 45, 45)))
-            painter.setPen(QColor(70, 70, 70))
-            painter.drawRoundedRect(thumb_rect, 6, 6)
+            card_f = QRectF(card).adjusted(0.5, 0.5, -0.5, -0.5)
+            painter.setBrush(QBrush(QColor(_THUMB_CARD_BG)))
+            painter.setPen(_NoPen)
+            painter.drawRoundedRect(card_f, 6.0, 6.0)
 
             if pixmap is not None and not pixmap.isNull():
                 pw = max(1, pixmap.width())
@@ -1419,35 +1573,16 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
                     draw_h,
                 )
                 painter.drawPixmap(draw_rect, pixmap)
+                if pick_value == -1:
+                    painter.fillRect(draw_rect, QColor(0, 0, 0, _THUMB_REJECT_DIM_ALPHA))
 
-            if is_video(index.data(_UserRole)):
-                # 独立角标，不改变原始封面或照片的星级/精选覆盖层。
-                badge = QRect(thumb_rect.left() + 4, thumb_rect.bottom() - 23, min(90, thumb_rect.width() - 8), 20)
-                painter.fillRect(badge, QColor(0, 0, 0, 190))
-                painter.setPen(QColor(255, 255, 255))
-                info = index.data(_VideoInfoRole) or {}
-                label = format_duration(info['duration']) if 'duration' in info else Path(index.data(_UserRole)).suffix[1:].upper()
-                painter.drawText(badge, _AlignCenter, "▶ " + label)
-
-            def draw_badge(text: str, bg: QColor, fg: QColor, *, left: bool) -> None:
-                f2 = QFont(opt.font)
-                f2.setPixelSize(11)
-                painter.setFont(f2)
-                fm2 = painter.fontMetrics()
-                try:
-                    sw = fm2.horizontalAdvance(text)
-                except AttributeError:
-                    sw = fm2.width(text)
-                bw2, bh2 = sw + 10, 16
-                if left:
-                    badge2 = QRect(draw_rect.left() + 2, draw_rect.top() + 2, bw2, bh2)
-                else:
-                    badge2 = QRect(draw_rect.right() - bw2 - 2, draw_rect.top() + 2, bw2, bh2)
-                painter.setBrush(QBrush(bg))
-                painter.setPen(_NoPen)
-                painter.drawRoundedRect(badge2, 4, 4)
-                painter.setPen(fg)
-                painter.drawText(badge2, _AlignCenter, text)
+            # 卡片描边在图片之后绘制，横图铺满宽度时色标描边也不会被盖住；色标为 2px 彩色描边。
+            label_hex = _COLOR_LABEL_COLORS.get(color_label, ("", ""))[0]
+            border_pen = QPen(QColor(label_hex or _THUMB_CARD_BORDER))
+            border_pen.setWidthF(2.0 if label_hex else 1.0)
+            painter.setBrush(QBrush())
+            painter.setPen(border_pen)
+            painter.drawRoundedRect(card_f, 6.0, 6.0)
 
             def _set_pen_color_width(color: QColor, width: float) -> None:
                 pen = QPen(color)
@@ -1483,9 +1618,10 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
                 box_rect = QRect(x1, y1, x2 - x1, y2 - y1)
                 line_width = max(1.25, min(4.0, base / 150.0))
                 shadow = QColor(0, 0, 0, 190)
-                focus_color = QColor("#00ff00")
-                if not focus_color.isValid():
-                    focus_color = QColor("#ff0000")
+                # 对焦框颜色跟随对焦等级（与列表视图配色一致），无等级时保持默认绿色。
+                focus_color = QColor(
+                    _focus_status_text_color(focus_status) if focus_status else _THUMB_FOCUS_BOX_DEFAULT_COLOR
+                )
 
                 painter.setBrush(QBrush())
                 _set_pen_color_width(shadow, line_width + 1.6)
@@ -1495,50 +1631,71 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
 
             draw_focus_box_overlay(focus_box)
 
+            badge_font = QFont(opt.font)
+            badge_font.setPixelSize(11)
+
+            if is_video(index.data(_UserRole)):
+                # 视频时长胶囊放在图片左上角，避开底部居中的鸟种标签。
+                painter.setFont(badge_font)
+                info = index.data(_VideoInfoRole) or {}
+                label = format_duration(info['duration']) if 'duration' in info else Path(index.data(_UserRole)).suffix[1:].upper()
+                text = "▶ " + label
+                vfm = painter.fontMetrics()
+                vw = min(float(thumb_rect.width() - 8), float(_font_text_width(vfm, text) + 12))
+                video_rect = QRectF(draw_rect.left() + 4, draw_rect.top() + 4, vw, 17.0)
+                _paint_thumb_pill(painter, video_rect, 185, border=True)
+                painter.setPen(QColor(255, 255, 255))
+                painter.drawText(video_rect, _AlignCenter, text)
+
             def draw_species_overlay(text: str) -> None:
-                if not text or draw_rect.width() <= 0 or draw_rect.height() <= 0:
+                if not text or small or draw_rect.width() <= 0 or draw_rect.height() <= 0:
                     return
                 f3 = QFont(opt.font)
                 f3.setPixelSize(12)
                 painter.setFont(f3)
                 fm3 = painter.fontMetrics()
-                pad_x, pad_y = 6, 2
+                pad_x, pad_y = 7, 2
                 max_w = max(8, draw_rect.width() - 8)
                 elided = fm3.elidedText(text, _ElideRight, max_w - pad_x * 2)
-                try:
-                    tw = fm3.horizontalAdvance(elided)
-                except AttributeError:
-                    tw = fm3.width(elided)
-                bw = min(max_w, tw + pad_x * 2)
+                bw = min(max_w, _font_text_width(fm3, elided) + pad_x * 2)
                 bh = fm3.height() + pad_y * 2
                 bx = draw_rect.left() + (draw_rect.width() - bw) // 2
                 by = draw_rect.bottom() - bh - 3
-                label_rect = QRect(bx, by, bw, bh)
-                painter.setBrush(QBrush(QColor(0, 0, 0, 150)))
-                painter.setPen(_NoPen)
-                painter.drawRoundedRect(label_rect, 4, 4)
-                painter.setPen(QColor("#00ff00"))
+                label_rect = QRectF(bx, by, bw, bh)
+                _paint_thumb_pill(painter, label_rect, 165, border=False)
+                painter.setPen(QColor(_THUMB_SPECIES_COLOR))
                 painter.drawText(label_rect, _AlignCenter, elided)
 
             draw_species_overlay(species_cn)
 
-            if pick == 1:
-                draw_badge("🏆", QColor(0, 0, 0, 160), QColor(COLORS["star_gold"]), left=True)
-            elif pick == -1:
-                draw_badge("🚫", QColor(0, 0, 0, 160), QColor("#ffffff"), left=True)
+            if footer_h:
+                footer = _paint_thumb_footer(painter, card, footer_h)
+                cy = footer.center().y()
+                star_r = 4.5 if small else 5.5
+                star_gap = 1.5 if small else 2.0
+                stars_w = _thumb_stars_width(star_r, star_gap)
+                stars_x = footer.right() - 6 - stars_w
+                _paint_thumb_stars(painter, stars_x, cy, star_r, rating_value, star_gap)
 
-            try:
-                rating_value = int(rating or 0)
-            except Exception:
-                rating_value = 0
-            if rating_value > 0:
-                draw_badge(
-                    "★" * min(5, rating_value),
-                    QColor(0, 0, 0, 140),
-                    QColor(_STAR_SILVER_COLOR),
-                    left=False,
-                )
-            text_rect = QRect(cell.left(), thumb_rect.bottom() + 4, cell.width(), name_height)
+                painter.setFont(badge_font)
+                x = footer.left() + 6
+                text_right = stars_x - 6
+                if pick_value in (1, -1):
+                    d = 13.0 if small else 14.0
+                    _paint_thumb_pick_chip(painter, x, cy, d, pick_value)
+                    x += d + 6
+                if focus_status and x + 9 <= text_right:
+                    focus_color = QColor(_focus_status_text_color(focus_status))
+                    x += _paint_thumb_dot_tag(
+                        painter, x, cy, focus_color, "" if small else focus_status, max_right=text_right,
+                    ) + 6
+                if label_hex and x + 9 <= text_right:
+                    label_text = _COLOR_LABEL_COLORS.get(color_label, ("", ""))[1]
+                    _paint_thumb_dot_tag(
+                        painter, x, cy, QColor(label_hex), "" if small else label_text, max_right=text_right,
+                    )
+
+            text_rect = QRect(cell.left(), card.bottom() + 4, cell.width(), name_height)
             text_color = opt.palette.highlightedText().color() if selected else opt.palette.text().color()
             painter.setPen(text_color)
             painter.setFont(opt.font)
@@ -1546,6 +1703,5 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
             painter.drawText(text_rect, _AlignCenter, elided)
         finally:
             painter.restore()
-
 
 __all__ = [name for name in globals() if not name.startswith('__')]

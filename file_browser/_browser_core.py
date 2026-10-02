@@ -547,7 +547,7 @@ _COLOR_SORT_ORDER: dict[str, int] = {
 _FOCUS_STATUS_TEXT_COLORS: dict[str, str] = {
     "精焦": COLORS["success"],
     "合焦": COLORS["warning"],
-    "偏移": "#0051FF",
+    "偏移": "#4C8DFF",   # 原 #0051FF 在深色底上过暗
     "失焦": "#888888",
 }
 _FOCUS_FILTER_OPTIONS: tuple[str, ...] = _FOCUS_STATUS_DISPLAY_ORDER
