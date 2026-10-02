@@ -41,6 +41,8 @@ class FileListPanel(QWidget):
     # Application-owned held-key playback is opt-in.  SuperBirdStamp subclasses
     # intentionally keep native Qt selection/currentItemChanged semantics.
     enable_key_navigation_playback = False
+    # "[" 标记区间起始图、"]" 选中起始图到当前图之间的所有图；仅 Viewer 启用。
+    enable_range_mark_shortcuts = False
     enable_in_memory_fast_preview = False
     skip_uncached_fast_preview = False
     # report.db is optional read-only fallback.  Subclasses may disable it.
@@ -149,6 +151,7 @@ class FileListPanel(QWidget):
         self._selection_key_nav_hold_active: bool = False
         self._thumb_selection_anchor_row: int = -1
         self._tree_selection_anchor_row: int = -1
+        self._range_mark_start_path: str = ""
         self._key_navigation_fps: int = get_key_navigation_fps()
         self._key_navigation_last_step_at: float = 0.0
         self._key_navigation_playback_timer: QTimer | None = None
@@ -841,6 +844,9 @@ class FileListPanel(QWidget):
             parts.append(f"当前 {current_row}/{total}")
         else:
             parts.append("当前未选中")
+        range_start_row = self._range_mark_start_row()
+        if range_start_row >= 0:
+            parts.append(f"区间起点 {range_start_row + 1}")
         label.setText(" | ".join(parts))
 
     def _show_meta_progress_status(
@@ -1386,6 +1392,7 @@ class FileListPanel(QWidget):
             return
         self._current_dir = path
         if not same_dir:
+            self._range_mark_start_path = ""
             self._directory_scope_cache.clear()
             self._loaded_directory_recursive = False
         # Resolve an optional read-only report scope; no browser operation
@@ -2551,6 +2558,97 @@ class FileListPanel(QWidget):
             return True
         if paths:
             self._move_paths_to_trash(paths)
+        return True
+
+    def _range_mark_kind_from_event(self, event) -> str:
+        """Return "start" for "[" and "end" for "]"; full-width IME variants count too."""
+        key = event.key()
+        if _key_matches(key, _KeyBracketLeft):
+            return "start"
+        if _key_matches(key, _KeyBracketRight):
+            return "end"
+        text = str(event.text() or "")
+        if text in {"[", "\u3010", "\uff3b", "\u300c"}:
+            return "start"
+        if text in {"]", "\u3011", "\uff3d", "\u300d"}:
+            return "end"
+        return ""
+
+    def _range_mark_index_for_path(self, path: str) -> QModelIndex:
+        if not path:
+            return QModelIndex()
+        if self._view_mode == self._MODE_THUMB:
+            return self._thumb_index_for_path(path)
+        return self._tree_index_for_path(path)
+
+    def _range_mark_start_row(self) -> int:
+        """起始标记在当前视图中的行号；被过滤掉或未标记时返回 -1。"""
+        if not self._range_mark_start_path:
+            return -1
+        index = self._range_mark_index_for_path(self._range_mark_start_path)
+        return index.row() if index.isValid() else -1
+
+    def _select_range_mark_rows(self, start_row: int, end_row: int) -> int:
+        """选中当前视图中 start_row..end_row（含）的所有行，保持当前图不变。"""
+        if self._view_mode == self._MODE_THUMB:
+            widget = self._list_widget
+            model = self._thumb_list_model
+            last_column = 0
+        else:
+            widget = self._tree_widget
+            model = widget.model()
+            last_column = max(0, int(model.columnCount()) - 1) if model is not None else 0
+        selection_model = widget.selectionModel() if widget is not None else None
+        if model is None or selection_model is None:
+            return 0
+        low, high = min(start_row, end_row), max(start_row, end_row)
+        top_left = model.index(low, 0)
+        bottom_right = model.index(high, last_column)
+        if not top_left.isValid() or not bottom_right.isValid():
+            return 0
+        selection_model.select(QItemSelection(top_left, bottom_right), _ClearAndSelect)
+        if self._view_mode == self._MODE_THUMB:
+            self._thumb_selection_anchor_row = start_row
+        else:
+            self._tree_selection_anchor_row = start_row
+        return high - low + 1
+
+    def _handle_range_mark_shortcut_keypress(self, event) -> bool:
+        if event is None or not bool(getattr(type(self), "enable_range_mark_shortcuts", False)):
+            return False
+        if self._event_has_blocked_shortcut_modifier(event, include_shift=True):
+            return False
+        mark_kind = self._range_mark_kind_from_event(event)
+        if not mark_kind:
+            return False
+        # 吞掉 "[" / "]"，避免 Qt 原生 keyboardSearch 把选中跳到同名前缀文件。
+        if self._event_is_auto_repeat(event):
+            return True
+        current_path = self._active_view_current_path()
+        current_index = self._range_mark_index_for_path(current_path)
+        if not current_index.isValid():
+            return True
+        if mark_kind == "start":
+            self._range_mark_start_path = current_path
+            _log.info("[range_mark] start path=%r row=%s", current_path, current_index.row())
+            self._update_selection_status()
+            return True
+        start_row = self._range_mark_start_row()
+        if start_row < 0:
+            _log.info("[range_mark] end without visible start path=%r", current_path)
+            label = getattr(self, "_selection_status_label", None)
+            if label is not None:
+                label.setText("请先按 [ 标记起始图，再按 ] 选中区间")
+            return True
+        # 保留起点，便于在其它图上再次按 "]" 调整区间终点。
+        count = self._select_range_mark_rows(start_row, current_index.row())
+        _log.info(
+            "[range_mark] select start_row=%s end_row=%s count=%s",
+            start_row,
+            current_index.row(),
+            count,
+        )
+        self._update_selection_status()
         return True
 
     def _resolve_rating_write_source(
@@ -4564,6 +4662,22 @@ class FileListPanel(QWidget):
                 )
             )
             and self._handle_delete_shortcut_keypress(event)
+        ):
+            return True
+        if (
+            event is not None
+            and event.type() == _EventKeyPress
+            and (
+                (
+                    self._view_mode == self._MODE_LIST
+                    and obj in (tree_widget, tree_viewport)
+                )
+                or (
+                    self._view_mode == self._MODE_THUMB
+                    and obj in (list_widget, list_viewport)
+                )
+            )
+            and self._handle_range_mark_shortcut_keypress(event)
         ):
             return True
         if (

@@ -39,7 +39,7 @@ try:
         QStyledItemDelegate, QStackedWidget, QSlider, QMessageBox, QComboBox,
         QApplication, QToolTip,
     )
-    from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal, QRect, QTimer, QUrl, QMimeData, QPoint, QEvent, QAbstractListModel, QAbstractTableModel, QModelIndex, QItemSelectionModel, QSortFilterProxyModel
+    from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal, QRect, QTimer, QUrl, QMimeData, QPoint, QEvent, QAbstractListModel, QAbstractTableModel, QModelIndex, QItemSelection, QItemSelectionModel, QSortFilterProxyModel
     from PyQt6.QtGui import (
         QPixmap, QImage, QFont, QColor, QIcon, QPainter, QBrush, QPen,
         QPainterPath, QKeySequence, QShortcut,
@@ -53,7 +53,7 @@ except ImportError:
         QStyledItemDelegate, QStackedWidget, QSlider, QMessageBox, QComboBox,
         QApplication, QShortcut, QToolTip,
     )
-    from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal, QRect, QTimer, QUrl, QMimeData, QPoint, QEvent, QAbstractListModel, QAbstractTableModel, QModelIndex, QItemSelectionModel, QSortFilterProxyModel
+    from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal, QRect, QTimer, QUrl, QMimeData, QPoint, QEvent, QAbstractListModel, QAbstractTableModel, QModelIndex, QItemSelection, QItemSelectionModel, QSortFilterProxyModel
     from PyQt5.QtGui import (
         QPixmap, QImage, QFont, QColor, QIcon, QPainter, QBrush, QPen,
         QPainterPath, QKeySequence,
@@ -1101,6 +1101,8 @@ _KeyPeriod = getattr(Qt.Key, "Key_Period", None) or getattr(Qt, "Key_Period", No
 _KeyQ = getattr(Qt.Key, "Key_Q", None) or getattr(Qt, "Key_Q", None)
 _KeyQuoteLeft = getattr(Qt.Key, "Key_QuoteLeft", None) or getattr(Qt, "Key_QuoteLeft", None)
 _KeyAsciiTilde = getattr(Qt.Key, "Key_AsciiTilde", None) or getattr(Qt, "Key_AsciiTilde", None)
+_KeyBracketLeft = getattr(Qt.Key, "Key_BracketLeft", None) or getattr(Qt, "Key_BracketLeft", None)
+_KeyBracketRight = getattr(Qt.Key, "Key_BracketRight", None) or getattr(Qt, "Key_BracketRight", None)
 _KeyRatingDigits = {}
 for _digit in range(1, 6):
     _key = getattr(Qt.Key, f"Key_{_digit}", None) or getattr(Qt, f"Key_{_digit}", None)
