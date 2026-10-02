@@ -116,6 +116,17 @@ def test_rating_stars_are_bright_gold_in_footer_right_side() -> None:
     assert not _row_has_color(unrated, footer_y, card.center().x(), card.right(), gold)
 
 
+def test_unrated_footer_has_no_empty_star_placeholders() -> None:
+    footer_bg = QColor(_THUMB_FOOTER_BG)
+    rated, card = _render(rating=1)
+    unrated, _ = _render(rating=0)
+    footer_y = _footer_center_y(card)
+    star_span = range(card.center().x(), card.right() - 4)
+    # 有评级时右侧画满 5 格（含空星），未评级时信息条右侧只剩底色
+    assert any(not _close(rated.pixelColor(x, footer_y), footer_bg, tol=4) for x in star_span)
+    assert all(_close(unrated.pixelColor(x, footer_y), footer_bg, tol=4) for x in star_span)
+
+
 def test_pick_and_reject_chips_and_reject_dims_image() -> None:
     green = QColor("#22c55e")
     red = QColor("#ef4444")

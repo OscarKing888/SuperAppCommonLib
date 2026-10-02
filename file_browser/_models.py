@@ -1673,13 +1673,16 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
                 cy = footer.center().y()
                 star_r = 4.5 if small else 5.5
                 star_gap = 1.5 if small else 2.0
-                stars_w = _thumb_stars_width(star_r, star_gap)
-                stars_x = footer.right() - 6 - stars_w
-                _paint_thumb_stars(painter, stars_x, cy, star_r, rating_value, star_gap)
+                text_right = footer.right() - 6
+                # 未评级时不画空星，信息条右侧留空；有评级时画满 5 格（点亮 + 空星）表示刻度。
+                if rating_value > 0:
+                    stars_w = _thumb_stars_width(star_r, star_gap)
+                    stars_x = footer.right() - 6 - stars_w
+                    _paint_thumb_stars(painter, stars_x, cy, star_r, rating_value, star_gap)
+                    text_right = stars_x - 6
 
                 painter.setFont(badge_font)
                 x = footer.left() + 6
-                text_right = stars_x - 6
                 if pick_value in (1, -1):
                     d = 13.0 if small else 14.0
                     _paint_thumb_pick_chip(painter, x, cy, d, pick_value)
