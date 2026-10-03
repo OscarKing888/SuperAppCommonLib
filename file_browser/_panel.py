@@ -39,6 +39,8 @@ class FileListPanel(QWidget):
 
     # 子类可重载为 False 以不创建过滤栏（filter_bar）
     create_filter_bar = True
+    # 排序状态在两种视图间共用；额外工具栏仅由需要它的宿主启用。
+    show_thumbnail_sort_controls = False
     # Application-owned held-key playback is opt-in.  SuperBirdStamp subclasses
     # intentionally keep native Qt selection/currentItemChanged semantics.
     enable_key_navigation_playback = False
@@ -122,6 +124,9 @@ class FileListPanel(QWidget):
         self._tree_header_fast_mode: bool = False
         self._tree_last_sort_column: int = _TREE_COL_NAME
         self._tree_last_sort_order = _AscendingOrder
+        self._sort_bar = None
+        self._sort_column_combo = None
+        self._sort_order_button = None
         self._tree_view_dirty: bool = False
         self._tree_model_populate_timer: QTimer | None = None
         self._tree_model_pending_paths: list[str] = []
@@ -302,6 +307,29 @@ class FileListPanel(QWidget):
         toolbar.addWidget(self._size_label)
         toolbar.addStretch()
         layout.addLayout(toolbar)
+
+        if self.show_thumbnail_sort_controls:
+            self._sort_bar = QWidget(self)
+            sort_layout = QHBoxLayout(self._sort_bar)
+            sort_layout.setContentsMargins(0, 0, 0, 0)
+            sort_layout.setSpacing(3)
+            sort_layout.addWidget(QLabel("排序:"))
+            self._sort_column_combo = QComboBox(self._sort_bar)
+            self._sort_column_combo.setToolTip("选择排序字段；与列表表头排序保持一致")
+            for column in range(self._file_table_model.columnCount()):
+                if column != _TREE_COL_SEQ:
+                    self._sort_column_combo.addItem(
+                        self._file_table_model.headerData(column, _Horizontal), column
+                    )
+            self._sort_column_combo.setMaximumWidth(180)
+            self._sort_column_combo.currentIndexChanged.connect(self._on_sort_column_changed)
+            sort_layout.addWidget(self._sort_column_combo)
+            self._sort_order_button = QToolButton(self._sort_bar)
+            self._sort_order_button.clicked.connect(self._on_sort_order_clicked)
+            sort_layout.addWidget(self._sort_order_button)
+            sort_layout.addStretch()
+            layout.addWidget(self._sort_bar)
+            self._sync_sort_controls()
 
         # ── 过滤栏（文件名 + 精选 + 星级）──
         if self._create_filter_bar:
@@ -1876,7 +1904,8 @@ class FileListPanel(QWidget):
             if current_target is not None:
                 idx_first = self._tree_index_for_path(current_target)
                 if idx_first.isValid():
-                    self._tree_widget.setCurrentIndex(idx_first)
+                    # 直接更新选择模型，避免视图默认的 ClearAndSelect 清空已恢复的多选。
+                    tree_sm.setCurrentIndex(idx_first, _Select)
                     self._record_selection_scroll_debug(
                         "apply_pending.tree",
                         current_target,
@@ -1902,8 +1931,8 @@ class FileListPanel(QWidget):
         current_target = self._pending_selection_current_path if preferred_current_matched else first_matched
         if current_target is not None:
             idx_first = self._thumb_index_for_path(current_target)
-            if idx_first.isValid():
-                self._list_widget.setCurrentIndex(idx_first)
+            if idx_first.isValid() and sm is not None:
+                sm.setCurrentIndex(idx_first, _Select)
                 self._thumb_selection_anchor_row = idx_first.row()
                 self._record_selection_scroll_debug(
                     "apply_pending.thumb",
@@ -2066,7 +2095,7 @@ class FileListPanel(QWidget):
                 self._record_selection_scroll_debug("scroll.tree.miss", norm_path)
                 return False
             if target_mode in (None, self._MODE_LIST):
-                self._tree_widget.setCurrentIndex(idx)
+                self._tree_widget.selectionModel().setCurrentIndex(idx, _Select)
             bar = self._tree_widget.verticalScrollBar()
             before = bar.value() if bar is not None else None
             rect_before = self._tree_widget.visualRect(idx)
@@ -2091,7 +2120,7 @@ class FileListPanel(QWidget):
                 self._record_selection_scroll_debug("scroll.thumb.miss", norm_path)
                 return False
             if target_mode in (None, self._MODE_THUMB):
-                self._list_widget.setCurrentIndex(idx)
+                self._list_widget.selectionModel().setCurrentIndex(idx, _Select)
             bar = self._list_widget.verticalScrollBar()
             before = bar.value() if bar is not None else None
             rect_before = self._list_widget.visualRect(idx)
@@ -3755,10 +3784,66 @@ class FileListPanel(QWidget):
         if model is not None:
             try:
                 model.sort(column, order)
-                return
             except Exception:
                 pass
+            else:
+                self._sort_thumbnail_items()
+                self._sync_sort_controls()
+                return
         self._tree_widget.sortByColumn(column, order)
+        self._sort_thumbnail_items()
+        self._sync_sort_controls()
+
+    def _sorted_thumbnail_paths(self, paths: list[str]) -> list[str]:
+        """使用列表相同的排序键；隐藏列表尚未填充时也不依赖控件行序。"""
+        return sorted(
+            paths,
+            key=lambda path: file_sort_key(
+                path, self._meta_cache.get(os.path.normpath(path), {}),
+                self._tree_last_sort_column,
+            ),
+            reverse=self._tree_last_sort_order != _AscendingOrder,
+        )
+
+    def _sort_thumbnail_items(self) -> None:
+        if self._view_mode != self._MODE_THUMB or getattr(self, "_list_widget", None) is None:
+            return
+        paths = self._thumb_list_model.all_paths()
+        if not self._thumb_list_model.reorder_paths(self._sorted_thumbnail_paths(paths)):
+            return
+        self._thumb_selection_anchor_row = -1
+        self._invalidate_visible_thumbnail_signature()
+        self._schedule_visible_thumbnail_update()
+        # 模型原地重排保留多选与当前项，滚动不触发重新加载预览。
+        current = self._list_widget.currentIndex()
+        if current.isValid():
+            self._list_widget.scrollTo(current)
+        self._update_selection_status()
+
+    def _sync_sort_controls(self) -> None:
+        if getattr(self, "_sort_bar", None) is None:
+            return
+        combo = self._sort_column_combo
+        blocked = combo.blockSignals(True)
+        try:
+            combo.setCurrentIndex(combo.findData(self._tree_last_sort_column))
+        finally:
+            combo.blockSignals(blocked)
+        ascending = self._tree_last_sort_order == _AscendingOrder
+        self._sort_order_button.setText("升序 ↑" if ascending else "降序 ↓")
+        self._sort_order_button.setToolTip("切换为降序" if ascending else "切换为升序")
+        self._sort_bar.setVisible(self._view_mode == self._MODE_THUMB)
+
+    def _on_sort_column_changed(self, index: int) -> None:
+        if index >= 0:
+            self._on_tree_sort_indicator_changed(
+                self._sort_column_combo.itemData(index), self._tree_last_sort_order,
+            )
+
+    def _on_sort_order_clicked(self) -> None:
+        descending = Qt.SortOrder.DescendingOrder if hasattr(Qt, "SortOrder") else Qt.DescendingOrder
+        order = descending if self._tree_last_sort_order == _AscendingOrder else _AscendingOrder
+        self._on_tree_sort_indicator_changed(self._tree_last_sort_column, order)
 
     def _rebuild_tree_items(self) -> None:
         self._probe_set_phase("tree_model_prepare", filtered=len(self._filtered_files))
@@ -3930,7 +4015,7 @@ class FileListPanel(QWidget):
         if self._background_shutdown_requested:
             return
         if not resume:
-            self._thumb_model_pending_paths = list(self._filtered_files)
+            self._thumb_model_pending_paths = self._sorted_thumbnail_paths(self._filtered_files)
             self._thumb_model_pending_index = 0
             self._thumb_model_populate_started_at = _time.perf_counter()
             self._probe_thumb_last_log_at = 0.0
@@ -3938,7 +4023,7 @@ class FileListPanel(QWidget):
             self._thumb_list_model.clear()
             self._invalidate_visible_thumbnail_signature()
         elif not self._thumb_model_pending_paths:
-            self._thumb_model_pending_paths = list(self._filtered_files)
+            self._thumb_model_pending_paths = self._sorted_thumbnail_paths(self._filtered_files)
         if not self._thumb_model_pending_paths:
             self._thumb_model_dirty = False
             return
@@ -4019,6 +4104,8 @@ class FileListPanel(QWidget):
         self._thumb_model_dirty = False
         self._thumb_model_pending_paths = []
         self._thumb_model_pending_index = 0
+        # 填充期间排序或元数据可能变化，完成时按最新状态校正一次。
+        self._sort_thumbnail_items()
         if self._pending_selection_paths:
             self._apply_pending_selection()
             self._pending_selection_paths = None
@@ -5103,6 +5190,7 @@ class FileListPanel(QWidget):
         self._btn_thumb.setChecked(mode == self._MODE_THUMB)
         self._stack.setCurrentIndex(0 if mode == self._MODE_LIST else 1)
         self._update_size_controls()
+        self._sync_sort_controls()
         self._invalidate_visible_thumbnail_signature()
         if mode == self._MODE_THUMB:
             self._pause_tree_model_population()
@@ -5111,6 +5199,7 @@ class FileListPanel(QWidget):
                 self._start_thumb_model_population(
                     resume=bool(self._thumb_model_pending_paths) and self._thumb_model_pending_index > 0
                 )
+            self._sort_thumbnail_items()
             self._schedule_visible_thumbnail_update()
         else:
             self._pause_thumb_model_population()
@@ -6550,7 +6639,7 @@ class FileListPanel(QWidget):
             return
         self._tree_last_sort_column = column
         self._tree_last_sort_order = order
-        self._apply_tree_sort(column, order)
+        self._apply_tree_sort(column, order, sync_indicator=True)
         QTimer.singleShot(0, self._refresh_tree_row_numbers)
 
     def _order_meta_items_by_file_list(self, meta_dict: dict) -> list:
