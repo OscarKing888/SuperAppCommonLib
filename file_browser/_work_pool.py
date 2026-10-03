@@ -41,19 +41,21 @@ class BrowserWorkPool:
     Completing/releasing the last action wakes every idle worker immediately;
     redistribution does not wait for a GUI progress callback.
     """
-    def __init__(self, max_workers: int, metadata_workers: int = 2):
+    def __init__(self, max_workers: int, metadata_workers: int = 2, analysis_workers: int = 0):
         self.metadata_workers = max(2, int(metadata_workers))
         self.max_workers = max(self.metadata_workers + 1, int(max_workers))
         self.thumbnail_workers = self.max_workers - self.metadata_workers
         self._condition = threading.Condition()
-        self._queues = {'metadata': [], 'thumbnail': []}
-        self._active = {'metadata': 0, 'thumbnail': 0}
+        kinds = [kind.value for kind in WorkKind]
+        self._queues = {kind: [] for kind in kinds}
+        self._active = {kind: 0 for kind in kinds}
         self._sequence = itertools.count()
         self._closed = False
         self._thumbnail_mode = True
-        self._seen = {'metadata': False, 'thumbnail': False}
-        self._producers = {'metadata': set(), 'thumbnail': set()}
-        self._policy = BrowserWorkPolicy(self.max_workers, self.metadata_workers)
+        self._seen = {kind: False for kind in kinds}
+        self._producers = {kind: set() for kind in kinds}
+        self._policy = BrowserWorkPolicy(self.max_workers, self.metadata_workers, analysis_workers)
+        self.analysis_workers = self._policy.analysis_limit
         self._threads = []
         self._owner = threading.get_ident()
         self._completed = 0
@@ -64,8 +66,8 @@ class BrowserWorkPool:
                                       name=f'browser-worker-{index + 1}', daemon=True)
             self._threads.append(worker)
             worker.start()
-        _log.info('[browser.pool] started total=%s metadata_reserved=%s thumbnails=%s',
-                  self.max_workers, self.metadata_workers, self.thumbnail_workers)
+        _log.info('[browser.pool] started total=%s metadata_reserved=%s thumbnails=%s analysis_limit=%s',
+                  self.max_workers, self.metadata_workers, self.thumbnail_workers, self.analysis_workers)
 
     def set_thumbnail_mode(self, enabled: bool):
         with self._condition:
@@ -96,6 +98,8 @@ class BrowserWorkPool:
         if not isinstance(action, WorkerAction):
             raise TypeError('Expected WorkerAction')
         kind = WorkKind(kind)
+        if kind == WorkKind.ANALYSIS and self.analysis_workers <= 0:
+            raise ValueError('This pool has no analysis capacity')
         future = Future()
         with self._condition:
             if self._closed:
@@ -148,7 +152,7 @@ class BrowserWorkPool:
 
     def _demand(self, kind):
         # Initial hints reserve capacity before delayed producers submit their first job.
-        initial = not self._seen[kind] and (kind == 'metadata' or self._thumbnail_mode)
+        initial = not self._seen[kind] and (kind == 'metadata' or (kind == 'thumbnail' and self._thumbnail_mode))
         return bool(initial or self._producers[kind] or self._queues[kind] or self._active[kind])
 
     def _take(self):
@@ -203,6 +207,8 @@ class BrowserWorkPool:
             return dict(total=self.max_workers, metadata_reserved=self.metadata_workers,
                         metadata_active=self._active['metadata'], thumbnail_active=self._active['thumbnail'],
                         metadata_queued=len(self._queues['metadata']), thumbnail_queued=len(self._queues['thumbnail']),
+                        analysis_limit=self.analysis_workers, analysis_active=self._active['analysis'],
+                        analysis_queued=len(self._queues['analysis']),
                         metadata_demand=self._demand('metadata'), thumbnail_demand=self._demand('thumbnail'),
                         completed=self._completed, max_queue_ms=self._max_queue_ms, max_run_ms=self._max_run_ms)
 

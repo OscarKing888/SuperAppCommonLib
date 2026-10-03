@@ -1434,6 +1434,19 @@ def _metadata_loader_worker_count() -> int:
     return max(1, get_metadata_loader_workers())
 
 
+def _analysis_worker_count() -> int:
+    """Concurrent long-running analysis actions (e.g. bird sharpness) in the browser pool.
+
+    Each holds a full-resolution decode (~0.3-0.5 GB for a 25-60 MP RAW), so the
+    default stays small; the pool further caps it to leave metadata and
+    thumbnail capacity free. ``SuperViewer_ANALYSIS_WORKERS`` overrides it.
+    """
+    override = _env_int("SuperViewer_ANALYSIS_WORKERS", 0)
+    if override > 0:
+        return override
+    return min(6, max(1, (os.cpu_count() or 2) // 2))
+
+
 def _metadata_loader_idle_worker_count() -> int:
     cpu_count = max(1, os.cpu_count() or 1)
     # Metadata loading is dominated by exiftool + sidecar I/O.  Use more than

@@ -5589,9 +5589,22 @@ class FileListPanel(QWidget):
         if self._browser_work_pool is None:
             metadata = max(2, _metadata_loader_worker_count())
             total = max(_thumbnail_loader_worker_count(), metadata + _persistent_thumb_cache_worker_count())
-            self._browser_work_pool = BrowserWorkPool(total, metadata)
+            self._browser_work_pool = BrowserWorkPool(total, metadata, _analysis_worker_count())
         self._browser_work_pool.set_thumbnail_mode(self._view_mode == self._MODE_THUMB)
         return self._browser_work_pool
+
+    def background_work_pool(self):
+        """Shared pool for host-app ``WorkKind.ANALYSIS`` actions, or ``None`` when unavailable.
+
+        Actions submitted here are owned by the browser: shutdown cancels queued
+        work and waits for running actions (see ``has_pending_pool_work``).
+        """
+        if self._background_shutdown_requested:
+            return None
+        pool = self._get_browser_work_pool()
+        if pool is None or getattr(pool, "analysis_workers", 0) <= 0:
+            return None
+        return pool
 
     def _own_pool_loader(self, loader):
         if not self.use_unified_worker_pool:

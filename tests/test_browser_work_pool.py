@@ -403,3 +403,72 @@ def test_real_coordinators_lend_all_capacity_before_qt_progress_is_delivered(mon
         meta.stop()
         assert thumb.wait(3000) and meta.wait(3000)
         assert pool.shutdown(timeout=3)
+
+
+def test_analysis_actions_use_only_spare_capacity_up_to_their_limit():
+    from app_common.file_browser._work_action import CallableAction as _Action
+
+    pool = BrowserWorkPool(6, 2, analysis_workers=10)
+    # Capped so metadata keeps its reservation and one thread is always left for thumbnails.
+    assert pool.analysis_workers == 3
+    condition = threading.Condition()
+    running = {'analysis': 0, 'peak': 0}
+    release = threading.Event()
+
+    def analyse():
+        with condition:
+            running['analysis'] += 1
+            running['peak'] = max(running['peak'], running['analysis'])
+            condition.notify_all()
+        assert release.wait(5)
+        with condition:
+            running['analysis'] -= 1
+        return 'analysed'
+
+    try:
+        analysis = [pool.submit_action(_Action(analyse), kind=WorkKind.ANALYSIS) for _ in range(8)]
+        with condition:
+            assert condition.wait_for(lambda: running['analysis'] == 3, timeout=3)
+        time.sleep(0.1)
+        assert pool.snapshot()['analysis_active'] == 3
+        assert pool.snapshot()['analysis_queued'] == 5
+        # Metadata and visible thumbnails still run immediately on the remaining threads.
+        meta = pool.submit_action(MetadataReadAction(lambda paths: 'meta', ['a']), kind=WorkKind.METADATA)
+        thumb = pool.submit(lambda: 'thumb', priority=VISIBLE)
+        assert meta.result(timeout=2) == 'meta'
+        assert thumb.result(timeout=2) == 'thumb'
+        release.set()
+        assert [f.result(timeout=5) for f in analysis] == ['analysed'] * 8
+        assert running['peak'] == 3
+    finally:
+        release.set()
+        assert pool.shutdown(timeout=5)
+
+
+def test_queued_analysis_is_cancelled_on_shutdown_and_pool_without_capacity_rejects_it():
+    from app_common.file_browser._work_action import CallableAction as _Action
+
+    pool = BrowserWorkPool(4, 2, analysis_workers=1)
+    started, release = threading.Event(), threading.Event()
+
+    def analyse():
+        started.set()
+        assert release.wait(5)
+        return 'done'
+
+    first = pool.submit_action(_Action(analyse), kind=WorkKind.ANALYSIS)
+    queued = pool.submit_action(_Action(lambda: 'never'), kind=WorkKind.ANALYSIS)
+    assert started.wait(2)
+    pool.request_shutdown()
+    assert queued.cancelled()
+    release.set()
+    assert first.result(timeout=2) == 'done'
+    assert pool.shutdown(timeout=3)
+
+    plain = BrowserWorkPool(3, 2)
+    try:
+        assert plain.analysis_workers == 0
+        with pytest.raises(ValueError):
+            plain.submit_action(_Action(lambda: None), kind=WorkKind.ANALYSIS)
+    finally:
+        assert plain.shutdown(timeout=3)
