@@ -105,6 +105,108 @@ def _metadata_burst_values(meta: dict | None) -> tuple[int | None, int | None]:
     )
 
 
+_SORT_TEXT_FIELDS = {
+    _TREE_COL_SPECIES: "species",
+    _TREE_COL_COMMENT: "comment",
+    _TREE_COL_TAGS: "tags_display",
+    _TREE_COL_SHUTTER: "shutter",
+    _TREE_COL_APERTURE: "aperture",
+    _TREE_COL_FOCAL: "focal_length",
+    _TREE_COL_CAMERA: "camera_model",
+    _TREE_COL_LENS: "lens_model",
+    _TREE_COL_CAPTURE_TIME: "capture_time",
+    _TREE_COL_FOCUS: "focus_status",
+}
+_SORT_NUMERIC_FIELDS = {
+    _TREE_COL_ISO: ("iso", lambda value: int(float(value))),
+    _TREE_COL_SHARP: ("sharpness", float),
+    _TREE_COL_AESTHETIC: ("aesthetic", float),
+}
+_SORT_METADATA_GETTERS = {
+    "species": _metadata_species_text,
+    "comment": _metadata_comment_from_meta,
+    "tags_display": _metadata_tags_display,
+    "shutter": _metadata_shutter_text,
+    "aperture": _metadata_aperture_text,
+    "iso": _metadata_iso_text,
+    "focal_length": _metadata_focal_length_text,
+    "camera_model": _metadata_camera_model_text,
+    "lens_model": _metadata_lens_model_text,
+    "capture_time": _metadata_capture_time_text,
+    "sharpness": _metadata_sharpness_text,
+    "aesthetic": _metadata_aesthetic_text,
+    "focus_status": _metadata_focus_status_text,
+    "bird_sharp": _metadata_bird_sharpness,
+    "rating": _metadata_rating_value,
+    "pick": _metadata_pick_value,
+    "burst_id": lambda meta: _metadata_burst_int(meta, "burst_id"),
+    "burst_position": lambda meta: _metadata_burst_int(meta, "burst_position"),
+    "video_info": lambda meta: meta.get("video_info"),
+}
+
+
+def _file_sort_value(name: str, column: int, field_value):
+    """列表和缩略图共用主排序键，只读取当前排序列涉及的字段。"""
+    if len(_FILE_TABLE_HEADERS) <= column < len(_FILE_TABLE_HEADERS) + len(_VIDEO_HEADERS):
+        info = field_value("video_info") or {}
+        offset = column - len(_FILE_TABLE_HEADERS)
+        if offset == 0:
+            return info.get("duration", -1)
+        if offset == 1:
+            return (info.get("width") or 0) * (info.get("height") or 0)
+        if offset == 2:
+            return info.get("fps", -1)
+        return info.get("video_codec", "").lower()
+    if column == _TREE_COL_NAME:
+        return name.lower()
+    if column == _TREE_COL_BURST:
+        burst_id = field_value("burst_id")
+        burst_position = field_value("burst_position")
+        missing = burst_position is None and burst_id is None
+        return (
+            1 if missing else 0,
+            burst_id if burst_id is not None else 10**12,
+            burst_position if burst_position is not None else 10**12,
+            name.lower(),
+        )
+    if column == _TREE_COL_STAR:
+        pick = field_value("pick")
+        if pick == 1:
+            return 10
+        if pick == -1:
+            return -1
+        return field_value("rating")
+    if column in _SORT_TEXT_FIELDS:
+        return field_value(_SORT_TEXT_FIELDS[column]).lower()
+    if column in _SORT_NUMERIC_FIELDS:
+        field_name, convert = _SORT_NUMERIC_FIELDS[column]
+        value = field_value(field_name)
+        try:
+            return (0, convert(value))
+        except Exception:
+            return (1, value.lower())
+    if column == _TREE_COL_BIRD_SHARP:
+        return _bird_sharp_sort_value(field_value("bird_sharp"))
+    return ""
+
+
+def _file_sort_tiebreaker(path: str) -> tuple[str, str, str]:
+    # 同名文件仍按规范化完整路径排序，避免两个视图依赖各自的旧行序。
+    normalized = os.path.normpath(path)
+    return (Path(path).name.lower(), os.path.normcase(normalized), normalized)
+
+
+def file_sort_key(path: str, meta: dict | None, column: int) -> tuple:
+    """从已有元数据生成与列表一致的排序键；不读取文件或解析其它列。"""
+    if not 0 <= column < len(_FILE_TABLE_HEADERS) + len(_VIDEO_HEADERS):
+        # 序号仅用于显示；无排序列时保留输入顺序。
+        return ()
+    meta = meta if isinstance(meta, dict) else {}
+    tie = _file_sort_tiebreaker(path)
+    value = _file_sort_value(tie[0], column, lambda field: _SORT_METADATA_GETTERS[field](meta))
+    return (value, *tie)
+
+
 def _clamp01_float(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
 
@@ -391,65 +493,7 @@ class FileTableModel(_BurstGroupMixin, QAbstractTableModel):
         return entry.mismatch
 
     def _sort_value(self, entry: FileTableEntry, column: int):
-        if column >= len(_FILE_TABLE_HEADERS):
-            info = entry.video_info or {}
-            values = (info.get('duration', -1), (info.get('width') or 0) * (info.get('height') or 0),
-                      info.get('fps', -1), info.get('video_codec', '').lower())
-            return values[column - len(_FILE_TABLE_HEADERS)]
-        if column == _TREE_COL_NAME:
-            return entry.name.lower()
-        if column == _TREE_COL_SPECIES:
-            return entry.species.lower()
-        if column == _TREE_COL_BURST:
-            missing = entry.burst_position is None and entry.burst_id is None
-            return (
-                1 if missing else 0,
-                entry.burst_id if entry.burst_id is not None else 10**12,
-                entry.burst_position if entry.burst_position is not None else 10**12,
-                entry.name.lower(),
-            )
-        if column == _TREE_COL_COMMENT:
-            return entry.comment.lower()
-        if column == _TREE_COL_STAR:
-            if entry.pick == 1:
-                return 10
-            if entry.pick == -1:
-                return -1
-            return entry.rating
-        if column == _TREE_COL_TAGS:
-            return entry.tags_display.lower()
-        if column == _TREE_COL_SHUTTER:
-            return entry.shutter.lower()
-        if column == _TREE_COL_APERTURE:
-            return entry.aperture.lower()
-        if column == _TREE_COL_ISO:
-            try:
-                return (0, int(float(entry.iso)))
-            except Exception:
-                return (1, entry.iso.lower())
-        if column == _TREE_COL_FOCAL:
-            return entry.focal_length.lower()
-        if column == _TREE_COL_CAMERA:
-            return entry.camera_model.lower()
-        if column == _TREE_COL_LENS:
-            return entry.lens_model.lower()
-        if column == _TREE_COL_CAPTURE_TIME:
-            return entry.capture_time.lower()
-        if column == _TREE_COL_SHARP:
-            try:
-                return (0, float(entry.sharpness))
-            except Exception:
-                return (1, entry.sharpness.lower())
-        if column == _TREE_COL_BIRD_SHARP:
-            return _bird_sharp_sort_value(entry.bird_sharp)
-        if column == _TREE_COL_AESTHETIC:
-            try:
-                return (0, float(entry.aesthetic))
-            except Exception:
-                return (1, entry.aesthetic.lower())
-        if column == _TREE_COL_FOCUS:
-            return entry.focus_status.lower()
-        return ""
+        return _file_sort_value(entry.name, column, lambda field: getattr(entry, field))
 
     def _display_value(self, entry: FileTableEntry, row: int, column: int) -> str:
         if column >= len(_FILE_TABLE_HEADERS):
@@ -730,9 +774,16 @@ class FileTableSortProxyModel(QSortFilterProxyModel):
         rv = source.data(right, _SortRole) if source is not None else None
         if lv is not None and rv is not None:
             try:
-                return lv < rv
+                if lv != rv:
+                    return lv < rv
             except TypeError:
-                return str(lv) < str(rv)
+                if str(lv) != str(rv):
+                    return str(lv) < str(rv)
+            if isinstance(source, FileTableModel):
+                return _file_sort_tiebreaker(source.path_for_index(left) or "") < _file_sort_tiebreaker(
+                    source.path_for_index(right) or ""
+                )
+            return False
         return super().lessThan(left, right)
 
 
@@ -1107,6 +1158,34 @@ class ThumbnailListModel(_BurstGroupMixin, QAbstractListModel):
 
     def all_paths(self) -> list[str]:
         return [entry.path for entry in self._entries]
+
+    def reorder_paths(self, paths: list[str]) -> bool:
+        """只移动已有条目，保留缩略图、元数据、选中项及当前项。"""
+        rows: list[int] = []
+        seen: set[int] = set()
+        for path in paths:
+            row = self.row_for_path(path)
+            if row is not None and row not in seen:
+                rows.append(row)
+                seen.add(row)
+        # 调用方通常传入完整排列；未覆盖的条目仍保留，防止异步追加时丢图。
+        rows.extend(row for row in range(len(self._entries)) if row not in seen)
+        if all(old_row == new_row for new_row, old_row in enumerate(rows)):
+            return False
+
+        self.layoutAboutToBeChanged.emit()
+        # 选择模型可在 aboutToBeChanged 中创建持久索引，必须在信号之后获取。
+        old_indexes = self.persistentIndexList()
+        new_row_by_old = {old_row: new_row for new_row, old_row in enumerate(rows)}
+        self._entries = [self._entries[row] for row in rows]
+        self._row_by_path = {os.path.normpath(entry.path): row for row, entry in enumerate(self._entries)}
+        self._mark_burst_groups_dirty()
+        self.changePersistentIndexList(
+            old_indexes,
+            [self.index(new_row_by_old[index.row()], index.column()) for index in old_indexes],
+        )
+        self.layoutChanged.emit()
+        return True
 
     def has_current_pixmap(self, path: str, thumb_size: int) -> bool:
         row = self.row_for_path(path)
