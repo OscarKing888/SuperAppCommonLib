@@ -27,30 +27,30 @@ __all__ = [
     "extract_focus_box",
 ]
 
-try:
-    from app_common.about_dialog import load_about_images, load_about_info, show_about_dialog
-    __all__.extend(["show_about_dialog", "load_about_info", "load_about_images"])
-except ModuleNotFoundError as exc:
-    if not str(getattr(exc, "name", "")).startswith("PyQt"):
-        raise
+# 顶层导出继续兼容旧调用；只读元数据、图像格式和 CLI 不应因导入包而加载 Qt。
+_LAZY_UI_EXPORTS = {
+    "show_about_dialog": "app_common.about_dialog",
+    "load_about_info": "app_common.about_dialog",
+    "load_about_images": "app_common.about_dialog",
+    "AppInfoBar": "app_common.app_info_bar",
+    "PreviewCanvas": "app_common.preview_canvas",
+    "PreviewWithStatusBar": "app_common.preview_canvas",
+    "TriangleToggleSplitter": "app_common.triangle_toggle_splitter",
+    "TriangleToggleSplitterHandle": "app_common.triangle_toggle_splitter",
+}
+__all__.extend(_LAZY_UI_EXPORTS)
 
-try:
-    from app_common.app_info_bar import AppInfoBar
-    __all__.append("AppInfoBar")
-except ModuleNotFoundError as exc:
-    if not str(getattr(exc, "name", "")).startswith("PyQt"):
-        raise
 
-try:
-    from app_common.preview_canvas import PreviewCanvas, PreviewWithStatusBar
-    __all__.extend(["PreviewCanvas", "PreviewWithStatusBar"])
-except ModuleNotFoundError as exc:
-    if not str(getattr(exc, "name", "")).startswith("PyQt"):
-        raise
+def __getattr__(name):
+    module_name = _LAZY_UI_EXPORTS.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from importlib import import_module
 
-try:
-    from app_common.triangle_toggle_splitter import TriangleToggleSplitter, TriangleToggleSplitterHandle
-    __all__.extend(["TriangleToggleSplitter", "TriangleToggleSplitterHandle"])
-except ModuleNotFoundError as exc:
-    if not str(getattr(exc, "name", "")).startswith("PyQt"):
-        raise
+    value = getattr(import_module(module_name), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(_LAZY_UI_EXPORTS))
