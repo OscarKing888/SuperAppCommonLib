@@ -274,3 +274,40 @@ def test_paint_burst_group_band_is_continuous_across_cells_without_seams() -> No
     sample = image.pixelColor(width + width // 2, mid_y)
     for got, want in zip((sample.red(), sample.green(), sample.blue()), (expected.red(), expected.green(), expected.blue())):
         assert abs(got - want) <= 4, (got, want)
+
+
+def test_panel_batch_metadata_sync_updates_burst_column_and_groups(monkeypatch) -> None:
+    """连拍计算写完 XMP 后一次批量同步：列显示、分组底框、report.db 旧分组被 0 覆盖。"""
+    from app_common import burst_info
+    from app_common.file_browser import _panel as panel_module
+    from app_common.file_browser._browser_core import _DisplayRole
+
+    monkeypatch.setattr(panel_module, "_shutdown_thumb_disk_writer", lambda **_kwargs: None)
+    panel = FileListPanel(create_filter_bar=False)
+    try:
+        paths = _paths("连拍1.jpg", "连拍2.jpg", "旧分组.jpg", folder="C:/鸟片")
+        panel._meta_cache = {paths[2]: {"report.burst_id": 5, "report.burst_position": 1}}
+        panel._file_table_model.rebuild(paths, meta_cache=panel._meta_cache,
+                                        tooltip_fn=_tooltip, mismatch_fn=_mismatch)
+        refreshes = []
+        original = panel._refresh_metadata_state_for_paths
+        monkeypatch.setattr(panel, "_refresh_metadata_state_for_paths",
+                            lambda items: refreshes.append(list(items)) or original(items))
+        updates = {
+            paths[0]: burst_info.browser_meta_updates({burst_info.BURST_ID_FIELD: "1", burst_info.BURST_POSITION_FIELD: "1"}),
+            paths[1]: burst_info.browser_meta_updates({burst_info.BURST_ID_FIELD: "1", burst_info.BURST_POSITION_FIELD: "2"}),
+            paths[2]: burst_info.browser_meta_updates({burst_info.BURST_ID_FIELD: "0", burst_info.BURST_POSITION_FIELD: "0"}),
+        }
+
+        assert panel.sync_metadata_edits_for_paths(updates) == 3
+
+        model = panel._file_table_model
+        assert len(refreshes) == 1
+        assert [model.data(model.index(r, _TREE_COL_BURST), _DisplayRole) for r in range(3)] == ["(1/1)", "(2/1)", ""]
+        assert model.burst_group_for_row(0) == (0, True, False)
+        assert model.burst_group_for_row(2) is None
+        assert panel.sync_metadata_edit_for_path(paths[0], meta_updates={"rating": 3}) is True
+        assert panel.sync_metadata_edits_for_paths({paths[0]: {}}) == 0
+    finally:
+        panel._metadata_loader = None
+        panel.close()

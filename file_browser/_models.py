@@ -91,9 +91,11 @@ def _metadata_burst_int(meta: dict | None, key: str) -> int | None:
     if not text:
         return None
     try:
-        return int(float(text))
+        value = int(float(text))
     except Exception:
         return None
+    # SuperPicky 约定 0 = 非连拍；连拍计算用它覆盖 report.db 中的旧分组。
+    return value if value > 0 else None
 
 
 def _metadata_burst_values(meta: dict | None) -> tuple[int | None, int | None]:

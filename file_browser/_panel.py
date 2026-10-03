@@ -1769,27 +1769,34 @@ class FileListPanel(QWidget):
         report_fields: dict | None = None,
         meta_updates: dict | None = None,
     ) -> bool:
-        norm_path = os.path.normpath(path) if path else ""
         # report.db is a read-only fallback source.  Ignore legacy
         # report_fields writes and only refresh in-memory XMP metadata state.
         _ = report_fields
-        meta_updates = {
-            str(k): v
-            for k, v in (meta_updates or {}).items()
-            if str(k) and v is not None
-        }
-        if not norm_path or not meta_updates:
-            return False
-        if not self._file_writes_allowed("同步元数据"):
-            return False
+        return self.sync_metadata_edits_for_paths({path: meta_updates or {}}) > 0
 
-        meta = self._meta_cache.get(norm_path)
-        if not isinstance(meta, dict):
-            meta = {}
-            self._meta_cache[norm_path] = meta
-        meta.update(meta_updates)
-        self._refresh_metadata_state_for_paths([norm_path])
-        return True
+    def sync_metadata_edits_for_paths(self, updates_by_path: dict) -> int:
+        """Merge ``{path: meta_updates}`` into the metadata cache and refresh rows once."""
+        changed: list[str] = []
+        for path, meta_updates in (updates_by_path or {}).items():
+            norm_path = os.path.normpath(path) if path else ""
+            meta_updates = {
+                str(k): v
+                for k, v in (meta_updates or {}).items()
+                if str(k) and v is not None
+            }
+            if not norm_path or not meta_updates:
+                continue
+            if not changed and not self._file_writes_allowed("同步元数据"):
+                return 0
+            meta = self._meta_cache.get(norm_path)
+            if not isinstance(meta, dict):
+                meta = {}
+                self._meta_cache[norm_path] = meta
+            meta.update(meta_updates)
+            changed.append(norm_path)
+        if changed:
+            self._refresh_metadata_state_for_paths(changed)
+        return len(changed)
 
     def set_pending_selection(
         self,
