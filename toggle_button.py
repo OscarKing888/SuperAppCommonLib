@@ -82,6 +82,8 @@ class _ToggleIconEngine(QIconEngine):
         painter.drawPixmap(rect, pixmap)
 
     def pixmap(self, size, mode, state):
+        if size.isEmpty():
+            return QPixmap()
         result = QPixmap(size)
         result.fill(getattr(Qt, "GlobalColor", Qt).transparent)
         painter = QPainter(result)
@@ -104,6 +106,13 @@ class ToggleToolButton(QToolButton):
         self.setAutoRaise(False)
         self.setFocusPolicy(getattr(Qt, "FocusPolicy", Qt).StrongFocus)
         self.setStyleSheet(TOGGLE_BUTTON_STYLE)
+        QApplication.instance().paletteChanged.connect(self._on_application_palette_changed)
+
+    def _on_application_palette_changed(self, palette) -> None:
+        # Qt 局部 QSS 会缓存 palette()；重解析背景与动态图标使用同一主题。
+        self.setPalette(palette)
+        self.setStyleSheet(self.styleSheet())
+        self.update()
 
     def setIcon(self, icon: QIcon) -> None:
         super().setIcon(QIcon(_ToggleIconEngine(icon)) if not icon.isNull() else icon)

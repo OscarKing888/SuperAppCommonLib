@@ -75,3 +75,27 @@ def test_exclusive_tools_keep_native_selection_semantics():
     assert second.isChecked() and not first.isChecked()
     second.click()
     assert second.isChecked()
+
+
+def test_live_theme_change_keeps_icon_and_background_in_same_palette():
+    from app_common.preview_toolbar import iconize
+    original = _APP.palette()
+    button = iconize(ToggleToolButton(), 'grid', '构图线')
+    button.setChecked(False)
+    button.resize(48, 36)
+    button.show()
+    try:
+        for background, text in (('#eeeeee', '#222222'), ('#303030', '#eeeeee'), ('#eeeeee', '#222222')):
+            palette = QPalette(original)
+            palette.setColor(QPalette.ColorRole.Button, QColor(background))
+            palette.setColor(QPalette.ColorRole.ButtonText, QColor(text))
+            _APP.setPalette(palette)
+            _APP.processEvents()
+            button.setAttribute(Qt.WidgetAttribute.WA_UnderMouse, False)
+            assert button.grab().toImage().pixelColor(8, 8).name() == background
+            icon = button.icon().pixmap(QSize(36, 36), QIcon.Mode.Normal, QIcon.State.Off).toImage()
+            assert any(icon.pixelColor(x, y).name() == text and icon.pixelColor(x, y).alpha() == 255
+                       for x in range(36) for y in range(36))
+    finally:
+        button.close()
+        _APP.setPalette(original)
