@@ -25,12 +25,39 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
 from .xmp_sidecar import _photo_descriptions
+
+
+# 固定数量的可重入锁避免自动后台缓存与用户编辑同时读改写同一侧车，
+# 也避免按浏览过的照片累积永久锁。锁覆盖整个事务，而不只是 os.replace。
+_XMP_WRITE_LOCKS = tuple(threading.RLock() for _ in range(64))
+
+
+def xmp_sidecar_write_lock(path: str):
+    """In-process write lock shared by same-stem RAW/JPEG/XMP paths.
+
+    The bounded striped registry may serialize unrelated sidecars occasionally;
+    unrelated stripes never wait for a global metadata or ExifTool write lock.
+    """
+    # 先取侧车 stem 再解析目录别名；源 JPEG 自身是符号链接时，侧车仍在
+    # 用户浏览的目录，不能跟着照片链接跳到另一目录而错开同名 RAW 的锁。
+    stem = os.path.realpath(os.path.splitext(os.path.abspath(os.fspath(path)))[0])
+    return _XMP_WRITE_LOCKS[hash(os.path.normcase(stem).casefold()) % len(_XMP_WRITE_LOCKS)]
+
+
+def _serialized_xmp_write(method):
+    @wraps(method)
+    def locked(self, path, *args, **kwargs):
+        with xmp_sidecar_write_lock(path):
+            return method(self, path, *args, **kwargs)
+    return locked
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +485,7 @@ class PhotoMetaDataXMP(PhotoMetaData):
         except Exception:
             return {}
 
+    @_serialized_xmp_write
     def write(self, path: str, fields: dict[str, Any]) -> bool:
         """Write fields into the XMP sidecar (creates/updates ``<stem>.xmp``)."""
         if not fields:
@@ -684,6 +712,7 @@ class PhotoMetaDataXMP(PhotoMetaData):
                 values.extend(self._subject_values_from_element(child))
         return _normalise_text_values(values)
 
+    @_serialized_xmp_write
     def write_subjects(
         self,
         path: str,
@@ -718,6 +747,7 @@ class PhotoMetaDataXMP(PhotoMetaData):
         except Exception:
             return False
 
+    @_serialized_xmp_write
     def add_subjects(self, path: str, subjects: Iterable[Any]) -> bool:
         incoming = _normalise_text_values(subjects)
         if not incoming:
@@ -732,6 +762,7 @@ class PhotoMetaDataXMP(PhotoMetaData):
             merged.append(value)
         return self.write_subjects(path, merged)
 
+    @_serialized_xmp_write
     def remove_subjects(self, path: str, subjects: Iterable[Any]) -> bool:
         remove = set(_normalise_text_values(subjects))
         if not remove:
@@ -739,6 +770,7 @@ class PhotoMetaDataXMP(PhotoMetaData):
         kept = [value for value in self.read_subjects(path) if value not in remove]
         return self.write_subjects(path, kept)
 
+    @_serialized_xmp_write
     def write_description(
         self,
         path: str,
@@ -770,6 +802,7 @@ class PhotoMetaDataXMP(PhotoMetaData):
         except Exception:
             return False
 
+    @_serialized_xmp_write
     def write_title(
         self,
         path: str,
@@ -802,6 +835,7 @@ class PhotoMetaDataXMP(PhotoMetaData):
         except Exception:
             return False
 
+    @_serialized_xmp_write
     def write_rating_pick(
         self,
         path: str,
@@ -841,6 +875,7 @@ class PhotoMetaDataXMP(PhotoMetaData):
         except Exception:
             return False
 
+    @_serialized_xmp_write
     def write_superpicky_fields(
         self,
         path: str,
