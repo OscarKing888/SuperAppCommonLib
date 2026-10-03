@@ -3,15 +3,16 @@ from __future__ import annotations
 
 try:
     from PyQt6.QtCore import QLineF, QRectF, QSize, Qt, pyqtSignal
-    from PyQt6.QtGui import QActionGroup, QIcon, QIconEngine, QPainter, QPen, QPixmap
-    from PyQt6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QMenu, QSlider, QToolButton, QWidget, QWidgetAction
+    from PyQt6.QtGui import QActionGroup, QIcon, QIconEngine, QIntValidator, QPainter, QPen, QPixmap
+    from PyQt6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QLineEdit, QMenu, QSlider, QToolButton, QWidget, QWidgetAction
 except ImportError:  # pragma: no cover
     from PyQt5.QtCore import QLineF, QRectF, QSize, Qt, pyqtSignal
-    from PyQt5.QtGui import QIcon, QIconEngine, QPainter, QPen, QPixmap
-    from PyQt5.QtWidgets import QActionGroup, QComboBox, QHBoxLayout, QLabel, QMenu, QSlider, QToolButton, QWidget, QWidgetAction
+    from PyQt5.QtGui import QIcon, QIconEngine, QIntValidator, QPainter, QPen, QPixmap
+    from PyQt5.QtWidgets import QActionGroup, QComboBox, QHBoxLayout, QLabel, QLineEdit, QMenu, QSlider, QToolButton, QWidget, QWidgetAction
 
 from .toggle_button import ToggleToolButton
-from .preview_canvas import PREVIEW_COMPOSITION_GRID_MODES, PREVIEW_COMPOSITION_GRID_LINE_WIDTHS
+from .preview_canvas import (PREVIEW_COMPOSITION_GRID_MODES,
+                             PREVIEW_COMPOSITION_GRID_MAX_LINE_WIDTH)
 
 GRID_ITEMS = (('none', '不显示'), ('thirds', '均分九宫格'), ('golden_thirds', '黄金分割九宫格'),
               ('square', '方格网格'), ('diag_square', '对角线 + 方格'), ('crosshair', '中心十字线'))
@@ -119,26 +120,75 @@ def menu_button(kind, label, parent=None):
     return button
 
 
-def combo_radio_menu(menu, combo):
-    """菜单每次打开读取原控件，恢复工作区时不额外发业务信号。"""
-    def populate():
-        menu.clear()
-        group = QActionGroup(menu)
-        group.setExclusive(True)
-        old = getattr(menu, '_radio_group', None)
-        if old is not None:
-            old.deleteLater()
-        menu._radio_group = group
-        for index in range(combo.count()):
-            action = menu.addAction(combo.itemText(index))
+class CompositionGridMenu(QMenu):
+    """一级构图单选列表与持久的线宽编辑行；复用原控件的恢复/信号契约。"""
+
+    def __init__(self, button, grid, width):
+        super().__init__(button)
+        self.grid, self.width = grid, width
+        self.group = QActionGroup(self)
+        self.group.setExclusive(True)
+        self.mode_actions = []
+        for index in range(grid.count()):
+            action = self.addAction(grid.itemText(index).removeprefix('构图线：'))
             action.setCheckable(True)
-            action.setChecked(index == combo.currentIndex())
-            action.setData(combo.itemData(index))
-            action.setEnabled(combo.isEnabled())
-            group.addAction(action)
-            action.triggered.connect(lambda _checked=False, index=index: combo.setCurrentIndex(index))
-    menu.aboutToShow.connect(populate)
-    populate()
+            action.setData(grid.itemData(index))
+            self.group.addAction(action)
+            self.mode_actions.append(action)
+            action.triggered.connect(lambda _checked=False, index=index: grid.setCurrentIndex(index))
+        self.addSeparator()
+        container = QWidget(self)
+        row = QHBoxLayout(container)
+        row.addWidget(QLabel('线宽', container))
+        self.width_slider = QSlider(Qt.Orientation.Horizontal, container)
+        self.width_slider.setRange(1, PREVIEW_COMPOSITION_GRID_MAX_LINE_WIDTH)
+        self.width_slider.setMinimumWidth(120)
+        self.width_slider.setAccessibleName('构图线宽度')
+        self.width_slider.setToolTip('构图线宽度：1–32 px')
+        row.addWidget(self.width_slider, 1)
+        self.width_edit = QLineEdit(container)
+        self.width_edit.setFixedWidth(52)
+        self.width_edit.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.width_edit.setValidator(QIntValidator(1, PREVIEW_COMPOSITION_GRID_MAX_LINE_WIDTH, self.width_edit))
+        self.width_edit.setAccessibleName('自定义构图线宽度')
+        self.width_edit.setToolTip('输入 1–32 的整数，按 Enter 或移开焦点生效')
+        row.addWidget(self.width_edit)
+        row.addWidget(QLabel('px', container))
+        action = QWidgetAction(self)
+        action.setDefaultWidget(container)
+        self.addAction(action)
+        self.width_slider.valueChanged.connect(self._set_width)
+        self.width_edit.editingFinished.connect(self._commit_width)
+        self.aboutToHide.connect(self._commit_width)
+        self.aboutToShow.connect(self.sync)
+        grid.currentIndexChanged.connect(self.sync)
+        width.currentIndexChanged.connect(self.sync)
+        self.sync()
+
+    def _set_width(self, value):
+        index = self.width.findData(value)
+        if index >= 0:
+            self.width.setCurrentIndex(index)
+
+    def _commit_width(self):
+        if self.width_edit.hasAcceptableInput():
+            self._set_width(int(self.width_edit.text()))
+        # 空值/越界值不替换已有设置，关闭菜单也不会保留无效文本。
+        self.sync()
+
+    def sync(self, *_args):
+        for index, action in enumerate(self.mode_actions):
+            action.setChecked(index == self.grid.currentIndex())
+            action.setEnabled(self.grid.isEnabled())
+        value = self.width.currentData() or 1
+        previous = self.width_slider.blockSignals(True)
+        try:
+            self.width_slider.setValue(value)
+        finally:
+            self.width_slider.blockSignals(previous)
+        self.width_edit.setText(str(value))
+        self.width_slider.setEnabled(self.width.isEnabled())
+        self.width_edit.setEnabled(self.width.isEnabled())
 
 
 def zoom_menu(combo):
@@ -176,9 +226,12 @@ class ViewportOverlayTools(QWidget):
                 if value in PREVIEW_COMPOSITION_GRID_MODES:
                     self.grid.addItem(label, value)
         self.width = width if width is not None else QComboBox(self)
-        if width is None:
-            for value in PREVIEW_COMPOSITION_GRID_LINE_WIDTHS:
+        # 隐藏的兼容控件保存所有合法整数，工作区可直接恢复自定义线宽。
+        previous = self.width.blockSignals(True)
+        for value in range(1, PREVIEW_COMPOSITION_GRID_MAX_LINE_WIDTH + 1):
+            if self.width.findData(value) < 0:
                 self.width.addItem(f'{value} px', value)
+        self.width.blockSignals(previous)
         for combo in (self.grid, self.width):
             combo.setParent(self)
             combo.hide()
@@ -217,13 +270,16 @@ class ViewportOverlayTools(QWidget):
             button.toggled.connect(self.changed)
         self.grid_button = menu_button('grid', '构图线与线宽')
         self.grid_button.setCheckable(True)
-        combo_radio_menu(self.grid_button.menu().addMenu('构图线'), self.grid)
-        combo_radio_menu(self.grid_button.menu().addMenu('线宽'), self.width)
+        old_menu = self.grid_button.menu()
+        self.grid_menu = CompositionGridMenu(self.grid_button, self.grid, self.width)
+        self.grid_button.setMenu(self.grid_menu)
+        old_menu.deleteLater()
         row.addWidget(self.grid_button)
         self.changed.connect(self.sync)
         self.sync()
 
     def sync(self):
+        self.grid_menu.sync()
         self.grid_button.setChecked(self.grid.currentData() != "none")
         label = self.grid.currentText().removeprefix('构图线：')
         self.grid_button.setToolTip(f'构图线：{label}；线宽：{self.width.currentText()}')

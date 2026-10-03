@@ -66,7 +66,8 @@ PREVIEW_COMPOSITION_GRID_MODES: tuple[str, ...] = (
     "diag_square",
     "crosshair",
 )
-PREVIEW_COMPOSITION_GRID_LINE_WIDTHS: tuple[int, ...] = (1, 2, 3, 4)
+PREVIEW_COMPOSITION_GRID_LINE_WIDTHS: tuple[int, ...] = (1, 2, 3, 4)  # 兼容旧下拉控件的常用档位
+PREVIEW_COMPOSITION_GRID_MAX_LINE_WIDTH = 32
 PREVIEW_SCALE_PRESET_PERCENTS: tuple[int, ...] = (
     10,
     20,
@@ -112,12 +113,12 @@ def normalize_preview_composition_grid_line_width(value: object) -> int:
     except Exception:
         return PREVIEW_COMPOSITION_GRID_LINE_WIDTHS[0]
     min_width = PREVIEW_COMPOSITION_GRID_LINE_WIDTHS[0]
-    max_width = PREVIEW_COMPOSITION_GRID_LINE_WIDTHS[-1]
+    max_width = PREVIEW_COMPOSITION_GRID_MAX_LINE_WIDTH
     if width < min_width:
         return min_width
     if width > max_width:
         return max_width
-    return width if width in PREVIEW_COMPOSITION_GRID_LINE_WIDTHS else min_width
+    return width
 
 
 def format_preview_scale_percent(scale_percent: object) -> str:

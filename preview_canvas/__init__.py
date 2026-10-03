@@ -38,6 +38,7 @@ Example::
 from app_common.preview_canvas.focus_centered import FocusCenteredPreviewCanvas
 from app_common.preview_canvas.canvas import (
     PREVIEW_COMPOSITION_GRID_LINE_WIDTHS,
+    PREVIEW_COMPOSITION_GRID_MAX_LINE_WIDTH,
     PREVIEW_COMPOSITION_GRID_MODES,
     PREVIEW_SCALE_PRESET_PERCENTS,
     PreviewCanvas,
@@ -54,6 +55,7 @@ from app_common.preview_canvas.canvas import (
 
 __all__ = [
     "PREVIEW_COMPOSITION_GRID_LINE_WIDTHS",
+    "PREVIEW_COMPOSITION_GRID_MAX_LINE_WIDTH",
     "PREVIEW_COMPOSITION_GRID_MODES",
     "PREVIEW_SCALE_PRESET_PERCENTS",
     "PreviewCanvas",
