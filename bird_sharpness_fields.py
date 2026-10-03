@@ -20,6 +20,10 @@ FIELD_BODY_SIGMA = "bird_sharpness_body_sigma"
 FIELD_MOTION_RATIO = "bird_sharpness_motion_ratio"
 FIELD_EYE_VISIBILITY = "bird_sharpness_eye_visibility"
 FIELD_VERSION = "bird_sharpness_version"
+# v2: blur radius behind the score, which pixels it came from, and how many birds were measured.
+FIELD_SIGMA = "bird_sharpness_sigma"
+FIELD_REGION = "bird_sharpness_region"
+FIELD_BIRD_COUNT = "bird_sharpness_bird_count"
 
 ALL_FIELDS = (
     FIELD_VERDICT,
@@ -29,7 +33,16 @@ ALL_FIELDS = (
     FIELD_MOTION_RATIO,
     FIELD_EYE_VISIBILITY,
     FIELD_VERSION,
+    FIELD_SIGMA,
+    FIELD_REGION,
+    FIELD_BIRD_COUNT,
 )
+
+# Which pixels the stored sharpness was measured on.
+REGION_BIRD = "bird"     # inside detected bird bodies (best bird wins)
+REGION_FOCUS = "focus"   # no bird: camera focus box, at least 128x128 px
+REGION_FULL = "full"     # no bird and no focus point: whole image
+REGION_LABELS = {REGION_BIRD: "鸟体", REGION_FOCUS: "焦点", REGION_FULL: "全图"}
 
 # Existing SuperPicky sharpness slot (0..1000, written as "%06.2f").
 SHARPNESS_XMP_KEY = "XMP-photoshop:City"
@@ -88,6 +101,9 @@ class BirdSharpnessDisplay:
     verdict: str
     head_sigma: float | None
     body_sigma: float | None
+    final_sigma: float | None = None
+    region: str = ""
+    bird_count: int | None = None
 
     @property
     def style(self) -> VerdictStyle | None:
@@ -99,15 +115,26 @@ class BirdSharpnessDisplay:
         return style.label if style else self.verdict
 
     @property
+    def region_label(self) -> str:
+        return REGION_LABELS.get(self.region, "")
+
+    @property
     def sigma(self) -> float | None:
+        if self.final_sigma is not None:
+            return self.final_sigma
         return self.head_sigma if self.head_sigma is not None else self.body_sigma
 
     def text(self) -> str:
-        """Compact list/thumbnail text such as ``清晰 0.62``."""
+        """Compact list/thumbnail text such as ``清晰 0.62`` or ``无鸟·焦点 1.27``."""
         sigma = self.sigma
-        if sigma is None or self.verdict in (VERDICT_NO_BIRD, VERDICT_ERROR):
+        if self.verdict == VERDICT_ERROR:
             return self.label
-        return f"{self.label} {sigma:.2f}"
+        label = self.label
+        if self.verdict == VERDICT_NO_BIRD and self.region_label:
+            label = f"{label}·{self.region_label}"
+        if sigma is None:
+            return label
+        return f"{label} {sigma:.2f}"
 
     def sort_key(self) -> tuple:
         style = self.style
@@ -124,17 +151,21 @@ def bird_sharpness_from_meta(meta: Mapping[str, Any] | None) -> BirdSharpnessDis
     verdict_text = str(verdict).strip().lower()
     if not verdict_text:
         return None
+    count = _optional_float(_meta_value(meta, FIELD_BIRD_COUNT))
     return BirdSharpnessDisplay(
         verdict_text,
         _optional_float(_meta_value(meta, FIELD_HEAD_SIGMA)),
         _optional_float(_meta_value(meta, FIELD_BODY_SIGMA)),
+        _optional_float(_meta_value(meta, FIELD_SIGMA)),
+        str(_meta_value(meta, FIELD_REGION) or "").strip().lower(),
+        None if count is None else int(count),
     )
 
 
 def browser_meta_fields(meta: Mapping[str, Any] | None) -> dict[str, Any]:
     """Raw-key subset kept in the file browser's per-path metadata cache."""
     result: dict[str, Any] = {}
-    for field in (FIELD_VERDICT, FIELD_HEAD_SIGMA, FIELD_BODY_SIGMA):
+    for field in (FIELD_VERDICT, FIELD_HEAD_SIGMA, FIELD_BODY_SIGMA, FIELD_SIGMA, FIELD_REGION, FIELD_BIRD_COUNT):
         value = _meta_value(meta, field)
         if value is not None:
             result[field] = value

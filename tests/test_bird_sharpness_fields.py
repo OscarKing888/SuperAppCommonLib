@@ -229,3 +229,24 @@ def test_directory_menu_extender_receives_context_path(monkeypatch, tmp_path) ->
         widget.close()
         widget.deleteLater()
         _APP.processEvents()
+
+
+def test_v2_display_uses_final_sigma_region_and_bird_count() -> None:
+    meta = {
+        "bird_sharpness_verdict": "sharp", "bird_sharpness_head_sigma": "0.70",
+        "XMP-superpicky:bird_sharpness_sigma": "0.66", "bird_sharpness_region": "bird",
+        "bird_sharpness_bird_count": "2",
+    }
+    display = bsf.bird_sharpness_from_meta(meta)
+    assert display.sigma == pytest.approx(0.66)  # final sigma wins over head/body
+    assert display.text() == "清晰 0.66"
+    assert display.bird_count == 2 and display.region_label == "鸟体"
+    focus = bsf.bird_sharpness_from_meta({"bird_sharpness_verdict": "no_bird", "bird_sharpness_sigma": "0.91",
+                                          "bird_sharpness_region": "focus"})
+    assert focus.text() == "无鸟·焦点 0.91"
+    full = bsf.bird_sharpness_from_meta({"bird_sharpness_verdict": "no_bird", "bird_sharpness_region": "full"})
+    assert full.text() == "无鸟·全图"
+    assert set(bsf.browser_meta_fields(meta)) == {
+        "bird_sharpness_verdict", "bird_sharpness_head_sigma", "bird_sharpness_sigma",
+        "bird_sharpness_region", "bird_sharpness_bird_count",
+    }
