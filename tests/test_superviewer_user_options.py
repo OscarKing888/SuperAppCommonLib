@@ -206,6 +206,24 @@ def test_bird_sharpness_max_birds_defaults_to_no_limit_and_is_clamped() -> None:
         superviewer_user_options.apply_runtime_user_options(None)
 
 
+def test_bird_sharpness_tile_options_default_clamp_and_reach_the_getter() -> None:
+    o = superviewer_user_options
+    defaults = normalize_user_options({})
+    assert defaults[o.KEY_BIRD_SHARPNESS_FULL_TILE] == 1024 and defaults[o.KEY_BIRD_SHARPNESS_MF_CENTER] == 1
+    assert defaults[o.KEY_BIRD_SHARPNESS_MF_CENTER_PERCENT] == 50 and defaults[o.KEY_BIRD_SHARPNESS_MF_TILE] == 256
+    assert defaults[o.KEY_BIRD_SHARPNESS_MF_SHARPEST_PERCENT] == 10
+    clamped = normalize_user_options({o.KEY_BIRD_SHARPNESS_FULL_TILE: 5, o.KEY_BIRD_SHARPNESS_MF_TILE: 10 ** 6,
+                                      o.KEY_BIRD_SHARPNESS_MF_CENTER: "x", o.KEY_BIRD_SHARPNESS_MF_SHARPEST_PERCENT: 0})
+    assert clamped[o.KEY_BIRD_SHARPNESS_FULL_TILE] == 128 and clamped[o.KEY_BIRD_SHARPNESS_MF_TILE] == 2048
+    assert clamped[o.KEY_BIRD_SHARPNESS_MF_CENTER] == 1 and clamped[o.KEY_BIRD_SHARPNESS_MF_SHARPEST_PERCENT] == 1
+    o.apply_runtime_user_options({o.KEY_BIRD_SHARPNESS_MF_CENTER: 0, o.KEY_BIRD_SHARPNESS_MF_TILE: 128})
+    try:
+        assert o.get_bird_sharpness_tile_options() == {"full_tile": 1024, "mf_center": False, "mf_center_percent": 50,
+                                                       "mf_tile": 128, "mf_sharpest_percent": 10}
+    finally:
+        o.apply_runtime_user_options(None)
+
+
 def test_bird_sharpness_edge_estimator_defaults_to_standard() -> None:
     key = superviewer_user_options.KEY_BIRD_SHARPNESS_EDGE_ESTIMATOR
     assert normalize_user_options({})[key] == "standard"

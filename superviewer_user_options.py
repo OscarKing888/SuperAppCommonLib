@@ -17,6 +17,21 @@ BIRD_SHARPNESS_MAX_BIRDS_LIMIT = 999
 # How bird sharpness reads blur from the strongest edges: "standard" (default) or "dense".
 KEY_BIRD_SHARPNESS_EDGE_ESTIMATOR = "bird_sharpness_edge_estimator"
 BIRD_SHARPNESS_EDGE_ESTIMATORS = ("standard", "dense")
+# No-bird tiling. Whole image (no focus point): tile side in px. Manual focus: tiles of the
+# frame centre (side % of the frame), the sharpest % of the measurable tiles decide.
+KEY_BIRD_SHARPNESS_FULL_TILE = "bird_sharpness_full_tile"
+KEY_BIRD_SHARPNESS_MF_CENTER = "bird_sharpness_mf_center"
+KEY_BIRD_SHARPNESS_MF_CENTER_PERCENT = "bird_sharpness_mf_center_percent"
+KEY_BIRD_SHARPNESS_MF_TILE = "bird_sharpness_mf_tile"
+KEY_BIRD_SHARPNESS_MF_SHARPEST_PERCENT = "bird_sharpness_mf_sharpest_percent"
+# key -> (default, min, max); keep in step with bird_sharpness.metrics.TileOptions
+BIRD_SHARPNESS_TILE_LIMITS = {
+    KEY_BIRD_SHARPNESS_FULL_TILE: (1024, 128, 4096),
+    KEY_BIRD_SHARPNESS_MF_CENTER: (1, 0, 1),
+    KEY_BIRD_SHARPNESS_MF_CENTER_PERCENT: (50, 10, 100),
+    KEY_BIRD_SHARPNESS_MF_TILE: (256, 32, 2048),
+    KEY_BIRD_SHARPNESS_MF_SHARPEST_PERCENT: (10, 1, 100),
+}
 DENOISE_DEFAULT_OPTIONS = {
     "denoise_output_mode": "source_subdir",
     "denoise_subdir": "denoised",
@@ -41,6 +56,7 @@ _DEFAULT_OPTIONS = {
     KEY_PERF_PROBES_ENABLED: 0,
     KEY_BIRD_SHARPNESS_MAX_BIRDS: 0,
     KEY_BIRD_SHARPNESS_EDGE_ESTIMATOR: "standard",
+    **{key: limits[0] for key, limits in BIRD_SHARPNESS_TILE_LIMITS.items()},
     **DENOISE_DEFAULT_OPTIONS,
 }
 _RUNTIME_OPTIONS = dict(_DEFAULT_OPTIONS)
@@ -130,6 +146,12 @@ def normalize_user_options(data: dict | None) -> dict[str, int | str]:
     value = source.get(KEY_BIRD_SHARPNESS_EDGE_ESTIMATOR)
     if isinstance(value, str) and value in BIRD_SHARPNESS_EDGE_ESTIMATORS:
         normalized[KEY_BIRD_SHARPNESS_EDGE_ESTIMATOR] = value
+    for key, (default, low, high) in BIRD_SHARPNESS_TILE_LIMITS.items():
+        try:
+            value = int(source.get(key, default))
+        except (TypeError, ValueError, OverflowError):
+            value = default
+        normalized[key] = max(low, min(high, value))
 
     for key, allowed in (
         ("denoise_output_mode", {"source_subdir", "fixed", "ask"}),
@@ -255,3 +277,14 @@ def get_bird_sharpness_max_birds() -> int:
 def get_bird_sharpness_edge_estimator() -> str:
     with _OPTIONS_LOCK:
         return str(_RUNTIME_OPTIONS[KEY_BIRD_SHARPNESS_EDGE_ESTIMATOR])
+
+
+def get_bird_sharpness_tile_options() -> dict:
+    """No-bird tiling as ``bird_sharpness.metrics.TileOptions`` keyword arguments."""
+    with _OPTIONS_LOCK:
+        o = _RUNTIME_OPTIONS
+        return {"full_tile": int(o[KEY_BIRD_SHARPNESS_FULL_TILE]),
+                "mf_center": bool(o[KEY_BIRD_SHARPNESS_MF_CENTER]),
+                "mf_center_percent": int(o[KEY_BIRD_SHARPNESS_MF_CENTER_PERCENT]),
+                "mf_tile": int(o[KEY_BIRD_SHARPNESS_MF_TILE]),
+                "mf_sharpest_percent": int(o[KEY_BIRD_SHARPNESS_MF_SHARPEST_PERCENT])}
