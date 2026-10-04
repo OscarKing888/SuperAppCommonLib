@@ -147,6 +147,8 @@ class FileListPanel(QWidget):
         self._thumb_model_populate_timer: QTimer | None = None
         self._thumb_model_pending_paths: list[str] = []
         self._thumb_model_pending_index: int = 0
+        # 规范化路径 → 目标排序序号；填充批次按它插入，保证增量插入后仍保持排序。
+        self._thumb_model_target_rank: dict[str, int] = {}
         self._thumb_model_populate_started_at: float = 0.0
         self._thumb_request_token: int = 0
         self._thumb_pending_batch: dict[str, "QImage"] = {}
@@ -3809,6 +3811,9 @@ class FileListPanel(QWidget):
         if self._view_mode != self._MODE_THUMB or getattr(self, "_list_widget", None) is None:
             return
         paths = self._thumb_list_model.all_paths()
+        if self._thumb_model_pending_paths:
+            # 填充未完成时排序变化，后续批次要按新顺序插入。
+            self._set_thumb_model_target(self._sorted_thumbnail_paths(self._filtered_files))
         if not self._thumb_list_model.reorder_paths(self._sorted_thumbnail_paths(paths)):
             return
         self._thumb_selection_anchor_row = -1
@@ -4000,7 +4005,13 @@ class FileListPanel(QWidget):
         self._pause_thumb_model_population()
         self._thumb_model_pending_paths = []
         self._thumb_model_pending_index = 0
+        self._thumb_model_target_rank = {}
         self._thumb_model_populate_started_at = 0.0
+
+    def _set_thumb_model_target(self, ordered_paths: list[str]) -> None:
+        self._thumb_model_target_rank = {
+            os.path.normpath(path): index for index, path in enumerate(ordered_paths) if path
+        }
 
     def _mark_thumb_model_dirty(self) -> None:
         self._pause_thumb_model_population()
@@ -4016,6 +4027,7 @@ class FileListPanel(QWidget):
             return
         if not resume:
             self._thumb_model_pending_paths = self._sorted_thumbnail_paths(self._filtered_files)
+            self._set_thumb_model_target(self._thumb_model_pending_paths)
             self._thumb_model_pending_index = 0
             self._thumb_model_populate_started_at = _time.perf_counter()
             self._probe_thumb_last_log_at = 0.0
@@ -4024,6 +4036,7 @@ class FileListPanel(QWidget):
             self._invalidate_visible_thumbnail_signature()
         elif not self._thumb_model_pending_paths:
             self._thumb_model_pending_paths = self._sorted_thumbnail_paths(self._filtered_files)
+            self._set_thumb_model_target(self._thumb_model_pending_paths)
         if not self._thumb_model_pending_paths:
             self._thumb_model_dirty = False
             return
@@ -4031,6 +4044,57 @@ class FileListPanel(QWidget):
             self._thumb_model_populate_started_at = _time.perf_counter()
         self._thumb_model_dirty = True
         self._probe_set_phase("thumb_model_populate", total=len(self._thumb_model_pending_paths), resume=bool(resume))
+        self._ensure_thumb_model_populate_timer()
+        self._populate_thumb_model_batch()
+
+    def _relayout_thumb_view_now(self) -> None:
+        """行增删后立即完成缩略图布局，不留出 QListView 清空布局后的空白帧。"""
+        if self._view_mode != self._MODE_THUMB:
+            return
+        if self._thumb_list_model.rowCount() > _THUMB_SYNC_LAYOUT_MAX_ROWS:
+            return
+        view = self._list_widget
+        layout_mode = view.layoutMode()
+        view.setLayoutMode(_ListLayoutSinglePass)
+        try:
+            view.executeDelayedItemsLayout()
+        finally:
+            view.setLayoutMode(layout_mode)
+
+    def _sync_thumb_model_to_filtered(self) -> None:
+        """过滤结果变化时原地增删缩略图行，不清空模型。
+
+        QListView 在插入/重置行时会立即丢弃整份布局，再异步分批重排；整表
+        clear 后重新分批填充期间视口是空白的。元数据流式到达时过滤每 120ms
+        刷新一次，反复清空就表现为缩略图列表闪烁。这里只删除不再命中的行、
+        按排序位置补入新命中的行，已有行和缩略图保持不动，未完成的填充接着做。
+        """
+        self._pause_thumb_model_population()
+        model = self._thumb_list_model
+        target = self._sorted_thumbnail_paths(self._filtered_files)
+        self._set_thumb_model_target(target)
+        removed = model.remove_paths_not_in(target)
+        reordered = model.reorder_paths(target)
+        present = {os.path.normpath(path) for path in model.all_paths()}
+        self._thumb_model_pending_paths = [path for path in target if os.path.normpath(path) not in present]
+        self._thumb_model_pending_index = 0
+        if removed or reordered:
+            self._relayout_thumb_view_now()
+            self._thumb_selection_anchor_row = -1
+            self._invalidate_visible_thumbnail_signature()
+        if not self._thumb_model_pending_paths:
+            self._thumb_model_dirty = False
+            self._thumb_model_populate_started_at = 0.0
+            return
+        if self._thumb_model_populate_started_at <= 0:
+            self._thumb_model_populate_started_at = _time.perf_counter()
+        self._thumb_model_dirty = True
+        self._probe_set_phase(
+            "thumb_model_populate",
+            total=len(self._thumb_model_pending_paths),
+            resume=True,
+            removed=removed,
+        )
         self._ensure_thumb_model_populate_timer()
         self._populate_thumb_model_batch()
 
@@ -4056,8 +4120,9 @@ class FileListPanel(QWidget):
                 break
             if processed >= min_batch and (_time.perf_counter() - tick_t0) >= _THUMB_MODEL_APPEND_BUDGET_S:
                 break
-        appended = self._thumb_list_model.append_paths(
+        appended = self._thumb_list_model.insert_paths_in_order(
             self._thumb_model_pending_paths[start:end],
+            rank=self._thumb_model_target_rank,
             meta_cache=self._meta_cache,
             tooltip_fn=self._build_list_path_tooltip,
             mismatch_fn=self._has_path_mismatch,
@@ -4091,6 +4156,7 @@ class FileListPanel(QWidget):
                 total,
             )
         if appended:
+            self._relayout_thumb_view_now()
             self._invalidate_visible_thumbnail_signature()
             if self._pending_selection_paths:
                 self._apply_pending_selection()
@@ -4124,8 +4190,12 @@ class FileListPanel(QWidget):
         self._thumb_model_populate_started_at = 0.0
         self._probe_set_phase("idle", reason="thumb_model_population_done", total=total)
 
-    def _rebuild_views(self, stop_loaders: bool = True) -> None:
-        """根据当前过滤结果重建列表/树视图与缩略图项。"""
+    def _rebuild_views(self, stop_loaders: bool = True, *, preserve_thumb_rows: bool = False) -> None:
+        """根据当前过滤结果重建列表/树视图与缩略图项。
+
+        *preserve_thumb_rows* 用于同一目录内的过滤刷新：缩略图模式原地同步行，
+        不清空模型，避免列表闪烁。
+        """
         rebuild_t0 = perf_counter()
         self._probe_set_phase("rebuild_views", mode=self._view_mode, stop_loaders=bool(stop_loaders))
         self._thumb_selection_anchor_row = -1
@@ -4138,7 +4208,9 @@ class FileListPanel(QWidget):
             stop_t0 = perf_counter()
             self._stop_thumbnail_loader()
             self._probe_log("rebuild_views.stop_thumbnail_loader", elapsed_ms=elapsed_ms(stop_t0))
-        self._cancel_thumb_model_population()
+        sync_thumb_rows = preserve_thumb_rows and self._view_mode == self._MODE_THUMB
+        if not sync_thumb_rows:
+            self._cancel_thumb_model_population()
         filter_t0 = perf_counter()
         self._filtered_files = self._compute_filtered_files()
         self._probe_log(
@@ -4159,6 +4231,11 @@ class FileListPanel(QWidget):
             self._rebuild_tree_items()
             self._probe_log("rebuild_views.start_tree_items", elapsed_ms=elapsed_ms(branch_t0))
             self._mark_thumb_model_dirty()
+        elif sync_thumb_rows:
+            branch_t0 = perf_counter()
+            self._mark_tree_view_dirty()
+            self._sync_thumb_model_to_filtered()
+            self._probe_log("rebuild_views.sync_thumb_items", elapsed_ms=elapsed_ms(branch_t0))
         else:
             branch_t0 = perf_counter()
             self._mark_tree_view_dirty()
@@ -4277,7 +4354,7 @@ class FileListPanel(QWidget):
             )
             return
         rebuild_t0 = perf_counter()
-        self._rebuild_views(stop_loaders=False)
+        self._rebuild_views(stop_loaders=False, preserve_thumb_rows=True)
         rebuild_ms = elapsed_ms(rebuild_t0)
         restore_t0 = perf_counter()
         self._restore_selection_after_view_change(
@@ -6551,13 +6628,7 @@ class FileListPanel(QWidget):
         self._meta_apply_loop_started_at = self._meta_apply_started_at
         self._meta_apply_tree_hits = 0
         self._meta_apply_list_hits = 0
-        self._meta_apply_needs_filter = bool(
-            ((self._filter_edit.text().strip()) if self._filter_edit else "")
-            or self._filter_pick
-            or self._filter_reject
-            or self._filter_min_rating > 0
-            or self._filter_focus_status
-        )
+        self._meta_apply_needs_filter = self._meta_filter_refresh_needed()
         self._meta_apply_loader_finished = False
         self._meta_apply_order_by_path = {}
         for index, path in enumerate(ordered_paths or []):
@@ -6656,9 +6727,21 @@ class FileListPanel(QWidget):
         ordered.sort(key=lambda item: (item[0], item[1]))
         return [(norm, meta) for _rank, norm, meta in ordered]
 
+    def _meta_filter_refresh_needed(self) -> bool:
+        """按当前过滤状态判断；会话开始后用户清除或新开过滤要立即生效。"""
+        return bool(
+            ((self._filter_edit.text().strip()) if self._filter_edit else "")
+            or self._filter_pick
+            or self._filter_reject
+            or self._filter_min_rating > 0
+            or self._filter_focus_status
+            or self._has_any_filter()
+        )
+
     def _schedule_meta_filter_refresh(self) -> None:
         if self._background_shutdown_requested:
             return
+        self._meta_apply_needs_filter = self._meta_filter_refresh_needed()
         if not self._meta_apply_needs_filter:
             return
         self._ensure_meta_filter_refresh_timer()
@@ -6670,6 +6753,7 @@ class FileListPanel(QWidget):
     def _flush_meta_filter_refresh(self) -> None:
         if self._background_shutdown_requested:
             return
+        self._meta_apply_needs_filter = self._meta_filter_refresh_needed()
         if not self._meta_apply_needs_filter:
             return
         perf_log(
@@ -6741,7 +6825,7 @@ class FileListPanel(QWidget):
             self._schedule_visible_thumbnail_update()
             perf_log(_log, "[STAT][_meta_apply] list viewport updated elapsed=%.3fs", _time.perf_counter() - paint_t0)
 
-        if self._meta_apply_needs_filter:
+        if self._meta_apply_needs_filter or self._meta_filter_refresh_needed():
             _log.info("[_meta_apply] final _apply_filter")
             filter_t0 = _time.perf_counter()
             self._apply_filter()

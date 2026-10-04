@@ -38,6 +38,9 @@ def _compute_thumb_cache_max_bytes() -> int:
 _THUMB_CACHE_MAX_BYTES_DEFAULT = _compute_thumb_cache_max_bytes()
 _THUMB_MODEL_APPEND_BATCH_SIZE = 160
 _THUMB_MODEL_APPEND_BUDGET_S = 0.008
+# QListView 插入/删除行后先清空布局、下一轮事件再分批重排，期间视口绘制为空白。
+# 行数不超过此值时改为立即同步重排（约 1µs/行），超过则保留 Qt 分批布局避免卡顿。
+_THUMB_SYNC_LAYOUT_MAX_ROWS = 8000
 
 
 class ThumbnailMemoryCache:
