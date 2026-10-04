@@ -14,6 +14,9 @@ KEY_PERF_PROBES_ENABLED = "perf_probes_enabled"
 # Birds measured per photo by bird sharpness; 0 = no limit (birds on the focus box go first when limited).
 KEY_BIRD_SHARPNESS_MAX_BIRDS = "bird_sharpness_max_birds"
 BIRD_SHARPNESS_MAX_BIRDS_LIMIT = 999
+# How bird sharpness reads blur from the strongest edges: "standard" (default) or "dense".
+KEY_BIRD_SHARPNESS_EDGE_ESTIMATOR = "bird_sharpness_edge_estimator"
+BIRD_SHARPNESS_EDGE_ESTIMATORS = ("standard", "dense")
 DENOISE_DEFAULT_OPTIONS = {
     "denoise_output_mode": "source_subdir",
     "denoise_subdir": "denoised",
@@ -37,6 +40,7 @@ _DEFAULT_OPTIONS = {
     "keep_view_on_switch": 1,
     KEY_PERF_PROBES_ENABLED: 0,
     KEY_BIRD_SHARPNESS_MAX_BIRDS: 0,
+    KEY_BIRD_SHARPNESS_EDGE_ESTIMATOR: "standard",
     **DENOISE_DEFAULT_OPTIONS,
 }
 _RUNTIME_OPTIONS = dict(_DEFAULT_OPTIONS)
@@ -123,6 +127,9 @@ def normalize_user_options(data: dict | None) -> dict[str, int | str]:
     except (TypeError, ValueError, OverflowError):
         value = 0
     normalized[KEY_BIRD_SHARPNESS_MAX_BIRDS] = max(0, min(BIRD_SHARPNESS_MAX_BIRDS_LIMIT, value))
+    value = source.get(KEY_BIRD_SHARPNESS_EDGE_ESTIMATOR)
+    if isinstance(value, str) and value in BIRD_SHARPNESS_EDGE_ESTIMATORS:
+        normalized[KEY_BIRD_SHARPNESS_EDGE_ESTIMATOR] = value
 
     for key, allowed in (
         ("denoise_output_mode", {"source_subdir", "fixed", "ask"}),
@@ -243,3 +250,8 @@ def get_bird_sharpness_max_birds() -> int:
     """Birds measured per photo by bird sharpness; 0 means no limit."""
     with _OPTIONS_LOCK:
         return int(_RUNTIME_OPTIONS[KEY_BIRD_SHARPNESS_MAX_BIRDS])
+
+
+def get_bird_sharpness_edge_estimator() -> str:
+    with _OPTIONS_LOCK:
+        return str(_RUNTIME_OPTIONS[KEY_BIRD_SHARPNESS_EDGE_ESTIMATOR])

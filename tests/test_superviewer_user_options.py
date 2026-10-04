@@ -204,3 +204,15 @@ def test_bird_sharpness_max_birds_defaults_to_no_limit_and_is_clamped() -> None:
         assert applied[key] == 5 and superviewer_user_options.get_bird_sharpness_max_birds() == 5
     finally:
         superviewer_user_options.apply_runtime_user_options(None)
+
+
+def test_bird_sharpness_edge_estimator_defaults_to_standard() -> None:
+    key = superviewer_user_options.KEY_BIRD_SHARPNESS_EDGE_ESTIMATOR
+    assert normalize_user_options({})[key] == "standard"
+    assert normalize_user_options({key: "dense"})[key] == "dense"
+    assert normalize_user_options({key: "bogus"})[key] == "standard"
+    superviewer_user_options.apply_runtime_user_options({key: "dense"})
+    try:
+        assert superviewer_user_options.get_bird_sharpness_edge_estimator() == "dense"
+    finally:
+        superviewer_user_options.apply_runtime_user_options(None)
