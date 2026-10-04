@@ -190,3 +190,17 @@ def test_metadata_and_thumbnail_progress_show_their_worker_counts(monkeypatch) -
     assert "(5线程)" in panel._meta_progress.format
     assert "(13线程)" in panel._persistent_thumb_progress.format
     assert "- 生成线程: 13" in panel._persistent_thumb_progress.tooltip
+
+
+def test_bird_sharpness_max_birds_defaults_to_no_limit_and_is_clamped() -> None:
+    key = superviewer_user_options.KEY_BIRD_SHARPNESS_MAX_BIRDS
+    assert normalize_user_options({})[key] == 0
+    assert normalize_user_options({key: 12})[key] == 12
+    assert normalize_user_options({key: -3})[key] == 0
+    assert normalize_user_options({key: "x"})[key] == 0
+    assert normalize_user_options({key: 10 ** 6})[key] == superviewer_user_options.BIRD_SHARPNESS_MAX_BIRDS_LIMIT
+    applied = superviewer_user_options.apply_runtime_user_options({key: 5})
+    try:
+        assert applied[key] == 5 and superviewer_user_options.get_bird_sharpness_max_birds() == 5
+    finally:
+        superviewer_user_options.apply_runtime_user_options(None)

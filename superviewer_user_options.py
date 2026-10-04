@@ -11,6 +11,9 @@ USER_OPTIONS_FILENAME = "SuperViewerUser.cfg"
 PERSISTENT_THUMB_SIZE_LEVELS = (128, 256, 512, 1024, 2048)
 KEY_NAVIGATION_FPS_OPTIONS = (1, 2, 4, 8, 10, 12, 13, 15, 20, 24, 25, 30, 40, 45, 50, 60, 120)
 KEY_PERF_PROBES_ENABLED = "perf_probes_enabled"
+# Birds measured per photo by bird sharpness; 0 = no limit (birds on the focus box go first when limited).
+KEY_BIRD_SHARPNESS_MAX_BIRDS = "bird_sharpness_max_birds"
+BIRD_SHARPNESS_MAX_BIRDS_LIMIT = 999
 DENOISE_DEFAULT_OPTIONS = {
     "denoise_output_mode": "source_subdir",
     "denoise_subdir": "denoised",
@@ -33,6 +36,7 @@ _DEFAULT_OPTIONS = {
     "key_navigation_fps": 24,
     "keep_view_on_switch": 1,
     KEY_PERF_PROBES_ENABLED: 0,
+    KEY_BIRD_SHARPNESS_MAX_BIRDS: 0,
     **DENOISE_DEFAULT_OPTIONS,
 }
 _RUNTIME_OPTIONS = dict(_DEFAULT_OPTIONS)
@@ -113,6 +117,12 @@ def normalize_user_options(data: dict | None) -> dict[str, int | str]:
     except Exception:
         value = normalized[KEY_PERF_PROBES_ENABLED]
     normalized[KEY_PERF_PROBES_ENABLED] = max(0, min(1, value))
+
+    try:
+        value = int(source.get(KEY_BIRD_SHARPNESS_MAX_BIRDS, 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        value = 0
+    normalized[KEY_BIRD_SHARPNESS_MAX_BIRDS] = max(0, min(BIRD_SHARPNESS_MAX_BIRDS_LIMIT, value))
 
     for key, allowed in (
         ("denoise_output_mode", {"source_subdir", "fixed", "ask"}),
@@ -227,3 +237,9 @@ def get_preferred_persistent_thumb_sizes(requested_size: int, max_size: int | No
 
 
 apply_runtime_user_options(None)
+
+
+def get_bird_sharpness_max_birds() -> int:
+    """Birds measured per photo by bird sharpness; 0 means no limit."""
+    with _OPTIONS_LOCK:
+        return int(_RUNTIME_OPTIONS[KEY_BIRD_SHARPNESS_MAX_BIRDS])
