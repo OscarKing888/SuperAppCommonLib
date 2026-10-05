@@ -244,6 +244,17 @@ def test_bird_sharpness_models_and_enhanced_search_options() -> None:
     assert set(params) == set(o.BIRD_SHARPNESS_PARAM_KEYS) and params["enh_lift"] is True
     entries = o.bird_sharpness_params_to_options({"enh_lift": False, "detector": "yolo11x.pt", "unknown": 1})
     assert entries == {o.KEY_BIRD_SHARPNESS_ENH_LIFT: 0, o.KEY_BIRD_SHARPNESS_DETECTOR: "yolo11x.pt"}
+    assert (d[o.KEY_BIRD_SHARPNESS_PIXELS], d[o.KEY_BIRD_SHARPNESS_GREY_FILL]) == ("outline", 0)
+    assert params["bird_pixels"] == "outline" and params["grey_fill"] is False
+    chosen = normalize_user_options({o.KEY_BIRD_SHARPNESS_PIXELS: "box", o.KEY_BIRD_SHARPNESS_GREY_FILL: 1})
+    assert (chosen[o.KEY_BIRD_SHARPNESS_PIXELS], chosen[o.KEY_BIRD_SHARPNESS_GREY_FILL]) == ("box", 1)
+    odd = normalize_user_options({o.KEY_BIRD_SHARPNESS_PIXELS: "mask", o.KEY_BIRD_SHARPNESS_GREY_FILL: "x"})
+    assert (odd[o.KEY_BIRD_SHARPNESS_PIXELS], odd[o.KEY_BIRD_SHARPNESS_GREY_FILL]) == ("outline", 0)
+    assert o.bird_sharpness_params_to_options({"bird_pixels": "box", "grey_fill": True}) == \
+        {o.KEY_BIRD_SHARPNESS_PIXELS: "box", o.KEY_BIRD_SHARPNESS_GREY_FILL: 1}
+    assert d[o.KEY_BIRD_SHARPNESS_MIN_BIRD_SIDE] == 0 and params["min_bird_side"] == 0
+    assert normalize_user_options({o.KEY_BIRD_SHARPNESS_MIN_BIRD_SIDE: 64})[o.KEY_BIRD_SHARPNESS_MIN_BIRD_SIDE] == 64
+    assert normalize_user_options({o.KEY_BIRD_SHARPNESS_MIN_BIRD_SIDE: -1})[o.KEY_BIRD_SHARPNESS_MIN_BIRD_SIDE] == 0
 
 
 def test_bird_sharpness_edge_estimator_defaults_to_standard() -> None:

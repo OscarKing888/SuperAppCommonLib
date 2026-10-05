@@ -29,6 +29,13 @@ KEY_BIRD_SHARPNESS_DETECTOR = "bird_sharpness_detector"
 KEY_BIRD_SHARPNESS_SAM_MODEL = "bird_sharpness_sam_model"
 KEY_BIRD_SHARPNESS_SAM_SCOPE = "bird_sharpness_sam_scope"
 BIRD_SHARPNESS_SAM_SCOPES = ("rechecked", "all")
+# Measured pixels of each bird ("outline" = segmentation / SAM mask, "box" = the whole box core) and
+# whether the rest of the bird's crop is painted grey (114) before measuring.
+KEY_BIRD_SHARPNESS_PIXELS = "bird_sharpness_pixels"
+BIRD_SHARPNESS_PIXELS = ("outline", "box")
+KEY_BIRD_SHARPNESS_GREY_FILL = "bird_sharpness_grey_fill"
+# Ignore detected birds whose box long side (full-resolution px) is below this; 0 = keep every bird.
+KEY_BIRD_SHARPNESS_MIN_BIRD_SIDE = "bird_sharpness_min_bird_side"
 # Enhanced bird search when no bird is found: zoomed overlapping windows over the centre region.
 KEY_BIRD_SHARPNESS_ENH_MODE = "bird_sharpness_enhanced_mode"
 BIRD_SHARPNESS_ENH_MODES = ("off", "manual", "nobird")
@@ -50,6 +57,8 @@ BIRD_SHARPNESS_INT_LIMITS = {
     KEY_BIRD_SHARPNESS_ENH_IMGSZ: (1024, 320, 2048),
     KEY_BIRD_SHARPNESS_ENH_MIN_CONF_PERCENT: (50, 5, 95),
     KEY_BIRD_SHARPNESS_ENH_LIFT: (1, 0, 1),
+    KEY_BIRD_SHARPNESS_GREY_FILL: (0, 0, 1),
+    KEY_BIRD_SHARPNESS_MIN_BIRD_SIDE: (0, 0, 4096),
 }
 # key -> (default, allowed values or None for a model file name)
 BIRD_SHARPNESS_TEXT_CHOICES = {
@@ -57,6 +66,7 @@ BIRD_SHARPNESS_TEXT_CHOICES = {
     KEY_BIRD_SHARPNESS_SAM_MODEL: ("", None),
     KEY_BIRD_SHARPNESS_SAM_SCOPE: ("rechecked", BIRD_SHARPNESS_SAM_SCOPES),
     KEY_BIRD_SHARPNESS_ENH_MODE: ("off", BIRD_SHARPNESS_ENH_MODES),
+    KEY_BIRD_SHARPNESS_PIXELS: ("outline", BIRD_SHARPNESS_PIXELS),
 }
 # bird_sharpness.params.AnalysisParams.as_params() name -> user option key (the one mapping between them)
 BIRD_SHARPNESS_PARAM_KEYS = {
@@ -68,8 +78,10 @@ BIRD_SHARPNESS_PARAM_KEYS = {
     "enh_lift": KEY_BIRD_SHARPNESS_ENH_LIFT, "full_tile": KEY_BIRD_SHARPNESS_FULL_TILE,
     "mf_center": KEY_BIRD_SHARPNESS_MF_CENTER, "mf_center_percent": KEY_BIRD_SHARPNESS_MF_CENTER_PERCENT,
     "mf_tile": KEY_BIRD_SHARPNESS_MF_TILE, "mf_sharpest_percent": KEY_BIRD_SHARPNESS_MF_SHARPEST_PERCENT,
+    "bird_pixels": KEY_BIRD_SHARPNESS_PIXELS, "grey_fill": KEY_BIRD_SHARPNESS_GREY_FILL,
+    "min_bird_side": KEY_BIRD_SHARPNESS_MIN_BIRD_SIDE,
 }
-_BOOL_PARAMS = ("mf_center", "enh_lift")
+_BOOL_PARAMS = ("mf_center", "enh_lift", "grey_fill")
 DENOISE_DEFAULT_OPTIONS = {
     "denoise_output_mode": "source_subdir",
     "denoise_subdir": "denoised",
