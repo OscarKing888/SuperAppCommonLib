@@ -7576,136 +7576,10 @@ class FileListPanel(QWidget):
         *,
         action: str,
     ) -> list[str]:
-        """Atomically stage/commit every pair in one clipboard paste."""
-        if action not in {"copy", "cut"}:
-            raise ValueError(f"Unsupported clipboard action: {action!r}")
-        pairs = [
-            (os.path.abspath(source), os.path.abspath(dest))
-            for source, dest in path_pairs
-        ]
-        pairs = [
-            (source, dest)
-            for source, dest in pairs
-            if not cls._same_file_path(source, dest)
-        ]
-        if not pairs:
-            return []
+        """照片和 XMP 的事务由无 Qt 共享模块统一实现。"""
+        from app_common.file_transactions import transfer_file_pairs
 
-        staged: list[tuple[str, str, str]] = []
-        committed: list[tuple[str, str, str]] = []
-        rollback_errors: list[str] = []
-        try:
-            for source, dest in pairs:
-                if not os.path.isfile(source):
-                    raise FileNotFoundError(source)
-                if os.path.exists(dest):
-                    raise FileExistsError(dest)
-                os.makedirs(os.path.dirname(dest), exist_ok=True)
-                fd, temp_path = tempfile.mkstemp(
-                    prefix=f".{Path(dest).name}.sbt-paste-",
-                    suffix=".tmp",
-                    dir=os.path.dirname(dest),
-                )
-                os.close(fd)
-                # mkstemp reserves a collision-free name.  Remove its empty
-                # placeholder so same-volume cut uses a fast rename instead
-                # of a copy-over-existing fallback on Windows.
-                os.remove(temp_path)
-                try:
-                    if action == "cut":
-                        shutil.move(source, temp_path)
-                    else:
-                        shutil.copy2(source, temp_path)
-                except Exception as stage_exc:
-                    stage_rollback_error = ""
-                    if action == "cut" and os.path.exists(temp_path) and not os.path.exists(source):
-                        try:
-                            # A filesystem move may complete and then raise
-                            # (for example while copying metadata).  Restore
-                            # the only surviving copy before unwinding.
-                            shutil.move(temp_path, source)
-                        except Exception as rollback_exc:
-                            stage_rollback_error = (
-                                f"{temp_path!r} -> {source!r}: {rollback_exc}"
-                            )
-                    elif os.path.exists(temp_path):
-                        try:
-                            os.remove(temp_path)
-                        except Exception as rollback_exc:
-                            stage_rollback_error = f"remove {temp_path!r}: {rollback_exc}"
-                    elif action == "cut" and not os.path.exists(source):
-                        stage_rollback_error = (
-                            f"both source and staging path are missing for {source!r}"
-                        )
-                    if stage_rollback_error:
-                        raise RuntimeError(
-                            f"Clipboard staging failed ({stage_exc}); rollback was incomplete: "
-                            f"{stage_rollback_error}"
-                        ) from stage_exc
-                    raise
-                staged.append((source, temp_path, dest))
-
-            for source, temp_path, dest in staged:
-                # Do not silently overwrite a destination created after the
-                # initial collision check.
-                if os.path.exists(dest):
-                    raise FileExistsError(dest)
-                os.replace(temp_path, dest)
-                committed.append((source, temp_path, dest))
-
-            touched: list[str] = []
-            for source, _temp_path, dest in committed:
-                if action == "cut":
-                    touched.append(source)
-                touched.append(dest)
-            return touched
-        except Exception as exc:
-            retained_paths: list[str] = []
-            if action == "cut":
-                committed_by_source = {source: dest for source, _tmp, dest in committed}
-                staged_by_source = {source: temp for source, temp, _dest in staged}
-                for source, _temp_path, _dest in reversed(staged):
-                    current = committed_by_source.get(source) or staged_by_source.get(source)
-                    if not current or not os.path.exists(current):
-                        continue
-                    try:
-                        if os.path.exists(source):
-                            raise FileExistsError(source)
-                        shutil.move(current, source)
-                    except Exception as rollback_exc:
-                        rollback_errors.append(f"{current!r} -> {source!r}: {rollback_exc}")
-                        if os.path.exists(current):
-                            retained_paths.append(current)
-            else:
-                for _source, _temp_path, dest in reversed(committed):
-                    try:
-                        if os.path.exists(dest):
-                            os.remove(dest)
-                    except Exception as rollback_exc:
-                        rollback_errors.append(f"remove {dest!r}: {rollback_exc}")
-            for _source, temp_path, _dest in reversed(staged):
-                try:
-                    if os.path.exists(temp_path):
-                        if action == "cut":
-                            # A failed restore can leave the only surviving
-                            # original in staging. Keep it for recovery even
-                            # when the source path now contains a partial copy.
-                            if temp_path not in retained_paths:
-                                retained_paths.append(temp_path)
-                            continue
-                        os.remove(temp_path)
-                except Exception as rollback_exc:
-                    rollback_errors.append(f"remove {temp_path!r}: {rollback_exc}")
-            if rollback_errors or retained_paths:
-                recovery_detail = (
-                    "; recoverable files retained at: " + ", ".join(repr(path) for path in retained_paths)
-                    if retained_paths else ""
-                )
-                raise RuntimeError(
-                    f"Clipboard bundle failed ({exc}); rollback was incomplete: "
-                    + "; ".join(rollback_errors) + recovery_detail
-                ) from exc
-            raise
+        return transfer_file_pairs(path_pairs, action=action)
 
     def _paste_clipboard_to_current_dir(self) -> None:
         """将剪贴板中的文件粘贴到当前目录；内部剪切会移动，复制会复制。"""
@@ -8144,6 +8018,7 @@ class FileListPanel(QWidget):
         paths: list[str],
         *,
         resolved_paths: list[str] | None = None,
+        scope_keys: list[str] | None = None,
     ) -> int:
         """Tombstone exact deleted fallback rows without mutating report.db."""
         if not hasattr(self, "_report_deleted_path_tombstones"):
@@ -8154,13 +8029,17 @@ class FileListPanel(QWidget):
             norm_path = os.path.normpath(path) if path else ""
             if not norm_path:
                 continue
-            row = self._get_report_row_for_path(norm_path)
+            # 异步文件操作可在用户切目录前快照报告作用域，避免完成时读到另一根。
+            if scope_keys is not None:
+                scope = scope_keys[index]
+            else:
+                scope = self._report_scope_path_key(self._get_report_row_for_path(norm_path))
             actual_path = (
                 os.path.normpath(resolved[index])
                 if index < len(resolved) and resolved[index]
                 else norm_path
             )
-            identity = (self._report_scope_path_key(row), _path_key(os.path.abspath(actual_path)))
+            identity = (scope, _path_key(os.path.abspath(actual_path)))
             if identity not in self._report_deleted_path_tombstones:
                 self._report_deleted_path_tombstones.add(identity)
                 added += 1
