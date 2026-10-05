@@ -24,14 +24,52 @@ KEY_BIRD_SHARPNESS_MF_CENTER = "bird_sharpness_mf_center"
 KEY_BIRD_SHARPNESS_MF_CENTER_PERCENT = "bird_sharpness_mf_center_percent"
 KEY_BIRD_SHARPNESS_MF_TILE = "bird_sharpness_mf_tile"
 KEY_BIRD_SHARPNESS_MF_SHARPEST_PERCENT = "bird_sharpness_mf_sharpest_percent"
-# key -> (default, min, max); keep in step with bird_sharpness.metrics.TileOptions
-BIRD_SHARPNESS_TILE_LIMITS = {
+# Detection models (file names, "auto" = the built-in choice) and SAM2 mask refinement ("" = off).
+KEY_BIRD_SHARPNESS_DETECTOR = "bird_sharpness_detector"
+KEY_BIRD_SHARPNESS_SAM_MODEL = "bird_sharpness_sam_model"
+KEY_BIRD_SHARPNESS_SAM_SCOPE = "bird_sharpness_sam_scope"
+BIRD_SHARPNESS_SAM_SCOPES = ("rechecked", "all")
+# Enhanced bird search when no bird is found: zoomed overlapping windows over the centre region.
+KEY_BIRD_SHARPNESS_ENH_MODE = "bird_sharpness_enhanced_mode"
+BIRD_SHARPNESS_ENH_MODES = ("off", "manual", "nobird")
+KEY_BIRD_SHARPNESS_ENH_REGION_PERCENT = "bird_sharpness_enhanced_region_percent"
+KEY_BIRD_SHARPNESS_ENH_GRID = "bird_sharpness_enhanced_grid"
+KEY_BIRD_SHARPNESS_ENH_IMGSZ = "bird_sharpness_enhanced_imgsz"
+KEY_BIRD_SHARPNESS_ENH_MIN_CONF_PERCENT = "bird_sharpness_enhanced_min_conf_percent"
+KEY_BIRD_SHARPNESS_ENH_LIFT = "bird_sharpness_enhanced_lift"
+_MODEL_FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.pt$")
+# key -> (default, min, max); keep in step with bird_sharpness.params.AnalysisParams
+BIRD_SHARPNESS_INT_LIMITS = {
     KEY_BIRD_SHARPNESS_FULL_TILE: (1024, 128, 4096),
     KEY_BIRD_SHARPNESS_MF_CENTER: (1, 0, 1),
     KEY_BIRD_SHARPNESS_MF_CENTER_PERCENT: (50, 10, 100),
     KEY_BIRD_SHARPNESS_MF_TILE: (256, 32, 2048),
     KEY_BIRD_SHARPNESS_MF_SHARPEST_PERCENT: (10, 1, 100),
+    KEY_BIRD_SHARPNESS_ENH_REGION_PERCENT: (70, 20, 100),
+    KEY_BIRD_SHARPNESS_ENH_GRID: (2, 1, 6),
+    KEY_BIRD_SHARPNESS_ENH_IMGSZ: (1024, 320, 2048),
+    KEY_BIRD_SHARPNESS_ENH_MIN_CONF_PERCENT: (50, 5, 95),
+    KEY_BIRD_SHARPNESS_ENH_LIFT: (1, 0, 1),
 }
+# key -> (default, allowed values or None for a model file name)
+BIRD_SHARPNESS_TEXT_CHOICES = {
+    KEY_BIRD_SHARPNESS_DETECTOR: ("auto", None),
+    KEY_BIRD_SHARPNESS_SAM_MODEL: ("", None),
+    KEY_BIRD_SHARPNESS_SAM_SCOPE: ("rechecked", BIRD_SHARPNESS_SAM_SCOPES),
+    KEY_BIRD_SHARPNESS_ENH_MODE: ("off", BIRD_SHARPNESS_ENH_MODES),
+}
+# bird_sharpness.params.AnalysisParams.as_params() name -> user option key (the one mapping between them)
+BIRD_SHARPNESS_PARAM_KEYS = {
+    "max_birds": KEY_BIRD_SHARPNESS_MAX_BIRDS, "edge_estimator": KEY_BIRD_SHARPNESS_EDGE_ESTIMATOR,
+    "detector": KEY_BIRD_SHARPNESS_DETECTOR, "sam_model": KEY_BIRD_SHARPNESS_SAM_MODEL,
+    "sam_scope": KEY_BIRD_SHARPNESS_SAM_SCOPE, "enh_mode": KEY_BIRD_SHARPNESS_ENH_MODE,
+    "enh_region_percent": KEY_BIRD_SHARPNESS_ENH_REGION_PERCENT, "enh_grid": KEY_BIRD_SHARPNESS_ENH_GRID,
+    "enh_imgsz": KEY_BIRD_SHARPNESS_ENH_IMGSZ, "enh_min_conf_percent": KEY_BIRD_SHARPNESS_ENH_MIN_CONF_PERCENT,
+    "enh_lift": KEY_BIRD_SHARPNESS_ENH_LIFT, "full_tile": KEY_BIRD_SHARPNESS_FULL_TILE,
+    "mf_center": KEY_BIRD_SHARPNESS_MF_CENTER, "mf_center_percent": KEY_BIRD_SHARPNESS_MF_CENTER_PERCENT,
+    "mf_tile": KEY_BIRD_SHARPNESS_MF_TILE, "mf_sharpest_percent": KEY_BIRD_SHARPNESS_MF_SHARPEST_PERCENT,
+}
+_BOOL_PARAMS = ("mf_center", "enh_lift")
 DENOISE_DEFAULT_OPTIONS = {
     "denoise_output_mode": "source_subdir",
     "denoise_subdir": "denoised",
@@ -56,7 +94,8 @@ _DEFAULT_OPTIONS = {
     KEY_PERF_PROBES_ENABLED: 0,
     KEY_BIRD_SHARPNESS_MAX_BIRDS: 0,
     KEY_BIRD_SHARPNESS_EDGE_ESTIMATOR: "standard",
-    **{key: limits[0] for key, limits in BIRD_SHARPNESS_TILE_LIMITS.items()},
+    **{key: limits[0] for key, limits in BIRD_SHARPNESS_INT_LIMITS.items()},
+    **{key: choice[0] for key, choice in BIRD_SHARPNESS_TEXT_CHOICES.items()},
     **DENOISE_DEFAULT_OPTIONS,
 }
 _RUNTIME_OPTIONS = dict(_DEFAULT_OPTIONS)
@@ -146,12 +185,22 @@ def normalize_user_options(data: dict | None) -> dict[str, int | str]:
     value = source.get(KEY_BIRD_SHARPNESS_EDGE_ESTIMATOR)
     if isinstance(value, str) and value in BIRD_SHARPNESS_EDGE_ESTIMATORS:
         normalized[KEY_BIRD_SHARPNESS_EDGE_ESTIMATOR] = value
-    for key, (default, low, high) in BIRD_SHARPNESS_TILE_LIMITS.items():
+    for key, (default, low, high) in BIRD_SHARPNESS_INT_LIMITS.items():
         try:
             value = int(source.get(key, default))
         except (TypeError, ValueError, OverflowError):
             value = default
         normalized[key] = max(low, min(high, value))
+    for key, (default, allowed) in BIRD_SHARPNESS_TEXT_CHOICES.items():
+        value = source.get(key, default)
+        if not isinstance(value, str):
+            value = default
+        value = value.strip()
+        if allowed is not None:
+            ok = value in allowed
+        else:  # a model file name; "auto" / "" are the built-in choices
+            ok = value in ("auto", "") or bool(_MODEL_FILE_RE.match(value))
+        normalized[key] = value if ok else default
 
     for key, allowed in (
         ("denoise_output_mode", {"source_subdir", "fixed", "ask"}),
@@ -277,6 +326,25 @@ def get_bird_sharpness_max_birds() -> int:
 def get_bird_sharpness_edge_estimator() -> str:
     with _OPTIONS_LOCK:
         return str(_RUNTIME_OPTIONS[KEY_BIRD_SHARPNESS_EDGE_ESTIMATOR])
+
+
+def get_bird_sharpness_params() -> dict:
+    """Every bird sharpness analysis option as ``bird_sharpness.params.AnalysisParams`` names."""
+    with _OPTIONS_LOCK:
+        out = {name: _RUNTIME_OPTIONS[key] for name, key in BIRD_SHARPNESS_PARAM_KEYS.items()}
+    for name in _BOOL_PARAMS:
+        out[name] = bool(out[name])
+    return out
+
+
+def bird_sharpness_params_to_options(params: dict) -> dict:
+    """User option entries for the known ``AnalysisParams`` names in ``params`` (others ignored)."""
+    out = {}
+    for name, key in BIRD_SHARPNESS_PARAM_KEYS.items():
+        if name in params:
+            value = params[name]
+            out[key] = int(value) if isinstance(value, bool) else value
+    return out
 
 
 def get_bird_sharpness_tile_options() -> dict:

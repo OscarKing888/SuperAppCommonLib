@@ -42,8 +42,8 @@ ALL_FIELDS = (
 REGION_BIRD = "bird"     # inside detected bird bodies (best bird wins)
 REGION_FOCUS = "focus"   # no bird: camera focus box, at least 128x128 px
 REGION_FULL = "full"     # no bird and no focus point: whole image
-REGION_MANUAL = "manual"  # no bird, manual focus: sharpest small tiles of the frame centre
-REGION_LABELS = {REGION_BIRD: "鸟体", REGION_FOCUS: "焦点", REGION_FULL: "全图", REGION_MANUAL: "手动对焦中心"}
+REGION_MANUAL = "manual"  # no bird, manual focus: the focal plane (sharpest small tiles of the centre), not a bird
+REGION_LABELS = {REGION_BIRD: "鸟体", REGION_FOCUS: "焦点", REGION_FULL: "全图", REGION_MANUAL: "手动对焦焦平面"}
 
 # Existing SuperPicky sharpness slot (0..1000, written as "%06.2f").
 SHARPNESS_XMP_KEY = "XMP-photoshop:City"

@@ -224,6 +224,28 @@ def test_bird_sharpness_tile_options_default_clamp_and_reach_the_getter() -> Non
         o.apply_runtime_user_options(None)
 
 
+def test_bird_sharpness_models_and_enhanced_search_options() -> None:
+    o = superviewer_user_options
+    d = normalize_user_options({})
+    assert (d[o.KEY_BIRD_SHARPNESS_DETECTOR], d[o.KEY_BIRD_SHARPNESS_SAM_MODEL]) == ("auto", "")
+    assert (d[o.KEY_BIRD_SHARPNESS_SAM_SCOPE], d[o.KEY_BIRD_SHARPNESS_ENH_MODE]) == ("rechecked", "off")
+    assert d[o.KEY_BIRD_SHARPNESS_ENH_GRID] == 2 and d[o.KEY_BIRD_SHARPNESS_ENH_REGION_PERCENT] == 70
+    assert d[o.KEY_BIRD_SHARPNESS_ENH_MIN_CONF_PERCENT] == 50
+    picked = normalize_user_options({o.KEY_BIRD_SHARPNESS_DETECTOR: "yolo26x-seg.pt",
+                                     o.KEY_BIRD_SHARPNESS_SAM_MODEL: "sam2.1_l.pt",
+                                     o.KEY_BIRD_SHARPNESS_ENH_MODE: "manual", o.KEY_BIRD_SHARPNESS_ENH_GRID: 99})
+    assert picked[o.KEY_BIRD_SHARPNESS_DETECTOR] == "yolo26x-seg.pt" and picked[o.KEY_BIRD_SHARPNESS_ENH_GRID] == 6
+    assert picked[o.KEY_BIRD_SHARPNESS_SAM_MODEL] == "sam2.1_l.pt" and picked[o.KEY_BIRD_SHARPNESS_ENH_MODE] == "manual"
+    bad = normalize_user_options({o.KEY_BIRD_SHARPNESS_DETECTOR: "../evil.pt", o.KEY_BIRD_SHARPNESS_SAM_MODEL: 3,
+                                  o.KEY_BIRD_SHARPNESS_ENH_MODE: "always"})
+    assert (bad[o.KEY_BIRD_SHARPNESS_DETECTOR], bad[o.KEY_BIRD_SHARPNESS_SAM_MODEL]) == ("auto", "")
+    assert bad[o.KEY_BIRD_SHARPNESS_ENH_MODE] == "off"
+    params = o.get_bird_sharpness_params()
+    assert set(params) == set(o.BIRD_SHARPNESS_PARAM_KEYS) and params["enh_lift"] is True
+    entries = o.bird_sharpness_params_to_options({"enh_lift": False, "detector": "yolo11x.pt", "unknown": 1})
+    assert entries == {o.KEY_BIRD_SHARPNESS_ENH_LIFT: 0, o.KEY_BIRD_SHARPNESS_DETECTOR: "yolo11x.pt"}
+
+
 def test_bird_sharpness_edge_estimator_defaults_to_standard() -> None:
     key = superviewer_user_options.KEY_BIRD_SHARPNESS_EDGE_ESTIMATOR
     assert normalize_user_options({})[key] == "standard"
