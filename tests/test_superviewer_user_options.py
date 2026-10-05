@@ -228,7 +228,7 @@ def test_bird_sharpness_models_and_enhanced_search_options() -> None:
     o = superviewer_user_options
     d = normalize_user_options({})
     assert (d[o.KEY_BIRD_SHARPNESS_DETECTOR], d[o.KEY_BIRD_SHARPNESS_SAM_MODEL]) == ("auto", "")
-    assert (d[o.KEY_BIRD_SHARPNESS_SAM_SCOPE], d[o.KEY_BIRD_SHARPNESS_ENH_MODE]) == ("rechecked", "off")
+    assert (d[o.KEY_BIRD_SHARPNESS_SAM_SCOPE], d[o.KEY_BIRD_SHARPNESS_ENH_MODE]) == ("all", "off")
     assert d[o.KEY_BIRD_SHARPNESS_ENH_GRID] == 2 and d[o.KEY_BIRD_SHARPNESS_ENH_REGION_PERCENT] == 70
     assert d[o.KEY_BIRD_SHARPNESS_ENH_MIN_CONF_PERCENT] == 50
     picked = normalize_user_options({o.KEY_BIRD_SHARPNESS_DETECTOR: "yolo26x-seg.pt",

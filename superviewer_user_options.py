@@ -28,7 +28,7 @@ KEY_BIRD_SHARPNESS_MF_SHARPEST_PERCENT = "bird_sharpness_mf_sharpest_percent"
 KEY_BIRD_SHARPNESS_DETECTOR = "bird_sharpness_detector"
 KEY_BIRD_SHARPNESS_SAM_MODEL = "bird_sharpness_sam_model"
 KEY_BIRD_SHARPNESS_SAM_SCOPE = "bird_sharpness_sam_scope"
-BIRD_SHARPNESS_SAM_SCOPES = ("rechecked", "all")
+BIRD_SHARPNESS_SAM_SCOPES = ("all", "rechecked")  # all (default): every detected bird
 # Measured pixels of each bird ("outline" = segmentation / SAM mask, "box" = the whole box core) and
 # whether the rest of the bird's crop is painted grey (114) before measuring.
 KEY_BIRD_SHARPNESS_PIXELS = "bird_sharpness_pixels"
@@ -64,7 +64,7 @@ BIRD_SHARPNESS_INT_LIMITS = {
 BIRD_SHARPNESS_TEXT_CHOICES = {
     KEY_BIRD_SHARPNESS_DETECTOR: ("auto", None),
     KEY_BIRD_SHARPNESS_SAM_MODEL: ("", None),
-    KEY_BIRD_SHARPNESS_SAM_SCOPE: ("rechecked", BIRD_SHARPNESS_SAM_SCOPES),
+    KEY_BIRD_SHARPNESS_SAM_SCOPE: ("all", BIRD_SHARPNESS_SAM_SCOPES),
     KEY_BIRD_SHARPNESS_ENH_MODE: ("off", BIRD_SHARPNESS_ENH_MODES),
     KEY_BIRD_SHARPNESS_PIXELS: ("outline", BIRD_SHARPNESS_PIXELS),
 }
