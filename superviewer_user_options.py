@@ -44,6 +44,10 @@ KEY_BIRD_SHARPNESS_ENH_GRID = "bird_sharpness_enhanced_grid"
 KEY_BIRD_SHARPNESS_ENH_IMGSZ = "bird_sharpness_enhanced_imgsz"
 KEY_BIRD_SHARPNESS_ENH_MIN_CONF_PERCENT = "bird_sharpness_enhanced_min_conf_percent"
 KEY_BIRD_SHARPNESS_ENH_LIFT = "bird_sharpness_enhanced_lift"
+# Which pixels are measured: the camera's embedded JPEG (SuperViewer default), the RAW decode
+# (bird_sharpness.params.AnalysisParams / CLI default, thresholds calibrated on it) or the denoised rendering.
+KEY_BIRD_SHARPNESS_IMAGE_SOURCE = "bird_sharpness_image_source"
+BIRD_SHARPNESS_IMAGE_SOURCES = ("jpeg", "raw", "denoised")
 _MODEL_FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.pt$")
 # key -> (default, min, max); keep in step with bird_sharpness.params.AnalysisParams
 BIRD_SHARPNESS_INT_LIMITS = {
@@ -67,6 +71,7 @@ BIRD_SHARPNESS_TEXT_CHOICES = {
     KEY_BIRD_SHARPNESS_SAM_SCOPE: ("all", BIRD_SHARPNESS_SAM_SCOPES),
     KEY_BIRD_SHARPNESS_ENH_MODE: ("off", BIRD_SHARPNESS_ENH_MODES),
     KEY_BIRD_SHARPNESS_PIXELS: ("outline", BIRD_SHARPNESS_PIXELS),
+    KEY_BIRD_SHARPNESS_IMAGE_SOURCE: ("jpeg", BIRD_SHARPNESS_IMAGE_SOURCES),
 }
 # bird_sharpness.params.AnalysisParams.as_params() name -> user option key (the one mapping between them)
 BIRD_SHARPNESS_PARAM_KEYS = {
@@ -79,7 +84,7 @@ BIRD_SHARPNESS_PARAM_KEYS = {
     "mf_center": KEY_BIRD_SHARPNESS_MF_CENTER, "mf_center_percent": KEY_BIRD_SHARPNESS_MF_CENTER_PERCENT,
     "mf_tile": KEY_BIRD_SHARPNESS_MF_TILE, "mf_sharpest_percent": KEY_BIRD_SHARPNESS_MF_SHARPEST_PERCENT,
     "bird_pixels": KEY_BIRD_SHARPNESS_PIXELS, "grey_fill": KEY_BIRD_SHARPNESS_GREY_FILL,
-    "min_bird_side": KEY_BIRD_SHARPNESS_MIN_BIRD_SIDE,
+    "min_bird_side": KEY_BIRD_SHARPNESS_MIN_BIRD_SIDE, "image_source": KEY_BIRD_SHARPNESS_IMAGE_SOURCE,
 }
 _BOOL_PARAMS = ("mf_center", "enh_lift", "grey_fill")
 DENOISE_DEFAULT_OPTIONS = {

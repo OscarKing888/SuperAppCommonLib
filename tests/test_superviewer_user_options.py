@@ -255,6 +255,12 @@ def test_bird_sharpness_models_and_enhanced_search_options() -> None:
     assert d[o.KEY_BIRD_SHARPNESS_MIN_BIRD_SIDE] == 0 and params["min_bird_side"] == 0
     assert normalize_user_options({o.KEY_BIRD_SHARPNESS_MIN_BIRD_SIDE: 64})[o.KEY_BIRD_SHARPNESS_MIN_BIRD_SIDE] == 64
     assert normalize_user_options({o.KEY_BIRD_SHARPNESS_MIN_BIRD_SIDE: -1})[o.KEY_BIRD_SHARPNESS_MIN_BIRD_SIDE] == 0
+    # SuperViewer measures the camera's embedded JPEG unless the user picks the RAW decode or the denoised image.
+    assert d[o.KEY_BIRD_SHARPNESS_IMAGE_SOURCE] == "jpeg" and params["image_source"] == "jpeg"
+    for source in ("raw", "denoised"):
+        assert normalize_user_options({o.KEY_BIRD_SHARPNESS_IMAGE_SOURCE: source})[o.KEY_BIRD_SHARPNESS_IMAGE_SOURCE] == source
+    assert normalize_user_options({o.KEY_BIRD_SHARPNESS_IMAGE_SOURCE: "png"})[o.KEY_BIRD_SHARPNESS_IMAGE_SOURCE] == "jpeg"
+    assert o.bird_sharpness_params_to_options({"image_source": "raw"}) == {o.KEY_BIRD_SHARPNESS_IMAGE_SOURCE: "raw"}
 
 
 def test_bird_sharpness_edge_estimator_defaults_to_standard() -> None:
