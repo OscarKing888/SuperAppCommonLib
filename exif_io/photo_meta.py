@@ -551,39 +551,36 @@ class PhotoMetaDataXMP(PhotoMetaData):
                 protected_report_fields=protected_report_fields,
             )
 
-        success = True
-        if subject_seen:
-            success = self.write_subjects(
-                path,
-                subject_values,
-                _protected_report_fields=protected_report_fields,
-            ) and success
-        if title_seen:
-            success = self.write_title(
-                path,
-                title_value,
-                _protected_report_fields=protected_report_fields,
-            ) and success
-        if description_seen:
-            success = self.write_description(
-                path,
-                description_value,
-                _protected_report_fields=protected_report_fields,
-            ) and success
-        if rating_seen or pick_seen:
-            success = self.write_rating_pick(
-                path,
-                rating=rating_value if rating_seen else None,
-                pick=pick_value if pick_seen else None,
-                _protected_report_fields=protected_report_fields,
-            ) and success
-        if superpicky_values:
-            success = self.write_superpicky_fields(
-                path,
-                superpicky_values,
-                _protected_report_fields=protected_report_fields,
-            ) and success
-        return success
+        # 同一次编辑的标准字段与自定义字段一次发布，避免标题已写而识别结果失败。
+        sidecar_path = self.sidecar_path_for(path)
+        try:
+            tree = self._load_or_create_xmp_tree(sidecar_path)
+            if tree is None:
+                return False
+            descriptions = self._ensure_descriptions(tree.getroot(), path)
+            # 先补全旧报告，再应用本次全部字段（含清除），保留已有字段优先级。
+            self._hydrate_report_db_fields_if_needed(
+                path, tree, protected_report_fields=protected_report_fields,
+            )
+            if subject_seen:
+                self._replace_subject_node(descriptions, subject_values)
+            if title_seen:
+                self._replace_alt_text_node(descriptions, _XMP_DC_TITLE_TAG, title_value)
+            if description_seen:
+                self._replace_alt_text_node(descriptions, _XMP_DC_DESCRIPTION_TAG, description_value)
+            if rating_seen:
+                self._replace_text_node(descriptions, _XMP_RATING_TAG, str(rating_value))
+            if pick_seen:
+                self._replace_text_node(descriptions, _XMP_DM_PICK_TAG, str(pick_value))
+            for name, value in superpicky_values.items():
+                self._replace_text_node(descriptions, f"{{{_SUPERPICKY_NS}}}{name}", value)
+            sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+            ok = self._write_tree_atomic(tree, sidecar_path)
+            if ok:
+                self._invalidate_metadata_cache(path)
+            return ok
+        except Exception:
+            return False
 
     def _write_exiftool_fields(
         self,
