@@ -41,6 +41,8 @@ class FileListPanel(QWidget):
     create_filter_bar = True
     # 排序状态在两种视图间共用；额外工具栏仅由需要它的宿主启用。
     show_thumbnail_sort_controls = False
+    # 宿主可扩展展示列；两种视图仍使用该模型定义的同一排序键。
+    file_table_model_class = FileTableModel
     # Application-owned held-key playback is opt-in.  SuperBirdStamp subclasses
     # intentionally keep native Qt selection/currentItemChanged semantics.
     enable_key_navigation_playback = False
@@ -89,7 +91,7 @@ class FileListPanel(QWidget):
         self._directory_scan_workers: set[DirectoryScanWorker] = set()
         self._directory_scan_request_id = 0
         self._pending_directory_listing_result: tuple | None = None
-        self._file_table_model = FileTableModel(self)
+        self._file_table_model = self.file_table_model_class(self)
         self._file_table_proxy = FileTableSortProxyModel(self)
         self._file_table_proxy.setSourceModel(self._file_table_model)
         self._thumb_list_model = ThumbnailListModel(self)
@@ -3800,7 +3802,7 @@ class FileListPanel(QWidget):
         """使用列表相同的排序键；隐藏列表尚未填充时也不依赖控件行序。"""
         return sorted(
             paths,
-            key=lambda path: file_sort_key(
+            key=lambda path: self._file_table_model.sort_key_for_path(
                 path, self._meta_cache.get(os.path.normpath(path), {}),
                 self._tree_last_sort_column,
             ),

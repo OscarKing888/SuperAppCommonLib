@@ -382,6 +382,8 @@ class _BurstGroupMixin:
 class FileTableModel(_BurstGroupMixin, QAbstractTableModel):
     """Flat file-list model for the list view."""
 
+    sort_key_for_path = staticmethod(file_sort_key)
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._video_columns = bool(getattr(parent, "include_videos", False))
