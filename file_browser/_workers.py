@@ -1154,6 +1154,10 @@ class MetadataLoader(QThread):
             meta["burst_id"] = burst_id
         if burst_position is not None:
             meta["burst_position"] = burst_position
+        # 只传递已保存的拼音，缺失时由用户显式更新，不在选图路径查词表。
+        from app_common.bird_pinyin import PINYIN_FIELD, PINYIN_SOURCE_FIELD, stored_pinyin
+        meta[PINYIN_FIELD] = stored_pinyin(rec)
+        meta[PINYIN_SOURCE_FIELD] = str(_metadata_value_from_candidates(rec, PINYIN_SOURCE_FIELD) or "")
         meta.update(_bird_sharpness_browser_meta_fields(rec))
         return meta
 
