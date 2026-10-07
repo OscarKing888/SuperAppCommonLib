@@ -685,7 +685,7 @@ class MetadataLoader(QThread):
                 focus_box_count += 1
             if meta.get("focus_box_checked"):
                 checked_focus_count += 1
-            species_cn = str(flat.get("bird_species_cn") or "").strip()
+            species_cn = str(flat.get("XMP-superpicky:bird_species_cn") or flat.get("bird_species_cn") or "").strip()
             if species_cn:
                 meta["bird_species_cn"] = species_cn
             parsed_batch[norm_path] = meta
@@ -1154,6 +1154,15 @@ class MetadataLoader(QThread):
             meta["burst_id"] = burst_id
         if burst_position is not None:
             meta["burst_position"] = burst_position
+        # 稀有度保留 0/null 和来源标记，重新加载不能恢复旧报告中的过期值。
+        from app_common.bird_rarity import (
+            RARITY_FIELD, IUCN_FIELD, RARITY_SOURCE_FIELD, RARITY_MISSING_FIELD, rarity_metadata,
+        )
+        rarity, category = rarity_metadata(rec)
+        meta[RARITY_FIELD] = rarity
+        meta[IUCN_FIELD] = category
+        meta[RARITY_SOURCE_FIELD] = str(_metadata_value_from_candidates(rec, RARITY_SOURCE_FIELD) or "")
+        meta[RARITY_MISSING_FIELD] = str(_metadata_value_from_candidates(rec, RARITY_MISSING_FIELD) or "")
         # 只传递已保存的拼音，缺失时由用户显式更新，不在选图路径查词表。
         from app_common.bird_pinyin import PINYIN_FIELD, PINYIN_SOURCE_FIELD, stored_pinyin
         meta[PINYIN_FIELD] = stored_pinyin(rec)

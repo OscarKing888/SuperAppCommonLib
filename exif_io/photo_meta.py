@@ -652,6 +652,10 @@ class PhotoMetaDataXMP(PhotoMetaData):
                 self._remove_property(descriptions, f"{{{_EXIF_NS}}}ISO")
             if "XMP-aux:Lens" in fields:
                 self._remove_property(descriptions, f"{{{_AUX_NS}}}LensModel")
+            # 标题/鸟名尚未写入前补全旧报告；否则新的鸟种标记会误挡首次 hydration。
+            self._hydrate_report_db_fields_if_needed(
+                path, tree, protected_report_fields=protected_report_fields,
+            )
             if "subject" in direct_fields:
                 self._replace_subject_node(descriptions, direct_fields["subject"])
             for key, tag in (("title", _XMP_DC_TITLE_TAG), ("description", _XMP_DC_DESCRIPTION_TAG)):

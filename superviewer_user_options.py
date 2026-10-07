@@ -7,6 +7,8 @@ import re
 import sys
 import threading
 
+from .bird_rarity import RARITY_DEFAULT_OPTIONS, normalize_rarity_options
+
 USER_OPTIONS_FILENAME = "SuperViewerUser.cfg"
 PERSISTENT_THUMB_SIZE_LEVELS = (128, 256, 512, 1024, 2048)
 KEY_NAVIGATION_FPS_OPTIONS = (1, 2, 4, 8, 10, 12, 13, 15, 20, 24, 25, 30, 40, 45, 50, 60, 120)
@@ -114,6 +116,7 @@ _DEFAULT_OPTIONS = {
     **{key: limits[0] for key, limits in BIRD_SHARPNESS_INT_LIMITS.items()},
     **{key: choice[0] for key, choice in BIRD_SHARPNESS_TEXT_CHOICES.items()},
     **DENOISE_DEFAULT_OPTIONS,
+    **RARITY_DEFAULT_OPTIONS,
 }
 _RUNTIME_OPTIONS = dict(_DEFAULT_OPTIONS)
 
@@ -239,6 +242,7 @@ def normalize_user_options(data: dict | None) -> dict[str, int | str]:
             value = normalized[key]
         normalized[key] = max(0 if key == "denoise_strength" else 1, min(maximum, value))
 
+    normalized.update(normalize_rarity_options(source))
     return normalized
 
 
