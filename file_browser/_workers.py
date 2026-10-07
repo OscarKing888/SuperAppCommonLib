@@ -1167,6 +1167,8 @@ class MetadataLoader(QThread):
         from app_common.bird_pinyin import PINYIN_FIELD, PINYIN_SOURCE_FIELD, stored_pinyin
         meta[PINYIN_FIELD] = stored_pinyin(rec)
         meta[PINYIN_SOURCE_FIELD] = str(_metadata_value_from_candidates(rec, PINYIN_SOURCE_FIELD) or "")
+        from app_common.shooting_location import LOCATION_FIELD, shooting_location
+        meta[LOCATION_FIELD] = shooting_location(rec)
         meta.update(_bird_sharpness_browser_meta_fields(rec))
         return meta
 
