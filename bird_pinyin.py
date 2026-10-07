@@ -59,7 +59,11 @@ def stored_pinyin(metadata: dict, name: str | None = None) -> str:
     source = _text(metadata.get(f"XMP-superpicky:{PINYIN_SOURCE_FIELD}") or metadata.get(PINYIN_SOURCE_FIELD))
     if source and source != name:
         return ""
-    for prefix in ("XMP-superpicky:", "", "report."):
+    # 侧车来源标记存在时，缺失拼音也是已保存状态，不能回退到报告的旧鸟种拼音。
+    prefixes = ("XMP-superpicky:",) if _text(metadata.get(f"XMP-superpicky:{PINYIN_SOURCE_FIELD}")) else (
+        "XMP-superpicky:", "", "report."
+    )
+    for prefix in prefixes:
         for alias in PINYIN_ALIASES:
             value = _text(metadata.get(prefix + alias))
             if value:

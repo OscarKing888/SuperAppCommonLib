@@ -7,6 +7,7 @@ import shutil
 import traceback
 import tempfile
 
+from app_common.bird_pinyin import PINYIN_ALIASES, PINYIN_FIELD, PINYIN_SOURCE_FIELD, pinyin_for
 from app_common.perf_probe import elapsed_ms, perf_counter, perf_log, perf_probes_enabled
 from app_common.qt_theme import is_theme_change_event
 from app_common.file_browser._browser_core import *
@@ -2275,14 +2276,22 @@ class FileListPanel(QWidget):
 
         updated = 0
         attempted = 0
-        updated_paths: list[str] = []
+        # 鸟名与拼音一次写入侧车；清除旧别名，避免未收录鸟名沿用上一鸟种的拼音。
+        pinyin_updates = {key: "" for key in PINYIN_ALIASES}
+        pinyin_updates.update({PINYIN_FIELD: pinyin_for(cn), PINYIN_SOURCE_FIELD: title})
+        fields = {
+            "XMP-dc:Title": title,
+            "XMP-superpicky:bird_species_cn": title,
+            **{f"XMP-superpicky:{key}": value for key, value in pinyin_updates.items()},
+        }
+        updates_by_path: dict[str, dict] = {}
         for path in self._unique_norm_paths(paths):
             target_path = self._resolve_source_path_for_action(path) or path
             if not target_path:
                 continue
             attempted += 1
             try:
-                ok = self._meta_proxy.write(target_path, {"XMP-dc:Title": title})
+                ok = self._meta_proxy.write(target_path, fields)
             except Exception as exc:
                 _log.warning("[_paste_species_to_paths] source=%r failed: %s", path, exc)
                 continue
@@ -2291,19 +2300,16 @@ class FileListPanel(QWidget):
                 continue
             norm_path = os.path.normpath(path) if path else ""
             if norm_path:
-                meta = self._meta_cache.setdefault(norm_path, {})
-                if isinstance(meta, dict):
-                    meta["bird_species_cn"] = cn
-                    meta["bird_species_en"] = en
-                    meta["title"] = title
-                    meta["Title"] = title
-                    meta["XMP-dc:Title"] = title
-                    self._file_table_model.set_meta_for_path(norm_path, meta)
-                updated_paths.append(norm_path)
+                updates_by_path[norm_path] = {
+                    **fields, **pinyin_updates,
+                    **{f"report.{key}": value for key, value in pinyin_updates.items()},
+                    "bird_species_cn": cn, "bird_species_en": en,
+                    "title": title, "Title": title,
+                }
             updated += 1
 
-        if updated_paths:
-            self._refresh_metadata_state_for_paths(updated_paths)
+        if updates_by_path:
+            self.sync_metadata_edits_for_paths(updates_by_path)
         self._tree_widget.viewport().update()
         _log.info(
             "[_paste_species_to_paths] source_filename=%r bird_species_cn=%r bird_species_en=%r attempted=%s updated=%s",
