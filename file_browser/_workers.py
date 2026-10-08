@@ -1169,6 +1169,11 @@ class MetadataLoader(QThread):
         meta[PINYIN_SOURCE_FIELD] = str(_metadata_value_from_candidates(rec, PINYIN_SOURCE_FIELD) or "")
         from app_common.shooting_location import LOCATION_FIELD, shooting_location
         meta[LOCATION_FIELD] = shooting_location(rec)
+        # 逐只识别列表和坐标说明保留到缓存；选图/悬停无需同步读取 XMP。
+        for key in ("birdid_individuals", "birdid_individuals_info"):
+            value = _metadata_value_from_candidates(rec, f"XMP-superpicky:{key}", key)
+            if value is not None:
+                meta[key] = value
         meta.update(_bird_sharpness_browser_meta_fields(rec))
         return meta
 
