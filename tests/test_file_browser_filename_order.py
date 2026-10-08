@@ -25,8 +25,7 @@ def _scan(directory, *, include_videos, report_root=None):
     results = []
     worker = DirectoryScanWorker(
         str(directory),
-        # 报告模式本身按子树列出照片，普通目录显式递归。
-        recursive=report_root is None,
+        recursive=True,
         report_root=str(report_root) if report_root else None,
         use_report_db=report_root is not None,
         include_videos=include_videos,

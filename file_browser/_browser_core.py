@@ -2506,8 +2506,10 @@ def _select_report_scope_files(
     selected_dir: str,
     report_root: str,
     full_report_cache: dict,
+    *,
+    recursive: bool = True,
 ) -> tuple[list, dict]:
-    """Filter full report cache down to the selected directory subtree."""
+    """Filter the full report cache to the selected directory or its subtree."""
     files: list = []
     selected_report_cache: dict = {}
     selected_dir = os.path.normpath(selected_dir)
@@ -2532,6 +2534,8 @@ def _select_report_scope_files(
         if is_apple_double_metadata_file(full_path):
             continue
         if not _is_same_or_child_path(selected_dir, full_path):
+            continue
+        if not recursive and _path_key(os.path.dirname(full_path)) != _path_key(selected_dir):
             continue
         files.append(full_path)
         selected_report_cache[stem] = row

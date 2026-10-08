@@ -82,6 +82,9 @@ class SidebarTabWidget(QTabWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setObjectName("SettingsSidebarTabs")
+        # West 方向的 left 表示从顶部开始排列，覆盖 macOS 默认的居中对齐。
+        self.setStyleSheet("QTabWidget#SettingsSidebarTabs::tab-bar { alignment: left; }")
         self.setTabBar(SidebarTabBar(self))
         self.setTabPosition(getattr(QTabWidget, "TabPosition", QTabWidget).West)
         self.setIconSize(QSize(20, 20))

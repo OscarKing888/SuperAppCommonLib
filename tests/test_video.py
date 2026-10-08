@@ -103,7 +103,7 @@ def test_report_scope_still_supplements_videos(tmp_path, monkeypatch):
     row = {'current_path': 'bird.jpg', 'original_path': 'bird.jpg'}
     monkeypatch.setattr(_workers, '_select_report_scope_files', lambda **k: ([str(photo)], {'bird': row}))
     results = []
-    worker = DirectoryScanWorker(str(tmp_path), False, report_root=str(tmp_path),
+    worker = DirectoryScanWorker(str(tmp_path), True, report_root=str(tmp_path),
                                  report_cache_full={'bird': row}, use_report_db=True, include_videos=True)
     worker.scan_finished.connect(lambda path, files, *_: results.extend(files))
     worker.run()

@@ -182,6 +182,7 @@ class DirectoryScanWorker(QThread):
                 selected_dir=selected_dir,
                 report_root=report_root,
                 full_report_cache=report_cache,
+                recursive=self._recursive,
             )
             selected_rel = ""
             if _is_same_or_child_path(report_root, selected_dir):
@@ -199,9 +200,8 @@ class DirectoryScanWorker(QThread):
                 len(files),
             )
             try:
-                # In report mode the DB view is subtree-based even without UI filters,
-                # so actual file supplementation must recurse under the selected dir.
-                actual_files = _collect_image_files_impl(self._path, True)
+                # 旧报告路径的实际文件补充也必须遵守当前目录范围。
+                actual_files = _collect_image_files_impl(self._path, self._recursive)
                 if self.isInterruptionRequested():
                     return
                 full_cache = full_report_cache or report_cache or {}
@@ -264,6 +264,8 @@ class DirectoryScanWorker(QThread):
                             ):
                                 files.append(os.path.join(root, name))
                         maybe_emit_progress(root)
+                        if not self._recursive:
+                            break
                 except (PermissionError, OSError) as e:
                     _log.warning("[DirectoryScanWorker.run] fallback scan error: %s", e)
         else:
@@ -343,8 +345,6 @@ class DirectoryScanWorker(QThread):
                 _log.warning("[DirectoryScanWorker.run] build report scopes failed: %s", exc)
         if self._include_videos:
             existing = {_path_key(p) for p in files}
-            # Report-backed photo views are subtree scopes even without recursive UI mode.
-            recursive = self._recursive or bool(report_source_available and self._report_root)
             for root, dirs, names in os.walk(self._path):
                 if self.isInterruptionRequested():
                     return
@@ -356,7 +356,7 @@ class DirectoryScanWorker(QThread):
                             files.append(candidate)
                             existing.add(_path_key(candidate))
                 maybe_emit_progress(root)
-                if not recursive:
+                if not self._recursive:
                     break
         # 分类目录不参与文件名主排序，保留相机文件名的拍摄顺序；同名时才按路径区分。
         # 照片扫描和视频补充共用此顺序，缩略图视图直接沿用扫描结果。
