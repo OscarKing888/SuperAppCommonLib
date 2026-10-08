@@ -44,6 +44,8 @@ class FileListPanel(QWidget):
     show_thumbnail_sort_controls = False
     # 宿主可扩展展示列；两种视图仍使用该模型定义的同一排序键。
     file_table_model_class = FileTableModel
+    thumbnail_model_class = ThumbnailListModel
+    thumbnail_delegate_class = ThumbnailItemDelegate
     # Application-owned held-key playback is opt-in.  SuperBirdStamp subclasses
     # intentionally keep native Qt selection/currentItemChanged semantics.
     enable_key_navigation_playback = False
@@ -95,7 +97,7 @@ class FileListPanel(QWidget):
         self._file_table_model = self.file_table_model_class(self)
         self._file_table_proxy = FileTableSortProxyModel(self)
         self._file_table_proxy.setSourceModel(self._file_table_model)
-        self._thumb_list_model = ThumbnailListModel(self)
+        self._thumb_list_model = self.thumbnail_model_class(self)
         self._meta_cache:    dict = {}   # norm_path → metadata dict
         self._directory_scope_cache: dict[bool, dict] = {}  # 当前目录 shallow/recursive 两个 scope 的文件列表缓存
         self._report_cache:  dict = {}   # legacy report row cache；sidecar/EXIF 模式下保持为空
@@ -520,7 +522,7 @@ class FileListPanel(QWidget):
         self._list_widget = QListView()
         self._list_widget.setViewMode(_ViewModeIcon)
         self._list_widget.setModel(self._thumb_list_model)
-        self._list_widget.setItemDelegate(ThumbnailItemDelegate(self._list_widget))
+        self._list_widget.setItemDelegate(self.thumbnail_delegate_class(self._list_widget))
         self._list_widget.setSelectionMode(_ExtendedSelection)  # Shift/Command 多选
         self._list_widget.setResizeMode(
             QListView.ResizeMode.Adjust if hasattr(QListView, "ResizeMode")
@@ -4650,7 +4652,7 @@ class FileListPanel(QWidget):
             except Exception:
                 grid_height = 0
             if grid_height <= 0:
-                grid_height = int(self._thumb_size) + 46
+                grid_height = self.thumbnail_delegate_class.grid_size(int(self._thumb_size)).height()
             return max(1, grid_height)
         return 1
 
@@ -4761,7 +4763,7 @@ class FileListPanel(QWidget):
                 idx = self._find_thumb_index_for_tooltip(event.pos())
                 path = self._thumb_path_from_index(idx) if idx.isValid() else ""
                 if path:
-                    tooltip = self._build_list_path_tooltip(path)
+                    tooltip = str(idx.data(_ToolTipRole) or "")
                     if tooltip:
                         QToolTip.showText(event.globalPos(), tooltip, list_viewport)
                         return True
@@ -5606,9 +5608,7 @@ class FileListPanel(QWidget):
     def _update_thumb_display(self) -> None:
         s = self._thumb_size
         self._list_widget.setIconSize(QSize(s, s))
-        cell_w = s + 32
-        cell_h = s + 46
-        self._list_widget.setGridSize(QSize(cell_w, cell_h))
+        self._list_widget.setGridSize(self.thumbnail_delegate_class.grid_size(s))
         self._list_widget.setSpacing(8)
         self._list_widget.doItemsLayout()
         self._sync_wheel_scroll_steps()

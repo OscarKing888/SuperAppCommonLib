@@ -1054,7 +1054,7 @@ class ThumbnailListModel(_BurstGroupMixin, QAbstractListModel):
             pick=pick,
             focus_status=_metadata_focus_status_text(meta),
             focus_box=_metadata_focus_box(meta),
-            species_cn=str(meta.get("bird_species_cn", "")),
+            species_cn=_metadata_species_text(meta),
             video_info=meta.get("video_info"),
             burst_position=burst_position,
             burst_id=burst_id,
@@ -1309,7 +1309,7 @@ class ThumbnailListModel(_BurstGroupMixin, QAbstractListModel):
         if entry.focus_box != new_focus_box:
             entry.focus_box = new_focus_box
             changed_roles.append(_MetaFocusBoxRole)
-        new_species_cn = str(meta.get("bird_species_cn", ""))
+        new_species_cn = _metadata_species_text(meta)
         if entry.species_cn != new_species_cn:
             entry.species_cn = new_species_cn
             changed_roles.append(_MetaSpeciesCnRole)
@@ -1680,6 +1680,17 @@ def _paint_thumb_footer(painter: QPainter, card: QRect, footer_h: int) -> QRectF
 class ThumbnailItemDelegate(QStyledItemDelegate):
     """Custom thumbnail delegate: aspect-fit preview card with a fixed metadata footer."""
 
+    identity_footer_height = 0
+    show_species_overlay = True
+
+    @classmethod
+    def grid_size(cls, thumb_size: int) -> QSize:
+        # Hosts can add identity rows without taking space from the preview slot.
+        return QSize(thumb_size + 32, thumb_size + 46 + cls.identity_footer_height)
+
+    def paint_identity_footer(self, painter, rect, index, option) -> None:
+        """Optional host metadata rows above the existing pick/focus/rating strip."""
+
     def sizeHint(self, option, index):
         widget = option.widget
         if widget is not None:
@@ -1741,7 +1752,8 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
                 cell.width(),
                 max(24, cell.height() - name_height - 6),
             )
-            footer_h = _THUMB_FOOTER_HEIGHT_SMALL if small else _THUMB_FOOTER_HEIGHT
+            status_h = _THUMB_FOOTER_HEIGHT_SMALL if small else _THUMB_FOOTER_HEIGHT
+            footer_h = status_h + self.identity_footer_height
             if card.height() - footer_h < 24:
                 footer_h = 0
             thumb_rect = QRect(card.left(), card.top(), card.width(), card.height() - footer_h)
@@ -1858,11 +1870,20 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
                 painter.setPen(QColor(_THUMB_SPECIES_COLOR))
                 painter.drawText(label_rect, _AlignCenter, elided)
 
-            draw_species_overlay(species_cn)
+            if self.show_species_overlay:
+                draw_species_overlay(species_cn)
 
             if footer_h:
                 footer = _paint_thumb_footer(painter, card, footer_h)
-                cy = footer.center().y()
+                if self.identity_footer_height:
+                    identity = QRectF(footer.left(), footer.top(), footer.width(), self.identity_footer_height)
+                    painter.save()
+                    try:
+                        painter.setClipRect(identity)
+                        self.paint_identity_footer(painter, identity, index, opt)
+                    finally:
+                        painter.restore()
+                cy = footer.center().y() + self.identity_footer_height / 2
                 star_r = 4.5 if small else 5.5
                 star_gap = 1.5 if small else 2.0
                 text_right = footer.right() - 6
