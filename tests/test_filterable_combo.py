@@ -32,15 +32,17 @@ def controls():
     other = QLineEdit()
     layout.addWidget(combo)
     layout.addWidget(other)
-    host.show()
-    host.activateWindow()
-    wait_until(host.isActiveWindow)
-    yield host, combo, other
-    combo.hidePopup()
-    host.close()
-    host.deleteLater()
-    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
-    _APP.processEvents()
+    try:
+        host.show()
+        host.activateWindow()
+        wait_until(lambda: _APP.focusWindow() is host.windowHandle())
+        yield host, combo, other
+    finally:
+        combo.hidePopup()
+        host.close()
+        host.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        _APP.processEvents()
 
 
 def open_with_mouse(combo):
