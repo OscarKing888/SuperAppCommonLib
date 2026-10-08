@@ -16,6 +16,7 @@ submodule 使用。共享代码改动必须同时保持两个应用的行为兼�
   - 宿主可通过 `FileListPanel.file_table_model_class` 扩展列表列，并由模型的
     `sort_key_for_path()` 为缩略图提供同一排序键；默认模型保持两款应用的原有列。
 - **bird_species_copy**：无 Qt 的鸟名复制快照和 XMP 粘贴字段映射；同时携带中英文名、拼音、稀有度、保护等级和拍摄地点，保留 0 分并清除目标旧值，不复制照片评分、相机参数或识别置信度。
+- **metadata_badges**：Qt/Pillow 共用的字段→徽章映射注册表，统一字段别名、分级、名称、背景色和文字色；支持稀有度和 IUCN 保护等级。`rarity_badge_*` 兼容旧配置，`iucn_badge_*` 默认采用 Cornell 保护状态配色，两组均由 `superviewer_user_options` 校验和保存。
 - **focus_calc**：按相机元数据解析焦点及显示方向
 - **raw_preview_geometry**：将相机内嵌 JPEG 的焦点映射到完整 RAW 可见区，处理默认裁切、传感器边缘和旋转；Viewer/BirdStamp 随像素传递几何，缺失信息不猜偏移
 - **preview_canvas**：图片预览组件；`FocusCenteredPreviewCanvas` 为 Viewer/BirdStamp 提供可选的焦点居中视口，共用缩放、叠加和导出基础能力

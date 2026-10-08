@@ -52,8 +52,13 @@ def rarity_level(value) -> str:
 
 
 def normalize_rarity_options(source: dict | None) -> dict[str, str]:
+    return normalize_badge_options(source, RARITY_DEFAULT_OPTIONS)
+
+
+def normalize_badge_options(source: dict | None, defaults: dict[str, str]) -> dict[str, str]:
+    """Validate configurable plain-text labels and hex colors for any badge palette."""
     source = source if isinstance(source, dict) else {}
-    result = dict(RARITY_DEFAULT_OPTIONS)
+    result = dict(defaults)
     for key in result:
         value = source.get(key)
         if not isinstance(value, str):
