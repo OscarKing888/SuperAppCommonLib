@@ -23,6 +23,7 @@ submodule 使用。共享代码改动必须同时保持两个应用的行为兼�
 - **preview_canvas**：图片预览组件；`FocusCenteredPreviewCanvas` 为 Viewer/BirdStamp 提供可选的焦点居中视口，共用缩放、叠加和导出基础能力
 - **report_db**：`慧眼选鸟`报告数据库兼容层；应用内仅作为只读 fallback/hydration
 - **send_to_app**：发送/接收文件到与其他应用
+- **filterable_combo**：`FilterableComboBox` 共用可过滤下拉框；支持可编辑/只选模式、显示文本和 `itemData` 多词匹配、延迟加载信号 `popupAboutToShow`、自定义 `setFilterPlaceholderText`。过滤不修改原值，明确选择才发送原生选择信号。macOS/Windows 使用能接收原生键盘与输入法的无边框工具弹窗，统一处理 Esc、外部点击、失活、父控件隐藏和屏幕边界。BirdStamp 的 Overlay 字段/字体与模板字段/字体均复用；回归在 `tests/test_filterable_combo.py`，可用 `QT_QPA_PLATFORM=cocoa` 显式运行 macOS 原生焦点检查（默认离屏）。
 - **ui_style**：UI 样式
 - **app_info_bar**：图标 + 主副标题 + “关于...” 按钮
   - `widget.py`：`AppInfoBar(parent, title=..., subtitle=..., icon_path=..., on_about_clicked=...)`
