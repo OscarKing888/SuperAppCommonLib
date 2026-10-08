@@ -1,6 +1,19 @@
 import os
+import json
 
 from app_common.file_browser._panel import FileListPanel
+
+
+def test_individual_bird_records_survive_browser_metadata_reload():
+    from app_common.file_browser._workers import MetadataLoader
+    records = json.dumps([{"cn_name": "白鹭", "box": [.1, .2, .4, .8]}], ensure_ascii=False)
+    loader = MetadataLoader([], meta_proxy=object())
+    for prefix in ("", "XMP-superpicky:"):
+        parsed = loader._parse_rec({prefix + "birdid_individuals": records,
+                                    prefix + "birdid_individuals_info": '{"schema":1}'})
+        assert parsed["birdid_individuals"] == records
+        assert parsed["birdid_individuals_info"] == '{"schema":1}'
+    assert loader._parse_rec({"XMP-superpicky:birdid_individuals": "[]"})["birdid_individuals"] == "[]"
 
 
 class _DescriptionProxy:
