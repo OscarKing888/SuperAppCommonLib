@@ -82,6 +82,7 @@ class FileListPanel(QWidget):
         self._all_files: list = []
         self._filtered_files: list = []
         self._current_dir = ""
+        self._include_subdirectories = True
         self._report_root_dir: str | None = None  # 当前使用的 report 根目录（含 .superpicky 的目录）
         self._report_full_root_dir: str | None = None
         self._report_full_cache: dict | None = None
@@ -1340,7 +1341,7 @@ class FileListPanel(QWidget):
             self._apply_filter()
             perf_log(_log, "[filter.scope] reason=no_current_dir elapsed_ms=%.1f", elapsed_ms(probe_t0))
             return
-        target_recursive = True
+        target_recursive = self._include_subdirectories
         if target_recursive == self._loaded_directory_recursive:
             self._apply_filter()
             perf_log(
@@ -1379,6 +1380,10 @@ class FileListPanel(QWidget):
             elapsed_ms(probe_t0),
         )
 
+    def set_include_subdirectories(self, enabled: bool) -> None:
+        """设置后续加载与过滤的目录范围；宿主负责刷新列表及预览。"""
+        self._include_subdirectories = bool(enabled)
+
     def load_directory(
         self,
         path: str,
@@ -1389,14 +1394,14 @@ class FileListPanel(QWidget):
     ) -> None:
         """
         扫描目录，加载支持的图像文件。扫描与 report 加载在后台线程执行，避免阻塞 UI。
-        递归遍历该目录及所有子目录（不进入 . 开头目录）。过滤切换同目录 scope 时可复用当前内存中的
+        默认递归遍历子目录（不进入 . 开头目录），宿主可关闭包含子目录。切换同目录 scope 时可复用当前内存中的
         文件列表和 metadata 缓存，避免重复全量读取。
         """
         if self._background_shutdown_requested:
             return
         self._stop_key_navigation_playback(commit=False)
         load_t0 = perf_counter()
-        recursive = True
+        recursive = self._include_subdirectories
         same_dir = path == self._current_dir
         self._probe_set_phase(
             "load_directory",
