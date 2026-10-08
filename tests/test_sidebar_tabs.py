@@ -35,6 +35,11 @@ def test_native_style_renders_horizontal_selected_tab_and_switches_pages(style, 
     _APP.processEvents()
     try:
         bar = tabs.tabBar()
+        # 必须检查栏在整个窗口中的位置；只截取 tabBar 会漏掉 macOS 垂直居中。
+        assert bar.y() <= 4
+        tabs.resize(440, 660)
+        _APP.processEvents()
+        assert bar.y() <= 4
         rect = bar.tabRect(0)
         rendered = QImage(bar.width()*scale, bar.height()*scale, QImage.Format.Format_ARGB32)
         rendered.setDevicePixelRatio(scale)
@@ -51,6 +56,7 @@ def test_native_style_renders_horizontal_selected_tab_and_switches_pages(style, 
                    for y in range(10*scale, 30*scale))
         tabs.addTab(second, '其他设置')
         _APP.processEvents()
+        assert bar.y() <= 4
         QTest.mouseClick(bar, Qt.MouseButton.LeftButton, pos=bar.tabRect(1).center())
         assert tabs.currentWidget() is second
         bar.setFocus()
