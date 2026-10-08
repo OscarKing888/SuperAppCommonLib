@@ -7,12 +7,28 @@ from PyQt6.QtWidgets import QApplication
 import pytest
 
 from app_common.bird_pinyin import PINYIN_ALIASES, stored_pinyin
+from app_common.bird_rarity import rarity_metadata
+from app_common.bird_species_copy import species_snapshot
+from app_common.shooting_location import shooting_location
 from app_common.exif_io.photo_meta import PhotoMetaDataXMP
 from app_common.file_browser import FileListPanel
 from app_common.file_browser import _panel as panel_module
 from app_common.file_browser._workers import MetadataLoader
 
 _APP = QApplication.instance() or QApplication([])
+
+
+def test_snapshot_merges_report_cache_and_sparse_sidecar():
+    snapshot = species_snapshot(
+        {"bird_species_cn": "白头鹎", "bird_species_en": "Light-vented Bulbul",
+         "gbif_rarity_100": 80, "pinyin_name": "报告拼音", "shooting_location": "旧地点"},
+        {"title": "白头鹎", "pinyin_name": "当前拼音", "shooting_location": ""},
+        {"XMP-superpicky:birdid_rarity_source": "白头鹎", "XMP-superpicky:gbif_rarity_100": 0},
+    )
+    assert snapshot["bird_species_en"] == "Light-vented Bulbul"
+    assert snapshot["pinyin_name"] == "当前拼音"
+    assert snapshot["gbif_rarity_100"] == 0
+    assert snapshot["shooting_location"] == ""
 
 
 @pytest.fixture
@@ -97,3 +113,80 @@ def test_partial_failure_keeps_failed_photo_and_cache(panel, tmp_path, monkeypat
     assert panel._meta_cache[paths[0]] == previous
     assert stored_pinyin(store.read(paths[1])) == "bái tóu bēi"
     assert stored_pinyin(panel._meta_cache[paths[1]]) == "bái tóu bēi"
+
+
+@pytest.mark.parametrize("score", [0, 87.25])
+def test_copy_paste_associated_metadata_snapshot(panel, tmp_path, monkeypatch, score):
+    source = make_photo(tmp_path, "来源.jpg")
+    targets = [make_photo(tmp_path, f"目标{i}.jpg") for i in range(2)]
+    store = PhotoMetaDataXMP()
+    assert store.write(source, {
+        "XMP-dc:Title": "白头鹎", "XMP-superpicky:bird_species_cn": "白头鹎",
+        "XMP-superpicky:bird_species_en": "Light-vented Bulbul",
+        "XMP-superpicky:pinyin_name": "保存的拼音 bái tóu bēi",
+        "XMP-superpicky:pinyin_name_source": "白头鹎",
+        "XMP-superpicky:gbif_rarity_100": score,
+        "XMP-superpicky:iucn_category": "LC",
+        "XMP-superpicky:birdid_rarity_source": "白头鹎",
+        "XMP-superpicky:shooting_location": "深圳湾·红树林",
+    })
+    # Old report/cache entries must not override the source's saved XMP.
+    old = {"bird_species_cn": "家燕", "bird_species_en": "Barn Swallow",
+           "pinyin_name": "jiā yàn", "gbif_rarity_100": 25, "iucn_category": "EN"}
+    panel._meta_cache[source] = dict(old)
+    monkeypatch.setattr(panel, "_get_report_row_for_path", lambda _path: dict(old))
+    display = str(tmp_path / "过期路径.jpg")
+    monkeypatch.setattr(panel, "_resolve_source_path_for_action", lambda path: source if path == display else path)
+    monkeypatch.setattr(panel_module, "read_batch_metadata", lambda *_args: pytest.fail("unexpected EXIF read"))
+    copied_text = []
+    monkeypatch.setattr(panel, "_copy_text_to_clipboard", copied_text.append)
+    panel._copy_species_from_path(display)
+    assert copied_text == ["白头鹎"]
+    # Copy is a snapshot: changing the source afterwards must not change paste.
+    assert store.write(source, {"XMP-superpicky:shooting_location": "另一个地点"})
+    originals = [Path(path).read_bytes() for path in targets]
+    panel._paste_species_to_paths(targets)
+    loader = MetadataLoader([], meta_proxy=object())
+    try:
+        for path, original in zip(targets, originals):
+            saved = store.read(path)
+            for rec in (saved, panel._meta_cache[path], loader._parse_rec(saved)):
+                assert stored_pinyin(rec) == "保存的拼音 bái tóu bēi"
+                assert rarity_metadata(rec) == (score, "LC")
+                assert shooting_location(rec) == "深圳湾·红树林"
+            assert saved["bird_species_en"] == "Light-vented Bulbul"
+            assert saved["Description"] == "保留中文备注" and saved["rating"] == 4
+            assert Path(path).read_bytes() == original
+    finally:
+        loader.deleteLater()
+
+
+def test_missing_source_fields_clear_previous_species_data(panel, tmp_path, monkeypatch):
+    source = make_photo(tmp_path, "来源.jpg")
+    target = make_photo(tmp_path, "目标.jpg")
+    store = PhotoMetaDataXMP()
+    assert store.write(source, {
+        "XMP-dc:Title": "未知鸟种", "XMP-superpicky:bird_species_cn": "未知鸟种",
+        "XMP-superpicky:pinyin_name_source": "家燕",
+        "XMP-superpicky:gbif_rarity_100": 90, "XMP-superpicky:birdid_rarity_source": "家燕",
+    })
+    assert store.write(target, {
+        "XMP-superpicky:bird_species_en": "Barn Swallow",
+        "XMP-superpicky:gbif_rarity_100": 80, "XMP-superpicky:iucn_category": "EN",
+        "XMP-iptcExt:Event": "80", "XMP-iptcCore:IntellectualGenre": "EN",
+        "XMP-superpicky:shooting_location": "旧地点",
+    })
+    monkeypatch.setattr(panel, "_get_report_row_for_path", lambda _path: {
+        "bird_species_cn": "家燕", "bird_species_en": "Barn Swallow",
+        "pinyin_name": "jiā yàn", "gbif_rarity_100": 70, "iucn_category": "EN",
+    })
+    monkeypatch.setattr(panel, "_copy_text_to_clipboard", lambda _text: None)
+    panel._copy_species_from_path(source)
+    panel._paste_species_to_paths([target])
+    rec = store.read(target)
+    # Marker fields prevent stale report values from being hydrated on reload.
+    assert rarity_metadata({"report.gbif_rarity_100": 70, **rec}) == (None, "")
+    assert stored_pinyin(rec) == "" and shooting_location(rec) == ""
+    assert not rec.get("bird_species_en")
+    assert rec["birdid_rarity_source"] == "未知鸟种"
+    assert set(rec["birdid_rarity_missing"].split(",")) == {"gbif_rarity_100", "iucn_category"}

@@ -7,7 +7,7 @@ import shutil
 import traceback
 import tempfile
 
-from app_common.bird_pinyin import PINYIN_ALIASES, PINYIN_FIELD, PINYIN_SOURCE_FIELD, pinyin_for
+from app_common.bird_species_copy import species_paste_fields, species_snapshot
 from app_common.perf_probe import elapsed_ms, perf_counter, perf_log, perf_probes_enabled
 from app_common.qt_theme import is_theme_change_event
 from app_common.file_browser._browser_core import *
@@ -2207,20 +2207,21 @@ class FileListPanel(QWidget):
                 cached_meta.setdefault("bird_species_cn", title)
         return title
 
-    def _get_species_payload_for_path(self, path: str) -> dict | None:
-        row = self._get_report_row_for_path(path)
-        filename = str((row or {}).get("filename") or Path(path).stem or "").strip()
+    def _get_species_payload_for_path(self, path: str, *, read_sidecar: bool = False) -> dict | None:
+        row = self._get_report_row_for_path(path) or {}
+        filename = str(row.get("filename") or Path(path).stem or "").strip()
         if not filename:
             return None
-        bird_species_cn = str((row or {}).get("bird_species_cn") or "").strip()
-        if not bird_species_cn:
-            bird_species_cn = self._get_species_cn_from_metadata(path)
-        return {
-            "filename": filename,
-            "source_path": os.path.normpath(path) if path else "",
-            "bird_species_cn": bird_species_cn,
-            "bird_species_en": str((row or {}).get("bird_species_en") or "").strip(),
-        }
+        norm_path = os.path.normpath(path) if path else ""
+        cached = self._meta_cache.get(norm_path, {})
+        sources = [row, cached if isinstance(cached, dict) else {}]
+        if read_sidecar:
+            actual_path = self._resolve_source_path_for_action(path) or path
+            sources.append(self._meta_proxy.xmp.read(actual_path))
+        payload = species_snapshot(*sources)
+        if not payload["bird_species_cn"]:
+            payload["bird_species_cn"] = self._get_species_cn_from_metadata(path)
+        return {"filename": filename, "source_path": norm_path, **payload}
 
     def _copy_text_to_clipboard(self, text: str) -> None:
         """通过 Qt 剪贴板复制纯文本，兼容 macOS / Windows。"""
@@ -2228,7 +2229,7 @@ class FileListPanel(QWidget):
         _log.info("[_copy_text_to_clipboard] platform=%r text=%r", sys.platform, text)
 
     def _copy_species_from_path(self, path: str) -> None:
-        payload = self._get_species_payload_for_path(path)
+        payload = self._get_species_payload_for_path(path, read_sidecar=True)
         if not payload:
             _log.info("[_copy_species_from_path] skip source=%r reason=no_report_row", path)
             return
@@ -2278,14 +2279,7 @@ class FileListPanel(QWidget):
 
         updated = 0
         attempted = 0
-        # 鸟名与拼音一次写入侧车；清除旧别名，避免未收录鸟名沿用上一鸟种的拼音。
-        pinyin_updates = {key: "" for key in PINYIN_ALIASES}
-        pinyin_updates.update({PINYIN_FIELD: pinyin_for(cn), PINYIN_SOURCE_FIELD: title})
-        fields = {
-            "XMP-dc:Title": title,
-            "XMP-superpicky:bird_species_cn": title,
-            **{f"XMP-superpicky:{key}": value for key, value in pinyin_updates.items()},
-        }
+        fields, metadata_updates = species_paste_fields(payload)
         updates_by_path: dict[str, dict] = {}
         for path in self._unique_norm_paths(paths):
             target_path = self._resolve_source_path_for_action(path) or path
@@ -2302,12 +2296,7 @@ class FileListPanel(QWidget):
                 continue
             norm_path = os.path.normpath(path) if path else ""
             if norm_path:
-                updates_by_path[norm_path] = {
-                    **fields, **pinyin_updates,
-                    **{f"report.{key}": value for key, value in pinyin_updates.items()},
-                    "bird_species_cn": cn, "bird_species_en": en,
-                    "title": title, "Title": title,
-                }
+                updates_by_path[norm_path] = dict(metadata_updates)
             updated += 1
 
         if updates_by_path:
