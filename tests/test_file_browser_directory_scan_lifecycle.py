@@ -51,6 +51,7 @@ def _wait_until(predicate, timeout=3):
 @pytest.fixture
 def panel(tmp_path, monkeypatch):
     monkeypatch.setattr(superviewer_user_options, "_get_app_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(superviewer_user_options, "get_user_config_dir", lambda: str(tmp_path))
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "cache"))
     monkeypatch.setattr(panel_module, "DirectoryScanWorker", _ControlledScan)
     monkeypatch.setattr(panel_module, "_shutdown_thumb_disk_writer", lambda **kwargs: None)

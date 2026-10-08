@@ -5,6 +5,7 @@ submodule 使用。共享代码改动必须同时保持两个应用的行为兼�
 
 ## 结构
 
+- **superviewer_user_options**：共享用户选项与 Viewer 用户目录解析。源码版和打包版统一写入用户状态目录的 `Config/SuperViewerUser.cfg`，旧程序目录文件仅作缺失时的读取回退；BirdStamp 也通过此入口读取共享选项。显式 `path` 参数仍可用于 CLI/测试隔离。
 - **about_dialog**：关于对话框 + about 配置
   - `about.cfg`：默认“关于”信息（JSON，含 `about` 键）
   - `config.py`：`load_about_info(override_path=None)` 从 about.cfg 加载，可选外部文件覆盖
@@ -73,4 +74,3 @@ show_about_dialog(parent, info, logo_path="...", banner_path="...")
 bar = AppInfoBar(parent, title="MyApp", subtitle="...", icon_path="...", on_about_clicked=lambda: ...)
 layout.addWidget(bar)
 ```
-

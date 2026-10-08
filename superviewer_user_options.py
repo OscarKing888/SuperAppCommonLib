@@ -131,8 +131,23 @@ def _get_app_dir() -> str:
     return app_dir
 
 
+def get_user_state_dir() -> str:
+    """源码版和打包版共用用户状态目录，保持已有历史文件的位置。"""
+    if sys.platform.startswith("win"):
+        base_dir = os.environ.get("APPDATA") or os.path.expanduser("~")
+        return os.path.join(base_dir, "SuperViewer")
+    if sys.platform == "darwin":
+        return os.path.join(os.path.expanduser("~"), "Library", "Application Support", "SuperViewer")
+    return os.path.join(os.path.expanduser("~"), ".superviewer")
+
+
+def get_user_config_dir() -> str:
+    """返回与安装目录、版本无关的可写配置目录。"""
+    return os.path.join(get_user_state_dir(), "Config")
+
+
 def get_user_options_path() -> str:
-    return os.path.join(_get_app_dir(), USER_OPTIONS_FILENAME)
+    return os.path.join(get_user_config_dir(), USER_OPTIONS_FILENAME)
 
 
 def valid_denoise_subdir(value) -> bool:
@@ -248,6 +263,9 @@ def normalize_user_options(data: dict | None) -> dict[str, int | str]:
 
 def load_user_options(path: str | None = None) -> dict[str, int | str]:
     cfg_path = path or get_user_options_path()
+    if path is None and not os.path.isfile(cfg_path):
+        # 旧程序目录仅作读取回退；保存始终写入统一用户目录。
+        cfg_path = os.path.join(_get_app_dir(), USER_OPTIONS_FILENAME)
     if not os.path.isfile(cfg_path):
         return dict(_DEFAULT_OPTIONS)
     try:
@@ -261,6 +279,7 @@ def load_user_options(path: str | None = None) -> dict[str, int | str]:
 def save_user_options(data: dict | None, path: str | None = None) -> dict[str, int | str]:
     normalized = normalize_user_options(data)
     cfg_path = path or get_user_options_path()
+    os.makedirs(os.path.dirname(os.path.abspath(cfg_path)), exist_ok=True)
     with open(cfg_path, "w", encoding="utf-8") as f:
         json.dump(normalized, f, ensure_ascii=False, indent=2)
     return normalized
