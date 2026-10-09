@@ -8171,7 +8171,11 @@ class FileListPanel(QWidget):
         if deleted_thumb_cache_count:
             _log.info("[_move_paths_to_trash] deleted_thumb_cache=%s", deleted_thumb_cache_count)
         if ok_count and self._current_dir:
-            self.load_directory(self._current_dir, force_reload=True)
+            self._reload_after_trash(moved_display_paths)
+
+    def _reload_after_trash(self, moved_paths: list[str]) -> None:
+        """Reload successful deletions; hosts may prepare a selection first."""
+        self.load_directory(self._current_dir, force_reload=True)
 
     def _on_list_context_menu(self, pos) -> None:
         index = self._list_widget.indexAt(pos)
