@@ -52,6 +52,19 @@ def make_photo(tmp_path, filename):
     return str(photo)
 
 
+def test_cached_species_payload_does_not_query_original_metadata(panel, tmp_path, monkeypatch):
+    path = make_photo(tmp_path, "未缓存鸟名.jpg")
+    reads = []
+    monkeypatch.setattr(panel, "_get_species_cn_from_metadata", lambda path: reads.append(path) or "家燕")
+    cached = panel._get_species_payload_for_path(path, allow_metadata_read=False)
+    assert cached["filename"] == "未缓存鸟名" and not cached["bird_species_cn"]
+    assert reads == []
+    # 默认调用保留兼容回退；显式复制仍读最新侧车。
+    assert panel._get_species_payload_for_path(path)["bird_species_cn"] == "家燕"
+    assert reads == [path]
+    assert panel._get_species_payload_for_path(path, read_sidecar=True, allow_metadata_read=False)["bird_species_cn"] == "家燕"
+
+
 @pytest.mark.parametrize("name,expected", [("白头鹎", "bái tóu bēi"), ("词表未知鸟名", "")])
 def test_paste_updates_real_xmp_and_cache_for_multiple_photos(panel, tmp_path, monkeypatch, name, expected):
     paths = [make_photo(tmp_path, f"中文照片{i}.jpg") for i in range(2)]

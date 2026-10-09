@@ -2215,7 +2215,9 @@ class FileListPanel(QWidget):
                 cached_meta.setdefault("bird_species_cn", title)
         return title
 
-    def _get_species_payload_for_path(self, path: str, *, read_sidecar: bool = False) -> dict | None:
+    def _get_species_payload_for_path(
+        self, path: str, *, read_sidecar: bool = False, allow_metadata_read: bool = True,
+    ) -> dict | None:
         row = self._get_report_row_for_path(path) or {}
         filename = str(row.get("filename") or Path(path).stem or "").strip()
         if not filename:
@@ -2227,7 +2229,7 @@ class FileListPanel(QWidget):
             actual_path = self._resolve_source_path_for_action(path) or path
             sources.append(self._meta_proxy.xmp.read(actual_path))
         payload = species_snapshot(*sources)
-        if not payload["bird_species_cn"]:
+        if not payload["bird_species_cn"] and allow_metadata_read:
             payload["bird_species_cn"] = self._get_species_cn_from_metadata(path)
         return {"filename": filename, "source_path": norm_path, **payload}
 
