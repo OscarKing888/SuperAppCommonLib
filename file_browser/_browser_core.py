@@ -145,6 +145,11 @@ except AttributeError:
     _ViewModeIcon = QListView.IconMode  # type: ignore[attr-defined]
 
 try:
+    _ListLayoutSinglePass = QListView.LayoutMode.SinglePass
+except AttributeError:
+    _ListLayoutSinglePass = QListView.SinglePass  # type: ignore[attr-defined]
+
+try:
     _SingleSelection = QAbstractItemView.SelectionMode.SingleSelection
 except AttributeError:
     _SingleSelection = QAbstractItemView.SingleSelection  # type: ignore[attr-defined]

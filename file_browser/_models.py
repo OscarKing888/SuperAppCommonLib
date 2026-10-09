@@ -2,6 +2,8 @@
 """Qt item models and delegates for app_common.file_browser."""
 from __future__ import annotations
 
+import bisect
+
 from app_common.file_browser._browser_core import *
 
 
@@ -503,6 +505,17 @@ class FileTableView(QTreeView):
 
 # ── 缩略图 delegate（缩略图 + 星级徽章）───────────────────────────────────────
 
+def _contiguous_row_ranges(rows: list[int]) -> list[tuple[int, int]]:
+    """把升序行号压缩成 [(start, end), ...] 闭区间。"""
+    ranges: list[tuple[int, int]] = []
+    for row in rows:
+        if ranges and row == ranges[-1][1] + 1:
+            ranges[-1] = (ranges[-1][0], row)
+        else:
+            ranges.append((row, row))
+    return ranges
+
+
 @dataclass(frozen=True)
 class ThumbViewportEntry:
     path: str
@@ -531,6 +544,7 @@ class ThumbnailListModel(QAbstractListModel):
         super().__init__(parent)
         self._entries: list[ThumbnailListEntry] = []
         self._row_by_path: dict[str, int] = {}
+        self._row_by_path_stale = False
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         if parent.isValid():
@@ -630,6 +644,71 @@ class ThumbnailListModel(QAbstractListModel):
         self.endInsertRows()
         return len(new_entries)
 
+    def insert_paths_in_order(
+        self,
+        paths: list[str],
+        *,
+        rank: dict[str, int],
+        meta_cache: dict,
+        tooltip_fn,
+        mismatch_fn,
+    ) -> int:
+        """按 *rank*（规范化路径 → 目标序号）插入新行，已有行与缩略图保持不动。
+
+        已有条目须已按 rank 升序；不在 rank 中的路径排在末尾。追加到末尾时
+        走 O(批次) 快路径，填充大目录不会因每批扫描整表而变慢。
+        """
+        if not paths:
+            return 0
+        tail = len(rank)
+
+        def key(path: str) -> int:
+            return rank.get(os.path.normpath(path), tail)
+
+        ordered = sorted(paths, key=key)
+        if not self._entries or key(ordered[0]) >= key(self._entries[-1].path):
+            return self.append_paths(ordered, meta_cache=meta_cache, tooltip_fn=tooltip_fn, mismatch_fn=mismatch_fn)
+        existing_keys = [key(entry.path) for entry in self._entries]
+        groups: list[tuple[int, list[str]]] = []
+        for path in ordered:
+            row = bisect.bisect_right(existing_keys, key(path))
+            if groups and groups[-1][0] == row:
+                groups[-1][1].append(path)
+            else:
+                groups.append((row, [path]))
+        inserted = 0
+        for row, group in groups:
+            at = row + inserted
+            new_entries = [
+                self._build_entry(path, meta_cache=meta_cache, tooltip_fn=tooltip_fn, mismatch_fn=mismatch_fn)
+                for path in group
+            ]
+            self.beginInsertRows(QModelIndex(), at, at + len(new_entries) - 1)
+            self._entries[at:at] = new_entries
+            self._row_by_path_stale = True
+            self.endInsertRows()
+            inserted += len(new_entries)
+        self._rebuild_row_map()
+        return inserted
+
+    def remove_paths_not_in(self, keep_paths) -> int:
+        """删除不在 *keep_paths* 中的行（按连续区间发信号），保留其余条目的缩略图。"""
+        keep = {os.path.normpath(path) for path in keep_paths if path}
+        rows = [row for row, entry in enumerate(self._entries) if os.path.normpath(entry.path) not in keep]
+        if not rows:
+            return 0
+        for start, end in reversed(_contiguous_row_ranges(rows)):
+            self.beginRemoveRows(QModelIndex(), start, end)
+            del self._entries[start:end + 1]
+            self._row_by_path_stale = True
+            self.endRemoveRows()
+        self._rebuild_row_map()
+        return len(rows)
+
+    def _rebuild_row_map(self) -> None:
+        self._row_by_path = {os.path.normpath(entry.path): row for row, entry in enumerate(self._entries)}
+        self._row_by_path_stale = False
+
     def rebuild(
         self,
         paths: list[str],
@@ -654,6 +733,9 @@ class ThumbnailListModel(QAbstractListModel):
         self.endResetModel()
 
     def row_for_path(self, path: str) -> int | None:
+        # 区间增删的信号回调里可能查询行号，此时按当前条目重建一次映射。
+        if self._row_by_path_stale:
+            self._rebuild_row_map()
         norm = os.path.normpath(path) if path else ""
         row = self._row_by_path.get(norm)
         if row is None:
