@@ -40,3 +40,7 @@ bar = AppInfoBar(parent, title="MyApp", subtitle="...", icon_path="...", on_abou
 layout.addWidget(bar)
 ```
 
+
+## Logging
+
+- **日志（log）**：`get_logger()` 写 stderr，打包版另写用户日志目录（macOS `~/Library/Logs/<应用>/app.log`，Windows `%LOCALAPPDATA%\<应用>\logs`；`APP_COMMON_LOG_FILE` 可重定向）。同一进程所有 logger 共用一个文件句柄；超过 10 MB 滚动为 `app.log.1`，最多保留 5 份旧日志（`APP_COMMON_LOG_MAX_BYTES` / `APP_COMMON_LOG_BACKUPS` 可调），总量不超过约 60 MB。多个进程写同一文件时按路径判断大小、跟随别的进程的滚动；Windows 上文件被占用无法改名时稍后重试。旧版无限增长留下的超大日志在首次滚动时只保留最后 10 MB。
