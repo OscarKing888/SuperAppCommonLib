@@ -273,3 +273,24 @@ def test_bird_sharpness_edge_estimator_defaults_to_standard() -> None:
         assert superviewer_user_options.get_bird_sharpness_edge_estimator() == "dense"
     finally:
         superviewer_user_options.apply_runtime_user_options(None)
+
+
+def test_bird_detection_options_mapping_normalization_and_runtime():
+    opts = superviewer_user_options
+    before = opts.get_runtime_user_options()
+    custom = {'detect_long_edge': 2048, 'detect_imgsz': 1280, 'detect_conf_percent': 10,
+              'duplicate_box_percent': 90, 'duplicate_mask_percent': 80, 'flock_mode': 'off', 'exclude_birds': False}
+    try:
+        values = opts.bird_sharpness_params_to_options(custom)
+        opts.apply_runtime_user_options(values)
+        result = opts.get_bird_sharpness_params()
+        assert all(result[k] == v for k, v in custom.items())
+        assert result['exclude_birds'] is False
+        normalized = opts.normalize_user_options({opts.KEY_BIRD_SHARPNESS_DETECT_CONF_PERCENT: -1,
+                    opts.KEY_BIRD_SHARPNESS_DUPLICATE_MASK_PERCENT: 500,
+                    opts.KEY_BIRD_SHARPNESS_FLOCK_MODE: 'invalid'})
+        assert normalized[opts.KEY_BIRD_SHARPNESS_DETECT_CONF_PERCENT] == 5
+        assert normalized[opts.KEY_BIRD_SHARPNESS_DUPLICATE_MASK_PERCENT] == 100
+        assert normalized[opts.KEY_BIRD_SHARPNESS_FLOCK_MODE] == 'auto'
+    finally:
+        opts.apply_runtime_user_options(before)

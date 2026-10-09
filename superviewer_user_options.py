@@ -51,8 +51,22 @@ KEY_BIRD_SHARPNESS_ENH_LIFT = "bird_sharpness_enhanced_lift"
 KEY_BIRD_SHARPNESS_IMAGE_SOURCE = "bird_sharpness_image_source"
 BIRD_SHARPNESS_IMAGE_SOURCES = ("jpeg", "raw", "denoised")
 _MODEL_FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.pt$")
+KEY_BIRD_SHARPNESS_DETECT_LONG_EDGE = "bird_sharpness_detect_long_edge"
+KEY_BIRD_SHARPNESS_DETECT_IMGSZ = "bird_sharpness_detect_imgsz"
+KEY_BIRD_SHARPNESS_DETECT_CONF_PERCENT = "bird_sharpness_detect_conf_percent"
+KEY_BIRD_SHARPNESS_DUPLICATE_BOX_PERCENT = "bird_sharpness_duplicate_box_percent"
+KEY_BIRD_SHARPNESS_DUPLICATE_MASK_PERCENT = "bird_sharpness_duplicate_mask_percent"
+KEY_BIRD_SHARPNESS_EXCLUDE_BIRDS = "bird_sharpness_exclude_birds"
+KEY_BIRD_SHARPNESS_FLOCK_MODE = "bird_sharpness_flock_mode"
 # key -> (default, min, max); keep in step with bird_sharpness.params.AnalysisParams
 BIRD_SHARPNESS_INT_LIMITS = {
+    KEY_BIRD_SHARPNESS_DETECT_LONG_EDGE: (1024, 640, 4096),
+    KEY_BIRD_SHARPNESS_DETECT_IMGSZ: (640, 320, 2048),
+    KEY_BIRD_SHARPNESS_DETECT_CONF_PERCENT: (25, 5, 95),
+    KEY_BIRD_SHARPNESS_DUPLICATE_BOX_PERCENT: (70, 1, 100),
+    KEY_BIRD_SHARPNESS_DUPLICATE_MASK_PERCENT: (70, 1, 100),
+    KEY_BIRD_SHARPNESS_EXCLUDE_BIRDS: (1, 0, 1),
+
     KEY_BIRD_SHARPNESS_FULL_TILE: (1024, 128, 4096),
     KEY_BIRD_SHARPNESS_MF_CENTER: (1, 0, 1),
     KEY_BIRD_SHARPNESS_MF_CENTER_PERCENT: (50, 10, 100),
@@ -68,6 +82,7 @@ BIRD_SHARPNESS_INT_LIMITS = {
 }
 # key -> (default, allowed values or None for a model file name)
 BIRD_SHARPNESS_TEXT_CHOICES = {
+    KEY_BIRD_SHARPNESS_FLOCK_MODE: ("auto", ("auto", "always", "off")),
     KEY_BIRD_SHARPNESS_DETECTOR: ("auto", None),
     KEY_BIRD_SHARPNESS_SAM_MODEL: ("", None),
     KEY_BIRD_SHARPNESS_SAM_SCOPE: ("all", BIRD_SHARPNESS_SAM_SCOPES),
@@ -77,6 +92,14 @@ BIRD_SHARPNESS_TEXT_CHOICES = {
 }
 # bird_sharpness.params.AnalysisParams.as_params() name -> user option key (the one mapping between them)
 BIRD_SHARPNESS_PARAM_KEYS = {
+    "detect_long_edge": KEY_BIRD_SHARPNESS_DETECT_LONG_EDGE,
+    "detect_imgsz": KEY_BIRD_SHARPNESS_DETECT_IMGSZ,
+    "detect_conf_percent": KEY_BIRD_SHARPNESS_DETECT_CONF_PERCENT,
+    "duplicate_box_percent": KEY_BIRD_SHARPNESS_DUPLICATE_BOX_PERCENT,
+    "duplicate_mask_percent": KEY_BIRD_SHARPNESS_DUPLICATE_MASK_PERCENT,
+    "exclude_birds": KEY_BIRD_SHARPNESS_EXCLUDE_BIRDS,
+    "flock_mode": KEY_BIRD_SHARPNESS_FLOCK_MODE,
+
     "max_birds": KEY_BIRD_SHARPNESS_MAX_BIRDS, "edge_estimator": KEY_BIRD_SHARPNESS_EDGE_ESTIMATOR,
     "detector": KEY_BIRD_SHARPNESS_DETECTOR, "sam_model": KEY_BIRD_SHARPNESS_SAM_MODEL,
     "sam_scope": KEY_BIRD_SHARPNESS_SAM_SCOPE, "enh_mode": KEY_BIRD_SHARPNESS_ENH_MODE,
@@ -88,7 +111,7 @@ BIRD_SHARPNESS_PARAM_KEYS = {
     "bird_pixels": KEY_BIRD_SHARPNESS_PIXELS, "grey_fill": KEY_BIRD_SHARPNESS_GREY_FILL,
     "min_bird_side": KEY_BIRD_SHARPNESS_MIN_BIRD_SIDE, "image_source": KEY_BIRD_SHARPNESS_IMAGE_SOURCE,
 }
-_BOOL_PARAMS = ("mf_center", "enh_lift", "grey_fill")
+_BOOL_PARAMS = ("mf_center", "enh_lift", "grey_fill", "exclude_birds")
 DENOISE_DEFAULT_OPTIONS = {
     "denoise_output_mode": "source_subdir",
     "denoise_subdir": "denoised",
