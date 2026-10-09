@@ -13,6 +13,7 @@ USER_OPTIONS_FILENAME = "SuperViewerUser.cfg"
 PERSISTENT_THUMB_SIZE_LEVELS = (128, 256, 512, 1024, 2048)
 KEY_NAVIGATION_FPS_OPTIONS = (1, 2, 4, 8, 10, 12, 13, 15, 20, 24, 25, 30, 40, 45, 50, 60, 120)
 KEY_PERF_PROBES_ENABLED = "perf_probes_enabled"
+KEY_BIRD_HOVER_COLOR = "bird_hover_color"
 # Birds measured per photo by bird sharpness; 0 = no limit (birds on the focus box go first when limited).
 KEY_BIRD_SHARPNESS_MAX_BIRDS = "bird_sharpness_max_birds"
 BIRD_SHARPNESS_MAX_BIRDS_LIMIT = 999
@@ -127,6 +128,7 @@ _DEFAULT_CPU_COUNT = max(1, os.cpu_count() or 1)
 _DEFAULT_METADATA_WORKERS = max(1, min(8, _DEFAULT_CPU_COUNT // 4 or 1))
 _DEFAULT_PERSISTENT_THUMB_WORKERS = max(1, _DEFAULT_CPU_COUNT - _DEFAULT_METADATA_WORKERS)
 _DEFAULT_OPTIONS = {
+    KEY_BIRD_HOVER_COLOR: "#FF0000",
     "thumbnail_loader_workers": _DEFAULT_CPU_COUNT,
     "metadata_loader_workers": _DEFAULT_METADATA_WORKERS,
     "persistent_thumb_workers": _DEFAULT_PERSISTENT_THUMB_WORKERS,
@@ -280,6 +282,9 @@ def normalize_user_options(data: dict | None) -> dict[str, int | str]:
             value = normalized[key]
         normalized[key] = max(0 if key == "denoise_strength" else 1, min(maximum, value))
 
+    color = source.get(KEY_BIRD_HOVER_COLOR)
+    if isinstance(color, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", color.strip()):
+        normalized[KEY_BIRD_HOVER_COLOR] = color.strip().upper()
     normalized.update(normalize_metadata_badge_options(source))
     return normalized
 

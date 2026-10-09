@@ -24,6 +24,16 @@ def test_default_workers_split_metadata_and_persistent_thumbnail_generation() ->
     assert options["persistent_thumb_workers"] == max(1, cpu_count - metadata_workers)
 
 
+def test_bird_hover_color_validates_and_roundtrips(tmp_path, monkeypatch):
+    key = superviewer_user_options.KEY_BIRD_HOVER_COLOR
+    for value in (None, '', 'red', '#11223344', '#oops', 123):
+        assert normalize_user_options({key: value})[key] == '#FF0000'
+    monkeypatch.setattr(superviewer_user_options, 'get_user_options_path', lambda: str(tmp_path / 'options.cfg'))
+    saved = superviewer_user_options.save_user_options({key: ' #aabbcc '})
+    assert saved[key] == '#AABBCC'
+    assert superviewer_user_options.load_user_options()[key] == '#AABBCC'
+
+
 def test_legacy_options_keep_persistent_worker_count_and_add_metadata_default() -> None:
     custom_persistent_workers = max(1, os.cpu_count() or 1) + 7
 
