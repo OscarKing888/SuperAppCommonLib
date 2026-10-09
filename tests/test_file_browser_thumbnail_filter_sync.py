@@ -175,3 +175,28 @@ def test_list_mode_filter_does_not_populate_thumbnails(panel, tmp_path, monkeypa
     panel._apply_filter()
     assert panel._filtered_files == paths[:1]
     assert not calls
+
+
+@pytest.mark.parametrize('mode', [FileListPanel._MODE_LIST, FileListPanel._MODE_THUMB])
+@pytest.mark.parametrize('keep_selected', [False, True])
+def test_delayed_scroll_preserves_updated_selection(panel, tmp_path, monkeypatch, mode, keep_selected):
+    paths = _load_thumbnails(panel, tmp_path, 3)
+    panel._set_view_mode(mode)
+    if mode == panel._MODE_LIST and panel._tree_view_dirty:
+        panel._populate_tree_model_batch()
+        assert not panel._tree_view_dirty
+    panel.set_pending_selection(paths[:2], paths[0])
+    callbacks = []
+    monkeypatch.setattr(panel_module.QTimer, 'singleShot', lambda delay, callback: callbacks.append(callback))
+    panel._schedule_selection_visibility_restore(paths[0])
+    view = panel._tree_widget if mode == panel._MODE_LIST else panel._list_widget
+    index_for_path = panel._tree_index_for_path if mode == panel._MODE_LIST else panel._thumb_index_for_path
+    view.setCurrentIndex(index_for_path(paths[1]))
+    if not keep_selected:
+        view.clearSelection()
+    before = panel._active_view_selected_paths()
+    assert before == ([paths[1]] if keep_selected else [])
+    for callback in callbacks:
+        callback()
+    assert panel._active_view_selected_paths() == before
+    assert view.currentIndex() == index_for_path(paths[1])

@@ -1880,7 +1880,7 @@ class FileListPanel(QWidget):
             view_mode=self._view_mode,
         )
         for delay_ms in normalized_delays:
-            QTimer.singleShot(delay_ms, lambda p=norm_path: self._scroll_path_into_view(p))
+            QTimer.singleShot(delay_ms, lambda p=norm_path: self._scroll_path_into_view(p, update_current=False))
 
     def _replay_selection_visibility_restore(self, reason: str) -> None:
         """在后续 tree refresh / sort 完成后，按需再次确保选中项可见。"""
@@ -1916,7 +1916,7 @@ class FileListPanel(QWidget):
             lines,
         )
 
-    def _scroll_path_into_view(self, path: str, *, prefer_active: bool = True) -> None:
+    def _scroll_path_into_view(self, path: str, *, prefer_active: bool = True, update_current: bool = True) -> None:
         """按路径滚动到目标项，必要时补设当前项。"""
         norm_path = os.path.normpath(path) if path else ""
         if not norm_path:
@@ -1928,7 +1928,7 @@ class FileListPanel(QWidget):
             if not idx.isValid():
                 self._record_selection_scroll_debug("scroll.tree.miss", norm_path)
                 return False
-            if target_mode in (None, self._MODE_LIST):
+            if update_current and target_mode in (None, self._MODE_LIST):
                 self._tree_widget.setCurrentIndex(idx)
             bar = self._tree_widget.verticalScrollBar()
             before = bar.value() if bar is not None else None
@@ -1953,7 +1953,7 @@ class FileListPanel(QWidget):
             if not idx.isValid():
                 self._record_selection_scroll_debug("scroll.thumb.miss", norm_path)
                 return False
-            if target_mode in (None, self._MODE_THUMB):
+            if update_current and target_mode in (None, self._MODE_THUMB):
                 self._list_widget.setCurrentIndex(idx)
             bar = self._list_widget.verticalScrollBar()
             before = bar.value() if bar is not None else None
