@@ -29,6 +29,7 @@ __all__ = [
 
 # 顶层导出继续兼容旧调用；只读元数据、图像格式和 CLI 不应因导入包而加载 Qt。
 _LAZY_UI_EXPORTS = {
+    "CollapsibleSection": "app_common.collapsible_section",
     "show_about_dialog": "app_common.about_dialog",
     "load_about_info": "app_common.about_dialog",
     "load_about_images": "app_common.about_dialog",

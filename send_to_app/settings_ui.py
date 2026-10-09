@@ -46,13 +46,12 @@ def _qt():
             QMessageBox,
             QDialogButtonBox,
             QFormLayout,
-            QGroupBox,
         )
         from PyQt6.QtCore import Qt
         return (
             QDialog, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem,
             QPushButton, QLabel, QLineEdit, QFileDialog, QMessageBox,
-            QDialogButtonBox, QFormLayout, QGroupBox, Qt,
+            QDialogButtonBox, QFormLayout, Qt,
         )
     except ImportError:
         from PyQt5.QtWidgets import (
@@ -68,13 +67,12 @@ def _qt():
             QMessageBox,
             QDialogButtonBox,
             QFormLayout,
-            QGroupBox,
         )
         from PyQt5.QtCore import Qt
         return (
             QDialog, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem,
             QPushButton, QLabel, QLineEdit, QFileDialog, QMessageBox,
-            QDialogButtonBox, QFormLayout, QGroupBox, Qt,
+            QDialogButtonBox, QFormLayout, Qt,
         )
 
 
@@ -91,8 +89,10 @@ def show_external_apps_settings_dialog(
     (
         QDialog, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem,
         QPushButton, QLabel, QLineEdit, QFileDialog, QMessageBox,
-        QDialogButtonBox, QFormLayout, QGroupBox, Qt,
+        QDialogButtonBox, QFormLayout, Qt,
     ) = _qt()
+
+    from ..collapsible_section import CollapsibleSection
 
     data = _config.load_config(config_dir=config_dir)
     apps = list(data.get("apps") or [])
@@ -101,8 +101,8 @@ def show_external_apps_settings_dialog(
     dlg.setWindowTitle("发送到外部应用 - 设置")
     layout = QVBoxLayout(dlg)
 
-    group = QGroupBox("已配置的应用")
-    group_layout = QVBoxLayout(group)
+    group = CollapsibleSection("已配置的应用")
+    group_layout = QVBoxLayout(group.body)
     list_widget = QListWidget()
     list_widget.setMinimumHeight(120)
     group_layout.addWidget(list_widget)
