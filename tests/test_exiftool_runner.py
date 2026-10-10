@@ -82,6 +82,7 @@ def test_run_exiftool_uses_stay_open_protocol(monkeypatch) -> None:
         popen_calls.append(list(cmd))
         return fake_proc
 
+    monkeypatch.setattr(exiftool_runner, "_create_process_job", lambda: None)
     monkeypatch.setattr(exiftool_runner.subprocess, "Popen", _fake_popen)
 
     try:
@@ -196,6 +197,7 @@ def test_stay_open_timeout_kills_process_and_next_command_restarts(monkeypatch) 
     hung = _FakeProc(_BlockingPipe())
     restarted = _FakeProc(_PipeOut([b"ok\n", b"{ready2}\n"]))
     processes = iter([hung, restarted])
+    monkeypatch.setattr(exiftool_runner, "_create_process_job", lambda: None)
     monkeypatch.setattr(
         exiftool_runner.subprocess,
         "Popen",
@@ -269,6 +271,7 @@ def test_close_cancels_waiting_stay_open_command(monkeypatch) -> None:
             self.terminate()
 
     fake_proc = _FakeProc()
+    monkeypatch.setattr(exiftool_runner, "_create_process_job", lambda: None)
     monkeypatch.setattr(
         exiftool_runner.subprocess,
         "Popen",
@@ -300,6 +303,7 @@ def test_close_cancels_waiting_stay_open_command(monkeypatch) -> None:
 def test_closed_manager_cannot_restart_an_orphan_process(monkeypatch) -> None:
     manager = exiftool_runner._StayOpenExifTool("exiftool.exe")
     manager.close()
+    monkeypatch.setattr(exiftool_runner, "_create_process_job", lambda: None)
     monkeypatch.setattr(
         exiftool_runner.subprocess,
         "Popen",
@@ -374,6 +378,7 @@ def test_caller_cancel_event_cancels_only_command_and_allows_restart(monkeypatch
     blocked = _FakeProc(_BlockingPipe())
     restarted = _FakeProc(_PipeOut([b"13.55\n", b"{ready2}\n"]))
     processes = iter([blocked, restarted])
+    monkeypatch.setattr(exiftool_runner, "_create_process_job", lambda: None)
     monkeypatch.setattr(
         exiftool_runner.subprocess,
         "Popen",

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import atexit
 from contextlib import contextmanager
+import logging
 import os
 import queue
 import subprocess
@@ -26,6 +27,15 @@ _STDOUT_ERROR_MARKERS = (
     "were not updated due to errors",
 )
 _DEFAULT_COMMAND_TIMEOUT_SECONDS = 120.0
+_log = logging.getLogger(__name__)
+
+
+def _create_process_job():
+    if sys.platform.startswith("win"):
+        from ._windows_job import WindowsExifToolJob
+
+        return WindowsExifToolJob()
+    return None
 
 
 def hidden_subprocess_kwargs() -> dict[str, Any]:
@@ -97,6 +107,7 @@ class _StayOpenExifTool:
         self._execute_lock = threading.Lock()
         self._state_lock = threading.RLock()
         self._proc: subprocess.Popen[bytes] | None = None
+        self._process_job = None
         self._closed = False
         self._cancel_event = threading.Event()
         self._command_sequence = 0
@@ -222,19 +233,23 @@ class _StayOpenExifTool:
         with self._state_lock:
             self._closed = True
             proc = self._proc
+            if proc is None:
+                return
+            # Keep ownership and the lock until the process has actually died.
+            # Worker-finally, GUI shutdown and atexit can close concurrently.
+            # Detaching first would let another closer report success early.
+            # Never write an exit command to a potentially blocked stdin.
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            self._finish_process(proc)
             self._proc = None
-        if proc is None:
-            return
-        # A wedged child may stop reading stdin.  Writing the stay-open exit
-        # command here can block forever before the bounded wait below starts.
-        # Shutdown cancels outstanding reads, so terminate the child directly.
-        try:
-            proc.terminate()
-        except Exception:
-            pass
-        self._finish_process(proc)
 
     def _finish_process(self, proc: subprocess.Popen[bytes]) -> None:
+        if self._process_job is not None:
+            self._process_job.close()
+            self._process_job = None
         stopped = False
         try:
             proc.wait(timeout=1)
@@ -245,7 +260,9 @@ class _StayOpenExifTool:
                 proc.wait(timeout=1)
                 stopped = True
             except Exception:
-                pass
+                _log.exception("ExifTool did not exit after terminate/kill (pid=%s)",
+                               getattr(proc, "pid", None))
+                raise
         finally:
             # Closing a stream while another thread is blocked in readline()
             # can wait on its IO lock.  A dead child releases those readers.
@@ -261,27 +278,42 @@ class _StayOpenExifTool:
         if proc is None:
             return
         with self._state_lock:
-            if self._proc is proc:
-                self._proc = None
-        try:
-            proc.kill()
-        except Exception:
+            if self._proc is not proc:
+                return  # Another closer has already reaped this process.
             try:
-                proc.terminate()
+                proc.kill()
             except Exception:
-                pass
-        self._finish_process(proc)
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            self._finish_process(proc)
+            self._proc = None
 
     def _ensure_started_locked(self) -> subprocess.Popen[bytes]:
         if self._proc is not None and self._proc.poll() is None:
             return self._proc
-        self._proc = subprocess.Popen(
-            [self.executable_path, "-stay_open", "True", "-@", "-"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            **hidden_subprocess_kwargs(),
-        )
+        if self._proc is not None:
+            self._finish_process(self._proc)
+            self._proc = None
+        self._process_job = _create_process_job()
+        try:
+            self._proc = subprocess.Popen(
+                [self.executable_path, "-stay_open", "True", "-@", "-"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                **hidden_subprocess_kwargs(),
+            )
+            if self._process_job is not None:
+                self._process_job.assign(self._proc)
+        except Exception:
+            if self._proc is not None:
+                self._abort_process(self._proc)
+            elif self._process_job is not None:
+                self._process_job.close()
+                self._process_job = None
+            raise
         self._stdout_queue = queue.Queue()
         self._stderr_chunks = []
         self._stdout_thread = threading.Thread(
@@ -415,7 +447,9 @@ def _looks_like_error(stdout: bytes, stderr: bytes, encoding: str, errors: str) 
 
 
 _manager_lock = threading.RLock()
+_close_lock = threading.Lock()
 _manager: _StayOpenExifTool | None = None
+_shutdown = False
 
 
 # Browser read sessions are local to bounded worker threads. The global session
@@ -478,23 +512,26 @@ def run_exiftool(
     """
     sessions = getattr(_worker_local, 'session', None)
     request = getattr(_worker_local, 'request', None)
-    if sessions is not None and request is not None:
-        manager = sessions.get(str(executable_path))
-        if manager is None:
-            manager = _StayOpenExifTool(str(executable_path))
-            sessions[str(executable_path)] = manager
-            with _manager_lock:
+    global _manager
+    with _manager_lock:
+        if _shutdown:
+            return _completed(args, 1, b"", b"ExifTool is shutting down", text, encoding, errors)
+        if sessions is not None and request is not None:
+            manager = sessions.get(str(executable_path))
+            if manager is None:
+                manager = _StayOpenExifTool(str(executable_path))
+                sessions[str(executable_path)] = manager
                 _read_sessions.add(manager)
+        else:
+            if _manager is None or _manager.executable_path != str(executable_path):
+                if _manager is not None:
+                    _manager.close()
+                _manager = _StayOpenExifTool(str(executable_path))
+            manager = _manager
+    if sessions is not None and request is not None:
         return manager.execute(args, text=text, encoding=encoding, errors=errors,
                                timeout=timeout if timeout is not None else request[1],
                                cancel_event=cancel_event if cancel_event is not None else request[0])
-    global _manager
-    with _manager_lock:
-        if _manager is None or _manager.executable_path != str(executable_path):
-            if _manager is not None:
-                _manager.close()
-            _manager = _StayOpenExifTool(str(executable_path))
-        manager = _manager
     return manager.execute(
         args,
         text=text,
@@ -506,16 +543,37 @@ def run_exiftool(
 
 
 def close_exiftool_process() -> None:
-    """Stop the shared ExifTool stay-open process if it is running."""
+    """Reap current sessions; subsequent work may start a new shared session.
+
+    Application exit must use shutdown_exiftool_process to reject late work.
+    """
     global _manager
+    with _close_lock:
+        with _manager_lock:
+            manager = _manager
+            sessions = set(_read_sessions)
+            if manager is not None:
+                sessions.add(manager)
+        failures = []
+        for session in sessions:
+            try:
+                session.close()
+            except Exception as exc:
+                _log.exception("Failed to close ExifTool session")
+                failures.append(exc)
+        if failures:
+            raise RuntimeError("ExifTool shutdown failed") from failures[0]
+        with _manager_lock:
+            if _manager is manager:
+                _manager = None
+
+
+def shutdown_exiftool_process() -> None:
+    """Permanently stop ExifTool for this application process (idempotent)."""
+    global _shutdown
     with _manager_lock:
-        manager = _manager
-        _manager = None
-        read_sessions = tuple(_read_sessions)
-    if manager is not None:
-        manager.close()
-    for session in read_sessions:
-        session.close()
+        _shutdown = True
+    close_exiftool_process()
 
 
-atexit.register(close_exiftool_process)
+atexit.register(shutdown_exiftool_process)
