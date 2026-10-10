@@ -198,6 +198,23 @@ def read_xmp_sidecar(image_path: str) -> list[tuple[str, str, str]]:
             pass
         return []
 
+    results = _parse_xmp_root(root)
+    try:
+        from app_common.exif_io.xmp_sidecar_edits import merge_xmp_rows_with_pending_edits
+        return merge_xmp_rows_with_pending_edits(xmp_path, results)
+    except Exception:
+        return results
+
+
+def parse_xmp_metadata(data: bytes | str) -> list[tuple[str, str, str]]:
+    """Parse an embedded XMP packet, without sidecar lookup or edit journals.
+
+    Malformed XML raises ParseError; callers decide how to handle a bad packet.
+    """
+    return _parse_xmp_root(ET.fromstring(data))
+
+
+def _parse_xmp_root(root) -> list[tuple[str, str, str]]:
     results: list[tuple[str, str, str]] = []
     rdf_ns = _RDF_NS
 
@@ -231,8 +248,4 @@ def read_xmp_sidecar(image_path: str) -> list[tuple[str, str, str]]:
                 group = f"XMP-{prefix}"
                 results.append((group, local, value))
 
-    try:
-        from app_common.exif_io.xmp_sidecar_edits import merge_xmp_rows_with_pending_edits
-        return merge_xmp_rows_with_pending_edits(xmp_path, results)
-    except Exception:
-        return results
+    return results

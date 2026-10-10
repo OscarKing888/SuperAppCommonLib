@@ -5549,7 +5549,7 @@ class FileListPanel(QWidget):
             return
         self._stop_pending_meta_apply()
         self._begin_meta_apply_session(total, ordered_paths=paths)
-        loader = MetadataLoader(
+        loader = self._create_metadata_loader(
             paths,
             meta_proxy=self._meta_proxy,
             # Focus prefetch is disabled by MetadataLoader. Building its unused
@@ -5567,7 +5567,11 @@ class FileListPanel(QWidget):
         self._own_pool_loader(loader)
         loader.start()
         self._probe_set_phase("metadata_loader_running", paths=len(paths), elapsed_ms=elapsed_ms(start_t0))
-        _log.info("[_start_metadata_loader] MetadataLoader started via PhotoMetaDataProxy")
+        _log.info("[_start_metadata_loader] %s started", type(loader).__name__)
+
+    def _create_metadata_loader(self, paths: list[str], **kwargs) -> MetadataLoader:
+        """Application extension point; shared callers keep the full metadata policy."""
+        return MetadataLoader(paths, **kwargs)
 
     def _stop_metadata_loader(self) -> None:
         if self._metadata_loader:

@@ -470,6 +470,17 @@ class MetadataLoader(QThread):
         """
         return False
 
+    def _read_embedded_metadata(self, paths: list[str]) -> tuple[dict[str, dict], list[str]]:
+        """Override the file reader without changing scheduling or sidecar precedence."""
+        return fast_read_browser_metadata(paths)
+
+    def _metadata_cache_db_path(self, path: str) -> str:
+        return _meta_disk_cache_db_path_for_file(path, self._selected_dir)
+
+    def _merge_sidecar_metadata(self, rec: dict, sidecar: dict) -> None:
+        rec.update(sidecar)
+        _apply_browser_metadata_aliases(rec)
+
     def _read_metadata_batch(self, paths: list[str]) -> dict[str, dict]:
         batch_t0 = perf_counter()
         norm_paths = [os.path.normpath(p) for p in paths]
@@ -482,7 +493,7 @@ class MetadataLoader(QThread):
             try:
                 stat = os.stat(path)
                 stats[norm] = (stat.st_mtime, stat.st_size)
-                db = _meta_disk_cache_db_path_for_file(path, self._selected_dir)
+                db = self._metadata_cache_db_path(path)
                 db_by_path[norm] = db
                 by_db.setdefault(db, {})[norm] = stats[norm]
             except OSError:
@@ -498,7 +509,7 @@ class MetadataLoader(QThread):
 
         fast_t0 = perf_counter()
         uncached = [path for path in paths if os.path.normpath(path) not in cached]
-        fast_records, fallback_paths = fast_read_browser_metadata(uncached)
+        fast_records, fallback_paths = self._read_embedded_metadata(uncached)
         for norm, rec in fast_records.items():
             if norm in result:
                 result[norm].update(rec)
@@ -538,8 +549,7 @@ class MetadataLoader(QThread):
                 continue
             for norm_path, flat in sidecars.items():
                 if norm_path in result and flat:
-                    result[norm_path].update(flat)
-                    _apply_browser_metadata_aliases(result[norm_path])
+                    self._merge_sidecar_metadata(result[norm_path], flat)
         perf_log(
             _log,
             "[metadata.read_batch] dir=%r paths=%s disk_hits=%s fast_hits=%s fallback=%s "
