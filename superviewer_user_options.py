@@ -10,13 +10,11 @@ USER_OPTIONS_FILENAME = "SuperViewerUser.cfg"
 PERSISTENT_THUMB_SIZE_LEVELS = (128, 256, 512, 1024)
 KEY_NAVIGATION_FPS_OPTIONS = (1, 2, 4, 8, 10, 12, 13, 15, 20, 24, 25, 30, 40, 45, 50, 60, 120)
 KEY_PERF_PROBES_ENABLED = "perf_probes_enabled"
-KEY_DIRECT_PREVIEW_LIMIT_MODE = "direct_preview_limit_mode"
-KEY_DIRECT_PREVIEW_MAX_PIXELS = "direct_preview_max_pixels"
+KEY_DIRECT_PREVIEW_MAX_WIDTH = "direct_preview_max_width"
+KEY_DIRECT_PREVIEW_MAX_HEIGHT = "direct_preview_max_height"
 KEY_DIRECT_PREVIEW_MAX_FILE_MB = "direct_preview_max_file_mb"
-DIRECT_PREVIEW_BY_PIXELS = 0
-DIRECT_PREVIEW_BY_FILE_SIZE = 1
-DEFAULT_DIRECT_PREVIEW_MAX_PIXELS = 40 * 1024 * 1024
-MAX_DIRECT_PREVIEW_PIXELS = 1_000_000_000
+DEFAULT_DIRECT_PREVIEW_MAX_DIMENSION = 2048
+MAX_DIRECT_PREVIEW_DIMENSION = 100_000
 MAX_DIRECT_PREVIEW_FILE_MB = 4096
 
 _OPTIONS_LOCK = threading.RLock()
@@ -30,8 +28,8 @@ _DEFAULT_OPTIONS = {
     "key_navigation_fps": 24,
     "keep_view_on_switch": 1,
     KEY_PERF_PROBES_ENABLED: 0,
-    KEY_DIRECT_PREVIEW_LIMIT_MODE: DIRECT_PREVIEW_BY_PIXELS,
-    KEY_DIRECT_PREVIEW_MAX_PIXELS: DEFAULT_DIRECT_PREVIEW_MAX_PIXELS,
+    KEY_DIRECT_PREVIEW_MAX_WIDTH: DEFAULT_DIRECT_PREVIEW_MAX_DIMENSION,
+    KEY_DIRECT_PREVIEW_MAX_HEIGHT: DEFAULT_DIRECT_PREVIEW_MAX_DIMENSION,
     KEY_DIRECT_PREVIEW_MAX_FILE_MB: 32,
 }
 _RUNTIME_OPTIONS = dict(_DEFAULT_OPTIONS)
@@ -102,8 +100,8 @@ def normalize_user_options(data: dict | None) -> dict[str, int]:
     normalized[KEY_PERF_PROBES_ENABLED] = max(0, min(1, value))
 
     for key, upper in (
-        (KEY_DIRECT_PREVIEW_LIMIT_MODE, DIRECT_PREVIEW_BY_FILE_SIZE),
-        (KEY_DIRECT_PREVIEW_MAX_PIXELS, MAX_DIRECT_PREVIEW_PIXELS),
+        (KEY_DIRECT_PREVIEW_MAX_WIDTH, MAX_DIRECT_PREVIEW_DIMENSION),
+        (KEY_DIRECT_PREVIEW_MAX_HEIGHT, MAX_DIRECT_PREVIEW_DIMENSION),
         (KEY_DIRECT_PREVIEW_MAX_FILE_MB, MAX_DIRECT_PREVIEW_FILE_MB),
     ):
         try:
@@ -111,7 +109,7 @@ def normalize_user_options(data: dict | None) -> dict[str, int]:
         except (TypeError, ValueError, OverflowError):
             value = normalized[key]
         # Invalid configuration falls back to the default; zero explicitly
-        # disables direct loading for either threshold mode.
+        # disables the corresponding dimension/file-size condition.
         normalized[key] = value if 0 <= value <= upper else normalized[key]
 
     return normalized
@@ -184,15 +182,14 @@ def get_keep_view_on_switch() -> bool:
         return bool(_RUNTIME_OPTIONS.get("keep_view_on_switch", 1))
 
 
-def get_direct_preview_limit() -> tuple[int, int]:
-    """Return a consistent (mode, pixel-or-byte limit) runtime snapshot."""
+def get_direct_preview_limits() -> tuple[int, int, int]:
+    """Return (max width, max height, max bytes): (width AND height) OR file size."""
     with _OPTIONS_LOCK:
-        mode = int(_RUNTIME_OPTIONS.get(KEY_DIRECT_PREVIEW_LIMIT_MODE, DIRECT_PREVIEW_BY_PIXELS))
-        if mode == DIRECT_PREVIEW_BY_FILE_SIZE:
-            limit = int(_RUNTIME_OPTIONS.get(KEY_DIRECT_PREVIEW_MAX_FILE_MB, 32)) * 1024 * 1024
-        else:
-            limit = int(_RUNTIME_OPTIONS.get(KEY_DIRECT_PREVIEW_MAX_PIXELS, DEFAULT_DIRECT_PREVIEW_MAX_PIXELS))
-        return mode, limit
+        return (
+            int(_RUNTIME_OPTIONS.get(KEY_DIRECT_PREVIEW_MAX_WIDTH, DEFAULT_DIRECT_PREVIEW_MAX_DIMENSION)),
+            int(_RUNTIME_OPTIONS.get(KEY_DIRECT_PREVIEW_MAX_HEIGHT, DEFAULT_DIRECT_PREVIEW_MAX_DIMENSION)),
+            int(_RUNTIME_OPTIONS.get(KEY_DIRECT_PREVIEW_MAX_FILE_MB, 32)) * 1024 * 1024,
+        )
 
 
 def get_perf_probes_enabled() -> bool:
