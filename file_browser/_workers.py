@@ -119,6 +119,7 @@ class DirectoryScanWorker(QThread):
                 selected_dir=selected_dir,
                 report_root=report_root,
                 full_report_cache=report_cache,
+                recursive=self._recursive,
             )
             selected_rel = ""
             if _is_same_or_child_path(report_root, selected_dir):
@@ -136,9 +137,8 @@ class DirectoryScanWorker(QThread):
                 len(files),
             )
             try:
-                # In report mode the DB view is subtree-based even without UI filters,
-                # so actual file supplementation must recurse under the selected dir.
-                actual_files = _collect_image_files_impl(self._path, True)
+                # 报告路径的实际文件补充也遵守当前目录范围。
+                actual_files = _collect_image_files_impl(self._path, self._recursive)
                 full_cache = full_report_cache or report_cache or {}
                 existing = {_path_key(p) for p in files if p}
                 file_index_by_stem = {Path(p).stem: i for i, p in enumerate(files) if p}
@@ -194,6 +194,8 @@ class DirectoryScanWorker(QThread):
                             if name.lower().endswith(IMAGE_EXTENSIONS):
                                 files.append(os.path.join(root, name))
                         maybe_emit_progress(root)
+                        if not self._recursive:
+                            break
                 except (PermissionError, OSError) as e:
                     _log.warning("[DirectoryScanWorker.run] fallback scan error: %s", e)
         else:

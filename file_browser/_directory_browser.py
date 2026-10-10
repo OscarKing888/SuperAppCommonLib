@@ -2,6 +2,11 @@
 """Directory browser widget implementation for app_common.file_browser."""
 from __future__ import annotations
 
+try:
+    from PyQt6.QtWidgets import QCheckBox
+except ImportError:
+    from PyQt5.QtWidgets import QCheckBox
+
 from app_common.file_browser._browser_core import *
 from app_common.file_browser._permissions import (
     mark_write_action_disabled,
@@ -25,9 +30,10 @@ class DirectoryBrowserWidget(QWidget):
     """
 
     directory_selected = pyqtSignal(str)
+    include_subdirectories_changed = pyqtSignal(bool)
     _PLACEHOLDER = "__ph__"
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, *, include_subdirectories: bool | None = None) -> None:
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -41,6 +47,16 @@ class DirectoryBrowserWidget(QWidget):
         self._title_label = QLabel("目录")
         toolbar.addWidget(self._title_label)
         toolbar.addStretch()
+
+        self._include_subdirectories_checkbox = None
+        if include_subdirectories is not None:
+            checkbox = QCheckBox("包含子目录")
+            checkbox.setToolTip("开启时列出当前目录及所有子目录的图像；关闭时只列出当前目录的图像")
+            checkbox.setAccessibleName("包含子目录")
+            checkbox.setChecked(include_subdirectories)
+            checkbox.toggled.connect(self.include_subdirectories_changed.emit)
+            toolbar.addWidget(checkbox)
+            self._include_subdirectories_checkbox = checkbox
 
         self._btn_refresh_tree = QToolButton()
         self._btn_refresh_tree.setText("刷新")

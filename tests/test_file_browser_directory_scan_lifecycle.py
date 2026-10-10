@@ -99,6 +99,26 @@ def test_scan_result_retains_owner_until_actual_finished_slot(panel, tmp_path, m
     assert panel._directory_scan_worker is None
 
 
+def test_scope_toggle_rejects_queued_results_from_previous_scope(panel, tmp_path, monkeypatch):
+    applied = []
+    monkeypatch.setattr(panel, "_apply_directory_listing_result", lambda *args, **kwargs: applied.append(kwargs))
+    first = _start_scan(panel, tmp_path)
+    first.send_result.set()
+    assert first.result_emitted.wait(1)
+    panel.set_include_subdirectories(False)
+    second = _start_scan(panel, tmp_path)
+    assert not second._recursive
+    panel.set_include_subdirectories(True)
+    latest = _start_scan(panel, tmp_path)
+    assert latest._recursive
+    _APP.processEvents()
+    assert applied == []
+    latest.send_result.set()
+    assert latest.result_emitted.wait(1)
+    _wait_until(lambda: bool(applied))
+    assert len(applied) == 1 and applied[0]["recursive"] is True
+
+
 def test_same_path_old_queued_signals_do_not_replace_new_scan(panel, tmp_path, monkeypatch):
     applied = []
     progress = []
