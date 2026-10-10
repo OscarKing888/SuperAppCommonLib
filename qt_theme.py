@@ -8,11 +8,11 @@ from typing import Literal
 try:
     from PyQt6.QtCore import QEvent
     from PyQt6.QtWidgets import QApplication
-    from PyQt6.QtGui import QPalette
+    from PyQt6.QtGui import QColor, QPalette
 except ImportError:  # pragma: no cover - PyQt5 fallback
     from PyQt5.QtCore import QEvent
     from PyQt5.QtWidgets import QApplication
-    from PyQt5.QtGui import QPalette
+    from PyQt5.QtGui import QColor, QPalette
 
 
 ColorSchemeName = Literal["dark", "light"]
@@ -124,6 +124,43 @@ def browser_chrome_colors(scheme: ColorSchemeName | None = None) -> BrowserChrom
     return _LIGHT_BROWSER if resolved == "light" else _DARK_BROWSER
 
 
+def filter_badge_stylesheet(
+    tone: str = "neutral", *, scheme: ColorSchemeName | None = None,
+    min_width: int = 42, font_size: int = 10, neutral_unchecked: bool = False,
+) -> str:
+    """Readable filter chips in both palettes, including checked/disabled states."""
+    app = QApplication.instance()
+    resolved = scheme or scheme_from_palette(app.palette() if app else None)
+    accents = (
+        {"neutral": "#5f6368", "gold": "#805600", "red": "#b3261e",
+         "green": "#137333", "amber": "#805600"}
+        if resolved == "light" else
+        {"neutral": "#c4c7c5", "gold": "#fdd663", "red": "#f28b82",
+         "green": "#81c995", "amber": "#fdd663"}
+    )
+    accent = accents.get(tone, accents["neutral"])
+    normal = accents["neutral"] if neutral_unchecked else accent
+    checked_text = "#ffffff" if resolved == "light" else "#202124"
+    muted = browser_chrome_colors(resolved).muted_text
+    def rgba(value: str, alpha: int) -> str:
+        c = QColor(value)
+        return f"rgba({c.red()}, {c.green()}, {c.blue()}, {alpha})"
+    return (
+        "QToolButton {"
+        f"font-size: {font_size}px; padding: 1px 6px; min-width: {min_width}px; "
+        f"border-radius: 9px; border: 1px solid {rgba(normal, 180)}; "
+        f"background: {rgba(normal, 22)}; color: {normal};"
+        "}"
+        f"QToolButton:hover {{ background: {rgba(normal, 42)}; }}"
+        "QToolButton:checked, QToolButton:checked:hover {"
+        f"background: {accent}; border-color: {accent}; color: {checked_text};"
+        "}"
+        "QToolButton:disabled {"
+        f"background: transparent; border-color: {rgba(muted, 100)}; color: {muted};"
+        "}"
+    )
+
+
 def is_theme_change_event(event) -> bool:
     """Return True for Qt ThemeChange / PaletteChange events."""
     if event is None:
@@ -147,5 +184,6 @@ __all__ = [
     "browser_chrome_colors",
     "detect_color_scheme",
     "is_theme_change_event",
+    "filter_badge_stylesheet",
     "scheme_from_palette",
 ]

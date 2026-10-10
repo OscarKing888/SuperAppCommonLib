@@ -1041,7 +1041,9 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
             if selected:
                 painter.fillRect(opt.rect, opt.palette.highlight())
             elif hovered:
-                painter.fillRect(opt.rect, QColor(255, 255, 255, 16))
+                hover = opt.palette.highlight().color()
+                hover.setAlpha(32)
+                painter.fillRect(opt.rect, hover)
 
             painter.setRenderHint(_PainterAntialiasing)
             cell = opt.rect.adjusted(6, 6, -6, -6)
@@ -1055,8 +1057,8 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
             )
             draw_rect = QRect(thumb_rect)
 
-            painter.setBrush(QBrush(QColor(45, 45, 45)))
-            painter.setPen(QColor(70, 70, 70))
+            painter.setBrush(opt.palette.alternateBase())
+            painter.setPen(opt.palette.mid().color())
             painter.drawRoundedRect(thumb_rect, 6, 6)
 
             if pixmap is not None and not pixmap.isNull():

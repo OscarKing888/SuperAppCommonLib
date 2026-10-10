@@ -6,6 +6,10 @@ import json
 import shutil
 import tempfile
 
+from app_common.qt_theme import (
+    browser_chrome_colors, filter_badge_stylesheet, is_theme_change_event, scheme_from_palette,
+)
+
 from app_common.exif_io.json_sidecar import JSON_SIDECAR_SUFFIX, find_json_sidecar, json_sidecar_path_for
 from app_common.perf_probe import elapsed_ms, perf_counter, perf_log, perf_probes_enabled
 from app_common.file_browser._browser_core import *
@@ -242,7 +246,10 @@ class FileListPanel(QWidget):
         if create_filter_bar is None:
             create_filter_bar = getattr(type(self), "create_filter_bar", True)
         self._create_filter_bar = bool(create_filter_bar)
+        self._theme_ready = False
         self._init_ui()
+        self._theme_ready = True
+        self.apply_theme()
         app = QApplication.instance()
         if app is not None:
             try:
@@ -250,6 +257,47 @@ class FileListPanel(QWidget):
             except Exception:
                 pass
         self._sync_file_browser_probe_timer()
+
+    def apply_theme(self, scheme=None) -> None:
+        """Restyle existing views/filters without rebuilding rows or scheduling I/O."""
+        scheme = scheme if scheme in ("dark", "light") else scheme_from_palette(self.palette())
+        self._file_list_theme_scheme = scheme
+        colors = browser_chrome_colors(scheme)
+        for view, selector, size in ((self._tree_widget, "QTreeView", 12),
+                                     (self._list_widget, "QListView", 11)):
+            view.setStyleSheet(
+                f"{selector} {{ font-size: {size}px; background: palette(base); "
+                "alternate-background-color: palette(alternate-base); color: palette(text); "
+                "selection-background-color: palette(highlight); "
+                "selection-color: palette(highlighted-text); }"
+            )
+            view.viewport().update()
+        self._size_label.setStyleSheet(f"color: {colors.muted_text}; font-size: 11px;")
+        self._selection_status_label.setStyleSheet(
+            f"color: {colors.muted_text}; font-size: 12px; padding: 0 4px;"
+        )
+        if self._filter_edit is not None:
+            self._filter_edit.setStyleSheet(
+                "QLineEdit { padding: 2px 4px; font-size: 12px; "
+                "background: palette(base); color: palette(text); "
+                "border: 1px solid palette(mid); selection-background-color: palette(highlight); "
+                "selection-color: palette(highlighted-text); }"
+            )
+        buttons = [(self._btn_filter_pick, "gold", 34),
+                   (self._btn_filter_reject, "red", 34),
+                   (self._btn_filter_rating_menu, "neutral", 46)]
+        buttons.extend((btn, "neutral", width)
+                       for btn, width in zip(self._star_btns, (22, 28, 34, 40, 46)))
+        focus_tones = dict(zip(_FOCUS_FILTER_OPTIONS, ("green", "amber", "neutral", "neutral")))
+        buttons.extend((btn, focus_tones[status], 42) for status, btn in self._focus_filter_btns.items())
+        for button, tone, width in buttons:
+            if button is not None:
+                button.setStyleSheet(filter_badge_stylesheet(tone, scheme=scheme, min_width=width))
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if getattr(self, "_theme_ready", False) and is_theme_change_event(event):
+            self.apply_theme()
 
     # ── UI 初始化 ──────────────────────────────────────────────────────────────
     def _init_ui(self) -> None:
@@ -288,7 +336,6 @@ class FileListPanel(QWidget):
         self._size_slider.valueChanged.connect(self._on_size_slider_changed)
 
         self._size_label = QLabel(f"{_THUMB_SIZE_STEPS[0]}px")
-        self._size_label.setStyleSheet("color: #aaa; font-size: 11px;")
         self._size_label.setFixedWidth(42)
         self._size_label.setToolTip("当前缩略图/快速预览尺寸")
 
@@ -345,13 +392,6 @@ class FileListPanel(QWidget):
             self._btn_filter_pick.setToolTip("只显示精选（Pick=1）")
             self._btn_filter_pick.setCheckable(True)
             self._btn_filter_pick.setAutoRaise(False)
-            self._btn_filter_pick.setStyleSheet(
-                _filter_badge_stylesheet(
-                    COLORS["star_gold"],
-                    min_width=34,
-                    checked_fg="#111111",
-                )
-            )
             self._btn_filter_pick.clicked.connect(self._on_pick_filter_toggled)
             self._rating_filter_badge_buttons.append(self._btn_filter_pick)
             filter_bar.addWidget(self._btn_filter_pick)
@@ -361,32 +401,17 @@ class FileListPanel(QWidget):
             self._btn_filter_reject.setToolTip("只显示排除（Pick=-1）")
             self._btn_filter_reject.setCheckable(True)
             self._btn_filter_reject.setAutoRaise(False)
-            self._btn_filter_reject.setStyleSheet(
-                _filter_badge_stylesheet(
-                    "#d45d5d",
-                    min_width=34,
-                    checked_fg="#f5f5f5",
-                )
-            )
             self._btn_filter_reject.clicked.connect(self._on_reject_filter_toggled)
             self._rating_filter_badge_buttons.append(self._btn_filter_reject)
             filter_bar.addWidget(self._btn_filter_reject)
 
             # 星级按钮（1～5，单选，点击已激活按钮则取消）
-            star_widths = [22, 28, 34, 40, 46]
             for n in range(1, 6):
                 btn = QToolButton()
                 btn.setText("★" * n)
                 btn.setToolTip(f"只显示 {n} 星")
                 btn.setCheckable(True)
                 btn.setAutoRaise(False)
-                btn.setStyleSheet(
-                    _filter_badge_stylesheet(
-                        _STAR_SILVER_COLOR,
-                        min_width=star_widths[n - 1],
-                        checked_fg="#111111",
-                    )
-                )
                 btn.clicked.connect(
                     lambda checked, rating=n: self._on_rating_filter_changed(rating)
                 )
@@ -398,13 +423,6 @@ class FileListPanel(QWidget):
             self._btn_filter_rating_menu.setText("评级")
             self._btn_filter_rating_menu.setToolTip("选择 Pick、排除或星级过滤")
             self._btn_filter_rating_menu.setAutoRaise(False)
-            self._btn_filter_rating_menu.setStyleSheet(
-                _filter_badge_stylesheet(
-                    _STAR_SILVER_COLOR,
-                    min_width=46,
-                    checked_fg="#111111",
-                )
-            )
             self._btn_filter_rating_menu.clicked.connect(
                 lambda checked=False: self._show_rating_filter_menu()
             )
@@ -416,7 +434,6 @@ class FileListPanel(QWidget):
                 btn.setToolTip(f"只显示{focus_status}文件")
                 btn.setCheckable(True)
                 btn.setAutoRaise(False)
-                btn.setStyleSheet(_focus_filter_button_stylesheet(focus_status))
                 btn.clicked.connect(
                     lambda checked, status=focus_status: self._on_focus_filter_changed(status)
                 )
@@ -539,10 +556,6 @@ class FileListPanel(QWidget):
         self._meta_progress.setFixedHeight(20)
         self._meta_progress.setTextVisible(True)
         self._meta_progress.setFormat("%v/%m")
-        self._meta_progress.setStyleSheet(
-            "QProgressBar { background: #333; border: none; border-radius: 3px; }"
-            "QProgressBar::chunk { background: #3a7bd5; border-radius: 3px; }"
-        )
         self._meta_progress.hide()
 
         self._persistent_thumb_progress = QProgressBar()
@@ -553,14 +566,9 @@ class FileListPanel(QWidget):
         self._persistent_thumb_progress.setMinimumWidth(200)
         self._persistent_thumb_progress.setTextVisible(True)
         self._persistent_thumb_progress.setFormat("小缩略图 %v/%m")
-        self._persistent_thumb_progress.setStyleSheet(
-            "QProgressBar { background: #333; border: none; border-radius: 3px; }"
-            "QProgressBar::chunk { background: #16a085; border-radius: 3px; }"
-        )
         self._persistent_thumb_progress.hide()
 
         self._selection_status_label = QLabel("共 0 张 | 当前未选中")
-        self._selection_status_label.setStyleSheet("color: #aaa; font-size: 12px; padding: 0 4px;")
         self._selection_status_label.setMinimumWidth(220)
 
         status_bar = QHBoxLayout()
