@@ -6,6 +6,7 @@ import concurrent.futures as _futures
 import os
 import time
 
+from app_common.perf_probe import elapsed_ms, perf_counter, perf_log
 from app_common.exif_io import meta_disk_cache
 from app_common.exif_io.fast_reader import fast_read_browser_metadata
 from app_common.exif_io.writer import (
@@ -373,6 +374,7 @@ class MetadataLoader(QThread):
         producer = None
         exhausted = False
         processed = 0
+        started = perf_counter()
         try:
             producer = self._work_pool.begin_producer(WorkKind.METADATA)
             while not self._stopped() and (pending or not exhausted):
@@ -396,6 +398,7 @@ class MetadataLoader(QThread):
                     try:
                         parsed, focus, count = future.result()
                     except Exception:
+                        _log.exception("[metadata.pool] chunk failed paths=%s", count)
                         parsed, focus = {}, {}
                     self._emit_metadata_chunk(parsed, focus)
                     processed += count
@@ -408,6 +411,8 @@ class MetadataLoader(QThread):
             while any(not future.done() for future in pending):
                 _futures.wait([future for future in pending if not future.done()], timeout=0.05)
             self._work_pool.end_producer(WorkKind.METADATA, producer)
+            _log.info("[metadata.pool] finished processed=%s/%s elapsed_ms=%.1f pool=%s",
+                      processed, len(self._paths), elapsed_ms(started), self._work_pool.snapshot())
 
     def run(self) -> None:
         if self._work_pool is not None:
@@ -464,6 +469,7 @@ class MetadataLoader(QThread):
         return False
 
     def _read_metadata_batch(self, paths: list[str]) -> dict[str, dict]:
+        batch_t0 = perf_counter()
         norm_paths = [os.path.normpath(p) for p in paths]
         result: dict[str, dict] = {norm: {"SourceFile": norm} for norm in norm_paths}
         stats: dict[str, tuple[float, int]] = {}
@@ -486,12 +492,16 @@ class MetadataLoader(QThread):
         for norm, rec in cached.items():
             if norm in result:
                 result[norm].update(rec)
+        disk_cache_ms = elapsed_ms(batch_t0)
 
+        fast_t0 = perf_counter()
         uncached = [path for path in paths if os.path.normpath(path) not in cached]
         fast_records, fallback_paths = fast_read_browser_metadata(uncached)
         for norm, rec in fast_records.items():
             if norm in result:
                 result[norm].update(rec)
+        fast_ms = elapsed_ms(fast_t0)
+        store_t0 = perf_counter()
         store_by_db: dict[str, dict[str, tuple[float, int, dict]]] = {}
         for norm, rec in fast_records.items():
             if norm in stats and norm in db_by_path:
@@ -499,7 +509,9 @@ class MetadataLoader(QThread):
                 store_by_db.setdefault(db_by_path[norm], {})[norm] = (mtime, size, rec)
         for db, entries in store_by_db.items():
             meta_disk_cache.put_many(db, entries)
+        store_ms = elapsed_ms(store_t0)
 
+        fallback_t0 = perf_counter()
         try:
             raw_batch = read_batch_metadata(
                 fallback_paths,
@@ -511,9 +523,11 @@ class MetadataLoader(QThread):
                     result[norm_path].update(flat)
         except Exception as exc:
             _log.warning("[MetadataLoader._read_metadata_batch] read_batch_metadata failed: %s", exc)
+        fallback_ms = elapsed_ms(fallback_t0)
 
         # Sidecars are deliberately outside the file-derived disk cache. Always
         # reread them, including valid empty values and the central JSON path.
+        sidecar_t0 = perf_counter()
         for reader in (_batch_read_xmp_sidecar, _batch_read_json_sidecar):
             try:
                 sidecars = reader(paths)
@@ -524,6 +538,13 @@ class MetadataLoader(QThread):
                 if norm_path in result and flat:
                     result[norm_path].update(flat)
                     _apply_browser_metadata_aliases(result[norm_path])
+        perf_log(
+            _log,
+            "[metadata.read_batch] dir=%r paths=%s disk_hits=%s fast_hits=%s fallback=%s "
+            "disk_ms=%.1f fast_ms=%.1f store_ms=%.1f fallback_ms=%.1f sidecar_ms=%.1f total_ms=%.1f",
+            self._selected_dir, len(paths), len(cached), len(fast_records), len(fallback_paths),
+            disk_cache_ms, fast_ms, store_ms, fallback_ms, elapsed_ms(sidecar_t0), elapsed_ms(batch_t0),
+        )
         return result
 
     def _parse_rec(self, rec: dict) -> dict:

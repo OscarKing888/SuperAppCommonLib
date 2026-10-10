@@ -4684,6 +4684,7 @@ class FileListPanel(QWidget):
         timer = QTimer(self)
         timer.setSingleShot(True)
         timer.timeout.connect(self._update_visible_thumbnail_range)
+        timer.timeout.connect(self._sync_shared_pool_budget)
         self._thumb_viewport_timer = timer
 
     def _invalidate_visible_thumbnail_signature(self) -> None:
@@ -4803,6 +4804,7 @@ class FileListPanel(QWidget):
         self._ensure_thumb_viewport_timer()
         if self._thumb_viewport_timer is not None:
             self._thumb_viewport_timer.start(25)
+            self._sync_shared_pool_budget()
 
     def _collect_prefetch_paths(
         self,
@@ -5474,6 +5476,31 @@ class FileListPanel(QWidget):
         self._thumb_profile_ready_received_at.clear()
         self._pending_loaders = [l for l in self._pending_loaders if l.isRunning()]
 
+    def _thumbnail_work_active_or_pending(self) -> bool:
+        loader = self._thumbnail_loader
+        if loader is not None and loader.isRunning():
+            return True
+        worker = self._persistent_thumb_cache_worker
+        if worker is not None and worker.isRunning():
+            # Persistent coordinators stay alive while idle. Their demand lease
+            # in the pool covers queued/running actions, not their QThread life.
+            if self._persistent_thumb_cache_done < self._persistent_thumb_cache_total:
+                return True
+        timer = self._persistent_thumb_cache_timer
+        if timer is not None and timer.isActive():
+            return True
+        return bool(self._persistent_thumb_cache_pending_paths and self._persistent_thumb_cache_base_dir)
+
+    def _sync_shared_pool_budget(self) -> None:
+        pool = self._browser_work_pool
+        if pool is None or self._background_shutdown_requested:
+            return
+        viewport_pending = self._thumb_viewport_timer is not None and self._thumb_viewport_timer.isActive()
+        demand = viewport_pending or self._thumbnail_work_active_or_pending()
+        # This is only an initial reservation hint. Actual producers, queued
+        # actions and running actions retain their demand inside BrowserWorkPool.
+        pool.set_thumbnail_mode(self._view_mode == self._MODE_THUMB and demand)
+
     def _get_browser_work_pool(self):
         if not self.use_unified_worker_pool:
             return None
@@ -5482,7 +5509,7 @@ class FileListPanel(QWidget):
             total = max(_thumbnail_loader_worker_count(),
                         metadata + _persistent_thumb_cache_worker_count())
             self._browser_work_pool = BrowserWorkPool(total, metadata)
-        self._browser_work_pool.set_thumbnail_mode(self._view_mode == self._MODE_THUMB)
+        self._sync_shared_pool_budget()
         return self._browser_work_pool
 
     def _own_pool_loader(self, loader) -> None:
@@ -5520,7 +5547,8 @@ class FileListPanel(QWidget):
         loader = MetadataLoader(
             paths,
             meta_proxy=self._meta_proxy,
-            focus_source_paths=self._build_metadata_focus_source_paths(paths),
+            # Focus prefetch is disabled by MetadataLoader. Building its unused
+            # snapshot did synchronous isfile/stat calls for the whole directory.
             metadata_tags=_SUPERBIRDSTAMP_BROWSER_METADATA_TAGS,
             worker_count=_metadata_loader_worker_count(),
             selected_dir=self._current_dir,
@@ -6006,6 +6034,7 @@ class FileListPanel(QWidget):
         self._persistent_thumb_cache_skipped = max(0, int(skipped))
         self._persistent_thumb_cache_failed = max(0, int(failed))
         self._persistent_thumb_cache_current_path = os.path.normpath(current_path) if current_path else ""
+        self._sync_shared_pool_budget()
         self._update_persistent_thumb_progress_widget()
         if self._persistent_thumb_cache_total > 0 and self._persistent_thumb_cache_done >= self._persistent_thumb_cache_total:
             QTimer.singleShot(1500, self._hide_persistent_thumb_progress_if_idle)
@@ -6410,28 +6439,29 @@ class FileListPanel(QWidget):
         tick_t0 = _time.perf_counter()
         max_batch = max(1, _META_APPLY_BATCH_SIZE)
         budget_s = max(1.0, _META_APPLY_TIME_BUDGET_MS) / 1000.0
-        while i < total:
-            if (i - start) >= max_batch:
-                break
-            if (i - start) >= 8 and (_time.perf_counter() - tick_t0) >= budget_s:
-                break
-            i += 1
-
-        end = i
-        batch_items = self._meta_apply_items[start:end]
-        if batch_items:
+        while i < total and (i - start) < max_batch:
+            # Include both model writes and synchronous dataChanged callbacks in
+            # the time budget. Counting rows first cannot bound actual UI work.
+            end = min(total, i + 8, start + max_batch)
+            batch_items = self._meta_apply_items[i:end]
             self._meta_apply_tree_hits += self._file_table_model.set_meta_for_paths(batch_items)
             if _DEBUG_FILE_LIST_LIMIT == 1:
                 for norm_path, meta in batch_items:
                     _log.info("[DEBUG][_apply_meta] norm=%r meta=%r", norm_path, meta)
             if self._view_mode == self._MODE_THUMB:
                 self._meta_apply_list_hits += self._thumb_list_model.set_meta_for_paths(batch_items)
+            i = end
+            if (_time.perf_counter() - tick_t0) >= budget_s:
+                break
+        end = i
         self._meta_apply_index = end
         self._show_meta_progress_status(
             "正在读取元数据",
             value=end,
             total=self._meta_progress.maximum(),
         )
+        self._probe_log("metadata_apply_tick", applied=end - start, remaining=total - end,
+                        elapsed_ms=elapsed_ms(tick_t0))
         if end % 1000 == 0 or end >= total:
             perf_log(
                 _log,
@@ -6581,6 +6611,7 @@ class FileListPanel(QWidget):
             return
         if total <= 0:
             return
+        self._sync_shared_pool_budget()
         self._meta_apply_expected_total = max(self._meta_apply_expected_total, int(total))
         self._show_meta_progress_status(
             "正在读取元数据",
