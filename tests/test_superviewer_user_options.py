@@ -14,6 +14,23 @@ def _expected_metadata_workers() -> int:
     return max(1, min(8, cpu_count // 4 or 1))
 
 
+def test_video_frame_options_defaults_validation_and_roundtrip(tmp_path):
+    defaults = normalize_user_options({})
+    assert defaults["video_frame_output_mode"] == "source_subdir"
+    assert defaults["video_frame_suffix"] == "_Frames"
+    for suffix in (None, 12, "../escape", "a\\b", ":bad", "bad.", "bad ", "\x00", "x" * 65):
+        assert normalize_user_options({"video_frame_suffix": suffix})["video_frame_suffix"] == "_Frames"
+    for suffix in ("", "_逐帧", "_Frames", "_100%"):
+        for mode in ("source_subdir", "fixed", "ask"):
+            values = {"video_frame_output_mode": mode, "video_frame_suffix": suffix,
+                      "video_frame_output_directory": str(tmp_path / "中文 输出")}
+            path = str(tmp_path / "options.cfg")
+            saved = superviewer_user_options.save_user_options(values, path)
+            loaded = superviewer_user_options.load_user_options(path)
+            assert all(loaded[key] == saved[key] == value for key, value in values.items())
+    assert normalize_user_options({"video_frame_output_mode": []})["video_frame_output_mode"] == "source_subdir"
+
+
 def test_default_workers_split_metadata_and_persistent_thumbnail_generation() -> None:
     cpu_count = max(1, os.cpu_count() or 1)
     metadata_workers = _expected_metadata_workers()

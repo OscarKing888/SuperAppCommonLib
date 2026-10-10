@@ -123,6 +123,12 @@ DENOISE_DEFAULT_OPTIONS = {
     "denoise_workers": 2,
 }
 
+VIDEO_FRAME_DEFAULT_OPTIONS = {
+    "video_frame_output_mode": "source_subdir",
+    "video_frame_output_directory": "",
+    "video_frame_suffix": "_Frames",
+}
+
 _OPTIONS_LOCK = threading.RLock()
 _DEFAULT_CPU_COUNT = max(1, os.cpu_count() or 1)
 _DEFAULT_METADATA_WORKERS = max(1, min(8, _DEFAULT_CPU_COUNT // 4 or 1))
@@ -141,6 +147,7 @@ _DEFAULT_OPTIONS = {
     **{key: limits[0] for key, limits in BIRD_SHARPNESS_INT_LIMITS.items()},
     **{key: choice[0] for key, choice in BIRD_SHARPNESS_TEXT_CHOICES.items()},
     **DENOISE_DEFAULT_OPTIONS,
+    **VIDEO_FRAME_DEFAULT_OPTIONS,
     **METADATA_BADGE_DEFAULT_OPTIONS,
 }
 _RUNTIME_OPTIONS = dict(_DEFAULT_OPTIONS)
@@ -181,6 +188,13 @@ def valid_denoise_subdir(value) -> bool:
             and value not in {".", ".."} and not value.endswith(".")
             and not any(ord(c) < 32 or c in '<>:"/\\|?*' for c in value)
             and not re.match(r"^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)", value, re.I))
+
+
+def valid_video_frame_suffix(value) -> bool:
+    """A suffix appended to a file stem, never a path; empty means no suffix."""
+    return (isinstance(value, str) and len(value) <= 64
+            and not value.endswith((".", " "))
+            and not any(ord(c) < 32 or c in '<>:"/\\|?*' for c in value))
 
 
 def normalize_user_options(data: dict | None) -> dict[str, int | str]:
@@ -281,6 +295,16 @@ def normalize_user_options(data: dict | None) -> dict[str, int | str]:
         except (TypeError, ValueError, OverflowError):
             value = normalized[key]
         normalized[key] = max(0 if key == "denoise_strength" else 1, min(maximum, value))
+
+    mode = source.get("video_frame_output_mode")
+    if isinstance(mode, str) and mode in {"source_subdir", "fixed", "ask"}:
+        normalized["video_frame_output_mode"] = mode
+    directory = source.get("video_frame_output_directory", "")
+    if isinstance(directory, str) and "\x00" not in directory:
+        normalized["video_frame_output_directory"] = directory.strip()
+    suffix = source.get("video_frame_suffix")
+    if valid_video_frame_suffix(suffix):
+        normalized["video_frame_suffix"] = suffix
 
     color = source.get(KEY_BIRD_HOVER_COLOR)
     if isinstance(color, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", color.strip()):
