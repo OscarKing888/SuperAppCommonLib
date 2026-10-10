@@ -222,6 +222,7 @@ class DirectoryScanWorker(QThread):
             except (PermissionError, OSError) as e:
                 _log.warning("[DirectoryScanWorker.run] scan error: %s", e)
         maybe_emit_progress(self._path, force=True)
+        files.sort(key=lambda p: (Path(p).name.lower(), os.path.normcase(os.path.normpath(p)), os.path.normpath(p)))
         _log.info("[DirectoryScanWorker.run] 目录扫描完成：列出 %s 个图像文件，report_cache %s 条，即将通知主线程加载 EXIF", len(files), len(report_cache))
         _log.info("[DirectoryScanWorker.run] scan done files=%s", len(files))
         if not self.isInterruptionRequested():

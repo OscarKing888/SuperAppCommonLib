@@ -59,6 +59,39 @@ def _metadata_pick_value(meta: dict | None) -> int:
         return 0
 
 
+def _file_sort_value(name: str, column: int, field_value):
+    if column == _TREE_COL_NAME:
+        return name.lower()
+    if column == _TREE_COL_COMMENT:
+        return field_value("comment").lower()
+    if column == _TREE_COL_STAR:
+        if field_value("pick") == 1:
+            return 10
+        if field_value("pick") == -1:
+            return -1
+        return field_value("rating")
+    if column == _TREE_COL_TAGS:
+        return field_value("tags_display").lower()
+    return ""
+
+
+def _file_sort_tiebreaker(path: str) -> tuple[str, str, str]:
+    normalized = os.path.normpath(path)
+    return (Path(path).name.lower(), os.path.normcase(normalized), normalized)
+
+
+def file_sort_key(path: str, meta: dict | None, column: int) -> tuple:
+    """Shared cached-field sort key; never reads metadata from disk."""
+    if not 0 <= column < len(_FILE_TABLE_HEADERS):
+        return ()
+    meta = meta if isinstance(meta, dict) else {}
+    getters = {"comment": _metadata_comment_from_meta,
+               "tags_display": _metadata_tags_display,
+               "rating": _metadata_rating_value, "pick": _metadata_pick_value}
+    tie = _file_sort_tiebreaker(path)
+    return (_file_sort_value(tie[0], column, lambda field: getters[field](meta)), *tie)
+
+
 class SortableTreeItem(QTreeWidgetItem):
     """支持数值感知排序的 QTreeWidgetItem（通过 _SortRole 存储排序键）。"""
 
@@ -166,19 +199,7 @@ class FileTableModel(QAbstractTableModel):
         return entry
 
     def _sort_value(self, entry: FileTableEntry, column: int):
-        if column == _TREE_COL_NAME:
-            return entry.name.lower()
-        if column == _TREE_COL_COMMENT:
-            return entry.comment.lower()
-        if column == _TREE_COL_STAR:
-            if entry.pick == 1:
-                return 10
-            if entry.pick == -1:
-                return -1
-            return entry.rating
-        if column == _TREE_COL_TAGS:
-            return entry.tags_display.lower()
-        return ""
+        return _file_sort_value(entry.name, column, lambda field: getattr(entry, field))
 
     def _display_value(self, entry: FileTableEntry, row: int, column: int) -> str:
         if column == _TREE_COL_NAME:
@@ -379,9 +400,16 @@ class FileTableSortProxyModel(QSortFilterProxyModel):
         rv = source.data(right, _SortRole) if source is not None else None
         if lv is not None and rv is not None:
             try:
-                return lv < rv
+                if lv != rv:
+                    return lv < rv
             except TypeError:
-                return str(lv) < str(rv)
+                if str(lv) != str(rv):
+                    return str(lv) < str(rv)
+            if isinstance(source, FileTableModel):
+                return _file_sort_tiebreaker(source.path_for_index(left) or "") < _file_sort_tiebreaker(
+                    source.path_for_index(right) or ""
+                )
+            return False
         return super().lessThan(left, right)
 
 
@@ -762,6 +790,34 @@ class ThumbnailListModel(QAbstractListModel):
 
     def all_paths(self) -> list[str]:
         return [entry.path for entry in self._entries]
+
+    def reorder_paths(self, paths: list[str]) -> bool:
+        """只移动已有条目，保留缩略图、元数据、选中项及当前项。"""
+        rows: list[int] = []
+        seen: set[int] = set()
+        for path in paths:
+            row = self.row_for_path(path)
+            if row is not None and row not in seen:
+                rows.append(row)
+                seen.add(row)
+        # 调用方通常传入完整排列；未覆盖的条目仍保留，防止异步追加时丢图。
+        rows.extend(row for row in range(len(self._entries)) if row not in seen)
+        if all(old_row == new_row for new_row, old_row in enumerate(rows)):
+            return False
+
+        self.layoutAboutToBeChanged.emit()
+        # 选择模型可在 aboutToBeChanged 中创建持久索引，必须在信号之后获取。
+        old_indexes = self.persistentIndexList()
+        new_row_by_old = {old_row: new_row for new_row, old_row in enumerate(rows)}
+        self._entries = [self._entries[row] for row in rows]
+        self._row_by_path = {os.path.normpath(entry.path): row for row, entry in enumerate(self._entries)}
+        self._row_by_path_stale = False
+        self.changePersistentIndexList(
+            old_indexes,
+            [self.index(new_row_by_old[index.row()], index.column()) for index in old_indexes],
+        )
+        self.layoutChanged.emit()
+        return True
 
     def has_current_pixmap(self, path: str, thumb_size: int) -> bool:
         row = self.row_for_path(path)
