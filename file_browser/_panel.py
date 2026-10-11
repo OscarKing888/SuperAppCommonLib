@@ -1715,6 +1715,10 @@ class FileListPanel(QWidget):
         """返回文件列表中当前选中的显示路径。"""
         return os.path.normpath(self._selected_display_path) if self._selected_display_path else ""
 
+    def get_selected_file_paths(self) -> list[str]:
+        """返回当前视图中选中的文件路径（多选顺序去重）；无多选时回退到当前文件。"""
+        return self._capture_selection_restore_state()[0]
+
     def get_display_file_paths(self) -> list[str]:
         """返回当前文件列表的稳定快照，供后台预热类任务复用。"""
         preferred = self._filtered_files or self._all_files

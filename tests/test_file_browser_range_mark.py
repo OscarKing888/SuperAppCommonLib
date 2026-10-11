@@ -149,3 +149,21 @@ def test_start_mark_hidden_by_filter_does_not_select_range() -> None:
         assert panel._active_view_selected_paths() == [visible[3]]
     finally:
         _close(panel)
+
+
+@pytest.mark.parametrize("mode", ["thumb", "tree"])
+def test_get_selected_file_paths_returns_multi_selection_or_current(mode: str) -> None:
+    panel, paths, view = _make_panel(mode)
+    try:
+        _set_current(view, 2)
+        assert _press(panel, view, Qt.Key.Key_BracketLeft, text="[")
+        _set_current(view, 4)
+        assert _press(panel, view, Qt.Key.Key_BracketRight, text="]")
+        assert panel.get_selected_file_paths() == paths[2:5]
+
+        view.clearSelection()
+        _set_current(view, 7)
+        view.clearSelection()
+        assert panel.get_selected_file_paths() == [paths[7]]
+    finally:
+        _close(panel)

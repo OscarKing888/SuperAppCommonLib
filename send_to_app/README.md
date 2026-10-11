@@ -15,6 +15,7 @@
 ## 设置 UI
 
 - **settings_ui**：`show_external_apps_settings_dialog(parent, config_dir=..., on_saved=...)`，编辑应用列表并写回 `extern_app.json`。
+- **icon**（需 Qt，未从包根导出）：`external_app_icon(app)` 通过 `QFileIconProvider` 取系统应用图标（macOS `.app`、Windows `.exe`）；macOS 上路径缺失时按应用名在 `/Applications`、`/System/Applications`、`~/Applications` 查找，仍找不到则绘制带应用名首字的圆角占位图标。`external_app_display_name(app)` 与菜单名称规则一致。
 
 ## 接收机制（与目录列表多选同等）
 
