@@ -8,6 +8,7 @@ import traceback
 import tempfile
 
 from app_common.bird_species_copy import species_paste_fields, species_snapshot
+from app_common.exif_io.xmp_sidecar import same_stem_key
 from app_common.perf_probe import elapsed_ms, perf_counter, perf_log, perf_probes_enabled
 from app_common.qt_theme import is_theme_change_event
 from app_common.file_browser._browser_core import *
@@ -80,6 +81,8 @@ class FileListPanel(QWidget):
         self._browser_work_pool = None
         self._live_pool_loaders = set()
         self._all_files: list = []
+        self._listed_path_index: tuple[set, dict] = (set(), {})
+        self._listed_path_index_source: list | None = None
         self._filtered_files: list = []
         self._current_dir = ""
         self._include_subdirectories = True
@@ -1817,6 +1820,39 @@ class FileListPanel(QWidget):
         # report_fields writes and only refresh in-memory XMP metadata state.
         _ = report_fields
         return self.sync_metadata_edits_for_paths({path: meta_updates or {}}) > 0
+
+    def _listed_paths(self) -> tuple[set, dict]:
+        """``(normcase paths, {same_stem_key: [paths]})`` of the current listing."""
+        files = self._all_files
+        if self._listed_path_index_source is not files:
+            # _all_files is replaced, never mutated, when a listing is applied.
+            keys: set[str] = set()
+            by_stem: dict[tuple[str, str], list[str]] = {}
+            for path in files:
+                if not path:
+                    continue
+                norm = os.path.normpath(path)
+                keys.add(os.path.normcase(norm))
+                by_stem.setdefault(same_stem_key(norm), []).append(norm)
+            self._listed_path_index = (keys, by_stem)
+            self._listed_path_index_source = files
+        return self._listed_path_index
+
+    def is_listed_path(self, path: str) -> bool:
+        """True when ``path`` is in the current directory listing.
+
+        Independent of view mode and filters: the list-view model is only
+        built lazily, so it is empty while the thumbnail view is shown.
+        """
+        if not path:
+            return False
+        return os.path.normcase(os.path.normpath(path)) in self._listed_paths()[0]
+
+    def listed_sidecar_siblings(self, path: str) -> list[str]:
+        """Listed paths sharing ``path``'s same-stem XMP sidecar (RAW+JPEG), ``path`` included."""
+        if not path:
+            return []
+        return list(self._listed_paths()[1].get(same_stem_key(path), ()))
 
     def sync_metadata_edits_for_paths(self, updates_by_path: dict) -> int:
         """Merge ``{path: meta_updates}`` into the metadata cache and refresh rows once."""

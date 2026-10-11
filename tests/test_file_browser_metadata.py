@@ -151,3 +151,32 @@ def test_deleted_report_tombstone_suppresses_reload_but_not_recreated_file(tmp_p
         {os.path.normpath(str(path)): row},
     )
     assert files == [str(path)]
+
+
+def test_listed_path_ignores_view_mode_and_follows_new_listings(tmp_path) -> None:
+    # The list-view model is built lazily, so membership must come from the listing itself.
+    first, second = str(tmp_path / "鸟A.jpg"), str(tmp_path / "鸟B.jpg")
+    panel = FileListPanel.__new__(FileListPanel)
+    panel._listed_path_index_source = None
+    panel._all_files = [first]
+    assert FileListPanel.is_listed_path(panel, os.path.join(str(tmp_path), ".", "鸟A.jpg"))
+    assert not FileListPanel.is_listed_path(panel, second)
+    assert not FileListPanel.is_listed_path(panel, "")
+    panel._all_files = [second]
+    assert not FileListPanel.is_listed_path(panel, first)
+    assert FileListPanel.is_listed_path(panel, second)
+
+
+def test_listed_sidecar_siblings_group_raw_and_jpeg_of_one_shot(tmp_path) -> None:
+    folder = str(tmp_path / "鸟片")
+    jpeg, raw = os.path.join(folder, "白鹭_A.JPG"), os.path.join(folder, "白鹭_a.arw")
+    other, elsewhere = os.path.join(folder, "白鹭_2.jpg"), str(tmp_path / "白鹭.jpg")
+    panel = FileListPanel.__new__(FileListPanel)
+    panel._listed_path_index_source = None
+    panel._all_files = [jpeg, raw, other]
+    assert FileListPanel.listed_sidecar_siblings(panel, jpeg) == [jpeg, raw]
+    # An unlisted sibling (e.g. the RAW actually analysed) still finds the listed rows.
+    assert FileListPanel.listed_sidecar_siblings(panel, os.path.join(folder, "白鹭_A.dng")) == [jpeg, raw]
+    assert FileListPanel.listed_sidecar_siblings(panel, other) == [other]
+    assert FileListPanel.listed_sidecar_siblings(panel, elsewhere) == []
+    assert FileListPanel.listed_sidecar_siblings(panel, "") == []

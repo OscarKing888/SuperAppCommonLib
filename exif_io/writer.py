@@ -824,3 +824,24 @@ def invalidate_metadata_cache(paths) -> None:
     with _METADATA_CACHE_LOCK:
         for norm in norms:
             _METADATA_CACHE.pop(norm, None)
+
+
+def invalidate_same_stem_metadata_cache(paths) -> None:
+    """Like :func:`invalidate_metadata_cache`, plus cached files sharing each path's sidecar.
+
+    Cached records include merged sidecar fields, so writing one RAW+JPEG
+    sidecar makes the sibling's record stale too. Scans the whole cache: use
+    for per-photo writes, not large batches.
+    """
+    from app_common.exif_io.xmp_sidecar import same_stem_key
+
+    if paths is None:
+        return
+    if isinstance(paths, (str, os.PathLike)):
+        paths = [paths]
+    keys = {same_stem_key(os.fspath(p)) for p in paths if p}
+    if not keys:
+        return
+    with _METADATA_CACHE_LOCK:
+        for norm in [norm for norm in _METADATA_CACHE if same_stem_key(norm) in keys]:
+            del _METADATA_CACHE[norm]

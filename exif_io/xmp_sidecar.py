@@ -126,6 +126,15 @@ def find_xmp_sidecar(image_path: str) -> str | None:
     return None
 
 
+def same_stem_key(image_path: str) -> tuple[str, str]:
+    """Key shared by files using one same-stem sidecar (RAW+JPEG of one shot).
+
+    The stem compares case-insensitively, like :func:`find_same_stem_xmp_sidecar`.
+    """
+    norm = os.path.normpath(image_path)
+    return os.path.normcase(os.path.dirname(norm)), os.path.splitext(os.path.basename(norm))[0].lower()
+
+
 def find_same_stem_xmp_sidecar(image_path: str) -> str | None:
     """Return only a same-directory, same-stem XMP sidecar.
 
