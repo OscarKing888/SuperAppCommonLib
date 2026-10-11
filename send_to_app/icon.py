@@ -20,7 +20,10 @@ except ImportError:  # pragma: no cover - Qt5 fallback
     from PyQt5.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
     from PyQt5.QtWidgets import QFileIconProvider
 
+from .config import external_app_display_name
 from .send import resolve_app_path
+
+__all__ = ["external_app_display_name", "external_app_icon", "resolve_app_icon_path"]
 
 _FALLBACK_COLORS = (
     (0, 120, 212),
@@ -30,11 +33,6 @@ _FALLBACK_COLORS = (
     (0, 153, 188),
     (194, 57, 179),
 )
-
-
-def external_app_display_name(app: dict[str, Any]) -> str:
-    """返回外部应用在菜单/工具栏中的显示名称。"""
-    return (str(app.get("name") or "") or str(app.get("path") or "") or "未命名").strip() or "未命名"
 
 
 def _mac_application_dirs() -> list[str]:

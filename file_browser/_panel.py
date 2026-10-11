@@ -7773,7 +7773,7 @@ class FileListPanel(QWidget):
         base_dir = self.get_current_dir() or ""
         selected_paths = list(paths or [])
         for app in apps:
-            name = (app.get("name") or app.get("path") or "未命名").strip()
+            name = external_app_display_name(app)
             act = menu.addAction(f"发送到:{name}")
             act.triggered.connect(
                 lambda checked=False, a=app, p=selected_paths: send_files_to_app(

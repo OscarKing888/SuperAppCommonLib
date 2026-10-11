@@ -10,6 +10,7 @@
 
 from .config import (
     CONFIG_FILENAME,
+    external_app_display_name,
     get_config_path,
     load_config,
     save_config,
@@ -29,6 +30,7 @@ from .send import (
 
 __all__ = [
     "CONFIG_FILENAME",
+    "external_app_display_name",
     "get_config_path",
     "load_config",
     "save_config",

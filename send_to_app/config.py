@@ -21,6 +21,25 @@ AUTO_BIRDSTAMP_APP_NAME = "SuperBirdStamp"
 AUTO_BIRDSTAMP_APP_ID = "birdstamp"
 
 
+_APP_NAME_SUFFIXES = (".app", ".exe")
+
+
+def external_app_display_name(app: dict[str, Any], default: str = "未命名") -> str:
+    """返回外部应用在菜单/工具栏/提示中的显示名称。
+
+    使用配置名；为空时取路径的文件名。末尾的 .app/.exe 后缀不显示，
+    如 “Adobe Photoshop 2026.app” 显示为 “Adobe Photoshop 2026”。
+    """
+    name = str(app.get("name") or "").strip()
+    if not name:
+        path = str(app.get("path") or "").strip().rstrip("/\\")
+        name = path.replace("\\", "/").rsplit("/", 1)[-1]
+    stem, ext = os.path.splitext(name)
+    if stem.strip() and ext.lower() in _APP_NAME_SUFFIXES:
+        name = stem.strip()
+    return name or default
+
+
 def _normalize_app_entry(item: Any) -> dict[str, str] | None:
     """规范化单个外部应用配置，兼容可选 app_id 字段。"""
     if not isinstance(item, dict):

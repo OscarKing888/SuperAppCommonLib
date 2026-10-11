@@ -15,6 +15,8 @@ import sys
 import threading
 from typing import Any
 
+from .config import external_app_display_name
+
 # Windows 下用 Qt 的 startDetached，与项目其它处行为一致，且正确传递带空格的路径
 if sys.platform == "win32":
     try:
@@ -126,7 +128,7 @@ def _send_files_to_app_sync(
     cancel_check: Any = None,
 ) -> tuple[bool, str]:
     path = str(app.get("path") or "").strip()
-    app_name = str(app.get("name") or path or "外部应用").strip()
+    app_name = external_app_display_name(app, "外部应用")
     total = len(resolved)
     if not path or not resolved:
         return (False, "未找到可用的发送目标。")
@@ -193,7 +195,7 @@ def _send_files_to_app_async_with_progress(
         return False
 
     total = len(resolved)
-    app_name = str(app.get("name") or app.get("path") or "外部应用").strip()
+    app_name = external_app_display_name(app, "外部应用")
     parent = q_app.activeWindow()
     dialog = QProgressDialog(f"准备发送到 {app_name} ...", "取消", 0, max(1, total), parent)
     dialog.setWindowTitle("发送到外部应用")

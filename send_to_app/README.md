@@ -9,13 +9,13 @@
 
 ## 核心（无 UI）
 
-- **config**：`load_config(config_dir=...)` / `save_config(apps, config_dir=...)`，读写 `extern_app.json`。
+- **config**：`load_config(config_dir=...)` / `save_config(apps, config_dir=...)`，读写 `extern_app.json`；`external_app_display_name(app)` 是菜单、工具栏和发送进度/错误提示共用的显示名（去掉末尾 `.app`/`.exe`，名称为空时取路径文件名），不修改配置中保存的名称。
 - **send**：`send_files_to_app(file_paths: list[str], app: dict, base_directory="")`，优先按 socket 协议热发送；失败时再启动指定应用并传入文件列表。
 
 ## 设置 UI
 
 - **settings_ui**：`show_external_apps_settings_dialog(parent, config_dir=..., on_saved=...)`，编辑应用列表并写回 `extern_app.json`。
-- **icon**（需 Qt，未从包根导出）：`external_app_icon(app)` 通过 `QFileIconProvider` 取系统应用图标（macOS `.app`、Windows `.exe`）；macOS 上路径缺失时按应用名在 `/Applications`、`/System/Applications`、`~/Applications` 查找，仍找不到则绘制带应用名首字的圆角占位图标。`external_app_display_name(app)` 与菜单名称规则一致。
+- **icon**（需 Qt，未从包根导出）：`external_app_icon(app)` 通过 `QFileIconProvider` 取系统应用图标（macOS `.app`、Windows `.exe`）；macOS 上路径缺失时按应用名在 `/Applications`、`/System/Applications`、`~/Applications` 查找，仍找不到则绘制带应用名首字的圆角占位图标。占位首字取自 `external_app_display_name(app)`。
 
 ## 接收机制（与目录列表多选同等）
 

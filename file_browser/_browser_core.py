@@ -85,7 +85,7 @@ from app_common.file_utils import (
     move_to_trash,
     move_empty_dirs_to_trash,
 )
-from app_common.send_to_app import get_external_apps, send_files_to_app
+from app_common.send_to_app import external_app_display_name, get_external_apps, send_files_to_app
 from app_common.report_db import (
     ReportDB,
     report_row_to_exiftool_style,
