@@ -604,7 +604,8 @@ class PhotoMetaDataXMP(PhotoMetaData):
                 return False
             sidecar_path = self.sidecar_path_for(path)
             exists = sidecar_path.is_file()
-            if exists and self._load_or_create_xmp_tree(sidecar_path) is None:
+            existing_tree = self._load_or_create_xmp_tree(sidecar_path) if exists else None
+            if exists and existing_tree is None:
                 return False
             sidecar_path.parent.mkdir(parents=True, exist_ok=True)
             fd, staged_name = tempfile.mkstemp(
@@ -614,6 +615,10 @@ class PhotoMetaDataXMP(PhotoMetaData):
             staged_path = Path(staged_name)
             if exists:
                 shutil.copy2(sidecar_path, staged_path)
+                # ExifTool rejects the whole file on a lang-alt item that wraps
+                # another container; repair only the staged copy it edits.
+                if self._flatten_nested_lang_alt(existing_tree.getroot()):
+                    existing_tree.write(staged_path, encoding="utf-8", xml_declaration=True)
             else:
                 staged_path.unlink()  # ExifTool -o requires a new output path.
             # ExifTool calls the standard XML exif:ISOSpeedRatings property ISO.
@@ -1226,6 +1231,23 @@ class PhotoMetaDataXMP(PhotoMetaData):
         item = ET.SubElement(alt, _RDF_LI_TAG, {_XML_LANG_ATTR: "x-default"})
         item.text = text
         alt.extend(translations)
+
+    @staticmethod
+    def _flatten_nested_lang_alt(root: ET.Element) -> bool:
+        """``rdf:li xml:lang`` must hold text; keep the innermost text of a nested Alt."""
+        changed = False
+        for alt in list(root.iter(_RDF_ALT_TAG)):
+            for item in alt.findall(_RDF_LI_TAG):
+                if item.find(_RDF_ALT_TAG) is None:
+                    continue
+                leaves = [li for li in item.iter(_RDF_LI_TAG) if li is not item and len(li) == 0]
+                default = [li for li in leaves if li.get(_XML_LANG_ATTR) in (None, "", "x-default")]
+                text = next((li.text for li in default + leaves if li.text), "")
+                for child in list(item):
+                    item.remove(child)
+                item.text = text
+                changed = True
+        return changed
 
     @classmethod
     def _replace_text_node(cls, descriptions: list[ET.Element], tag: str, text: str) -> None:

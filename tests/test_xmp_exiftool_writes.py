@@ -95,3 +95,27 @@ def test_generic_write_keeps_corrupt_existing_sidecar(photo) -> None:
     sidecar.write_bytes(original)
     assert not PhotoMetaDataXMP().write(str(photo), {"EXIF:ISO": "800"})
     assert sidecar.read_bytes() == original
+
+
+def test_nested_lang_alt_from_external_editor_is_flattened_for_exiftool(photo) -> None:
+    sidecar = photo.with_suffix(".xmp")
+    sidecar.write_text('''<?xml version="1.0" encoding="UTF-8"?>
+      <x:xmpmeta xmlns:x="adobe:ns:meta/">
+        <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+          <rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/"
+             xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/" crs:Exposure2012="+2.18">
+            <dc:description><rdf:Alt><rdf:li xml:lang="x-default">
+              <rdf:Alt><rdf:li xml:lang="x-default">相机里的中文说明</rdf:li></rdf:Alt>
+            </rdf:li></rdf:Alt></dc:description>
+          </rdf:Description>
+        </rdf:RDF>
+      </x:xmpmeta>''', encoding="utf-8")
+    metadata = PhotoMetaDataXMP()
+
+    assert metadata.write(str(photo), {"XMP-iptcExt:Event": "41.55", "XMP-dc:Title": "赤翡翠"})
+
+    read = metadata.read(str(photo))
+    assert read["Title"] == "赤翡翠"
+    assert read["XMP-Iptc4xmpExt:Event"] == "41.55"
+    assert read["Description"] == "相机里的中文说明"
+    assert read["XMP-crs:Exposure2012"] == "+2.18"
