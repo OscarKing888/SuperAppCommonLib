@@ -6,6 +6,7 @@ import bisect
 import math
 
 from app_common.file_browser._browser_core import *
+from app_common.file_browser._cut_state import CUT_LABEL, cut_tooltip
 from app_common.video import is_video, format_duration
 
 try:
@@ -393,6 +394,7 @@ class FileTableModel(_BurstGroupMixin, QAbstractTableModel):
         self._mismatch_fn = None
         self._burst_groups_dirty = True
         self._burst_group_display_enabled = True
+        self.cut_state = None
 
     def _emit_burst_group_changed_all(self) -> None:
         if not self._entries:
@@ -555,12 +557,14 @@ class FileTableModel(_BurstGroupMixin, QAbstractTableModel):
         if row < 0 or row >= len(self._entries):
             return None
         entry = self._entries[row]
+        if role == _CutPendingRole:
+            return bool(self.cut_state and self.cut_state.contains(entry.path))
         if role == _DisplayRole:
             return self._display_value(entry, row, column)
         if role == _UserRole:
             return entry.path
         if role == _ToolTipRole:
-            return self._resolve_tooltip(entry)
+            return cut_tooltip(self._resolve_tooltip(entry), bool(self.data(index, _CutPendingRole)))
         if role == _SortRole:
             return self._sort_value(entry, column)
         if role == _ForegroundRole:
@@ -965,6 +969,7 @@ class ThumbnailListModel(_BurstGroupMixin, QAbstractListModel):
         self._mismatch_fn = None
         self._burst_groups_dirty = True
         self._burst_group_display_enabled = True
+        self.cut_state = None
 
     def _emit_burst_group_changed_all(self) -> None:
         if not self._entries:
@@ -992,6 +997,8 @@ class ThumbnailListModel(_BurstGroupMixin, QAbstractListModel):
         if row < 0 or row >= len(self._entries):
             return None
         entry = self._entries[row]
+        if role == _CutPendingRole:
+            return bool(self.cut_state and self.cut_state.contains(entry.path))
         if role == _VideoInfoRole:
             return entry.video_info
         if role == _DisplayRole:
@@ -1003,7 +1010,7 @@ class ThumbnailListModel(_BurstGroupMixin, QAbstractListModel):
             if entry.bird_sharp is not None:
                 bird_line = f"鸟清晰度：{entry.bird_sharp.text()}"
                 tooltip = f"{tooltip}\n{bird_line}" if tooltip else bird_line
-            return tooltip
+            return cut_tooltip(tooltip, bool(self.data(index, _CutPendingRole)))
         if role == _ForegroundRole:
             return QBrush(QColor("#c0392b")) if self._resolve_mismatch(entry) else None
         if role == _MetaBirdSharpRole:
@@ -1677,6 +1684,16 @@ def _paint_thumb_footer(painter: QPainter, card: QRect, footer_h: int) -> QRectF
     return footer
 
 
+class CutFileNameDelegate(QStyledItemDelegate):
+    """文件名展示待剪切状态，不改排序键、源路径或其他列的颜色。"""
+
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        if index.data(_CutPendingRole):
+            option.text = f"{CUT_LABEL} · {option.text}"
+            option.font.setItalic(True)
+
+
 class ThumbnailItemDelegate(QStyledItemDelegate):
     """Custom thumbnail delegate: aspect-fit preview card with a fixed metadata footer."""
 
@@ -1704,6 +1721,7 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
         self.initStyleOption(opt, index)
         selected = bool(opt.state & _StateSelected)
         hovered = bool(opt.state & _StateMouseOver)
+        pending_cut = bool(index.data(_CutPendingRole))
         name = str(index.data() or "")
         burst_text = str(index.data(_MetaBurstTextRole) or "")
         rating = index.data(_MetaRatingRole)
@@ -1776,7 +1794,11 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
                     draw_w,
                     draw_h,
                 )
+                painter.save()
+                if pending_cut:
+                    painter.setOpacity(painter.opacity() * 0.4)
                 painter.drawPixmap(draw_rect, pixmap)
+                painter.restore()
                 if pick_value == -1:
                     painter.fillRect(draw_rect, QColor(0, 0, 0, _THUMB_REJECT_DIM_ALPHA))
 
@@ -1872,6 +1894,19 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
 
             if self.show_species_overlay:
                 draw_species_overlay(species_cn)
+
+            if pending_cut:
+                # 状态放在图片槽内，不挤占鸟名/评级，也不盖住选中边框和视频时长。
+                painter.setFont(opt.font)
+                cut_fm = painter.fontMetrics()
+                width = min(thumb_rect.width() - 8, _font_text_width(cut_fm, CUT_LABEL) + 12)
+                height = min(thumb_rect.height() - 8, cut_fm.height() + 4)
+                cut_rect = QRectF(thumb_rect.right() - width - 3, thumb_rect.bottom() - height - 3,
+                                  width, height)
+                _paint_thumb_pill(painter, cut_rect, 220, border=True)
+                painter.setPen(QColor(255, 255, 255))
+                painter.drawText(cut_rect, _AlignCenter,
+                                 cut_fm.elidedText(CUT_LABEL, _ElideRight, max(0, int(width) - 12)))
 
             if footer_h:
                 footer = _paint_thumb_footer(painter, card, footer_h)
