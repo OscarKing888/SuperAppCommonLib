@@ -617,7 +617,9 @@ class PhotoMetaDataXMP(PhotoMetaData):
                 shutil.copy2(sidecar_path, staged_path)
                 # ExifTool rejects the whole file on a lang-alt item that wraps
                 # another container; repair only the staged copy it edits.
-                if self._flatten_nested_lang_alt(existing_tree.getroot()):
+                repaired = self._flatten_nested_lang_alt(existing_tree.getroot())
+                repaired |= self._deduplicate_photo_scalars(existing_tree.getroot(), path)
+                if repaired:
                     existing_tree.write(staged_path, encoding="utf-8", xml_declaration=True)
             else:
                 staged_path.unlink()  # ExifTool -o requires a new output path.
@@ -1231,6 +1233,37 @@ class PhotoMetaDataXMP(PhotoMetaData):
         item = ET.SubElement(alt, _RDF_LI_TAG, {_XML_LANG_ATTR: "x-default"})
         item.text = text
         alt.extend(translations)
+
+    @staticmethod
+    def _deduplicate_photo_scalars(root: ET.Element, path: str) -> bool:
+        """仅修复旧侧车重复的评分/标记标量，保持读取时最后非空值的语义。"""
+        descriptions = _photo_descriptions(root, path)
+        changed = False
+        # 不碰其它资源、未知属性或容器；这些字段在旧报告写入后可能重复追加。
+        tags = (_XMP_RATING_TAG, _XMP_DM_PICK_TAG, *(f"{{{_PHOTOSHOP_NS}}}{name}"
+                for name in ("City", "State", "Country", "Country-PrimaryLocationName")))
+        for tag in tags:
+            occurrences = []
+            complex_value = False
+            for desc in descriptions:
+                if tag in desc.attrib:
+                    occurrences.append((desc, None, desc.attrib[tag]))
+                for child in desc.findall(tag):
+                    complex_value |= bool(len(child) or child.attrib)
+                    occurrences.append((desc, child, child.text or ""))
+            if len(occurrences) < 2 or complex_value:
+                continue
+            kept = next((i for i in range(len(occurrences) - 1, -1, -1)
+                         if occurrences[i][2].strip()), len(occurrences) - 1)
+            for i, (desc, child, _value) in enumerate(occurrences):
+                if i == kept:
+                    continue
+                if child is None:
+                    desc.attrib.pop(tag, None)
+                else:
+                    desc.remove(child)
+                changed = True
+        return changed
 
     @staticmethod
     def _flatten_nested_lang_alt(root: ET.Element) -> bool:

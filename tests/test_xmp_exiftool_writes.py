@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
 from PIL import Image
 import pytest
@@ -119,3 +120,54 @@ def test_nested_lang_alt_from_external_editor_is_flattened_for_exiftool(photo) -
     assert read["XMP-Iptc4xmpExt:Event"] == "41.55"
     assert read["Description"] == "相机里的中文说明"
     assert read["XMP-crs:Exposure2012"] == "+2.18"
+
+
+@pytest.mark.parametrize('reject', [False, True])
+def test_legacy_duplicate_scores_only_repaired_on_successful_staged_write(photo, reject):
+    sidecar = photo.with_suffix('.xmp')
+    sidecar.write_text('''<x:xmpmeta xmlns:x="adobe:ns:meta/"
+        xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+        xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmlns:xmpDM="http://ns.adobe.com/xmp/1.0/DynamicMedia/"
+        xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/" xmlns:dc="http://purl.org/dc/elements/1.1/"
+        xmlns:custom="https://example.test/unknown/">
+      <rdf:RDF>
+        <rdf:Description rdf:about="" xmp:Rating="2" xmpDM:pick="0" photoshop:City="652.6489857543405">
+          <photoshop:State>6.3203125</photoshop:State><photoshop:Country>GOOD</photoshop:Country>
+          <dc:description><rdf:Alt><rdf:li xml:lang="x-default">保留中文拍摄笔记</rdf:li></rdf:Alt></dc:description>
+          <custom:note>保留未知字段</custom:note>
+        </rdf:Description>
+        <rdf:Description rdf:about=""><xmp:Rating>3</xmp:Rating><xmpDM:pick>1</xmpDM:pick>
+          <photoshop:City>652.65</photoshop:City><photoshop:State>06.32</photoshop:State>
+          <photoshop:Country>GOOD</photoshop:Country></rdf:Description>
+        <rdf:Description rdf:about=""><photoshop:City /></rdf:Description>
+      </rdf:RDF></x:xmpmeta>''', encoding='utf-8')
+    before = sidecar.read_bytes(), photo.read_bytes()
+    store = PhotoMetaDataXMP()
+    metadata = store.read(str(photo))
+    fields = {'XMP-iptcExt:Event': '0', 'XMP-dc:Title': '反嘴鹬'}
+    if reject:
+        fields['XMP-exif:NotARealWritableTag'] = '禁止部分保存'
+    assert store.write(str(photo), fields) is not reject
+    assert photo.read_bytes() == before[1]
+    if reject:
+        assert sidecar.read_bytes() == before[0]
+    else:
+        read = store.read(str(photo))
+        assert read['Title'] == '反嘴鹬' and read['XMP-Iptc4xmpExt:Event'] == '0'
+        for key in ['rating', 'pick', 'XMP-photoshop:City', 'XMP-photoshop:State', 'XMP-photoshop:Country',
+                    'Description', 'XMP-unknown:note']:
+            assert read[key] == metadata[key]
+        assert read['rating'] == 3 and read['pick'] == 1
+    assert sorted(p.name for p in photo.parent.iterdir()) == sorted([photo.name, sidecar.name])
+
+
+def test_duplicate_scalar_repair_preserves_foreign_resources_and_structured_values(photo):
+    root = ET.fromstring('''<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+        xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmlns:custom="https://example.test/unknown/">
+      <rdf:Description rdf:about="other.jpg" xmp:Rating="1"><xmp:Rating>2</xmp:Rating></rdf:Description>
+      <rdf:Description rdf:about="" xmp:Rating="3"><xmp:Rating custom:note="限定值">4</xmp:Rating>
+        <custom:note>未知1</custom:note><custom:note>未知2</custom:note></rdf:Description>
+    </rdf:RDF>''')
+    before = ET.tostring(root)
+    assert not PhotoMetaDataXMP._deduplicate_photo_scalars(root, str(photo))
+    assert ET.tostring(root) == before
