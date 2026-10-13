@@ -28,6 +28,7 @@ class DirectoryBrowserWidget(QWidget):
     directory_selected = pyqtSignal(str)
     include_subdirectories_changed = pyqtSignal(bool)
     _PLACEHOLDER = "__ph__"
+    directory_tree_class = QTreeWidget
 
     def __init__(self, parent=None, *, include_subdirectories: bool | None = None) -> None:
         super().__init__(parent)
@@ -64,7 +65,7 @@ class DirectoryBrowserWidget(QWidget):
         toolbar.addWidget(self._btn_refresh_tree)
         layout.addWidget(self._toolbar_widget)
 
-        self._tree = QTreeWidget()
+        self._tree = self.directory_tree_class()
         self._tree.setHeaderHidden(True)
         self._tree.setColumnCount(1)
         self._tree.setAnimated(True)

@@ -45,6 +45,8 @@ class FileListPanel(QWidget):
     show_thumbnail_sort_controls = False
     # 宿主可扩展展示列；两种视图仍使用该模型定义的同一排序键。
     file_table_model_class = FileTableModel
+    file_table_view_class = FileTableView
+    thumbnail_view_class = QListView
     thumbnail_model_class = ThumbnailListModel
     thumbnail_delegate_class = ThumbnailItemDelegate
     # Application-owned held-key playback is opt-in.  SuperBirdStamp subclasses
@@ -466,7 +468,7 @@ class FileListPanel(QWidget):
         self._stack = QStackedWidget()
 
         # ── 列表模式：多列 QTreeWidget ──
-        self._tree_widget = FileTableView()
+        self._tree_widget = self.file_table_view_class()
         self._tree_widget.setModel(self._file_table_proxy)
         self._tree_widget.setHeader(FileTableHeaderView(self._tree_widget))
 
@@ -523,7 +525,7 @@ class FileListPanel(QWidget):
         self._stack.addWidget(self._tree_widget)
 
         # ── 缩略图模式：QListWidget ──
-        self._list_widget = QListView()
+        self._list_widget = self.thumbnail_view_class()
         self._list_widget.setViewMode(_ViewModeIcon)
         self._list_widget.setModel(self._thumb_list_model)
         self._list_widget.setItemDelegate(self.thumbnail_delegate_class(self._list_widget))
