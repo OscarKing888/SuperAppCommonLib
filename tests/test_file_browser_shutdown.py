@@ -5,8 +5,9 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PyQt6.QtCore import QObject, QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QModelIndex, QObject, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QImage
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
 
 from app_common.file_browser import _panel as panel_module
@@ -39,6 +40,29 @@ def _connect_metadata(emitter, panel) -> None:
     emitter.progress_updated.connect(
         panel._on_metadata_progress, Qt.ConnectionType.QueuedConnection
     )
+
+
+def test_delayed_selection_scroll_does_not_access_models_during_shutdown(panel, monkeypatch):
+    reads = []
+    panel._view_mode = panel._MODE_LIST
+    monkeypatch.setattr(panel, "_tree_index_for_path", lambda path: reads.append(path) or QModelIndex())
+    panel._schedule_selection_visibility_restore("中文/photo.jpg", delays_ms=(5, 15))
+    panel._request_background_shutdown()
+    QTest.qWait(40)
+    assert reads == []
+
+
+def test_delayed_selection_scroll_is_cancelled_when_panel_is_deleted(monkeypatch):
+    monkeypatch.setattr(panel_module, "_shutdown_thumb_disk_writer", lambda **_kwargs: None)
+    widget = FileListPanel(create_filter_bar=False)
+    calls = []
+    monkeypatch.setattr(widget, "_scroll_path_into_view", lambda *a, **kw: calls.append(a))
+    widget._schedule_selection_visibility_restore("中文/photo.jpg", delays_ms=(5, 15))
+    widget.close()
+    widget.deleteLater()
+    _APP.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    QTest.qWait(40)
+    assert calls == []
 
 
 def test_metadata_bursts_coalesce_before_model_updates(panel, monkeypatch):

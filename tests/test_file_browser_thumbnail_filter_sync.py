@@ -5,8 +5,9 @@ import os
 from pathlib import Path
 
 import pytest
-from PyQt6.QtCore import QPoint
+from PyQt6.QtCore import QItemSelectionModel, QPoint
 from PyQt6.QtGui import QPixmap
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
 
 from app_common import superviewer_user_options
@@ -126,24 +127,25 @@ def test_cleared_filter_stops_streamed_metadata_refresh(panel, tmp_path, monkeyp
 
 @pytest.mark.parametrize('mode', [FileListPanel._MODE_LIST, FileListPanel._MODE_THUMB])
 @pytest.mark.parametrize('keep_selected', [False, True])
-def test_delayed_scroll_preserves_updated_selection(panel, tmp_path, monkeypatch, mode, keep_selected):
+def test_delayed_scroll_preserves_updated_selection(panel, tmp_path, mode, keep_selected):
     paths = _load_thumbnails(panel, tmp_path, 3)
     panel._set_view_mode(mode)
     if mode == panel._MODE_LIST and panel._tree_view_dirty:
         panel._populate_tree_model_batch()
         assert not panel._tree_view_dirty
     panel.set_pending_selection(paths[:2], paths[0])
-    callbacks = []
-    monkeypatch.setattr(panel_module.QTimer, 'singleShot', lambda delay, callback: callbacks.append(callback))
     panel._schedule_selection_visibility_restore(paths[0])
     view = panel._tree_widget if mode == panel._MODE_LIST else panel._list_widget
     index_for_path = panel._tree_index_for_path if mode == panel._MODE_LIST else panel._thumb_index_for_path
-    view.setCurrentIndex(index_for_path(paths[1]))
+    view.selectionModel().setCurrentIndex(
+        index_for_path(paths[1]),
+        QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows,
+    )
     if not keep_selected:
         view.clearSelection()
     before = panel._active_view_selected_paths()
     assert before == ([paths[1]] if keep_selected else [])
-    for callback in callbacks:
-        callback()
+    # 执行真实 Qt 延迟回调，不能重新选择先前的照片。
+    QTest.qWait(300)
     assert panel._active_view_selected_paths() == before
     assert view.currentIndex() == index_for_path(paths[1])

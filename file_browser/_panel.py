@@ -2112,7 +2112,18 @@ class FileListPanel(QWidget):
         )
         for delay_ms in normalized_delays:
             # 延迟定位不能恢复旧选择：后台操作或用户可能已取消/改变选择。
-            QTimer.singleShot(delay_ms, lambda p=norm_path: self._scroll_path_into_view(p, update_current=False))
+            # 由面板持有定时器，避免已销毁的模型仍被 singleShot 闭包访问。
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setProperty("selection_restore_path", norm_path)
+            timer.timeout.connect(self._on_selection_visibility_restore_timeout)
+            timer.start(delay_ms)
+
+    def _on_selection_visibility_restore_timeout(self) -> None:
+        timer = self.sender()
+        path = timer.property("selection_restore_path")
+        timer.deleteLater()
+        self._scroll_path_into_view(path, update_current=False)
 
     def _replay_selection_visibility_restore(self, reason: str) -> None:
         """在后续 tree refresh / sort 完成后，按需再次确保选中项可见。"""
@@ -2150,6 +2161,8 @@ class FileListPanel(QWidget):
 
     def _scroll_path_into_view(self, path: str, *, prefer_active: bool = True, update_current: bool = True) -> None:
         """按路径滚动到目标项，必要时补设当前项。"""
+        if self._background_shutdown_requested:
+            return
         norm_path = os.path.normpath(path) if path else ""
         if not norm_path:
             return
