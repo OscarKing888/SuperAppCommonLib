@@ -16,9 +16,9 @@ from app_common.file_browser._models import *
 from app_common.file_browser._thumbnail import *
 from app_common.file_browser._workers import *
 from app_common.file_browser._work_pool import BrowserWorkPool
-
-_FILE_CLIPBOARD_ACTION_MIME = "application/x-superbirdtools-file-action"
-_FILE_CLIPBOARD_ENTRIES_MIME = "application/x-superbirdtools-file-entries"
+from app_common.file_browser._cut_state import (
+    FileCutState, _FILE_CLIPBOARD_ACTION_MIME, _FILE_CLIPBOARD_ENTRIES_MIME,
+)
 
 
 def mark_write_action_disabled(target, tooltip: str = "") -> None:
@@ -43,6 +43,7 @@ class FileListPanel(QWidget):
     create_filter_bar = True
     # 排序状态在两种视图间共用；额外工具栏仅由需要它的宿主启用。
     show_thumbnail_sort_controls = False
+    show_cut_state = False
     # 宿主可扩展展示列；两种视图仍使用该模型定义的同一排序键。
     file_table_model_class = FileTableModel
     thumbnail_model_class = ThumbnailListModel
@@ -260,6 +261,16 @@ class FileListPanel(QWidget):
             create_filter_bar = getattr(type(self), "create_filter_bar", True)
         self._create_filter_bar = bool(create_filter_bar)
         self._init_ui()
+        if self.show_cut_state:
+            self._file_cut_state = FileCutState(
+                QApplication.clipboard(), self, resolve_cached_path=_get_cached_actual_path,
+            )
+            self._file_table_model.cut_state = self._file_cut_state
+            self._thumb_list_model.cut_state = self._file_cut_state
+            self._tree_widget.setItemDelegateForColumn(_TREE_COL_NAME, CutFileNameDelegate(self._tree_widget))
+            # 剪贴板改变只请求可见区域重绘，不重建模型、重排或触发缩略图加载。
+            self._file_cut_state.changed.connect(self._tree_widget.viewport().update)
+            self._file_cut_state.changed.connect(self._list_widget.viewport().update)
         self.installEventFilter(self)
         app = QApplication.instance()
         if app is not None:
@@ -7274,7 +7285,10 @@ class FileListPanel(QWidget):
             seen.add(norm_key)
 
             sidecars = self._metadata_sidecars_for_source_path(p, abs_path)
-            entries.append({"source": abs_path, "sidecar": sidecars[0] if sidecars else "", "sidecars": sidecars})
+            entry = {"source": abs_path, "sidecar": sidecars[0] if sidecars else "", "sidecars": sidecars}
+            if os.path.normcase(os.path.abspath(p)) != norm_key:
+                entry["display_source"] = os.path.abspath(p)
+            entries.append(entry)
             _log.info(
                 "[_collect_file_clipboard_entries] source=%r resolved_source=%r source_exists=%s sidecars=%s",
                 p,

@@ -258,6 +258,7 @@ _MetaFocusBoxRole = int(_UserRole) + 24
 _MetaBurstGroupRole = int(_UserRole) + 25
 # 鸟清晰度检测结果：None 或 BirdSharpnessDisplay（见 app_common.bird_sharpness_fields）
 _MetaBirdSharpRole = int(_UserRole) + 27  # +26 为 _models._VideoInfoRole
+_CutPendingRole = int(_UserRole) + 28  # 当前系统剪贴板中的待剪切照片
 
 # 连拍分组底框配色（两种颜色交替使用），半透明以兼容深/浅色主题
 _BURST_GROUP_COLORS: tuple[str, str] = ("#3d8bfd", "#f5a623")
