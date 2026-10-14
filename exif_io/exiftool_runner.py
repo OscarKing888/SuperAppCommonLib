@@ -101,6 +101,22 @@ def run_exiftool_once(cmd: Sequence[str], **kwargs: Any) -> subprocess.Completed
     return result
 
 
+def run_exiftool_utf8_args(executable: str, args: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess:
+    """One-shot UTF-8 argument stream, avoiding Windows Perl's ANSI argv decoding.
+
+    File paths and ``-Tag<=file`` arguments travel over stdin, including on
+    Windows. The process exits on EOF and retains the regular timeout/cancel
+    ownership of run_exiftool_once. Newlines cannot be encoded in an arg file.
+    """
+    values = [str(value) for value in args]
+    if any("\n" in value or "\r" in value or "\0" in value for value in values):
+        raise ValueError("ExifTool argument streams cannot contain newline or NUL characters")
+    if "input" in kwargs:
+        raise ValueError("ExifTool UTF-8 argument stream owns stdin")
+    kwargs.update(text=True, encoding="utf-8", errors="replace", input="\n".join(values)+"\n")
+    return run_exiftool_once([str(executable), "-@", "-"], **kwargs)
+
+
 class _StayOpenExifTool:
     def __init__(self, executable_path: str) -> None:
         self.executable_path = str(executable_path)

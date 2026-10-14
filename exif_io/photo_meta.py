@@ -21,6 +21,7 @@ not need to care about the underlying source.  Existing functions in
 from __future__ import annotations
 
 import abc
+import json
 import os
 import re
 import shutil
@@ -453,6 +454,72 @@ class PhotoMetaDataXMP(PhotoMetaData):
         except Exception:
             pass
         return Path(os.path.splitext(os.path.normpath(path))[0] + ".xmp")
+
+    @staticmethod
+    def _structured_field_tag(name: str) -> str:
+        if not _superpicky_field_name(f"XMP-superpicky:{name}"):
+            raise ValueError("Invalid structured XMP field name")
+        return f"{{{_SUPERPICKY_NS}}}{name}"
+
+    @staticmethod
+    def _structured_field_value(tree, path: str, sidecar: Path, tag: str):
+        values = []
+        for desc in _photo_descriptions(tree.getroot(), path, sidecar_path=str(sidecar)):
+            if tag in desc.attrib:
+                values.append(desc.attrib[tag])
+            values.extend(node.text or "" for node in desc.findall(tag))
+        values = [value for value in values if value.strip()]
+        if not values:
+            return None
+        if len(set(values)) > 1:
+            raise ValueError("Conflicting structured XMP properties; original sidecar retained")
+        return json.loads(values[0])
+
+    @_serialized_xmp_write
+    def read_json_field(self, path: str, name: str):
+        """Strict structured application property; malformed XML/JSON is never empty state."""
+        tag = self._structured_field_tag(name)
+        sidecar = self.sidecar_path_for(path)
+        if not sidecar.exists():
+            return None
+        if sidecar.stat().st_size > 64 * 1024 * 1024:
+            raise ValueError("XMP sidecar exceeds the structured metadata read limit")
+        return self._structured_field_value(ET.parse(sidecar), path, sidecar, tag)
+
+    @_serialized_xmp_write
+    def update_json_field(self, path: str, name: str, update):
+        """Read/merge/write one property under the same lock as ratings and tags.
+
+        ``update(current)`` returns the replacement JSON value (None removes it)
+        and may raise to reject an optimistic-revision conflict. No original
+        image is written. Other namespaces and report hydration are preserved.
+        """
+        if not Path(path).is_file():
+            raise FileNotFoundError(path)
+        tag = self._structured_field_tag(name)
+        sidecar = self.sidecar_path_for(path)
+        original = sidecar.read_bytes() if sidecar.exists() else None
+        if original is not None and len(original) > 64 * 1024 * 1024:
+            raise ValueError("XMP sidecar exceeds the structured metadata read limit")
+        tree = ET.ElementTree(ET.fromstring(original)) if original is not None else self._new_xmp_tree()
+        current = self._structured_field_value(tree, path, sidecar, tag)
+        replacement = update(current)
+        text = "" if replacement is None else json.dumps(replacement, ensure_ascii=False, sort_keys=True,
+                                                       separators=(",", ":"), allow_nan=False)
+        if len(text.encode("utf-8")) > 2 * 1024 * 1024:
+            raise ValueError("Structured XMP property exceeds 2 MiB; store large resources separately")
+        self._replace_text_node(self._ensure_descriptions(tree.getroot(), path), tag, text)
+        self._hydrate_report_db_fields_if_needed(path, tree, protected_report_fields={name: text})
+        # Other application processes don't use our in-process lock. Detect any
+        # change observed during the transaction instead of publishing stale XML.
+        latest = sidecar.read_bytes() if sidecar.exists() else None
+        if latest != original:
+            raise RuntimeError("XMP changed externally during save; retry with the latest metadata")
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        if not self._write_tree_atomic(tree, sidecar):
+            raise OSError(f"Could not save XMP: {sidecar}")
+        self._invalidate_metadata_cache(path)
+        return replacement
 
     def read(self, path: str) -> dict[str, Any]:
         try:

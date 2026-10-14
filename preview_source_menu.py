@@ -11,12 +11,12 @@ except ImportError:  # pragma: no cover - PyQt5 compatibility
 class PreviewSourceMenu(QMenu):
     mode_selected = pyqtSignal(str)
 
-    def __init__(self, button):
+    def __init__(self, button, *, extra_modes=()):
         super().__init__(button)
         self.group = QActionGroup(self)
         self.group.setExclusive(True)
         self.mode_actions = {}
-        for mode, label in (('default', '默认预览'), ('raw', '显示 RAW'), ('denoised', '显示降噪')):
+        for mode, label in (('default', '默认预览'), ('raw', '显示 RAW'), ('denoised', '显示降噪'), *extra_modes):
             action = self.addAction(label)
             action.setCheckable(True)
             action.setData(mode)

@@ -723,7 +723,8 @@ class FileListPanel(QWidget):
         return resolved_paths
 
     def file_operation_paths_allowed(self, paths: list[str]) -> bool:
-        return True
+        guard = getattr(self, "file_operation_guard", None)
+        return bool(guard(self._resolved_file_operation_paths(paths), warn=False)) if guard else True
 
     def file_operation_paths_disabled_tooltip(
         self,
@@ -739,7 +740,8 @@ class FileListPanel(QWidget):
         *,
         warn: bool = False,
     ) -> bool:
-        return True
+        guard = getattr(self, "file_operation_guard", None)
+        return bool(guard(self._resolved_file_operation_paths(paths), warn=warn)) if guard else True
 
     def sidecar_writes_allowed(self) -> bool:
         return True
@@ -7667,10 +7669,9 @@ class FileListPanel(QWidget):
         if not entries:
             _log.info("[_paste_clipboard_to_current_dir] skip reason=no_clipboard_files")
             return
-        if action == "cut":
-            source_paths = [str(entry.get("source") or "") for entry in entries]
-            if source_paths and not self._file_operation_paths_allowed(source_paths, "剪切粘贴", warn=True):
-                return
+        source_paths = [str(entry.get("source") or "") for entry in entries]
+        if source_paths and not self._file_operation_paths_allowed(source_paths, "粘贴", warn=True):
+            return
 
         pasted_sources: list[str] = []
         touched_paths: list[str] = []

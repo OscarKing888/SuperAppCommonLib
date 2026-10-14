@@ -1,0 +1,22 @@
+[package]
+name = "superbird-photo-edit-native"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "_native"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "=0.27.2", features = ["extension-module"] }
+numpy = "=0.27.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+photocraft-algo = { workspace = true }
+photocraft-compose = { workspace = true }
+photocraft-doc = { workspace = true }
+photocraft-color = { workspace = true }
+photocraft-geom = { workspace = true }
+photocraft-cms = { workspace = true }
+roxmltree = "0.21"

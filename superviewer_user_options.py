@@ -123,6 +123,15 @@ DENOISE_DEFAULT_OPTIONS = {
     "denoise_workers": 2,
 }
 
+PHOTO_EDIT_DEFAULT_OPTIONS = {
+    "photo_edit_output_mode": "source_subdir",
+    "photo_edit_subdir": "edited",
+    "photo_edit_output_directory": "",
+    "photo_edit_format": "tiff",
+    "photo_edit_memory_mb": 512,
+    "photo_edit_disk_mb": 1024,
+}
+
 VIDEO_FRAME_DEFAULT_OPTIONS = {
     "video_frame_output_mode": "source_subdir",
     "video_frame_output_directory": "",
@@ -147,6 +156,7 @@ _DEFAULT_OPTIONS = {
     **{key: limits[0] for key, limits in BIRD_SHARPNESS_INT_LIMITS.items()},
     **{key: choice[0] for key, choice in BIRD_SHARPNESS_TEXT_CHOICES.items()},
     **DENOISE_DEFAULT_OPTIONS,
+    **PHOTO_EDIT_DEFAULT_OPTIONS,
     **VIDEO_FRAME_DEFAULT_OPTIONS,
     **METADATA_BADGE_DEFAULT_OPTIONS,
 }
@@ -277,7 +287,7 @@ def normalize_user_options(data: dict | None) -> dict[str, int | str]:
         normalized[key] = value if ok else default
 
     for key, allowed in (
-        ("denoise_output_mode", {"source_subdir", "fixed", "ask"}),
+        ("denoise_output_mode", {"source_subdir", "source_dir", "sibling_dir", "fixed", "ask"}),
         ("denoise_format", {"tiff", "jpeg"}),
         ("denoise_device", {"auto", "cpu", "cuda", "mps"}),
     ):
@@ -295,6 +305,27 @@ def normalize_user_options(data: dict | None) -> dict[str, int | str]:
         except (TypeError, ValueError, OverflowError):
             value = normalized[key]
         normalized[key] = max(0 if key == "denoise_strength" else 1, min(maximum, value))
+
+    from app_common.image_output_paths import OUTPUT_MODES, validate_component
+    for key, allowed in (("photo_edit_output_mode", dict(OUTPUT_MODES)),
+                         ("photo_edit_format", {"tiff", "jpeg", "png"})):
+        value = source.get(key)
+        if isinstance(value, str) and value in allowed:
+            normalized[key] = value
+    try:
+        validate_component(source.get("photo_edit_subdir"))
+        normalized["photo_edit_subdir"] = source["photo_edit_subdir"]
+    except ValueError:
+        pass
+    directory = source.get("photo_edit_output_directory", "")
+    if isinstance(directory, str) and "\x00" not in directory:
+        normalized["photo_edit_output_directory"] = directory.strip()
+    for key, minimum, maximum in (("photo_edit_memory_mb", 64, 4096), ("photo_edit_disk_mb", 0, 16384)):
+        try:
+            value = int(source.get(key, normalized[key]))
+        except (TypeError, ValueError, OverflowError):
+            value = normalized[key]
+        normalized[key] = max(minimum, min(maximum, value))
 
     mode = source.get("video_frame_output_mode")
     if isinstance(mode, str) and mode in {"source_subdir", "fixed", "ask"}:

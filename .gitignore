@@ -207,3 +207,6 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+photo_edit/_native.build.json
+photo_edit/_native.notices.txt

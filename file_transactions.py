@@ -67,6 +67,10 @@ def transfer_file_pairs(
     if not pairs:
         return []
 
+    from app_common.photo_edit.file_assets import copy_photo_edit_assets
+    for source,dest in pairs:
+        copy_photo_edit_assets(source,dest)
+
     copy_keys = {os.path.abspath(p) for p in copy_sources}
 
     def is_cut(source):
@@ -112,7 +116,7 @@ def transfer_file_pairs(
                 elif is_cut(source) and os.path.exists(temp_path):
                     # 失败的跨卷移动可能同时留下不完整源文件和完整暂存副本。
                     # 无法确认哪份完整时保留两份，绝不按“源存在”删除恢复副本。
-                    stage_rollback_error = f"recoverable file retained at {temp_path!r}; source also exists: {source!r}"
+                    stage_rollback_error = f"recoverable file retained at '{temp_path}'; source also exists: '{source}'"
                 elif os.path.exists(temp_path):
                     try:
                         os.remove(temp_path)
@@ -180,7 +184,7 @@ def transfer_file_pairs(
                 rollback_errors.append(f"remove {temp_path!r}: {rollback_exc}")
         if rollback_errors or retained_paths:
             recovery_detail = (
-                "; recoverable files retained at: " + ", ".join(repr(path) for path in retained_paths)
+                "; recoverable files retained at: " + ", ".join(retained_paths)
                 if retained_paths else ""
             )
             raise RuntimeError(

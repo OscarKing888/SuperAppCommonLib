@@ -1,0 +1,2 @@
+# Snapshot bytes are hashed against git objects, including upstream EOFs.
+upstream/** -text whitespace=-blank-at-eof
