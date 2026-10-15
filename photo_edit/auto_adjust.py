@@ -136,7 +136,17 @@ def prepare_auto_adjustment(state, mode="all", *, cache=None, cancelled=None):
     return AutoAdjustmentResult(recipe, mode, recipe != original)
 
 
-def auto_basic_parameters(rgba, kind):
+def _is_backlit(luma):
+    if len(luma) < 32:
+        return False
+    p10, middle, p90 = np.percentile(luma, [10, 50, 90])
+    # 大面积亮背景与暗主体并存时，中位数代表天空，不能据此全局压暗。
+    # 同时要求明显暗部和稀疏中间调，避免把一般偏亮照片当成逆光场景。
+    return bool(middle > .65 and p10 < .25 and p90 > .8
+                and np.mean((luma >= .3) & (luma <= .65)) < .15)
+
+
+def auto_basic_parameters(rgba, kind, *, backlit=None):
     """Estimate one ordinary editor group's parameters in its own input space.
 
     Each estimate is conservative and quantized to that form's displayed units.
@@ -151,18 +161,29 @@ def auto_basic_parameters(rgba, kind):
         return params
     luma = rgb @ np.array([.2126, .7152, .0722])
     p10, middle, p90 = np.percentile(luma, [10, 50, 90])
+    if backlit is None:
+        backlit = _is_backlit(luma)
     if kind == "brightnessContrast":
-        params.update(brightness=round(float(np.clip((.45 - middle) * 60, -18, 18))),
-                      contrast=round(float(np.clip((.65 - (p90 - p10)) * 35, -8, 16))))
+        if not backlit:
+            params.update(brightness=round(float(np.clip((.45 - middle) * 60, -18, 18))),
+                          contrast=round(float(np.clip((.65 - (p90 - p10)) * 35, -8, 16))))
     elif kind == "levels":
         # RGB 总通道直接显示黑白点，不再把所有自动值藏在单独颜色通道中。
         params = auto_levels(rgba, "contrast")
         for key in ("in_black", "in_white"):
             params["master"][key] = round(params["master"][key], 3)
+        if backlit:
+            # 不减去暗主体的黑位，也不把已有亮天空进一步拉到剪切边缘。
+            params["master"].update(in_black=0, in_white=max(.98, params["master"]["in_white"]))
     elif kind == "curves":
-        lift = round(float(np.clip((.45 - middle) * .12, -.03, .03)), 3)
-        if abs(lift) >= .003:
-            params["master"].insert(1, dict(input=.5, output=.5 + lift))
+        if backlit:
+            # 用实际可编辑曲线局部抬升暗调；中间调和高光锚点维持原亮度。
+            params["master"][1:1] = [dict(input=.15, output=.23),
+                                      dict(input=.5, output=.5), dict(input=.8, output=.8)]
+        else:
+            lift = round(float(np.clip((.45 - middle) * .12, -.03, .03)), 3)
+            if abs(lift) >= .003:
+                params["master"].insert(1, dict(input=.5, output=.5 + lift))
     elif kind == "exposure":
         # 在高光允许的范围内轻微提亮，剩余中间调偏差交给可见 gamma 控件。
         top = float(np.percentile(rgb.max(axis=1), 99.5))
@@ -174,6 +195,8 @@ def auto_basic_parameters(rgba, kind):
         # 限在 0.9～1.1，否则带高光的欠曝照片几乎不变。gamma 保留黑白端点，
         # 按实际偏差校正并限制在半倍到两倍，正常亮度保持 1。
         params["gamma"] = round(float(np.clip(math.log(projected) / math.log(target), .5, 2.0)), 2)
+        if backlit:
+            params["gamma"] = max(1, params["gamma"])
     elif kind == "vibrance":
         saturation = np.ptp(rgb, axis=1) / np.maximum(rgb.max(axis=1), .01)
         colored = saturation[saturation > .02]
@@ -223,12 +246,16 @@ def _prepare_all_adjustments(state, *, cache=None, cancelled=None):
     cache = cache if cache is not None else ImageCache()
     prefix = []
     updated_ids = []
+    backlit = None
     for step in planned.steps:
         check_cancelled(cancelled)
         if step.id in targets:
             snapshot.current.recipe.steps = list(prefix)
             preview = render_recipe(snapshot, proxy=True, cache=cache, cancelled=cancelled)
-            step.params = auto_basic_parameters(preview.rgba, step.kind)
+            if backlit is None:
+                # 一轮内固定场景判断：不能因前一组已抬起暗部，后一组又当作过曝压回去。
+                backlit = _is_backlit(_sample_rgb(preview.rgba) @ np.array([.2126, .7152, .0722]))
+            step.params = auto_basic_parameters(preview.rgba, step.kind, backlit=backlit)
             step.enabled = step.params != adjustment_defaults(step.kind)
             if step.enabled or step.id in old_ids:
                 prefix.append(step)
