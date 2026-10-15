@@ -31,9 +31,10 @@ def main(argv=None):
     commands.add_parser("info",help="原生引擎版本和支持的参数")
     show = commands.add_parser("show",help="读取照片 XMP 中的编辑状态")
     show.add_argument("source")
-    auto = commands.add_parser("auto-adjust", help="自动调节当前底图，将可微调的色阶保存到照片 XMP")
+    auto = commands.add_parser("auto-adjust", help="一键自动调节当前底图，将基础组参数保存到照片 XMP")
     auto.add_argument("source")
-    auto.add_argument("--mode", choices=("tone", "contrast", "color"), default="tone")
+    auto.add_argument("--mode", choices=("all", "tone", "contrast", "color"), default="all",
+                      help="默认 all 综合调节；保留旧版单模式供脚本兼容")
     render = commands.add_parser("render",help="导出完整分辨率成片（不会修改原照片参数）")
     render.add_argument("sources",nargs="+")
     render.add_argument("--recipe",help="显式配方 JSON 文件，默认使用源照片 XMP")

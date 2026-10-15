@@ -4,7 +4,8 @@ import pytest
 from PIL import Image
 
 from app_common.image_processing_types import ImageProcessingCancelled
-from app_common.photo_edit.auto_adjust import auto_levels, prepare_auto_adjustment, auto_step_mode
+from app_common.photo_edit.auto_adjust import (AUTO_BASIC_KINDS, auto_levels, auto_basic_parameters,
+                                              prepare_auto_adjustment, auto_step_mode, can_auto_adjust)
 from app_common.photo_edit.catalog import adjustment_defaults
 from app_common.photo_edit.model import Recipe, AdjustmentStep
 from app_common.photo_edit.native import render_pixels
@@ -102,13 +103,13 @@ def test_repeat_is_stable_preserves_edits_and_roundtrips_chinese_xmp(source):
     state.current.recipe.steps = [AdjustmentStep("vibrance", {"vibrance": 10})]
     state.current.recipe = state.current.recipe.validated()
     before = state.to_dict()
-    result = prepare_auto_adjustment(state)
+    result = prepare_auto_adjustment(state, "tone")
     assert state.to_dict() == before and result.changed
     assert result.recipe.steps[:-1] == state.current.recipe.steps
     assert result.recipe.camera == state.current.recipe.camera
     assert auto_step_mode(result.recipe.steps[-1]) == "tone"
     state.current.recipe = result.recipe
-    again = prepare_auto_adjustment(state)
+    again = prepare_auto_adjustment(state, "tone")
     assert not again.changed and again.recipe == result.recipe
     RecipeStore().save(state)
     loaded = RecipeStore().load(source)
@@ -148,3 +149,96 @@ def test_verified_denoised_input_keeps_original_recipe(source, tmp_path):
     state.current.recipe = result.recipe
     assert result.changed and result.recipe.steps
     assert state.inputs["original"].recipe.is_identity()
+
+
+@pytest.mark.parametrize("kind", AUTO_BASIC_KINDS)
+def test_all_basic_groups_have_real_editable_parameters_and_pixel_effects(kind):
+    pytest.importorskip("app_common.photo_edit._native")
+    rgba = ramp(.12, .42)
+    if kind in {"vibrance", "colorBalance"}:
+        rgba = ramp(.2, .7)
+        rgba[..., 0] += .025
+        rgba[..., 2] -= .02
+    params = auto_basic_parameters(rgba, kind)
+    recipe = Recipe(steps=[AdjustmentStep(kind, params)]).validated()
+    assert params != adjustment_defaults(kind)
+    output = render_pixels(rgba, recipe)
+    assert np.isfinite(output).all() and not np.allclose(output, rgba)
+    assert np.array_equal(output[..., 3], rgba[..., 3])
+    if kind in {"brightnessContrast", "curves", "exposure"}:
+        assert np.median(output[..., :3]) > np.median(rgba[..., :3])
+    elif kind == "colorBalance":
+        assert abs(np.median(output[..., 0] - output[..., 2])) < abs(np.median(rgba[..., 0] - rgba[..., 2]))
+    elif kind == "levels":
+        assert params["master"]["in_black"] > 0
+        assert all(c == adjustment_defaults("levels")["master"] for c in params["per_channel"])
+
+
+def test_unified_recomputes_existing_groups_preserves_ids_duplicates_and_order(source, monkeypatch):
+    pytest.importorskip("app_common.photo_edit._native")
+    from app_common.photo_edit import pipeline
+    state = RecipeStore().load(source)
+    first = AdjustmentStep("exposure", {"exposure": 2})
+    creative = AdjustmentStep("photoFilter", {"density": .12})
+    duplicate = AdjustmentStep("exposure", {"exposure": -.15})
+    legacy = AdjustmentStep("levels", auto_levels(ramp()), id="auto-levels-tone-old")
+    state.current.recipe.steps = [first, creative, duplicate, legacy]
+    state.current.recipe = state.current.recipe.validated()
+    state.current.recipe.camera["exposure"] = .1
+    before = state.to_dict()
+    decode = pipeline.decode_image
+    decodes = []
+    def counted(*args, **kwargs):
+        decodes.append(args[0])
+        return decode(*args, **kwargs)
+    monkeypatch.setattr(pipeline, "decode_image", counted)
+    result = prepare_auto_adjustment(state)
+    assert result.mode == "all" and result.changed
+    assert state.to_dict() == before and len(decodes) == 1
+    assert result.recipe.camera == state.current.recipe.camera
+    old_ids = [step.id for step in state.current.recipe.steps]
+    assert [step.id for step in result.recipe.steps if step.id in old_ids] == old_ids
+    by_id = {step.id: step for step in result.recipe.steps}
+    assert by_id[creative.id] == state.current.recipe.steps[1]
+    assert by_id[duplicate.id] == state.current.recipe.steps[2]
+    assert by_id[first.id].params["exposure"] != 2
+    assert sum(step.kind == "levels" for step in result.recipe.steps) == 1
+    state.current.recipe = result.recipe
+    repeat = prepare_auto_adjustment(state)
+    assert not repeat.changed and repeat.recipe == result.recipe
+    RecipeStore().save(state)
+    assert RecipeStore().load(source).current.recipe == result.recipe
+
+
+def test_unified_limits_reuses_existing_slots_and_cancels_mid_analysis(source, monkeypatch):
+    pytest.importorskip("app_common.photo_edit._native")
+    from app_common.photo_edit import auto_adjust
+    state = RecipeStore().load(source)
+    state.current.recipe.steps = [AdjustmentStep(kind) for kind in AUTO_BASIC_KINDS]
+    state.current.recipe.steps += [AdjustmentStep("invert", enabled=False) for _ in range(58)]
+    assert can_auto_adjust(state.current.recipe)
+    result = prepare_auto_adjustment(state)
+    assert len(result.recipe.steps) == 64
+    state.current.recipe.steps = [AdjustmentStep("invert", enabled=False) for _ in range(59)]
+    assert not can_auto_adjust(state.current.recipe)
+    with pytest.raises(ValueError, match="64"):
+        prepare_auto_adjustment(state)
+    state.current.recipe = Recipe()
+    before = state.to_dict()
+    calls = []
+    estimate = auto_adjust.auto_basic_parameters
+    def cancel_after_first(*args):
+        calls.append(1)
+        return estimate(*args)
+    monkeypatch.setattr(auto_adjust, "auto_basic_parameters", cancel_after_first)
+    with pytest.raises(ImageProcessingCancelled):
+        prepare_auto_adjustment(state, cancelled=lambda: bool(calls))
+    assert len(calls) == 1 and state.to_dict() == before
+
+
+def test_unified_flat_image_remains_noop(source):
+    pytest.importorskip("app_common.photo_edit._native")
+    Image.new("RGB", (64, 64), (64, 80, 100)).save(source)
+    state = RecipeStore().load(source)
+    result = prepare_auto_adjustment(state)
+    assert not result.changed and result.recipe.is_identity() and not result.step_ids

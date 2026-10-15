@@ -1,4 +1,4 @@
-"""Estimate editable RGB levels from a bounded preview; no Qt or image writes."""
+"""Estimate ordinary color-editor parameters from bounded previews; no Qt or writes."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,15 +7,19 @@ import math
 import numpy as np
 
 from app_common.image_processing_types import check_cancelled
-from .catalog import adjustment_defaults
+from .catalog import ADJUSTMENT_TITLES, adjustment_defaults
 from .model import AdjustmentStep, Recipe
 
-AUTO_MODES = {"tone": "自动色调", "contrast": "自动对比度", "color": "自动颜色"}
+AUTO_MODES = {"all": "一键自动调节", "tone": "自动色调", "contrast": "自动对比度", "color": "自动颜色"}
+AUTO_BASIC_KINDS = ("brightnessContrast", "levels", "curves", "exposure", "vibrance", "colorBalance")
 _PREFIX = "auto-levels-"
+_BASIC_PREFIX = "auto-basic-"
 _MAX_SAMPLES = 262144
 
 
 def auto_step_mode(step):
+    if step.kind in AUTO_BASIC_KINDS and step.id.startswith(_BASIC_PREFIX):
+        return "all"
     if step.kind == "levels" and step.id.startswith(_PREFIX):
         mode = step.id[len(_PREFIX):].split("-", 1)[0]
         if mode in AUTO_MODES:
@@ -24,10 +28,14 @@ def auto_step_mode(step):
 
 
 def _replaceable_step(recipe):
-    return bool(recipe.steps and recipe.steps[-1].enabled and auto_step_mode(recipe.steps[-1]))
+    return bool(recipe.steps and recipe.steps[-1].enabled
+                and auto_step_mode(recipe.steps[-1]) in {"tone", "contrast", "color"})
 
 
-def can_auto_adjust(recipe):
+def can_auto_adjust(recipe, mode="all"):
+    if mode == "all":
+        missing = set(AUTO_BASIC_KINDS) - {step.kind for step in recipe.steps}
+        return len(recipe.steps) + len(missing) <= 64
     return len(recipe.steps) < 64 or _replaceable_step(recipe)
 
 
@@ -39,24 +47,23 @@ def _endpoints(low, high):
     return round(float(low), 6), round(float(high), 6)
 
 
-def auto_levels(rgba, mode="tone"):
-    """Return ordinary levels parameters for float SDR/sRGB RGBA pixels.
-
-    Tone stretches channels independently; contrast uses common endpoints;
-    color additionally balances sufficiently represented near-neutral midtones.
-    Ignore invisible pixels, clip 0.5% tails, and leave flat images unchanged.
-    """
-    if mode not in AUTO_MODES:
-        raise ValueError("未知自动调节模式")
+def _sample_rgb(rgba):
     array = np.asarray(rgba)
     if array.ndim != 3 or array.shape[2] != 4:
         raise ValueError("自动调节需要 RGBA 像素")
-    params = adjustment_defaults("levels")
     stride = max(1, math.ceil(math.sqrt(array.shape[0] * array.shape[1] / _MAX_SAMPLES)))
     column_stride = max(1, math.ceil(array.shape[1] * math.ceil(array.shape[0] / stride) / _MAX_SAMPLES))
     sampled = array[::stride, ::column_stride]
     valid = np.isfinite(sampled).all(axis=2) & (sampled[..., 3] >= .5)
-    rgb = np.clip(sampled[..., :3][valid], 0, 1).astype(np.float64)
+    return np.clip(sampled[..., :3][valid], 0, 1).astype(np.float64)
+
+
+def auto_levels(rgba, mode="tone"):
+    """Legacy single-purpose levels estimators, retained for saved CLI workflows."""
+    if mode not in {"tone", "contrast", "color"}:
+        raise ValueError("未知自动调节模式")
+    params = adjustment_defaults("levels")
+    rgb = _sample_rgb(rgba)
     if len(rgb) < 32:
         return params
     low, high = np.percentile(rgb, [.5, 99.5], axis=0)
@@ -93,23 +100,26 @@ class AutoAdjustmentResult:
     recipe: Recipe
     mode: str
     changed: bool
+    step_ids: tuple[str, ...] = ()
 
 
-def prepare_auto_adjustment(state, mode="tone", *, cache=None, cancelled=None):
+def prepare_auto_adjustment(state, mode="all", *, cache=None, cancelled=None):
     """Analyze the current input and edits in a worker, without mutating state.
 
-    Recompute a trailing enabled auto step from its input, keeping repeated
-    clicks stable. Other edits, disabled steps and their order remain intact.
+    Default to integrated basic-group correction. Explicit legacy modes retain
+    their trailing-levels replacement behavior for existing scripts.
     """
     from .pipeline import render_recipe
     from .storage import PhotoEditState
 
     if mode not in AUTO_MODES:
         raise ValueError("未知自动调节模式")
+    if mode == "all":
+        return _prepare_all_adjustments(state, cache=cache, cancelled=cancelled)
     check_cancelled(cancelled)
     snapshot = PhotoEditState.from_dict(state.source, state.to_dict())
     original = snapshot.current.recipe.validated()
-    if not can_auto_adjust(original):
+    if not can_auto_adjust(original, mode):
         raise ValueError("最多支持 64 个步骤，请移除一个步骤后再自动调节。")
     recipe = snapshot.current.recipe
     previous = recipe.steps.pop() if _replaceable_step(recipe) else None
@@ -124,3 +134,105 @@ def prepare_auto_adjustment(state, mode="tone", *, cache=None, cancelled=None):
         recipe.steps.append(step)
     recipe = recipe.validated()
     return AutoAdjustmentResult(recipe, mode, recipe != original)
+
+
+def auto_basic_parameters(rgba, kind):
+    """Estimate one ordinary editor group's parameters in its own input space.
+
+    Each estimate is conservative and quantized to that form's displayed units.
+    The caller renders preceding steps before estimating the next group, so
+    tone/contrast/color corrections never stretch the same histogram three times.
+    """
+    if kind not in AUTO_BASIC_KINDS:
+        raise ValueError("不支持自动调节的参数组")
+    params = adjustment_defaults(kind)
+    rgb = _sample_rgb(rgba)
+    if len(rgb) < 32 or np.ptp(np.percentile(rgb, [.5, 99.5], axis=0), axis=0).max() < .03:
+        return params
+    luma = rgb @ np.array([.2126, .7152, .0722])
+    p10, middle, p90 = np.percentile(luma, [10, 50, 90])
+    if kind == "brightnessContrast":
+        params.update(brightness=round(float(np.clip((.45 - middle) * 60, -18, 18))),
+                      contrast=round(float(np.clip((.65 - (p90 - p10)) * 35, -8, 16))))
+    elif kind == "levels":
+        # RGB 总通道直接显示黑白点，不再把所有自动值藏在单独颜色通道中。
+        params = auto_levels(rgba, "contrast")
+        for key in ("in_black", "in_white"):
+            params["master"][key] = round(params["master"][key], 3)
+    elif kind == "curves":
+        lift = round(float(np.clip((.45 - middle) * .12, -.03, .03)), 3)
+        if abs(lift) >= .003:
+            params["master"].insert(1, dict(input=.5, output=.5 + lift))
+    elif kind == "exposure":
+        # 在高光允许的范围内轻微提亮，剩余中间调偏差交给可见 gamma 控件。
+        top = float(np.percentile(rgb.max(axis=1), 99.5))
+        if middle < .35 and 0 < top < .98:
+            params["exposure"] = round(min(.35, 2.2 * math.log2(.98 / top)), 2)
+        projected = float(np.clip(middle * 2 ** (params["exposure"] / 2.2), .01, .99))
+        target = float(np.clip(projected, .35, .65))
+        params["gamma"] = round(float(np.clip(math.log(projected) / math.log(target), .9, 1.1)), 2)
+    elif kind == "vibrance":
+        saturation = np.ptp(rgb, axis=1) / np.maximum(rgb.max(axis=1), .01)
+        colored = saturation[saturation > .02]
+        if len(colored) >= max(32, math.ceil(len(rgb) * .01)):
+            params["vibrance"] = round(float(np.clip((.35 - np.median(colored)) * 50, -10, 18)))
+    elif kind == "colorBalance":
+        neutral = ((np.ptp(rgb, axis=1) <= .28 * np.maximum(rgb.max(axis=1), .01))
+                   & (luma > .1) & (luma < .9))
+        if neutral.sum() >= max(32, math.ceil(len(rgb) * .01)):
+            center = np.median(rgb[neutral], axis=0)
+            target = float(center @ np.array([.2126, .7152, .0722]))
+            sliders = 100 * np.log2(np.log(center) / math.log(target))
+            sliders -= (sliders.max() + sliders.min()) / 2
+            params["midtones"] = [round(float(v)) for v in np.clip(sliders, -18, 18)]
+    return params
+
+
+def _prepare_all_adjustments(state, *, cache=None, cancelled=None):
+    """Recompute the first group of each basic kind, preserving step order/IDs.
+
+    Additional instances and creative effects remain untouched. Missing groups
+    occupy the same insertion slots as the panel; identity placeholders are not
+    saved. Every group is estimated from the real pipeline's preceding effects.
+    """
+    from .cache import ImageCache
+    from .pipeline import render_recipe
+    from .storage import PhotoEditState
+
+    check_cancelled(cancelled)
+    snapshot = PhotoEditState.from_dict(state.source, state.to_dict())
+    original = snapshot.current.recipe.validated()
+    if not can_auto_adjust(original):
+        raise ValueError("最多支持 64 个步骤；请为缺少的基础调节组腾出位置后重试。")
+    planned = original.validated()
+    old_ids = {step.id for step in planned.steps}
+    ranks = {kind: index for index, kind in enumerate(ADJUSTMENT_TITLES)}
+    targets = {}
+    for kind in AUTO_BASIC_KINDS:
+        step = next((step for step in planned.steps if step.kind == kind), None)
+        if step is None:
+            step = AdjustmentStep(kind, adjustment_defaults(kind), enabled=False)
+            step.id = _BASIC_PREFIX + step.id
+            index = next((i for i, other in enumerate(planned.steps) if ranks[other.kind] > ranks[kind]), len(planned.steps))
+            planned.steps.insert(index, step)
+        targets[step.id] = kind
+    # CLI 也保留代理缓存：六个分析阶段只解码一次，不在每组重读 RAW。
+    cache = cache if cache is not None else ImageCache()
+    prefix = []
+    updated_ids = []
+    for step in planned.steps:
+        check_cancelled(cancelled)
+        if step.id in targets:
+            snapshot.current.recipe.steps = list(prefix)
+            preview = render_recipe(snapshot, proxy=True, cache=cache, cancelled=cancelled)
+            step.params = auto_basic_parameters(preview.rgba, step.kind)
+            step.enabled = step.params != adjustment_defaults(step.kind)
+            if step.enabled or step.id in old_ids:
+                prefix.append(step)
+                updated_ids.append(step.id)
+        else:
+            prefix.append(step)
+    check_cancelled(cancelled)
+    planned.steps = prefix
+    recipe = planned.validated()
+    return AutoAdjustmentResult(recipe, "all", recipe != original, tuple(updated_ids))
