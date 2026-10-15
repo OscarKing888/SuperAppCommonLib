@@ -31,6 +31,9 @@ def main(argv=None):
     commands.add_parser("info",help="原生引擎版本和支持的参数")
     show = commands.add_parser("show",help="读取照片 XMP 中的编辑状态")
     show.add_argument("source")
+    auto = commands.add_parser("auto-adjust", help="自动调节当前底图，将可微调的色阶保存到照片 XMP")
+    auto.add_argument("source")
+    auto.add_argument("--mode", choices=("tone", "contrast", "color"), default="tone")
     render = commands.add_parser("render",help="导出完整分辨率成片（不会修改原照片参数）")
     render.add_argument("sources",nargs="+")
     render.add_argument("--recipe",help="显式配方 JSON 文件，默认使用源照片 XMP")
@@ -63,6 +66,14 @@ def main(argv=None):
         state = store.load(args.source)
         if args.command=="show":
             print(json.dumps(state.to_dict(),ensure_ascii=False,indent=2))
+        elif args.command=="auto-adjust":
+            from .auto_adjust import prepare_auto_adjustment
+            result = prepare_auto_adjustment(state, args.mode, cancelled=stop.is_set)
+            check_cancelled(stop.is_set)
+            if result.changed:
+                state.current.recipe = result.recipe
+                state.revision = store.save(state)
+            print(json.dumps(dict(mode=result.mode, changed=result.changed), ensure_ascii=False))
         elif args.command=="import-settings":
             from .native import import_settings
             imported = import_settings(state.current.recipe.camera,read_bounded(args.settings))

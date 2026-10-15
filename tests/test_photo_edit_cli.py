@@ -79,3 +79,21 @@ def test_cli_batch_continues_after_missing_input(tmp_path):
     assert result.returncode==1,result.stderr
     reports = [json.loads(line) for line in result.stdout.splitlines()]
     assert [item["status"] for item in reports]==["failed","success"]
+
+
+def test_cli_auto_adjust_saves_editable_levels_and_repeat_is_noop(tmp_path):
+    pytest.importorskip("app_common.photo_edit._native")
+    import numpy as np
+    source = tmp_path/"自动调色.png"
+    pixels = np.tile(np.arange(60, 181, dtype=np.uint8)[None, :, None], (32, 1, 3))
+    Image.fromarray(pixels).save(source)
+    original = source.read_bytes()
+    result = run_cli("auto-adjust", source, "--mode", "contrast")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"mode": "contrast", "changed": True}
+    assert RecipeStore().load(source).current.recipe.steps[-1].kind == "levels"
+    xmp = source.with_suffix(".xmp").read_bytes()
+    result = run_cli("auto-adjust", source, "--mode", "contrast")
+    assert result.returncode == 0, result.stderr
+    assert not json.loads(result.stdout)["changed"]
+    assert source.read_bytes() == original and source.with_suffix(".xmp").read_bytes() == xmp
