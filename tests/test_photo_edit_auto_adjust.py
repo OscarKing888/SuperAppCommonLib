@@ -227,9 +227,9 @@ def test_unified_limits_reuses_existing_slots_and_cancels_mid_analysis(source, m
     before = state.to_dict()
     calls = []
     estimate = auto_adjust.auto_basic_parameters
-    def cancel_after_first(*args):
+    def cancel_after_first(*args, **kwargs):
         calls.append(1)
-        return estimate(*args)
+        return estimate(*args, **kwargs)
     monkeypatch.setattr(auto_adjust, "auto_basic_parameters", cancel_after_first)
     with pytest.raises(ImageProcessingCancelled):
         prepare_auto_adjustment(state, cancelled=lambda: bool(calls))
@@ -278,3 +278,31 @@ def test_unified_balanced_grayscale_stays_close_to_original(source):
     output = render_pixels(rgba,result.recipe)
     assert np.abs(output[...,:3]-rgba[...,:3]).mean()<.02
     assert abs(np.median(output[...,0])-.5)<.03
+
+
+@pytest.mark.parametrize("colored", [False, True])
+@pytest.mark.parametrize("shadow_range", [(.02, .22), (.18, .29)])
+def test_unified_backlit_subject_is_lifted_without_darkening_it_to_match_bright_sky(source,colored,shadow_range):
+    pytest.importorskip("app_common.photo_edit._native")
+    rgba = np.ones((40, 400, 4), dtype=np.float32)
+    rgba[:, :120, :3] = np.linspace(*shadow_range, 120)[None, :, None]
+    rgba[:, 120:, :3] = np.linspace(.82, .95, 280)[None, :, None]
+    if colored:
+        rgba[..., 0] *= .94
+        rgba[..., 2] *= 1.02
+    rgba[..., 3] = .8
+    Image.fromarray(np.rint(rgba*255).astype(np.uint8)).save(source)
+    state = RecipeStore().load(source)
+    result = prepare_auto_adjustment(state)
+    output = render_pixels(rgba, result.recipe)
+    before = rgba[..., :3] @ np.array([.2126, .7152, .0722])
+    after = output[..., :3] @ np.array([.2126, .7152, .0722])
+    assert np.median(after[:, :120] - before[:, :120]) > .03
+    assert np.all(after[:, :120] >= before[:, :120])
+    assert np.abs(after[:, 120:] - before[:, 120:]).mean() < .05
+    assert np.array_equal(output[..., 3], rgba[..., 3])
+    # 同一轮的后续组不能因阴影已提亮而又反向压暗；重算与 XMP 回读也稳定。
+    state.current.recipe = result.recipe
+    assert not prepare_auto_adjustment(state).changed
+    RecipeStore().save(state)
+    assert RecipeStore().load(source).current.recipe == result.recipe
