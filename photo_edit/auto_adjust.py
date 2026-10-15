@@ -170,7 +170,10 @@ def auto_basic_parameters(rgba, kind):
             params["exposure"] = round(min(.35, 2.2 * math.log2(.98 / top)), 2)
         projected = float(np.clip(middle * 2 ** (params["exposure"] / 2.2), .01, .99))
         target = float(np.clip(projected, .35, .65))
-        params["gamma"] = round(float(np.clip(math.log(projected) / math.log(target), .9, 1.1)), 2)
+        # 色阶可能已覆盖黑白端点，但主体仍偏暗／偏亮；不能把剩余中间调校正
+        # 限在 0.9～1.1，否则带高光的欠曝照片几乎不变。gamma 保留黑白端点，
+        # 按实际偏差校正并限制在半倍到两倍，正常亮度保持 1。
+        params["gamma"] = round(float(np.clip(math.log(projected) / math.log(target), .5, 2.0)), 2)
     elif kind == "vibrance":
         saturation = np.ptp(rgb, axis=1) / np.maximum(rgb.max(axis=1), .01)
         colored = saturation[saturation > .02]

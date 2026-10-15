@@ -242,3 +242,39 @@ def test_unified_flat_image_remains_noop(source):
     state = RecipeStore().load(source)
     result = prepare_auto_adjustment(state)
     assert not result.changed and result.recipe.is_identity() and not result.step_ids
+
+
+@pytest.mark.parametrize("bright",[False,True])
+def test_unified_corrects_midtone_exposure_when_black_and_white_points_already_span_range(source,bright):
+    pytest.importorskip("app_common.photo_edit._native")
+    rgba = ramp(0,1)
+    rgba[...,:3] **= 4
+    if bright:
+        rgba[...,:3] = 1-rgba[...,:3]
+    Image.fromarray(np.rint(rgba[...,:3]*255).astype(np.uint8)).save(source)
+    state = RecipeStore().load(source)
+    result = prepare_auto_adjustment(state)
+    output = render_pixels(rgba,result.recipe)
+    before,after = np.median(rgba[...,0]),np.median(output[...,0])
+    if bright:
+        assert .5 < after < .82 and before-after > .1
+    else:
+        assert .22 < after < .5 and after-before > .1
+    assert np.allclose(output[...,0],output[...,1])
+    assert np.allclose(output[...,1],output[...,2])
+    assert np.array_equal(output[...,3],rgba[...,3])
+    # Gamma must preserve the endpoints instead of clipping them further to exaggerate the change.
+    assert output[...,:3].min()==pytest.approx(0,abs=1e-5)
+    assert output[...,:3].max()==pytest.approx(1,abs=1e-5)
+    state.current.recipe = result.recipe
+    assert not prepare_auto_adjustment(state).changed
+
+
+def test_unified_balanced_grayscale_stays_close_to_original(source):
+    pytest.importorskip("app_common.photo_edit._native")
+    rgba = ramp(0,1)
+    Image.fromarray(np.rint(rgba[...,:3]*255).astype(np.uint8)).save(source)
+    result = prepare_auto_adjustment(RecipeStore().load(source))
+    output = render_pixels(rgba,result.recipe)
+    assert np.abs(output[...,:3]-rgba[...,:3]).mean()<.02
+    assert abs(np.median(output[...,0])-.5)<.03
