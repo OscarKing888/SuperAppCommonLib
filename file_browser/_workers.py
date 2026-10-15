@@ -16,6 +16,7 @@ from app_common.raw_focus_metadata import is_raw_image_path, read_raw_embedded_f
 from app_common.exif_io.writer import _batch_read_xmp_sidecar
 from app_common.exif_io.fast_reader import fast_read_browser_metadata
 from app_common.exif_io import meta_disk_cache
+from app_common.image_formats import HEIF_EXTENSIONS
 
 
 _RAW_FOCUS_CHECKED_KEY = "_superviewer_raw_focus_checked"
@@ -751,7 +752,11 @@ class MetadataLoader(QThread):
         for norm_path in norm_paths:
             report_row = self._report_rows_by_path.get(norm_path)
             original_path = original_by_norm.get(norm_path, norm_path)
-            if _report_row_has_browser_fast_path(report_row):
+            # HIF 的相机焦点/方向不在报告或侧车的拍摄字段中；跳过源文件会
+            # 把“尚未读取”误报成“无焦点”，晚到的列表缓存还会清掉预览焦点。
+            if os.path.splitext(norm_path)[1].lower() in HEIF_EXTENSIONS:
+                exiftool_paths.append(original_path)
+            elif _report_row_has_browser_fast_path(report_row):
                 report_fast_paths.append(original_path)
             elif _flat_metadata_has_browser_fast_path(sidecar_batch.get(norm_path)):
                 xmp_fast_paths.append(original_path)
