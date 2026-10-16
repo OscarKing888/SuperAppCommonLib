@@ -99,7 +99,7 @@ def test_cli_auto_adjust_saves_editable_levels_and_repeat_is_noop(tmp_path):
     assert source.read_bytes() == original and source.with_suffix(".xmp").read_bytes() == xmp
 
 
-def test_cli_default_auto_adjust_populates_multiple_groups(tmp_path):
+def test_cli_default_auto_adjust_only_populates_needed_groups(tmp_path):
     pytest.importorskip("app_common.photo_edit._native")
     import numpy as np
     source = tmp_path/"一键自动.png"
@@ -110,7 +110,8 @@ def test_cli_default_auto_adjust_populates_multiple_groups(tmp_path):
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == {"mode": "all", "changed": True}
     steps = RecipeStore().load(source).current.recipe.steps
-    assert {"brightnessContrast", "levels"} <= {step.kind for step in steps}
+    assert {step.kind for step in steps} == {"levels"}
+    assert steps[0].params["master"]["in_white"] - steps[0].params["master"]["in_black"] >= .5 - 1e-6
     assert source.read_bytes() == original
     result = run_cli("auto-adjust", source)
     assert result.returncode == 0, result.stderr

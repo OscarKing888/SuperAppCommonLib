@@ -146,12 +146,90 @@ def _is_backlit(luma):
                 and np.mean((luma >= .3) & (luma <= .65)) < .15)
 
 
-def auto_basic_parameters(rgba, kind, *, backlit=None):
-    """Estimate one ordinary editor group's parameters in its own input space.
+def _natural_levels(rgb, *, backlit):
+    """One shared RGB mapping; automatic contrast must not rebalance channels."""
+    params = adjustment_defaults("levels")
+    # 参考 Auto Contrast 的合并直方图／0.1% 裁切思路，保留高位深采样。
+    # 默认最多放大两倍反差，避免把雾气和轻微噪声变成生硬的黑白端点。
+    black, white = np.percentile(rgb, [.1, 99.9])
+    if white - black < .5:
+        black = max(0., min(float((black + white) / 2) - .25, .5))
+        white = black + .5
+    if backlit:
+        black, white = 0., max(.98, white)
+    params["master"].update(in_black=round(float(black), 3), in_white=round(float(white), 3))
+    return params
 
-    Each estimate is conservative and quantized to that form's displayed units.
-    The caller renders preceding steps before estimating the next group, so
-    tone/contrast/color corrections never stretch the same histogram three times.
+
+def _natural_curve(luma, *, backlit):
+    """Correct residual tones once, with visible master-curve control points."""
+    params = adjustment_defaults("curves")
+    if backlit:
+        # 暗主体与亮背景分离时局部抬暗部，中高光固定；不能按天空的中位数压暗。
+        params["master"][1:1] = [dict(input=.15, output=.23),
+                                  dict(input=.5, output=.5), dict(input=.8, output=.8)]
+        return params
+    middle = float(np.clip(np.median(luma), .01, .99))
+    target = float(np.clip(middle, .35, .65))
+    gamma = float(np.clip(math.log(middle) / math.log(target), .5, 2.))
+    if abs(gamma - 1) < .01:
+        return params
+    # 曝光／亮度保持中性，只用这一条曲线补偿色阶之后的剩余偏差。
+    # 黑白端点固定，避免为了达到目标中位数而进一步裁掉阴影／高光。
+    inputs = [0., .01, .03, .08, .15, .25, .4, .6, .8, 1.]
+    params["master"] = [dict(input=x, output=round(x ** (1 / gamma), 3)) for x in inputs]
+    return params
+
+
+def _neutral_color_balance(rgb):
+    """Return a small correction only for consistent, well-supported midtones.
+
+    Low chroma alone is not proof of a neutral object. Require evidence across
+    three tonal bands and agreement within/between them; bright skies, isolated
+    patches and mixed casts must not drive a global channel-gamma correction.
+    None means insufficient evidence; a zero vector means confidently neutral.
+    """
+    if len(rgb) < 96:
+        return None
+    luma = rgb @ np.array([.2126, .7152, .0722])
+    neutral = ((luma >= .15) & (luma < .75)
+               & (np.ptp(rgb, axis=1) <= .12 * np.maximum(rgb.max(axis=1), .01)))
+    if neutral.sum() < max(96, math.ceil(len(rgb) * .05)):
+        return None
+    samples, values = rgb[neutral], luma[neutral]
+    colors = np.log(samples / values[:, None])
+    if np.ptp(np.percentile(colors, [10, 90], axis=0), axis=0).max() > .04:
+        return None
+    centers, casts = [], []
+    for low, high in ((.15, .35), (.35, .55), (.55, .75)):
+        band = (values >= low) & (values < high)
+        if band.sum() < max(32, math.ceil(len(rgb) * .01)):
+            return None
+        centers.append(np.median(samples[band], axis=0))
+        casts.append(np.median(colors[band], axis=0))
+    if np.ptp(casts, axis=0).max() > .025:
+        return None
+    # 三个亮度区间等权拟合，防止面积最大的天空／墙面主导；只做一半校正。
+    centers = np.asarray(centers)
+    logs = np.log(centers)
+    targets = np.log(centers @ np.array([.2126, .7152, .0722]))
+    powers = np.sum(logs * targets[:, None], axis=0) / np.sum(logs * logs, axis=0)
+    sliders = -100 * np.log2(powers)
+    sliders -= (sliders.max() + sliders.min()) / 2
+    sliders *= .5
+    # 按同一比例限制强度，不分别截断各通道；最多 ±6，避免暗部被 gamma 放大色偏。
+    peak = float(np.abs(sliders).max())
+    if peak > 6:
+        sliders *= 6 / peak
+    return [round(float(value)) for value in sliders]
+
+
+def auto_basic_parameters(rgba, kind, *, backlit=None, allow_color_balance=True):
+    """Coordinate endpoint contrast, one tonal curve and evidence-based color.
+
+    Brightness/contrast, exposure and vibrance remain neutral instead of each
+    pushing toward another histogram/saturation target. Every returned value is
+    an ordinary, editable parameter in that group's displayed units.
     """
     if kind not in AUTO_BASIC_KINDS:
         raise ValueError("不支持自动调节的参数组")
@@ -160,57 +238,16 @@ def auto_basic_parameters(rgba, kind, *, backlit=None):
     if len(rgb) < 32 or np.ptp(np.percentile(rgb, [.5, 99.5], axis=0), axis=0).max() < .03:
         return params
     luma = rgb @ np.array([.2126, .7152, .0722])
-    p10, middle, p90 = np.percentile(luma, [10, 50, 90])
     if backlit is None:
         backlit = _is_backlit(luma)
-    if kind == "brightnessContrast":
-        if not backlit:
-            params.update(brightness=round(float(np.clip((.45 - middle) * 60, -18, 18))),
-                          contrast=round(float(np.clip((.65 - (p90 - p10)) * 35, -8, 16))))
-    elif kind == "levels":
-        # RGB 总通道直接显示黑白点，不再把所有自动值藏在单独颜色通道中。
-        params = auto_levels(rgba, "contrast")
-        for key in ("in_black", "in_white"):
-            params["master"][key] = round(params["master"][key], 3)
-        if backlit:
-            # 不减去暗主体的黑位，也不把已有亮天空进一步拉到剪切边缘。
-            params["master"].update(in_black=0, in_white=max(.98, params["master"]["in_white"]))
-    elif kind == "curves":
-        if backlit:
-            # 用实际可编辑曲线局部抬升暗调；中间调和高光锚点维持原亮度。
-            params["master"][1:1] = [dict(input=.15, output=.23),
-                                      dict(input=.5, output=.5), dict(input=.8, output=.8)]
-        else:
-            lift = round(float(np.clip((.45 - middle) * .12, -.03, .03)), 3)
-            if abs(lift) >= .003:
-                params["master"].insert(1, dict(input=.5, output=.5 + lift))
-    elif kind == "exposure":
-        # 在高光允许的范围内轻微提亮，剩余中间调偏差交给可见 gamma 控件。
-        top = float(np.percentile(rgb.max(axis=1), 99.5))
-        if middle < .35 and 0 < top < .98:
-            params["exposure"] = round(min(.35, 2.2 * math.log2(.98 / top)), 2)
-        projected = float(np.clip(middle * 2 ** (params["exposure"] / 2.2), .01, .99))
-        target = float(np.clip(projected, .35, .65))
-        # 色阶可能已覆盖黑白端点，但主体仍偏暗／偏亮；不能把剩余中间调校正
-        # 限在 0.9～1.1，否则带高光的欠曝照片几乎不变。gamma 保留黑白端点，
-        # 按实际偏差校正并限制在半倍到两倍，正常亮度保持 1。
-        params["gamma"] = round(float(np.clip(math.log(projected) / math.log(target), .5, 2.0)), 2)
-        if backlit:
-            params["gamma"] = max(1, params["gamma"])
-    elif kind == "vibrance":
-        saturation = np.ptp(rgb, axis=1) / np.maximum(rgb.max(axis=1), .01)
-        colored = saturation[saturation > .02]
-        if len(colored) >= max(32, math.ceil(len(rgb) * .01)):
-            params["vibrance"] = round(float(np.clip((.35 - np.median(colored)) * 50, -10, 18)))
-    elif kind == "colorBalance":
-        neutral = ((np.ptp(rgb, axis=1) <= .28 * np.maximum(rgb.max(axis=1), .01))
-                   & (luma > .1) & (luma < .9))
-        if neutral.sum() >= max(32, math.ceil(len(rgb) * .01)):
-            center = np.median(rgb[neutral], axis=0)
-            target = float(center @ np.array([.2126, .7152, .0722]))
-            sliders = 100 * np.log2(np.log(center) / math.log(target))
-            sliders -= (sliders.max() + sliders.min()) / 2
-            params["midtones"] = [round(float(v)) for v in np.clip(sliders, -18, 18)]
+    if kind == "levels":
+        return _natural_levels(rgb, backlit=backlit)
+    if kind == "curves":
+        return _natural_curve(luma, backlit=backlit)
+    if kind == "colorBalance" and allow_color_balance and not backlit:
+        sliders = _neutral_color_balance(rgb)
+        if sliders is not None:
+            params["midtones"] = sliders
     return params
 
 
@@ -247,6 +284,7 @@ def _prepare_all_adjustments(state, *, cache=None, cancelled=None):
     prefix = []
     updated_ids = []
     backlit = None
+    allow_color_balance = False
     for step in planned.steps:
         check_cancelled(cancelled)
         if step.id in targets:
@@ -254,8 +292,12 @@ def _prepare_all_adjustments(state, *, cache=None, cancelled=None):
             preview = render_recipe(snapshot, proxy=True, cache=cache, cancelled=cancelled)
             if backlit is None:
                 # 一轮内固定场景判断：不能因前一组已抬起暗部，后一组又当作过曝压回去。
-                backlit = _is_backlit(_sample_rgb(preview.rgba) @ np.array([.2126, .7152, .0722]))
-            step.params = auto_basic_parameters(preview.rgba, step.kind, backlit=backlit)
+                original_rgb = _sample_rgb(preview.rgba)
+                backlit = _is_backlit(original_rgb @ np.array([.2126, .7152, .0722]))
+                # 原始分析没有可靠中性色时，不能把提亮后碰巧落入阈值的颜色当作依据。
+                allow_color_balance = not backlit and _neutral_color_balance(original_rgb) is not None
+            step.params = auto_basic_parameters(preview.rgba, step.kind, backlit=backlit,
+                                                allow_color_balance=allow_color_balance)
             step.enabled = step.params != adjustment_defaults(step.kind)
             if step.enabled or step.id in old_ids:
                 prefix.append(step)

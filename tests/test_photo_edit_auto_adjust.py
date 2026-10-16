@@ -151,27 +151,109 @@ def test_verified_denoised_input_keeps_original_recipe(source, tmp_path):
     assert state.inputs["original"].recipe.is_identity()
 
 
-@pytest.mark.parametrize("kind", AUTO_BASIC_KINDS)
-def test_all_basic_groups_have_real_editable_parameters_and_pixel_effects(kind):
+@pytest.mark.parametrize("kind", ["levels", "curves", "colorBalance"])
+def test_coordinated_corrections_have_real_editable_parameters_and_pixel_effects(kind):
     pytest.importorskip("app_common.photo_edit._native")
     rgba = ramp(.12, .42)
-    if kind in {"vibrance", "colorBalance"}:
-        rgba = ramp(.2, .7)
-        rgba[..., 0] += .025
-        rgba[..., 2] -= .02
+    if kind == "colorBalance":
+        rgba = ramp(.15, .78)
+        rgba[..., :3] *= [1.025, 1, .975]
+    rgba[..., 3] = .8
+    before = rgba.copy()
     params = auto_basic_parameters(rgba, kind)
     recipe = Recipe(steps=[AdjustmentStep(kind, params)]).validated()
     assert params != adjustment_defaults(kind)
     output = render_pixels(rgba, recipe)
     assert np.isfinite(output).all() and not np.allclose(output, rgba)
     assert np.array_equal(output[..., 3], rgba[..., 3])
-    if kind in {"brightnessContrast", "curves", "exposure"}:
+    assert np.array_equal(rgba, before)
+    if kind == "curves":
         assert np.median(output[..., :3]) > np.median(rgba[..., :3])
     elif kind == "colorBalance":
         assert abs(np.median(output[..., 0] - output[..., 2])) < abs(np.median(rgba[..., 0] - rgba[..., 2]))
     elif kind == "levels":
         assert params["master"]["in_black"] > 0
         assert all(c == adjustment_defaults("levels")["master"] for c in params["per_channel"])
+
+
+@pytest.mark.parametrize("kind", ["brightnessContrast", "exposure", "vibrance"])
+def test_auto_does_not_stack_extra_tone_or_saturation_targets(kind):
+    for rgba in (ramp(.05, .3), ramp(.7, .95), ramp(.2, .7)):
+        assert auto_basic_parameters(rgba, kind) == adjustment_defaults(kind)
+
+
+def test_natural_contrast_shares_endpoints_and_limits_noise_amplification():
+    rgba = ramp(.2, .24)
+    rgba[..., :3] *= [1, 1.1, .9]
+    params = auto_basic_parameters(rgba, "levels")
+    assert params["master"]["in_white"] - params["master"]["in_black"] >= .5 - 1e-6
+    assert params["per_channel"] == adjustment_defaults("levels")["per_channel"]
+    rgba = ramp(.2, .7)
+    rgba[0, 0, :3] = 0
+    rgba[-1, -1, :3] = 1
+    params = auto_basic_parameters(rgba, "levels")
+    assert .19 < params["master"]["in_black"] < .21
+    assert .69 < params["master"]["in_white"] < .71
+
+
+@pytest.mark.parametrize("kind", AUTO_BASIC_KINDS)
+def test_natural_analysis_ignores_hidden_invalid_and_tiny_samples(kind):
+    rgba = ramp(.15, .78)
+    rgba[..., :3] *= [1.025, 1, .975]
+    hidden = np.ones_like(rgba)
+    hidden[..., :3] = [np.nan, 1, 0]
+    hidden[..., 3] = 0
+    assert auto_basic_parameters(np.concatenate([rgba, hidden]), kind) == auto_basic_parameters(rgba, kind)
+    assert auto_basic_parameters(hidden, kind) == adjustment_defaults(kind)
+    assert auto_basic_parameters(rgba[:1, :1], kind) == adjustment_defaults(kind)
+
+
+@pytest.mark.parametrize("scale", [[1.025, 1, .975], [.975, 1, 1.025], [1.06, 1, .94]])
+def test_supported_neutral_cast_gets_only_partial_bounded_correction(scale):
+    pytest.importorskip("app_common.photo_edit._native")
+    rgba = ramp(.15, .78)
+    rgba[..., :3] *= scale
+    params = auto_basic_parameters(rgba, "colorBalance")
+    assert 0 < max(abs(value) for value in params["midtones"]) <= 6
+    assert params["shadows"] == params["highlights"] == [0, 0, 0]
+    output = render_pixels(rgba, Recipe(steps=[AdjustmentStep("colorBalance", params)]))
+    before = np.median(rgba[..., 0] - rgba[..., 2])
+    after = np.median(output[..., 0] - output[..., 2])
+    assert .2 < after / before < .9  # 保留部分原有色调，不追求强行变灰。
+
+
+@pytest.mark.parametrize("scene", ["bright_sky", "one_tonal_band", "mixed_casts", "tiny_patch", "foliage", "sunset"])
+def test_scene_colors_without_reliable_neutral_evidence_are_not_white_balanced(scene):
+    rgba = ramp(.15, .78)
+    rgba[..., :3] *= [1.025, 1, .975]
+    if scene == "bright_sky":
+        rgba = ramp(.78, .95)
+        rgba[..., :3] *= [.95, 1, 1.02]
+    elif scene == "one_tonal_band":
+        rgba = ramp(.36, .54)
+        rgba[..., :3] *= [1.025, 1, .975]
+    elif scene == "mixed_casts":
+        rgba[:, 128:, :3] *= [.95, 1, 1.05]
+    elif scene == "tiny_patch":
+        rgba = np.tile(rgba, (32, 1, 1))
+        rgba[32:, :, :3] = [.15, .4, .1]
+    elif scene == "foliage":
+        rgba[..., :3] *= [.5, 1, .4]
+    elif scene == "sunset":
+        rgba[..., :3] *= [1, .6, .4]
+    assert auto_basic_parameters(rgba, "colorBalance") == adjustment_defaults("colorBalance")
+    assert auto_basic_parameters(rgba, "vibrance") == adjustment_defaults("vibrance")
+
+
+def test_tone_stretch_cannot_fabricate_neutral_evidence_missing_from_input(source):
+    pytest.importorskip("app_common.photo_edit._native")
+    rgba = ramp(.04, .34)
+    rgba[..., :3] *= [1.03, 1, .97]
+    Image.fromarray(np.rint(rgba[..., :3] * 255).astype(np.uint8)).save(source)
+    result = prepare_auto_adjustment(RecipeStore().load(source))
+    output = render_pixels(rgba, result.recipe)
+    assert auto_basic_parameters(output, "colorBalance") != adjustment_defaults("colorBalance")
+    assert not any(step.enabled and step.kind == "colorBalance" for step in result.recipe.steps)
 
 
 def test_unified_recomputes_existing_groups_preserves_ids_duplicates_and_order(source, monkeypatch):
@@ -257,7 +339,8 @@ def test_unified_corrects_midtone_exposure_when_black_and_white_points_already_s
     output = render_pixels(rgba,result.recipe)
     before,after = np.median(rgba[...,0]),np.median(output[...,0])
     if bright:
-        assert .5 < after < .82 and before-after > .1
+        # 高调画面温和回收亮度，不把大面积亮背景强压到中灰。
+        assert .8 < after < .92 and before-after > .04
     else:
         assert .22 < after < .5 and after-before > .1
     assert np.allclose(output[...,0],output[...,1])
@@ -301,6 +384,10 @@ def test_unified_backlit_subject_is_lifted_without_darkening_it_to_match_bright_
     assert np.all(after[:, :120] >= before[:, :120])
     assert np.abs(after[:, 120:] - before[:, 120:]).mean() < .05
     assert np.array_equal(output[..., 3], rgba[..., 3])
+    assert not any(step.enabled and step.kind in {"colorBalance", "vibrance"} for step in result.recipe.steps)
+    if colored:
+        # RGB 共用色阶／曲线后，暗部仍偏冷；不能被天空校色反转成暖棕色。
+        assert np.all(output[:, :120, 0] < output[:, :120, 2])
     # 同一轮的后续组不能因阴影已提亮而又反向压暗；重算与 XMP 回读也稳定。
     state.current.recipe = result.recipe
     assert not prepare_auto_adjustment(state).changed
