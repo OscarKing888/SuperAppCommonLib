@@ -6,6 +6,7 @@ from app_common.video import VIDEO_EXTENSIONS, is_video, probe_video
 from app_common.file_browser._work_pool import METADATA, BrowserPoolClosed
 from app_common.file_browser._work_action import MetadataReadAction
 from app_common.file_browser._work_policy import WorkKind
+from app_common.file_browser._metadata_memory import MetadataMemoryCache, metadata_signatures
 
 import concurrent.futures as _futures
 import threading
@@ -481,9 +482,11 @@ class MetadataLoader(QThread):
         selected_dir: str | None = None,
         parent=None,
         work_pool=None,
+        memory_cache: MetadataMemoryCache | None = None,
     ) -> None:
         super().__init__(parent)
         self._work_pool = work_pool
+        self._memory_cache = memory_cache
         self._paths = list(paths)
         self._meta_proxy = meta_proxy
         self._selected_dir = str(selected_dir or "") or None
@@ -728,6 +731,41 @@ class MetadataLoader(QThread):
         return False
 
     def _read_metadata_batch(self, paths: list[str]) -> dict[str, dict]:
+        cache = self._memory_cache
+        if cache is None:
+            return self._read_metadata_batch_uncached(paths)
+        started = perf_counter()
+        signatures = metadata_signatures(paths, self._metadata_tags, self._report_rows_by_path)
+        result, missing, generations = {}, [], {}
+        for path in paths:
+            norm = os.path.normpath(path)
+            record, generations[norm] = cache.lookup(path, signatures.get(norm))
+            if record is None:
+                missing.append(path)
+            else:
+                result[norm] = record
+        hits = len(result)
+        if missing and not self._stopped():
+            failed = set()
+            sidecar_paths = {norm for norm, signature in signatures.items() if signature[1] is not None}
+            fresh = self._read_metadata_batch_uncached(
+                missing, failed_paths=failed, sidecar_paths=sidecar_paths,
+            )
+            # 读取期间发生写入/删除时，不把旧结果绑定到新指纹。
+            after = metadata_signatures(missing, self._metadata_tags, self._report_rows_by_path)
+            for norm, record in fresh.items():
+                if (not self._stopped() and norm not in failed and signatures.get(norm) is not None
+                        and after.get(norm) == signatures[norm]):
+                    cache.store(norm, signatures[norm], record, generations[norm])
+            result.update(fresh)
+        stats = cache.stats()
+        _log.info("[metadata.memory] paths=%s hits=%s misses=%s entries=%s bytes=%s elapsed_ms=%.1f",
+                  len(paths), hits, len(missing), stats["entries"], stats["bytes"], elapsed_ms(started))
+        return result
+
+    def _read_metadata_batch_uncached(self, paths: list[str], *, failed_paths=None,
+                                      sidecar_paths=()) -> dict[str, dict]:
+        failed_paths = set() if failed_paths is None else failed_paths
         batch_t0 = perf_counter()
         norm_paths = [os.path.normpath(p) for p in paths]
         original_by_norm = {os.path.normpath(p): p for p in paths}
@@ -743,7 +781,11 @@ class MetadataLoader(QThread):
                     result[norm_path].update(flat)
         except Exception as exc:
             _log.warning("[MetadataLoader._read_metadata_batch] XMP sidecar read failed: %s", exc)
+            failed_paths.update(norm_paths)
             sidecar_batch = {}
+        # 底层对损坏/暂时不可读的 XML 返回空记录；保守地不缓存这种降级结果。
+        # 合法但无任何字段的空侧车也会重试，不把一次读取故障当成永久空值。
+        failed_paths.update(norm for norm in sidecar_paths if len(sidecar_batch.get(norm, {})) <= 1)
         sidecar_ms = elapsed_ms(sidecar_t0)
 
         report_fast_paths: list[str] = []
@@ -846,13 +888,18 @@ class MetadataLoader(QThread):
                 raw_batch = read_batch_metadata(
                     fallback_paths,
                     tags=self._metadata_tags or None,
-                    use_cache=not bool(self._metadata_tags),
+                    # 会话缓存已核验指纹；不能再命中旧的仅按路径缓存。
+                    use_cache=self._memory_cache is None and not bool(self._metadata_tags),
                 )
+                failed_paths.update(os.path.normpath(p) for p in fallback_paths
+                                    if len(raw_batch.get(os.path.normpath(p), {})) <= 1
+                                    or raw_batch.get(os.path.normpath(p), {}).get("Error"))
                 for norm_path, flat in raw_batch.items():
                     if norm_path in result and flat:
                         result[norm_path].update(flat)
             except Exception as exc:
                 _log.warning("[MetadataLoader._read_metadata_batch] read_batch_metadata failed: %s", exc)
+                failed_paths.update(os.path.normpath(p) for p in fallback_paths)
         read_batch_ms = elapsed_ms(read_batch_t0)
         merge_t0 = perf_counter()
         raw_focus_merge_count = len(raw_focus_batch)

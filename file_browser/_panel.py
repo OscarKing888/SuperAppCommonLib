@@ -16,6 +16,7 @@ from app_common.file_browser._models import *
 from app_common.file_browser._thumbnail import *
 from app_common.file_browser._workers import *
 from app_common.file_browser._work_pool import BrowserWorkPool
+from app_common.file_browser._metadata_memory import MetadataMemoryCache
 from app_common.file_browser._cut_state import (
     FileCutState, _FILE_CLIPBOARD_ACTION_MIME, _FILE_CLIPBOARD_ENTRIES_MIME,
 )
@@ -106,6 +107,7 @@ class FileListPanel(QWidget):
         self._file_table_proxy.setSourceModel(self._file_table_model)
         self._thumb_list_model = self.thumbnail_model_class(self)
         self._meta_cache:    dict = {}   # norm_path → metadata dict
+        self._metadata_memory_cache = MetadataMemoryCache()
         self._directory_scope_cache: dict[bool, dict] = {}  # 当前目录 shallow/recursive 两个 scope 的文件列表缓存
         self._report_cache:  dict = {}   # legacy report row cache；sidecar/EXIF 模式下保持为空
         self._report_row_by_path: dict = {}
@@ -1450,6 +1452,10 @@ class FileListPanel(QWidget):
             _log.info("[load_directory] SKIP same dir")
             self._probe_set_phase("idle", reason="load_directory_skip_same_dir", elapsed_ms=elapsed_ms(load_t0))
             return
+        self._metadata_memory_cache.set_scope(path)
+        if force_reload and not preserve_meta_cache:
+            self._metadata_memory_cache.invalidate_scope(path)
+            self._report_full_cache = None
         self._current_dir = path
         if not same_dir:
             self._range_mark_start_path = ""
@@ -5906,6 +5912,7 @@ class FileListPanel(QWidget):
             worker_count=self._metadata_loader_workers,
             selected_dir=self._current_dir,
             work_pool=pool,
+            memory_cache=self._metadata_memory_cache,
         )
         loader.progress_updated.connect(self._on_metadata_progress)
         loader.metadata_batch_ready.connect(self._on_metadata_batch_ready)
@@ -6623,6 +6630,7 @@ class FileListPanel(QWidget):
             return
         self._background_shutdown_started = True
         self._request_background_shutdown()
+        self._metadata_memory_cache.clear()
 
         directory_worker = self._directory_scan_worker
         lookup_workers = list(self._path_lookup_workers)
