@@ -1828,6 +1828,7 @@ def _existing_persistent_thumb_cache_path_for_exact_size(
     source_stamp: float | None = None,
     *,
     selected_dir: str | None = None,
+    existence_only: bool = False,
 ) -> str:
     cache_path = _persistent_thumb_cache_path_for_file(
         path,
@@ -1848,6 +1849,9 @@ def _existing_persistent_thumb_cache_path_for_exact_size(
                     break
         if not cache_path or not os.path.isfile(cache_path):
             return ""
+    # Viewer 的目录重访只检查文件存在；内容损坏或源图变更由显式刷新修复。
+    if existence_only:
+        return cache_path
     if not _thumb_cache_image_matches_size(cache_path, path, size):
         return ""
     if source_stamp is None:
@@ -1870,6 +1874,7 @@ def _existing_persistent_thumb_cache_path_for_file(
     source_stamp: float | None = None,
     candidate_sizes: list[int] | tuple[int, ...] | None = None,
     selected_dir: str | None = None,
+    existence_only: bool = False,
 ) -> str:
     for size in _preferred_persistent_thumb_sizes_for_request(
         requested_size,
@@ -1881,6 +1886,7 @@ def _existing_persistent_thumb_cache_path_for_file(
             size,
             source_stamp=source_stamp,
             selected_dir=selected_dir,
+            existence_only=existence_only,
         )
         if cache_path:
             return cache_path

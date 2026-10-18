@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from dataclasses import replace
 from app_common.video import is_video
 from app_common.file_browser._work_pool import VISIBLE, PREFETCH, PERSISTENT, BrowserPoolClosed
 from app_common.file_browser._work_action import ThumbnailAction, PersistentThumbnailAction
@@ -60,6 +61,27 @@ class ThumbnailMemoryCache:
             _THUMB_CACHE_MAX_BYTES_DEFAULT if max_bytes is None else max_bytes
         )
         self._lru_keys: OrderedDict[tuple[str, object], None] = OrderedDict()
+        self._generations: dict[str, int] = {}
+
+    def generation(self, path: str) -> int:
+        with self._lock:
+            return self._generations.get(_thumb_cache_key(path), 0)
+
+    def invalidate(self, paths) -> None:
+        """只失效指定源图，并拒绝刷新前已经开始的解码写回。"""
+        with self._lock:
+            keys = {_thumb_cache_key(path) for path in paths}
+            for key in keys:
+                self._generations[key] = self._generations.get(key, 0) + 1
+                entry = self._base_images.pop(key, None)
+                if entry is not None:
+                    self._bytes -= _qimage_num_bytes(entry[1])
+                self._lru_keys.pop(self._lru_key_base(key), None)
+            for key, tier in list(self._jpeg_mips):
+                if key in keys:
+                    image = self._jpeg_mips.pop((key, tier))
+                    self._bytes -= _qimage_num_bytes(image)
+                    self._lru_keys.pop(self._lru_key_jpeg(key, tier), None)
 
     def _lru_key_jpeg(self, cache_key: str, requested_size: int) -> tuple[str, tuple[str, int]]:
         return ("jpeg", (cache_key, int(requested_size)))
@@ -118,11 +140,13 @@ class ThumbnailMemoryCache:
             return None
         return _scale_qimage_for_thumb(base, requested_size)
 
-    def put(self, source_path: str, requested_size: int, image: QImage) -> None:
+    def put(self, source_path: str, requested_size: int, image: QImage, *, generation: int | None = None) -> None:
         if image is None or image.isNull():
             return
         cache_key = _thumb_cache_key(source_path)
         with self._lock:
+            if generation is not None and generation != self._generations.get(cache_key, 0):
+                return
             if self._is_jpeg_like(source_path):
                 jkey = (cache_key, int(requested_size))
                 lru_k = self._lru_key_jpeg(cache_key, requested_size)
@@ -227,6 +251,7 @@ class ThumbnailLoader(QThread):
         thumb_cache: ThumbnailMemoryCache | None = None,
         parent=None,
         work_pool=None,
+        fast_cache_check: bool = False,
     ) -> None:
         super().__init__(parent)
         self._size = int(size)
@@ -235,6 +260,7 @@ class ThumbnailLoader(QThread):
         self._current_dir = current_dir or ""
         self._work_pool = work_pool
         self._thumb_cache = thumb_cache
+        self._fast_cache_check = bool(fast_cache_check)
         self._stop_flag = False
         self._executor: _futures.ThreadPoolExecutor | None = None
         self._max_workers = _thumbnail_loader_worker_count()
@@ -396,6 +422,14 @@ class ThumbnailLoader(QThread):
 
     def _resolve_load_target_path(self, path: str) -> str:
         norm_path = os.path.normpath(path)
+        if self._fast_cache_check:
+            cached = _existing_persistent_thumb_cache_path_for_file(
+                norm_path, self._current_dir, requested_size=self._size,
+                candidate_sizes=_effective_persistent_thumb_cache_sizes(self._size),
+                selected_dir=self._current_dir, existence_only=True,
+            )
+            if cached:
+                return cached
         source_path = _resolve_thumb_source_path(norm_path, self._report_cache, self._current_dir)
         source_stamp = _thumb_source_stamp(norm_path, source_path)
         persistent_path = _existing_persistent_thumb_cache_path_for_file(
@@ -505,6 +539,7 @@ class ThumbnailLoader(QThread):
             return
 
         cache = self._thumb_cache
+        generation = cache.generation(path_to_load) if cache is not None else None
         load_size = self._size
         load_target_path = self._resolve_load_target_path(path_to_load)
 
@@ -523,6 +558,18 @@ class ThumbnailLoader(QThread):
 
         ext = Path(load_target_path).suffix.lower()
 
+        if self._fast_cache_check and load_target_path.endswith('.thumb.jpg'):
+            # 持久缩略图已经是可显示 JPEG，不再把它当源图生成第二份哈希缓存。
+            qimg = QImage(load_target_path)
+            if not qimg.isNull():
+                qimg = _scale_qimage_for_thumb(qimg, load_size)
+                if cache is not None:
+                    cache.put(path_to_load, load_size, qimg, generation=generation)
+                safe_emit(qimg)
+                return
+            # 文件存在但不可解码时保留缓存，用户可用“刷新缩略图”主动重建。
+            return
+
         # ── 2. JPEG / RAW: disk cache then progressive pipeline ──────────────
         if ext in thumb_stream._JPEG_EXTENSIONS or ext in thumb_stream._RAW_EXTENSIONS:
             try:
@@ -533,7 +580,7 @@ class ThumbnailLoader(QThread):
             disk_img = _read_thumb_from_disk_cache(load_target_path, mtime, load_size, self._current_dir)
             if disk_img is not None and not disk_img.isNull():
                 if cache is not None:
-                    cache.put(path_to_load, load_size, disk_img)
+                    cache.put(path_to_load, load_size, disk_img, generation=generation)
                 safe_emit(disk_img)
                 self._profile_record_decode(
                     path_to_load,
@@ -549,7 +596,7 @@ class ThumbnailLoader(QThread):
                 if qimg is None or qimg.isNull() or stopped():
                     return
                 if cache is not None:
-                    cache.put(path_to_load, load_size, qimg)
+                    cache.put(path_to_load, load_size, qimg, generation=generation)
                     cached = cache.get(path_to_load, load_size)
                     if cached is not None and not cached.isNull():
                         qimg = cached
@@ -575,7 +622,7 @@ class ThumbnailLoader(QThread):
 
             if final_qimg is not None and not final_qimg.isNull():
                 if cache is not None:
-                    cache.put(path_to_load, load_size, final_qimg)
+                    cache.put(path_to_load, load_size, final_qimg, generation=generation)
                 cache_path = _thumb_disk_cache_path(load_target_path, mtime, load_size, self._current_dir)
                 _schedule_thumb_disk_cache_write(cache_path, final_qimg)
                 self._profile_record_decode(
@@ -594,7 +641,7 @@ class ThumbnailLoader(QThread):
             if qimg is None or qimg.isNull() or stopped():
                 return
             if cache is not None:
-                cache.put(path_to_load, load_size, qimg)
+                cache.put(path_to_load, load_size, qimg, generation=generation)
                 cached = cache.get(path_to_load, load_size)
                 if cached is not None and not cached.isNull():
                     qimg = cached
@@ -801,6 +848,9 @@ class ThumbnailLoader(QThread):
             _log.debug("[ThumbnailLoader.run] END")
 
 
+_PersistentThumbKey = tuple[str, str, str, tuple[int, ...], int]
+
+
 @dataclass(frozen=True)
 class PersistentThumbCacheTask:
     source_path: str
@@ -808,14 +858,18 @@ class PersistentThumbCacheTask:
     report_cache: dict
     report_root_dir: str
     sizes: tuple[int, ...]
+    fast_cache_check: bool = False
+    refresh_id: int = 0
+    refresh_source_path: str = ""
 
     @property
-    def key(self) -> tuple[str, str, tuple[int, ...]]:
+    def key(self) -> _PersistentThumbKey:
         return (
             _path_key(self.source_path),
             _path_key(self.current_dir),
             _path_key(self.report_root_dir),
             tuple(int(size) for size in self.sizes),
+            self.refresh_id,
         )
 
 
@@ -824,6 +878,7 @@ class PersistentThumbCacheWorker(QThread):
 
     progress_updated = pyqtSignal(int, int, int, int, int, str)
     finished_summary = pyqtSignal(int, int, int, int, int)
+    thumbnail_refreshed = pyqtSignal(str, bool)
 
     def __init__(
         self,
@@ -835,17 +890,22 @@ class PersistentThumbCacheWorker(QThread):
         worker_count: int | None = None,
         parent=None,
         work_pool=None,
+        fast_cache_check: bool = False,
     ) -> None:
         super().__init__(parent)
         self._work_pool = work_pool
+        self._fast_cache_check = bool(fast_cache_check)
+        self._source_locks: dict[str, threading.Lock] = {}
+        self._refresh_serial = 0
+        self._latest_refresh: dict[str, int] = {}
         self._task_queue: _queue.PriorityQueue = _queue.PriorityQueue()
         self._queue_lock = threading.RLock()
         self._wake_event = threading.Event()
         self._seq = 0
-        self._inflight_keys: set[tuple[str, str, tuple[int, ...]]] = set()
-        self._completed_results: dict[tuple[str, str, tuple[int, ...]], tuple[int, int, int]] = {}
-        self._focus_keys: set[tuple[str, str, tuple[int, ...]]] = set()
-        self._focus_done_keys: set[tuple[str, str, tuple[int, ...]]] = set()
+        self._inflight_keys: set[_PersistentThumbKey] = set()
+        self._completed_results: dict[_PersistentThumbKey, tuple[int, int, int]] = {}
+        self._focus_keys: set[_PersistentThumbKey] = set()
+        self._focus_done_keys: set[_PersistentThumbKey] = set()
         self._focus_generated = 0
         self._focus_skipped = 0
         self._focus_failed = 0
@@ -888,14 +948,15 @@ class PersistentThumbCacheWorker(QThread):
         *,
         report_cache: dict | None,
         sizes: list[int] | tuple[int, ...] | None,
+        allow_local_cache: bool = False,
     ) -> list[PersistentThumbCacheTask]:
         current_dir_norm = os.path.normpath(current_dir) if current_dir else ""
         sizes_tuple = PersistentThumbCacheWorker._normalize_sizes(sizes)
         cache = report_cache or {}
         result: list[PersistentThumbCacheTask] = []
-        seen: set[tuple[str, str, tuple[int, ...]]] = set()
+        seen: set[_PersistentThumbKey] = set()
         for source_path in ThumbnailLoader._normalize_unique_paths(paths or []):
-            if current_dir_norm and not _find_cache_superpicky_dir_for_file(source_path, current_dir_norm):
+            if not allow_local_cache and current_dir_norm and not _find_cache_superpicky_dir_for_file(source_path, current_dir_norm):
                 continue
             report_row = _report_row_from_cache_for_path(source_path, cache)
             report_root_dir = ""
@@ -927,16 +988,37 @@ class PersistentThumbCacheWorker(QThread):
         sizes: list[int] | tuple[int, ...] | None = None,
         priority: int = 1,
         replace_focus: bool = False,
+        force_refresh: bool = False,
+        source_paths: dict[str, str] | None = None,
     ) -> int:
         tasks = self._build_tasks(
             paths,
             current_dir,
             report_cache=report_cache,
             sizes=sizes,
+            allow_local_cache=force_refresh,
         )
         with self._queue_lock:
+            if force_refresh:
+                self._refresh_serial += 1
+            tasks = [replace(
+                task, fast_cache_check=self._fast_cache_check,
+                refresh_id=self._refresh_serial if force_refresh else 0,
+                refresh_source_path=(source_paths or {}).get(task.source_path, task.source_path) if force_refresh else "",
+            ) for task in tasks]
+            for task in tasks:
+                source_key = _path_key(task.source_path)
+                self._source_locks.setdefault(source_key, threading.Lock())
+                if force_refresh:
+                    self._latest_refresh[source_key] = task.refresh_id
             if replace_focus:
                 self._focus_keys = {task.key for task in tasks}
+                self._rebuild_focus_counters_locked()
+            elif force_refresh:
+                # 显式刷新追加到当前进度，不取消同目录尚未完成的自动任务。
+                source_keys = {_path_key(task.source_path) for task in tasks}
+                self._focus_keys = {key for key in self._focus_keys if not (key[-1] and key[0] in source_keys)}
+                self._focus_keys.update(task.key for task in tasks)
                 self._rebuild_focus_counters_locked()
             added = 0
             for task in tasks:
@@ -993,64 +1075,86 @@ class PersistentThumbCacheWorker(QThread):
         source_path = task.source_path
         if stop_event.is_set():
             return source_path, 0, 0, 1
-        load_target_path = _resolve_thumb_source_path(
-            source_path,
-            task.report_cache,
-            task.report_root_dir or task.current_dir,
-        )
-        source_stamp = _thumb_source_stamp(source_path, load_target_path)
+        # 快速模式先查文件名；全命中时不打开 JPEG，也不读取源图/预览时间戳。
+        load_target_path = ""
+        source_stamp = None
+        if not task.fast_cache_check and not task.refresh_id:
+            load_target_path = _resolve_thumb_source_path(
+                source_path, task.report_cache, task.report_root_dir or task.current_dir,
+            )
+            source_stamp = _thumb_source_stamp(source_path, load_target_path)
         missing_sizes = [
             size
             for size in task.sizes
-            if not _existing_persistent_thumb_cache_path_for_exact_size(
+            if task.refresh_id or not _existing_persistent_thumb_cache_path_for_exact_size(
                 source_path,
                 task.current_dir,
                 size,
                 source_stamp=source_stamp,
                 selected_dir=task.current_dir,
+                existence_only=task.fast_cache_check,
             )
         ]
         if not missing_sizes:
             return source_path, 0, 1, 0
         if stop_event.is_set():
             return source_path, 0, 0, 1
-        if is_video(load_target_path):
-            base_image = _load_thumbnail_image(load_target_path, max(missing_sizes), task.current_dir,
-                                               cancelled=stop_event.is_set)
+        if task.refresh_id:
+            # 同时刷新已存在的大尺寸层级，避免以后切换尺寸又显示旧图。
+            missing_sizes = sorted(set(missing_sizes) | {
+                size for size in _THUMB_SIZE_STEPS
+                if _existing_persistent_thumb_cache_path_for_exact_size(
+                    source_path, task.current_dir, size, selected_dir=task.current_dir,
+                    existence_only=True,
+                )
+            })
+            load_target_path = task.refresh_source_path or source_path
+            from app_common.video import video_thumbnail_rgb
+            result = (video_thumbnail_rgb(load_target_path, max(missing_sizes), cancelled=stop_event.is_set)
+                      if is_video(load_target_path)
+                      else thumb_stream.load_thumbnail_rgb(load_target_path, max(missing_sizes)))
+            base_image = _rgb_bytes_to_qimage(*result) if result is not None else None
         else:
-            base_image = _load_thumbnail_image(load_target_path, max(missing_sizes), task.current_dir)
+            load_target_path = load_target_path or _resolve_thumb_source_path(
+                source_path, task.report_cache, task.report_root_dir or task.current_dir,
+            )
+            if is_video(load_target_path):
+                base_image = _load_thumbnail_image(load_target_path, max(missing_sizes), task.current_dir,
+                                                   cancelled=stop_event.is_set)
+            else:
+                base_image = _load_thumbnail_image(load_target_path, max(missing_sizes), task.current_dir)
+        source_stamp = _thumb_source_stamp(source_path, load_target_path)
         if base_image is None or base_image.isNull():
             return source_path, 0, 0, 1
         wrote_any = False
+        failed = False
         for size in missing_sizes:
             if stop_event.is_set():
                 break
             target_path = _persistent_thumb_cache_path_for_file(
-                source_path,
-                task.current_dir,
-                size,
-                selected_dir=task.current_dir,
+                source_path, task.current_dir, size, selected_dir=task.current_dir,
             )
+            if not target_path and task.refresh_id:
+                target_path = _thumb_disk_cache_path(load_target_path, os.path.getmtime(load_target_path), size, task.current_dir)
             output_image = base_image if size >= max(missing_sizes) else _scale_qimage_for_thumb(base_image, size)
             if (
                 target_path
                 and not output_image.isNull()
-                and _thumb_image_matches_size_for_source(
-                    source_path,
-                    int(output_image.width()),
-                    int(output_image.height()),
-                    int(size),
-                )
-                and _write_persistent_thumb_cache_image(
-                    target_path,
-                    output_image,
-                    source_stamp=source_stamp,
-                )
+                and _thumb_image_matches_size_for_source(source_path, output_image.width(), output_image.height(), size)
+                and _write_persistent_thumb_cache_image(target_path, output_image, source_stamp=source_stamp)
             ):
                 wrote_any = True
-        if wrote_any:
-            return source_path, 1, 0, 0
-        return source_path, 0, 0, 1
+            else:
+                failed = True
+        return source_path, int(wrote_any), 0, int(failed or not wrote_any)
+
+    def _process_serialized_task(self, task, stop_event):
+        # 同一文件的自动生成和手动刷新串行，防止旧任务晚写覆盖刷新结果。
+        with self._source_locks[_path_key(task.source_path)]:
+            return self._process_task(task, stop_event)
+
+    def _refresh_is_obsolete(self, task):
+        return bool(task.refresh_id and self._latest_refresh.get(_path_key(task.source_path)) != task.refresh_id)
 
     def _complete_task(
         self,
@@ -1062,6 +1166,8 @@ class PersistentThumbCacheWorker(QThread):
     ) -> tuple[int, int, int, int, int, str]:
         with self._queue_lock:
             self._inflight_keys.discard(task.key)
+            if task.refresh_id and not self._stop_event.is_set() and not self._refresh_is_obsolete(task):
+                self.thumbnail_refreshed.emit(task.source_path, bool(generated))
             self._completed_results[task.key] = (int(generated), int(skipped), int(failed))
             if task.key in self._focus_keys and task.key not in self._focus_done_keys:
                 self._focus_done_keys.add(task.key)
@@ -1077,7 +1183,8 @@ class PersistentThumbCacheWorker(QThread):
         producer = None
         def cancelled(task):
             with self._queue_lock:
-                return self._stop_event.is_set() or task.key not in self._focus_keys
+                return (self._stop_event.is_set() or self._refresh_is_obsolete(task)
+                        or (not task.refresh_id and task.key not in self._focus_keys))
         try:
             while not self._stop_event.is_set() and not self.isInterruptionRequested():
                 with self._queue_lock:
@@ -1114,9 +1221,9 @@ class PersistentThumbCacheWorker(QThread):
                             self._inflight_keys.discard(task.key)
                         continue
                     future = self._work_pool.submit_action(
-                        PersistentThumbnailAction(self._process_task, task,
+                        PersistentThumbnailAction(self._process_serialized_task, task,
                                                   cancelled=lambda t=task: cancelled(t)),
-                        kind=WorkKind.THUMBNAIL, priority=PERSISTENT)
+                        kind=WorkKind.THUMBNAIL, priority=PREFETCH if task.refresh_id else PERSISTENT)
                     pending[future] = task
                 if pending:
                     _futures.wait([f for f in pending if not f.done()], timeout=0.025,
@@ -1192,7 +1299,7 @@ class PersistentThumbCacheWorker(QThread):
                     self._wake_event.clear()
                     continue
                 futures = {
-                    executor.submit(self._process_task, task, self._stop_event): task
+                    executor.submit(self._process_serialized_task, task, self._stop_event): task
                     for task in batch
                 }
                 for future in _futures.as_completed(futures):

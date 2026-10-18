@@ -65,6 +65,7 @@ class FileListPanel(QWidget):
     use_unified_worker_pool = False
     # 子类可重载为 False，避免使用 .superpicky/cache 下的派生预览图与持久缩略图。
     use_preview_cache = True
+    fast_thumbnail_cache_check = False
 
     file_selected = pyqtSignal(str)
     file_fast_preview_requested = pyqtSignal(str)
@@ -199,6 +200,10 @@ class FileListPanel(QWidget):
         self._persistent_thumb_cache_status_text: str = ""
         self._persistent_thumb_cache_focus_priority: int = 0
         self._persistent_thumb_cache_pending_priority: int = 0
+        self._refreshed_thumbnail_paths: set[str] = set()
+        self._thumbnail_refresh_apply_timer = QTimer(self)
+        self._thumbnail_refresh_apply_timer.setSingleShot(True)
+        self._thumbnail_refresh_apply_timer.timeout.connect(self._apply_refreshed_thumbnails)
         self._thumb_profile_enabled: bool = _thumb_profile_enabled()
         self._thumb_profile_last_report_at: float = 0.0
         self._thumb_profile_window_started_at: float = _time.perf_counter()
@@ -3154,7 +3159,7 @@ class FileListPanel(QWidget):
         report_cache = self._report_full_cache or self._report_cache or {}
         source_path = actual_path or norm_path
         thumb_source = _resolve_thumb_source_path(source_path, report_cache, preview_base_dir)
-        source_stamp = _thumb_source_stamp(source_path, thumb_source)
+        source_stamp = None if self.fast_thumbnail_cache_check else _thumb_source_stamp(source_path, thumb_source)
         candidate_sizes = (
             (int(self._thumb_size),)
             if exact_size_only
@@ -3167,6 +3172,7 @@ class FileListPanel(QWidget):
             source_stamp=source_stamp,
             candidate_sizes=candidate_sizes,
             selected_dir=preview_base_dir,
+            existence_only=self.fast_thumbnail_cache_check,
         )
         if persistent_thumb_path:
             return persistent_thumb_path
@@ -3480,7 +3486,7 @@ class FileListPanel(QWidget):
         source_path = actual_path or norm_path
         if prefer_fast_preview:
             thumb_source = _resolve_thumb_source_path(source_path, report_cache, preview_base_dir)
-            source_stamp = _thumb_source_stamp(source_path, thumb_source)
+            source_stamp = None if self.fast_thumbnail_cache_check else _thumb_source_stamp(source_path, thumb_source)
             persistent_thumb_path = _existing_persistent_thumb_cache_path_for_file(
                 source_path,
                 preview_base_dir,
@@ -3488,6 +3494,7 @@ class FileListPanel(QWidget):
                 source_stamp=source_stamp,
                 candidate_sizes=_effective_persistent_thumb_cache_sizes(self._thumb_size),
                 selected_dir=preview_base_dir,
+                existence_only=self.fast_thumbnail_cache_check,
             )
             if persistent_thumb_path:
                 _log.info(
@@ -5773,6 +5780,7 @@ class FileListPanel(QWidget):
             current_dir=preview_base_dir,
             thumb_cache=self._thumb_memory_cache,
             work_pool=self._get_browser_work_pool(),
+            fast_cache_check=self.fast_thumbnail_cache_check,
         )
         if requested_visible:
             loader.enqueue(requested_visible, priority=ThumbnailLoader.PRIORITY_VISIBLE)
@@ -6120,6 +6128,7 @@ class FileListPanel(QWidget):
                 current_dir=self._current_dir if self._use_preview_cache else "",
                 thumb_cache=self._thumb_memory_cache,
                 work_pool=self._get_browser_work_pool(),
+                fast_cache_check=self.fast_thumbnail_cache_check,
             )
             loader.enqueue([norm_path], priority=ThumbnailLoader.PRIORITY_VISIBLE)
             loader.set_desired_paths([norm_path], [])
@@ -6467,9 +6476,11 @@ class FileListPanel(QWidget):
             worker_count=_persistent_thumb_cache_worker_count(),
             parent=self,
             work_pool=self._get_browser_work_pool(),
+            fast_cache_check=self.fast_thumbnail_cache_check,
         )
         worker.progress_updated.connect(self._on_persistent_thumb_cache_progress)
         worker.finished_summary.connect(self._on_persistent_thumb_cache_finished)
+        worker.thumbnail_refreshed.connect(self._on_thumbnail_refreshed)
         self._persistent_thumb_cache_worker = worker
         self._own_pool_loader(worker)
         worker.start()
@@ -6481,6 +6492,55 @@ class FileListPanel(QWidget):
             _persistent_thumb_cache_worker_count(),
         )
         self._persistent_thumb_cache_pending_paths = []
+
+    def refresh_thumbnails(self, paths: list[str]) -> None:
+        """后台重建选择快照；保留模型、选择、排序及当前目录的其他任务。"""
+        if self._background_shutdown_requested or not self._file_writes_allowed("刷新缩略图"):
+            return
+        paths = ThumbnailLoader._normalize_unique_paths(paths)
+        if not paths:
+            return
+        sources = {path: self._resolve_source_path_for_action(path) or path for path in paths}
+        worker = self._persistent_thumb_cache_worker
+        if worker is None:
+            worker = PersistentThumbCacheWorker(
+                [], self._current_dir, parent=self, work_pool=self._get_browser_work_pool(),
+                fast_cache_check=self.fast_thumbnail_cache_check,
+            )
+            worker.progress_updated.connect(self._on_persistent_thumb_cache_progress)
+            worker.finished_summary.connect(self._on_persistent_thumb_cache_finished)
+            worker.thumbnail_refreshed.connect(self._on_thumbnail_refreshed)
+            self._persistent_thumb_cache_worker = worker
+            self._own_pool_loader(worker)
+            worker.start()
+        worker.enqueue_paths(
+            paths, self._current_dir, report_cache=self._report_full_cache or self._report_cache or {},
+            sizes=_effective_persistent_thumb_cache_sizes(self._thumb_size), priority=-2,
+            force_refresh=True, source_paths=sources,
+        )
+
+    def _on_thumbnail_refreshed(self, path: str, success: bool) -> None:
+        if self._background_shutdown_requested or self.sender() is not self._persistent_thumb_cache_worker:
+            return
+        if not success:
+            _log.warning("[thumbnail.refresh] failed path=%r", path)
+            return
+        self._refreshed_thumbnail_paths.add(os.path.normpath(path))
+        if not self._thumbnail_refresh_apply_timer.isActive():
+            self._thumbnail_refresh_apply_timer.start(50)
+
+    def _apply_refreshed_thumbnails(self) -> None:
+        paths = self._refreshed_thumbnail_paths
+        self._refreshed_thumbnail_paths = set()
+        if self._background_shutdown_requested or not paths:
+            return
+        # 先取消旧视口结果，再按源图版本失效内存，迟到解码不能写回旧像素。
+        self._stop_thumbnail_loader()
+        self._thumb_memory_cache.invalidate(paths)
+        self._thumb_list_model.set_pixmaps_for_paths([(path, None, 0) for path in paths])
+        self._thumb_visible_signature = None
+        if self._view_mode == self._MODE_THUMB:
+            self._schedule_visible_thumbnail_update()
 
     def _stop_persistent_thumb_cache_worker(self) -> None:
         if self._persistent_thumb_cache_timer is not None and self._persistent_thumb_cache_timer.isActive():
@@ -6615,6 +6675,7 @@ class FileListPanel(QWidget):
             self._thumb_viewport_timer,
             self._thumb_apply_timer,
             self._persistent_thumb_cache_timer,
+            self._thumbnail_refresh_apply_timer,
             self._meta_apply_timer,
             self._meta_filter_refresh_timer,
             self._tree_model_populate_timer,
@@ -6624,6 +6685,7 @@ class FileListPanel(QWidget):
             if timer is not None and timer.isActive():
                 timer.stop()
         self._thumb_pending_batch.clear()
+        self._refreshed_thumbnail_paths.clear()
 
     def _shutdown_background_work(self) -> None:
         if self._background_shutdown_started:

@@ -131,6 +131,7 @@ def test_persistent_thumbnail_worker_starts_while_metadata_is_running(monkeypatc
             self.kwargs = kwargs
             self.progress_updated = _Signal()
             self.finished_summary = _Signal()
+            self.thumbnail_refreshed = _Signal()
             self.started = False
             self.instances.append(self)
 
