@@ -559,38 +559,32 @@ def _batch_read_exiftool(et_path: str, paths: list, extra_tags: list | None) -> 
     return result
 
 
-def _batch_read_xmp_sidecar(paths: list) -> dict:
+def _batch_read_xmp_sidecar(paths: list, *, directory_index=None) -> dict:
     """
     逐文件读取 XMP sidecar，转换为 exiftool 风格平坦字典。
     返回 {os.path.normpath(path): flat_dict}（无 sidecar 的文件也有空条目）。
     """
-    from app_common.exif_io.xmp_sidecar import find_xmp_sidecars, read_xmp_file  # 局部导入避免循环
+    from app_common.exif_io.xmp_sidecar import find_xmp_sidecars, read_xmp_files  # 局部导入避免循环
 
     batch_t0 = perf_counter()
     result: dict = {}
     find_t0 = perf_counter()
-    sidecars_by_norm = find_xmp_sidecars([os.path.normpath(path) for path in paths])
+    sidecars_by_norm = find_xmp_sidecars([os.path.normpath(path) for path in paths], directory_index=directory_index)
     find_ms = elapsed_ms(find_t0)
-    parse_ms = 0.0
+    read_t0 = perf_counter()
+    rows_by_norm = read_xmp_files(sidecars_by_norm)
+    read_ms = elapsed_ms(read_t0)
     flatten_ms = 0.0
     parsed_files = 0
     parsed_rows = 0
-    slowest_parse_path = ""
-    slowest_parse_ms = 0.0
     for path in paths:
         norm = os.path.normpath(path)
         try:
             xmp_path = sidecars_by_norm.get(norm)
             if xmp_path:
-                parse_t0 = perf_counter()
-                xmp_rows = read_xmp_file(xmp_path, image_path=path)
-                file_parse_ms = elapsed_ms(parse_t0)
-                parse_ms += file_parse_ms
+                xmp_rows = rows_by_norm.get(norm, [])
                 parsed_files += 1
                 parsed_rows += len(xmp_rows)
-                if file_parse_ms > slowest_parse_ms:
-                    slowest_parse_ms = file_parse_ms
-                    slowest_parse_path = xmp_path
             else:
                 xmp_rows = []
             flatten_t0 = perf_counter()
@@ -600,17 +594,15 @@ def _batch_read_xmp_sidecar(paths: list) -> dict:
             result[norm] = {"SourceFile": path}
     perf_log(
         _log,
-        "[metadata.xmp_sidecar.read_batch] paths=%s found=%s parsed_files=%s parsed_rows=%s find_ms=%.1f parse_ms=%.1f flatten_ms=%.1f total_ms=%.1f slowest_parse_ms=%.1f slowest_parse=%r",
+        "[metadata.xmp_sidecar.read_batch] paths=%s found=%s files=%s rows=%s find_ms=%.1f read_ms=%.1f flatten_ms=%.1f total_ms=%.1f",
         len(paths or []),
         len(sidecars_by_norm),
         parsed_files,
         parsed_rows,
         find_ms,
-        parse_ms,
+        read_ms,
         flatten_ms,
         elapsed_ms(batch_t0),
-        slowest_parse_ms,
-        slowest_parse_path,
     )
     return result
 

@@ -30,7 +30,7 @@ def test_heif_focus_survives_complete_browser_metadata(
         reads.append(list(paths))
         return {path: {**source, **sidecar}}
 
-    monkeypatch.setattr(_workers, "_batch_read_xmp_sidecar", lambda paths: {path: sidecar})
+    monkeypatch.setattr(_workers, "_batch_read_xmp_sidecar", lambda paths, **kwargs: {path: sidecar})
     monkeypatch.setattr(_workers, "read_batch_metadata", read)
     monkeypatch.setattr(_workers, "fast_read_browser_metadata", lambda paths: ({}, paths))
     monkeypatch.setattr(_workers.meta_disk_cache, "get_many", lambda *args: {})

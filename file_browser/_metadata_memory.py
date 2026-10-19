@@ -20,14 +20,14 @@ def _path_key(path: str) -> str:
 def _file_stamp(path: str) -> tuple | None:
     try:
         st = os.stat(path)
-        return st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_ino
+        return st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_ino, st.st_dev
     except OSError:
         return None
 
 
-def metadata_signatures(paths, tags, report_rows) -> dict:
+def metadata_signatures(paths, tags, report_rows, *, directory_index=None) -> dict:
     """保留共享侧车的大小写、派生文件及父目录查找语义，不解析 XML。"""
-    sidecars = find_xmp_sidecars(paths)
+    sidecars = find_xmp_sidecars(paths, directory_index=directory_index)
     signatures = {}
     for path in paths:
         norm = os.path.normpath(path)
@@ -169,6 +169,10 @@ class MetadataMemoryCache:
                 for key in list(queue):
                     if key.startswith(prefix):
                         self._drop(queue, key)
+
+    def generation_is_current(self, generation):
+        with self._lock:
+            return generation == self._generation
 
     def clear(self):
         with self._lock:

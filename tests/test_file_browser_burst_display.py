@@ -518,7 +518,7 @@ def test_metadata_loader_xmp_fast_path_skips_exiftool_without_report_row(monkeyp
         ],
     )
 
-    monkeypatch.setattr(_workers, "_batch_read_xmp_sidecar", lambda _paths: {path: sidecar_flat})
+    monkeypatch.setattr(_workers, "_batch_read_xmp_sidecar", lambda _paths, **kwargs: {path: sidecar_flat})
     monkeypatch.setattr(
         _workers,
         "read_batch_metadata",

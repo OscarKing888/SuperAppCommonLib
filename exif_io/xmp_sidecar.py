@@ -6,6 +6,8 @@ XMP 是基于 XML 的元数据格式，sidecar 文件与图像同名，扩展名
 from __future__ import annotations
 
 import os
+from collections import OrderedDict
+import threading
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -170,7 +172,33 @@ def _build_xmp_dir_index(dir_path: Path) -> dict[str, str]:
     return index
 
 
-def find_xmp_sidecars(image_paths: list[str]) -> dict[str, str]:
+class XmpDirectoryIndex:
+    """一次目录加载的共享索引；多 worker 不重复扫描，新增/删除通过目录指纹发现。"""
+
+    def __init__(self, max_dirs=128):
+        self._indexes = OrderedDict()
+        self._lock = threading.Lock()
+        self._max_dirs = max_dirs
+
+    def get(self, directory):
+        from .metadata_sqlite import file_stamp
+        key = os.path.normcase(os.path.abspath(directory))
+        with self._lock:
+            stamp = file_stamp(directory)
+            cached = self._indexes.get(key)
+            if stamp is not None and cached is not None and cached[0] == stamp:
+                self._indexes.move_to_end(key)
+                return cached[1]
+            index = _build_xmp_dir_index(Path(directory))
+            if stamp is not None and file_stamp(directory) == stamp:
+                self._indexes[key] = (stamp, index)
+                self._indexes.move_to_end(key)
+                while len(self._indexes) > self._max_dirs:
+                    self._indexes.popitem(last=False)
+            return index
+
+
+def find_xmp_sidecars(image_paths: list[str], *, directory_index=None) -> dict[str, str]:
     """
     批量查找 XMP sidecar，避免同一目录被每张 RAW 重复 scandir。
 
@@ -198,7 +226,7 @@ def find_xmp_sidecars(image_paths: list[str]) -> dict[str, str]:
             if index is None:
                 candidate_dirs += 1
                 index_t0 = perf_counter()
-                index = _build_xmp_dir_index(dir_path)
+                index = directory_index.get(dir_path) if directory_index is not None else _build_xmp_dir_index(dir_path)
                 dir_ms = elapsed_ms(index_t0)
                 index_ms += dir_ms
                 if dir_ms > slowest_dir_ms:
@@ -422,3 +450,32 @@ def read_xmp_sidecar(image_path: str) -> list[tuple[str, str, str]]:
     if not xmp_path:
         return []
     return read_xmp_file(xmp_path, image_path=image_path)
+
+
+def read_xmp_files(sidecars: dict[str, str]) -> dict[str, list]:
+    """批量复用已解析 XMP；软件外修改、原子替换或删除均在读取时核验。"""
+    from .metadata_sqlite import get_cache, file_stamp, path_key, XMP_NAMESPACE
+    started = perf_counter()
+    cache = get_cache()
+    revision = cache.revision()
+    signatures = {image: (path_key(sidecar), file_stamp(sidecar)) for image, sidecar in sidecars.items()}
+    signatures = {image: signature for image, signature in signatures.items() if signature[1] is not None}
+    hits = cache.get_many(XMP_NAMESPACE, signatures)
+    result = {image: [tuple(row) for row in record["rows"]] for image, record in hits.items()
+              if isinstance(record.get("rows"), list)
+              and all(isinstance(row, list) and len(row) == 3 and all(isinstance(v, str) for v in row)
+                      for row in record["rows"])}
+    hit_count = len(result)
+    pending = {}
+    for image, sidecar in sidecars.items():
+        if image in result:
+            continue
+        rows = read_xmp_file(sidecar, image_path=image)
+        result[image] = rows
+        signature = signatures.get(image)
+        if rows and signature is not None and file_stamp(sidecar) == signature[1]:
+            pending[image] = (signature, {"rows": rows}, sidecar)
+    cache.put_many(XMP_NAMESPACE, pending, revision)
+    perf_log(_log, "[metadata.xmp.sqlite] paths=%s hits=%s misses=%s elapsed_ms=%.1f",
+             len(sidecars), hit_count, len(sidecars) - hit_count, elapsed_ms(started))
+    return result

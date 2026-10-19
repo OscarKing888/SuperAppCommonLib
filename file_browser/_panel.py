@@ -1461,6 +1461,8 @@ class FileListPanel(QWidget):
         self._metadata_memory_cache.set_scope(path)
         if force_reload and not preserve_meta_cache:
             self._metadata_memory_cache.invalidate_scope(path)
+            from app_common.exif_io.metadata_sqlite import get_cache
+            get_cache().invalidate_scope(path)
             self._report_full_cache = None
         self._current_dir = path
         if not same_dir:

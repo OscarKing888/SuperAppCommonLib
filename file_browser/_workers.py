@@ -16,7 +16,8 @@ from app_common.perf_probe import elapsed_ms, perf_counter, perf_log, perf_probe
 from app_common.raw_focus_metadata import is_raw_image_path, read_raw_embedded_focus_metadata
 from app_common.exif_io.writer import _batch_read_xmp_sidecar
 from app_common.exif_io.fast_reader import fast_read_browser_metadata
-from app_common.exif_io import meta_disk_cache
+from app_common.exif_io import meta_disk_cache, metadata_sqlite
+from app_common.exif_io.xmp_sidecar import XmpDirectoryIndex
 from app_common.image_formats import HEIF_EXTENSIONS
 
 
@@ -487,6 +488,8 @@ class MetadataLoader(QThread):
         super().__init__(parent)
         self._work_pool = work_pool
         self._memory_cache = memory_cache
+        self._sqlite_cache = metadata_sqlite.get_cache() if memory_cache is not None else None
+        self._sidecar_index = XmpDirectoryIndex()
         self._paths = list(paths)
         self._meta_proxy = meta_proxy
         self._selected_dir = str(selected_dir or "") or None
@@ -662,17 +665,6 @@ class MetadataLoader(QThread):
             return {}, {}, 0
         chunk_t0 = perf_counter()
         batch = self._read_metadata_batch(chunk)
-        for path in chunk:
-            if self._stopped():
-                return {}, {}, 0
-            if is_video(path):
-                try:
-                    info = probe_video(path, cancelled=self._stopped)
-                    batch.setdefault(os.path.normpath(path), {})["video_info"] = info
-                except Exception as exc:
-                    _log.warning("Video metadata failed path=%r: %s", path, exc)
-                    batch.setdefault(os.path.normpath(path), {})["video_info"] = {}
-
         read_ms = elapsed_ms(chunk_t0)
         focus_t0 = perf_counter()
         focus_batch = self._build_focus_cache_batch(chunk) if self._should_prefetch_focus_cache() else {}
@@ -735,7 +727,10 @@ class MetadataLoader(QThread):
         if cache is None:
             return self._read_metadata_batch_uncached(paths)
         started = perf_counter()
-        signatures = metadata_signatures(paths, self._metadata_tags, self._report_rows_by_path)
+        signatures = metadata_signatures(paths, self._metadata_tags, self._report_rows_by_path,
+                                         directory_index=self._sidecar_index)
+        disk = self._sqlite_cache
+        revision = disk.revision()
         result, missing, generations = {}, [], {}
         for path in paths:
             norm = os.path.normpath(path)
@@ -745,6 +740,12 @@ class MetadataLoader(QThread):
             else:
                 result[norm] = record
         hits = len(result)
+        disk_hits = disk.get_many(metadata_sqlite.BROWSER_NAMESPACE,
+                                  {os.path.normpath(p): signatures.get(os.path.normpath(p)) for p in missing})
+        for norm, record in disk_hits.items():
+            cache.store(norm, signatures[norm], record, generations[norm])
+        result.update(disk_hits)
+        missing = [p for p in missing if os.path.normpath(p) not in disk_hits]
         if missing and not self._stopped():
             failed = set()
             sidecar_paths = {norm for norm, signature in signatures.items() if signature[1] is not None}
@@ -752,15 +753,22 @@ class MetadataLoader(QThread):
                 missing, failed_paths=failed, sidecar_paths=sidecar_paths,
             )
             # 读取期间发生写入/删除时，不把旧结果绑定到新指纹。
-            after = metadata_signatures(missing, self._metadata_tags, self._report_rows_by_path)
+            after = metadata_signatures(missing, self._metadata_tags, self._report_rows_by_path,
+                                        directory_index=self._sidecar_index)
+            pending = {}
             for norm, record in fresh.items():
                 if (not self._stopped() and norm not in failed and signatures.get(norm) is not None
                         and after.get(norm) == signatures[norm]):
                     cache.store(norm, signatures[norm], record, generations[norm])
+                    if cache.generation_is_current(generations[norm]):
+                        sidecar = signatures[norm][1]
+                        pending[norm] = (signatures[norm], record, sidecar[0] if sidecar else None)
+            if not self._stopped():
+                disk.put_many(metadata_sqlite.BROWSER_NAMESPACE, pending, revision)
             result.update(fresh)
         stats = cache.stats()
-        _log.info("[metadata.memory] paths=%s hits=%s misses=%s entries=%s bytes=%s elapsed_ms=%.1f",
-                  len(paths), hits, len(missing), stats["entries"], stats["bytes"], elapsed_ms(started))
+        _log.info("[metadata.memory] paths=%s hits=%s sqlite_hits=%s misses=%s entries=%s bytes=%s elapsed_ms=%.1f",
+                  len(paths), hits, len(disk_hits), len(missing), stats["entries"], stats["bytes"], elapsed_ms(started))
         return result
 
     def _read_metadata_batch_uncached(self, paths: list[str], *, failed_paths=None,
@@ -775,7 +783,7 @@ class MetadataLoader(QThread):
         sidecar_batch: dict[str, dict] = {}
         sidecar_t0 = perf_counter()
         try:
-            sidecar_batch = _batch_read_xmp_sidecar(paths)
+            sidecar_batch = _batch_read_xmp_sidecar(paths, directory_index=self._sidecar_index)
             for norm_path, flat in sidecar_batch.items():
                 if norm_path in result and flat:
                     result[norm_path].update(flat)
@@ -972,6 +980,18 @@ class MetadataLoader(QThread):
             report_xmp_restore_count,
             report_raw_key_restore_count,
         )
+        # 视频探测结果同样持久化，重新打开目录不再逐文件启动 ffprobe。
+        for path in paths:
+            if self._stopped():
+                break
+            if is_video(path):
+                norm = os.path.normpath(path)
+                try:
+                    result[norm]["video_info"] = probe_video(path, cancelled=self._stopped)
+                except Exception as exc:
+                    _log.warning("Video metadata failed path=%r: %s", path, exc)
+                    result[norm]["video_info"] = {}
+                    failed_paths.add(norm)
         return result
 
     @staticmethod

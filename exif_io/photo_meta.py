@@ -1406,6 +1406,11 @@ class PhotoMetaDataXMP(PhotoMetaData):
             invalidate_metadata_cache(path)
         except Exception:
             pass
+        try:
+            from .metadata_sqlite import get_cache
+            get_cache().refresh_xmp(path)
+        except Exception:
+            pass  # 缓存失败不影响已成功写入的 XMP。
 
     def supports_write(self) -> bool:
         return True

@@ -5,7 +5,8 @@
 
 只缓存「文件派生」字段（exifread / exiftool 从图片文件本身读出的拍摄+对焦数据），
 **不缓存** XMP sidecar / report.db 字段：
-- sidecar/report 在每次加载时都会重新读取并合并（成本很低）；
+- 本模块仅是原图派生字段层；完整合并结果及解析后的 XMP 由 metadata_sqlite 缓存；
+- 完整缓存未命中时，调用方重新读取/合并 sidecar/report；
 - 因此用户改评分/标签（写入 sidecar，不改图片文件 mtime/size）时，本缓存天然有效，
   无需额外失效逻辑；图片文件本身被修改时，mtime/size 变化会自动判定缓存失效。
 
