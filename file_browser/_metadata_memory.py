@@ -10,6 +10,7 @@ import threading
 from time import monotonic
 
 from app_common.exif_io.xmp_sidecar import find_xmp_sidecars
+from app_common.superviewer_user_options import METADATA_MEMORY_DEFAULT_MB
 
 
 def _path_key(path: str) -> str:
@@ -67,9 +68,9 @@ class _Entry:
 
 
 class MetadataMemoryCache:
-    """每面板独有：最多 2 万条/128 MiB，闲置 15 分钟淘汰，范围外 LRU 优先。"""
+    """每面板独有：最多 2 万条，默认 256 MiB，闲置 15 分钟淘汰，范围外 LRU 优先。"""
 
-    def __init__(self, *, max_entries=20_000, max_bytes=128 * 1024 * 1024,
+    def __init__(self, *, max_entries=20_000, max_bytes=METADATA_MEMORY_DEFAULT_MB * 1024 * 1024,
                  idle_seconds=15 * 60, clock=monotonic):
         self.max_entries = max(0, int(max_entries))
         self.max_bytes = max(0, int(max_bytes))
@@ -87,6 +88,19 @@ class MetadataMemoryCache:
 
     def _drop(self, queue, key):
         self._bytes -= queue.pop(key).size
+
+    def _evict_to_limits(self):
+        # 调用方持锁；缩小容量和新结果写入共用同一淘汰策略。
+        while (len(self._active) + len(self._inactive) > self.max_entries
+               or self._bytes > self.max_bytes):
+            victims = self._inactive if self._inactive else self._active
+            self._drop(victims, next(iter(victims)))
+
+    def set_max_bytes(self, max_bytes):
+        """即时调整容量，不做文件 I/O；保留仍在额度内的条目和读取代次。"""
+        with self._lock:
+            self.max_bytes = max(0, int(max_bytes))
+            self._evict_to_limits()
 
     def _expire(self, now):
         for queue in (self._inactive, self._active):
@@ -145,10 +159,7 @@ class MetadataMemoryCache:
                 return
             queue[key] = _Entry(signature, record, now, size)
             self._bytes += size
-            while (len(self._active) + len(self._inactive) > self.max_entries
-                   or self._bytes > self.max_bytes):
-                victims = self._inactive if self._inactive else self._active
-                self._drop(victims, next(iter(victims)))
+            self._evict_to_limits()
 
     def invalidate_scope(self, directory):
         prefix = _path_key(directory).rstrip(os.sep) + os.sep

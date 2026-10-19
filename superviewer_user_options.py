@@ -14,6 +14,10 @@ PERSISTENT_THUMB_SIZE_LEVELS = (128, 256, 512, 1024, 2048)
 KEY_NAVIGATION_FPS_OPTIONS = (1, 2, 4, 8, 10, 12, 13, 15, 20, 24, 25, 30, 40, 45, 50, 60, 120)
 KEY_PERF_PROBES_ENABLED = "perf_probes_enabled"
 KEY_BIRD_HOVER_COLOR = "bird_hover_color"
+KEY_METADATA_MEMORY_MB = "metadata_memory_mb"
+METADATA_MEMORY_DEFAULT_MB = 256
+METADATA_MEMORY_MIN_MB = 64
+METADATA_MEMORY_MAX_MB = 4096
 # Birds measured per photo by bird sharpness; 0 = no limit (birds on the focus box go first when limited).
 KEY_BIRD_SHARPNESS_MAX_BIRDS = "bird_sharpness_max_birds"
 BIRD_SHARPNESS_MAX_BIRDS_LIMIT = 999
@@ -146,6 +150,7 @@ _DEFAULT_OPTIONS = {
     KEY_BIRD_HOVER_COLOR: "#FF0000",
     "thumbnail_loader_workers": _DEFAULT_CPU_COUNT,
     "metadata_loader_workers": _DEFAULT_METADATA_WORKERS,
+    KEY_METADATA_MEMORY_MB: METADATA_MEMORY_DEFAULT_MB,
     "persistent_thumb_workers": _DEFAULT_PERSISTENT_THUMB_WORKERS,
     "persistent_thumb_max_size": 128,
     "key_navigation_fps": 24,
@@ -224,6 +229,12 @@ def normalize_user_options(data: dict | None) -> dict[str, int | str]:
     except Exception:
         value = normalized["metadata_loader_workers"]
     normalized["metadata_loader_workers"] = max(1, value)
+
+    try:
+        value = int(source.get(KEY_METADATA_MEMORY_MB, METADATA_MEMORY_DEFAULT_MB))
+    except (TypeError, ValueError, OverflowError):
+        value = METADATA_MEMORY_DEFAULT_MB
+    normalized[KEY_METADATA_MEMORY_MB] = max(METADATA_MEMORY_MIN_MB, min(METADATA_MEMORY_MAX_MB, value))
 
     try:
         value = int(source.get("persistent_thumb_workers", normalized["persistent_thumb_workers"]) or 0)
@@ -393,6 +404,11 @@ def get_thumbnail_loader_workers() -> int:
 def get_metadata_loader_workers() -> int:
     with _OPTIONS_LOCK:
         return int(_RUNTIME_OPTIONS["metadata_loader_workers"])
+
+
+def get_metadata_memory_mb() -> int:
+    with _OPTIONS_LOCK:
+        return int(_RUNTIME_OPTIONS[KEY_METADATA_MEMORY_MB])
 
 
 def get_persistent_thumb_workers() -> int:

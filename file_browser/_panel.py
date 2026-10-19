@@ -17,6 +17,7 @@ from app_common.file_browser._thumbnail import *
 from app_common.file_browser._workers import *
 from app_common.file_browser._work_pool import BrowserWorkPool
 from app_common.file_browser._metadata_memory import MetadataMemoryCache
+from app_common.superviewer_user_options import get_metadata_memory_mb
 from app_common.file_browser._cut_state import (
     FileCutState, _FILE_CLIPBOARD_ACTION_MIME, _FILE_CLIPBOARD_ENTRIES_MIME,
 )
@@ -108,7 +109,7 @@ class FileListPanel(QWidget):
         self._file_table_proxy.setSourceModel(self._file_table_model)
         self._thumb_list_model = self.thumbnail_model_class(self)
         self._meta_cache:    dict = {}   # norm_path → metadata dict
-        self._metadata_memory_cache = MetadataMemoryCache()
+        self._metadata_memory_cache = MetadataMemoryCache(max_bytes=get_metadata_memory_mb() * 1024 * 1024)
         self._directory_scope_cache: dict[bool, dict] = {}  # 当前目录 shallow/recursive 两个 scope 的文件列表缓存
         self._report_cache:  dict = {}   # legacy report row cache；sidecar/EXIF 模式下保持为空
         self._report_row_by_path: dict = {}
@@ -5662,6 +5663,7 @@ class FileListPanel(QWidget):
         return True
 
     def apply_user_options(self) -> None:
+        self._metadata_memory_cache.set_max_bytes(get_metadata_memory_mb() * 1024 * 1024)
         self._thumb_profile_enabled = _thumb_profile_enabled()
         self._sync_file_browser_probe_timer()
         self._thumb_loader_workers = _thumbnail_loader_worker_count()

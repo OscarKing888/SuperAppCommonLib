@@ -81,6 +81,31 @@ def test_refresh_and_shutdown_reject_late_stores(tmp_path):
     assert cache.stats() == {"entries": 0, "bytes": 0}
 
 
+def test_resize_retains_active_entries_and_inflight_reads_obey_new_limit(tmp_path):
+    cache = MetadataMemoryCache()
+    a, b = [str(tmp_path / "active" / name) for name in ("a", "b")]
+    c = str(tmp_path / "other" / "c")
+    cache.set_scope(str(tmp_path / "active"))
+    for path in (a, b, c):
+        put(cache, path)
+    _, generation = cache.lookup(a, (1,))
+    original_bytes = cache.stats()["bytes"]
+    # 范围外 c 比 a、b 更新，缩小时也应先淘汰 c。
+    cache.set_max_bytes(original_bytes - 1)
+    assert get(cache, c) is None
+    assert get(cache, a) and get(cache, b)
+    assert cache.stats()["bytes"] < original_bytes
+    cache.set_max_bytes(original_bytes * 2)
+    assert cache.lookup(a, (1,))[1] == generation
+    assert get(cache, a) and get(cache, b)
+    cache.set_max_bytes(0)
+    cache.store(c, (1,), {"title": "迟到的白鹭"}, generation)
+    assert cache.stats() == {"entries": 0, "bytes": 0}
+    cache.set_max_bytes(original_bytes)
+    cache.store(c, (1,), {"title": "迟到的白鹭"}, generation)
+    assert get(cache, c)["title"] == "迟到的白鹭"
+
+
 def test_parallel_readers_keep_capacity_and_copies(tmp_path):
     cache = MetadataMemoryCache(max_entries=20, max_bytes=100_000)
 

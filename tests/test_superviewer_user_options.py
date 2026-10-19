@@ -41,6 +41,24 @@ def test_default_workers_split_metadata_and_persistent_thumbnail_generation() ->
     assert options["persistent_thumb_workers"] == max(1, cpu_count - metadata_workers)
 
 
+def test_metadata_memory_limit_defaults_validation_and_roundtrip(tmp_path):
+    options = superviewer_user_options
+    key = options.KEY_METADATA_MEMORY_MB
+    assert normalize_user_options({})[key] == 256
+    for value in (None, "invalid", [], float("inf")):
+        assert normalize_user_options({key: value})[key] == 256
+    for value, expected in ((-1, 64), (0, 64), (64, 64), ("512", 512), (99999, 4096)):
+        assert normalize_user_options({key: value})[key] == expected
+    path = str(tmp_path / "中文配置.cfg")
+    previous = options.get_runtime_user_options()
+    try:
+        options.save_user_options({key: 512}, path)
+        options.apply_runtime_user_options(options.load_user_options(path))
+        assert options.get_metadata_memory_mb() == 512
+    finally:
+        options.apply_runtime_user_options(previous)
+
+
 def test_bird_hover_color_validates_and_roundtrips(tmp_path, monkeypatch):
     key = superviewer_user_options.KEY_BIRD_HOVER_COLOR
     for value in (None, '', 'red', '#11223344', '#oops', 123):
