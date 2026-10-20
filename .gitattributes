@@ -1,2 +1,9 @@
 # Preserve upstream ExifTool module files as distributed, including blank EOF lines.
 exif_io/exiftools_win/exiftool_files/lib/** -whitespace
+
+# Preserve the exact upstream ExifTool bytes, including on Windows checkouts.
+# Upstream trailing spaces and blank EOF lines are covered by SHA256SUMS.
+exif_io/exiftools_mac/exiftool -text -whitespace
+exif_io/exiftools_mac/lib/** -text -whitespace
+exif_io/exiftools_mac/LICENSE -text -whitespace
+exif_io/exiftools_mac/README.upstream -text -whitespace

@@ -17,6 +17,8 @@ eggs/
 lib/
 # The bundled Windows ExifTool launcher needs its adjacent Perl modules.
 !exif_io/exiftools_win/exiftool_files/lib/
+# The macOS ExifTool script also needs its complete adjacent Perl modules.
+!exif_io/exiftools_mac/lib/
 lib64/
 parts/
 sdist/

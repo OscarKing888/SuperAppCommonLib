@@ -13,6 +13,13 @@ EXIF/XMP 配置、ExifTool 路径、元数据读取与 XMP sidecar 写入。内�
 - **xmp_sidecar.py**：XMP 读取；提供宽松读取 resolver 和严格生命周期 resolver
 - **exiftools_mac/**、**exiftools_win/**：平台 exiftool 可执行文件
 
+macOS 的 `exiftool` 是 Perl 入口脚本，必须与相邻的完整 `lib/` 模块树一起
+分发。当前脚本与库统一为官方 13.50（含上游 macOS 安全修复），通过 macOS
+系统 Perl 运行，不依赖 Homebrew。来源提交、许可证和逐文件 SHA-256 见
+`exiftools_mac/UPSTREAM.md`、`LICENSE`、`SHA256SUMS`。离线回归测试会核对
+上游文件清单，并在隔离环境中复制目录后验证版本和中文 XMP 写入、读回；
+不能以本机系统安装的 ExifTool 成功代替包内版本验证。
+
 Windows 的 `exiftool.exe` 是启动器，必须连同相邻的
 `exiftool_files/lib/Image/ExifTool.pm` 及整个 `lib/` 模块树一起打包；
 只复制 EXE、Perl 运行时和 `exiftool.pl` 无法启动。当前库与脚本同为 13.49；
