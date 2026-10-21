@@ -249,6 +249,20 @@ def test_missing_source_fails_without_orphan_sidecar(panel, tmp_path):
     assert panel._meta_cache == {}
 
 
+def test_copy_keeps_report_and_cache_layers_until_sidecar_species_is_known(panel, tmp_path, monkeypatch):
+    path = photo(tmp_path, '报告回退.jpg')
+    assert PhotoMetaDataXMP().write_title(path, '白头鹎')
+    monkeypatch.setattr(panel, '_get_report_row_for_path', lambda p: {
+        'bird_species_cn': '白头鹎', 'bird_species_en': 'Light-vented Bulbul', 'gbif_rarity_100': 0,
+    })
+    panel._meta_cache[path] = {'bird_species_cn': '家燕', 'bird_species_en': 'Barn Swallow'}
+    panel._copy_species_from_path(path)
+    wait_for(lambda: not panel._metadata_copy_controller.busy)
+    assert panel._copied_species_payload['bird_species_cn'] == '白头鹎'
+    assert panel._copied_species_payload['bird_species_en'] == 'Light-vented Bulbul'
+    assert panel._copied_species_payload['gbif_rarity_100'] == 0
+
+
 def test_progress_escape_requests_stop_and_keeps_action_reachable(panel):
     dialog = MetadataProgressDialog(panel)
     stopped = []

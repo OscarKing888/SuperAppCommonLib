@@ -57,21 +57,23 @@ class MetadataWriteAction(WorkerAction):
 
 
 class SpeciesCopyAction(WorkerAction):
-    def __init__(self, path, payload, *, cancelled=lambda: False):
+    def __init__(self, path, payload, *, sources=None, cancelled=lambda: False):
         super().__init__(cancelled=cancelled)
         self.path, self.payload = path, copy.deepcopy(payload)
+        # Keep report/cache layers separate until the sidecar's species is known.
+        self.sources = copy.deepcopy(sources if sources is not None else (payload,))
 
     def execute(self):
         if self.is_cancelled():
             return None
         sidecar = PhotoMetaDataXMP().read(self.path)
-        payload = {**self.payload, **species_snapshot(self.payload, sidecar)}
+        payload = {**self.payload, **species_snapshot(*self.sources, sidecar)}
         if not payload["bird_species_cn"] and not self.is_cancelled():
             # The pool owns a reusable, thread-local ExifTool read session.
             from app_common.exif_io import read_batch_metadata
             records = read_batch_metadata([self.path])
             record = records.get(os.path.normpath(self.path)) or records.get(self.path) or {}
-            payload.update(species_snapshot(self.payload, record, sidecar))
+            payload.update(species_snapshot(*self.sources, record, sidecar))
         return payload
 
 

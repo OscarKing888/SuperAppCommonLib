@@ -2335,12 +2335,14 @@ class FileListPanel(QWidget):
         if not payload:
             return
         source = self._resolve_source_path_for_action(path) or path
+        sources = (self._get_report_row_for_path(path) or {},
+                   self._meta_cache.get(os.path.normpath(path), {}) or {})
         if self._metadata_copy_controller is None:
             self._metadata_copy_controller = MetadataCopyController(self)
         self._copied_species_payload = None
         self._pending_species_paste = None
         self._metadata_copy_controller.start(
-            lambda cancelled: SpeciesCopyAction(source, payload, cancelled=cancelled),
+            lambda cancelled: SpeciesCopyAction(source, payload, sources=sources, cancelled=cancelled),
             self._species_copied,
             lambda exc: _log.warning("[metadata.copy] source=%r failed: %s", source, exc),
         )
