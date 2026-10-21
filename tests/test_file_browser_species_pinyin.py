@@ -1,6 +1,7 @@
 """粘贴鸟名必须一并保存拼音，写失败时保留原有元数据。"""
 from pathlib import Path
 import sqlite3
+import time
 
 from PIL import Image
 from PyQt6.QtWidgets import QApplication
@@ -16,6 +17,15 @@ from app_common.file_browser import _panel as panel_module
 from app_common.file_browser._workers import MetadataLoader
 
 _APP = QApplication.instance() or QApplication([])
+
+
+def wait_actions(panel):
+    deadline = time.monotonic() + 8
+    while ((panel._metadata_copy_controller and panel._metadata_copy_controller.busy)
+           or (panel._species_paste_controller and panel._species_paste_controller.busy)):
+        assert time.monotonic() < deadline
+        _APP.processEvents()
+        time.sleep(.001)
 
 
 def test_snapshot_merges_report_cache_and_sparse_sidecar():
@@ -82,6 +92,7 @@ def test_paste_updates_real_xmp_and_cache_for_multiple_photos(panel, tmp_path, m
     panel._meta_cache = {path: store.read(path) for path in paths}
     panel._copied_species_payload = {"bird_species_cn": name}
     panel._paste_species_to_paths(paths + paths[:1])
+    wait_actions(panel)
     loader = MetadataLoader([], meta_proxy=object())
     try:
         for path, original in zip(paths, originals):
@@ -122,6 +133,7 @@ def test_partial_failure_keeps_failed_photo_and_cache(panel, tmp_path, monkeypat
     monkeypatch.setattr(panel._meta_proxy, "write", fail_one)
     panel._copied_species_payload = {"bird_species_cn": "白头鹎"}
     panel._paste_species_to_paths(paths)
+    wait_actions(panel)
     assert sidecar.read_bytes() == before
     assert panel._meta_cache[paths[0]] == previous
     assert stored_pinyin(store.read(paths[1])) == "bái tóu bēi"
@@ -154,11 +166,13 @@ def test_copy_paste_associated_metadata_snapshot(panel, tmp_path, monkeypatch, s
     copied_text = []
     monkeypatch.setattr(panel, "_copy_text_to_clipboard", copied_text.append)
     panel._copy_species_from_path(display)
+    wait_actions(panel)
     assert copied_text == ["白头鹎"]
     # Copy is a snapshot: changing the source afterwards must not change paste.
     assert store.write(source, {"XMP-superpicky:shooting_location": "另一个地点"})
     originals = [Path(path).read_bytes() for path in targets]
     panel._paste_species_to_paths(targets)
+    wait_actions(panel)
     loader = MetadataLoader([], meta_proxy=object())
     try:
         for path, original in zip(targets, originals):
@@ -195,7 +209,9 @@ def test_missing_source_fields_clear_previous_species_data(panel, tmp_path, monk
     })
     monkeypatch.setattr(panel, "_copy_text_to_clipboard", lambda _text: None)
     panel._copy_species_from_path(source)
+    wait_actions(panel)
     panel._paste_species_to_paths([target])
+    wait_actions(panel)
     rec = store.read(target)
     # Marker fields prevent stale report values from being hydrated on reload.
     assert rarity_metadata({"report.gbif_rarity_100": 70, **rec}) == (None, "")

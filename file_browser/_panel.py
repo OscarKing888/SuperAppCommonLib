@@ -85,6 +85,10 @@ class FileListPanel(QWidget):
         self._styled_widget_palette = None
         super().__init__(parent)
         self._browser_work_pool = None
+        self._metadata_edit_pool = None
+        self._species_paste_controller = None
+        self._metadata_copy_controller = None
+        self._pending_species_paste = None
         self._live_pool_loaders = set()
         self._all_files: list = []
         self._listed_path_index: tuple[set, dict] = (set(), {})
@@ -2321,22 +2325,34 @@ class FileListPanel(QWidget):
         _log.info("[_copy_text_to_clipboard] platform=%r text=%r", sys.platform, text)
 
     def _copy_species_from_path(self, path: str) -> None:
-        payload = self._get_species_payload_for_path(path, read_sidecar=True)
-        if not payload:
-            _log.info("[_copy_species_from_path] skip source=%r reason=no_report_row", path)
+        from ._metadata_actions import SpeciesCopyAction
+        from ._metadata_tasks import MetadataCopyController
+        if self._background_shutdown_requested:
             return
-        self._copied_species_payload = payload
-        species_cn = str(payload.get("bird_species_cn") or "").strip()
-        if species_cn:
-            self._copy_text_to_clipboard(species_cn)
-        _log.info(
-            "[_copy_species_from_path] source=%r filename=%r bird_species_cn=%r bird_species_en=%r copied_to_clipboard=%s",
-            path,
-            payload.get("filename"),
-            payload.get("bird_species_cn"),
-            payload.get("bird_species_en"),
-            bool(species_cn),
+        # Only cached/report fields are captured on the GUI thread. Sidecar and
+        # original metadata reads belong to the action, never the menu callback.
+        payload = FileListPanel._get_species_payload_for_path(self, path, allow_metadata_read=False)
+        if not payload:
+            return
+        source = self._resolve_source_path_for_action(path) or path
+        if self._metadata_copy_controller is None:
+            self._metadata_copy_controller = MetadataCopyController(self)
+        self._copied_species_payload = None
+        self._pending_species_paste = None
+        self._metadata_copy_controller.start(
+            lambda cancelled: SpeciesCopyAction(source, payload, cancelled=cancelled),
+            self._species_copied,
+            lambda exc: _log.warning("[metadata.copy] source=%r failed: %s", source, exc),
         )
+
+    def _species_copied(self, payload):
+        self._copied_species_payload = payload
+        species = str(payload.get("bird_species_cn") or "").strip()
+        if species:
+            self._copy_text_to_clipboard(species)
+        pending, self._pending_species_paste = self._pending_species_paste, None
+        if pending:
+            self._paste_species_to_paths(pending)
 
     def _get_paste_species_action_text(self) -> str:
         payload = getattr(self, "_copied_species_payload", None) or {}
@@ -2355,59 +2371,31 @@ class FileListPanel(QWidget):
         return "复制鸟名"
 
     def _paste_species_to_paths(self, paths: list[str]) -> None:
-        if not self._file_writes_allowed("粘贴鸟名", warn=True):
+        from ._metadata_actions import MetadataWriteAction
+        from ._metadata_tasks import MetadataBatchController
+        if self._background_shutdown_requested or not self._file_writes_allowed("粘贴鸟名", warn=True):
+            return
+        if self._metadata_copy_controller is not None and self._metadata_copy_controller.pending:
+            self._pending_species_paste = list(paths)
             return
         payload = getattr(self, "_copied_species_payload", None)
         if not payload:
-            _log.info("[_paste_species_to_paths] skip reason=no_copied_species")
             return
-
-        cn = str(payload.get("bird_species_cn") or "").strip()
-        en = str(payload.get("bird_species_en") or "").strip()
-        title = cn or en
-        if not title:
-            _log.info("[_paste_species_to_paths] skip reason=empty_species")
+        fields, updates = species_paste_fields(payload)
+        if not fields:
             return
-
-        updated = 0
-        attempted = 0
-        fields, metadata_updates = species_paste_fields(payload)
-        updates_by_path: dict[str, dict] = {}
-        for path in self._unique_norm_paths(paths):
-            target_path = self._resolve_source_path_for_action(path) or path
-            if not target_path:
-                continue
-            attempted += 1
-            try:
-                ok = self._meta_proxy.write(target_path, fields)
-            except Exception as exc:
-                _log.warning("[_paste_species_to_paths] source=%r failed: %s", path, exc)
-                continue
-            if not ok:
-                _log.warning("[_paste_species_to_paths] source=%r write returned False", path)
-                continue
-            norm_path = os.path.normpath(path) if path else ""
-            if norm_path:
-                updates_by_path[norm_path] = dict(metadata_updates)
-            updated += 1
-
-        if updates_by_path:
-            self.sync_metadata_edits_for_paths(updates_by_path)
-        self._tree_widget.viewport().update()
-        _log.info(
-            "[_paste_species_to_paths] source_filename=%r bird_species_cn=%r bird_species_en=%r attempted=%s updated=%s",
-            payload.get("filename"),
-            cn,
-            en,
-            attempted,
-            updated,
+        if self._species_paste_controller is None:
+            self._species_paste_controller = MetadataBatchController(self)
+        aliases = [(path, self._resolve_source_path_for_action(path) or path)
+                   for path in self._unique_norm_paths(paths)]
+        writer = self._meta_proxy.write
+        self._species_paste_controller.start_batch(
+            aliases,
+            lambda path, cancelled: MetadataWriteAction(
+                path, fields, updates, writer=writer, cancelled=cancelled,
+            ),
+            "粘贴鸟名",
         )
-        if updated > 0 and self._selected_display_path:
-            selected_norm = os.path.normpath(self._selected_display_path)
-            path_keys = {os.path.normcase(os.path.normpath(p)) for p in paths if p}
-            if os.path.normcase(selected_norm) in path_keys:
-                refreshed_path = self._resolve_source_path_for_action(selected_norm)
-                self.file_selected.emit(refreshed_path or selected_norm)
 
     def _unique_norm_paths(self, paths: list[str]) -> list[str]:
         unique: list[str] = []
@@ -5857,6 +5845,19 @@ class FileListPanel(QWidget):
         self._browser_work_pool.set_thumbnail_mode(self._view_mode == self._MODE_THUMB)
         return self._browser_work_pool
 
+    def metadata_work_pool(self):
+        """Metadata edit/read actions share Viewer's pool; other hosts opt in lazily."""
+        if self._background_shutdown_requested:
+            raise RuntimeError("浏览器正在关闭")
+        pool = self._get_browser_work_pool()
+        if pool is not None:
+            self._sync_shared_pool_budget()
+            return pool
+        if self._metadata_edit_pool is None:
+            self._metadata_edit_pool = BrowserWorkPool(4, 2)
+            self._metadata_edit_pool.set_thumbnail_mode(False)
+        return self._metadata_edit_pool
+
     def background_work_pool(self):
         """Shared pool for host-app ``WorkKind.ANALYSIS`` actions, or ``None`` when unavailable.
 
@@ -5877,13 +5878,17 @@ class FileListPanel(QWidget):
         loader.finished.connect(lambda owned=loader: self._live_pool_loaders.discard(owned))
 
     def _request_worker_pool_shutdown(self):
-        pool = self._browser_work_pool
-        if pool is not None:
-            pool.request_shutdown()
+        for pool in (self._browser_work_pool, self._metadata_edit_pool):
+            if pool is not None:
+                pool.request_shutdown()
 
     def has_pending_pool_work(self):
         pool = self._browser_work_pool
-        return bool(self._live_pool_loaders or (pool is not None and not pool.is_finished()))
+        edits = self._metadata_edit_pool
+        species = self._species_paste_controller
+        return bool(self._live_pool_loaders or (pool is not None and not pool.is_finished())
+                    or (edits is not None and not edits.is_finished())
+                    or (species is not None and species.busy))
 
     def _start_metadata_loader(self, paths: list) -> None:
         if self._background_shutdown_requested:
@@ -6670,6 +6675,10 @@ class FileListPanel(QWidget):
         if self._background_shutdown_requested:
             return
         self._background_shutdown_requested = True
+        self._pending_species_paste = None
+        for controller in (self._species_paste_controller, self._metadata_copy_controller):
+            if controller is not None:
+                controller.request_shutdown()
         self._stop_directory_scan_worker()
         self._pending_directory_listing_result = None
         self._stop_key_navigation_playback(commit=False)
@@ -6740,6 +6749,10 @@ class FileListPanel(QWidget):
                 pass
         if self._browser_work_pool is not None:
             self._browser_work_pool.shutdown()
+        if self._metadata_edit_pool is not None:
+            self._metadata_edit_pool.shutdown()
+        if self._species_paste_controller is not None:
+            self._species_paste_controller.shutdown()
         self._flush_selection_scroll_debug_summary()
         _log_thumb_bottleneck_summary()
         _shutdown_thumb_disk_writer(wait=True)
@@ -7929,7 +7942,7 @@ class FileListPanel(QWidget):
 
     def _add_species_menu_actions(self, menu: QMenu, primary_path: str | None, paths: list[str]) -> None:
         source_path = primary_path or (paths[0] if paths else "")
-        copy_payload = self._get_species_payload_for_path(source_path) if source_path else None
+        copy_payload = FileListPanel._get_species_payload_for_path(self, source_path, allow_metadata_read=False) if source_path else None
         act_copy_species = menu.addAction(self._get_copy_species_action_text(copy_payload))
         act_copy_species.setEnabled(copy_payload is not None)
         if copy_payload is not None:
@@ -7939,8 +7952,11 @@ class FileListPanel(QWidget):
         writes_allowed = self._file_writes_allowed("粘贴鸟名")
         can_paste = (
             writes_allowed
-            and getattr(self, "_copied_species_payload", None) is not None
+            and (getattr(self, "_copied_species_payload", None) is not None
+                 or (self._metadata_copy_controller is not None and self._metadata_copy_controller.pending))
             and bool(paths)
+            and not (self._species_paste_controller and self._species_paste_controller.busy)
+            and not self._background_shutdown_requested
             and bool(self._report_root_dir or self._current_dir)
         )
         act_paste_species.setEnabled(can_paste)
