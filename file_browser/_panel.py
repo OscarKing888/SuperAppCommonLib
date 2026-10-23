@@ -3671,13 +3671,11 @@ class FileListPanel(QWidget):
         # ready (e.g. immediately after a directory switch before layout settles).
         range_data = visible_range if visible_range is not None else self._build_visible_thumbnail_data_source()
         if range_data is not None and range_data.entries:
-            visible_norms = {e.path for e in range_data.entries}
+            paths = (entry.path for entry in range_data.entries)
         else:
-            visible_norms = None  # layout not ready – apply to all (small directories)
+            paths = self._thumb_list_model.all_paths()  # layout not ready – small directories
         applied = 0
-        for norm in self._thumb_list_model.all_paths():
-            if visible_norms is not None and norm not in visible_norms:
-                continue
+        for norm in paths:
             if self._thumb_list_model.has_current_pixmap(norm, self._thumb_size):
                 continue
             cached = self._thumb_memory_cache.get(norm, self._thumb_size)
@@ -3693,7 +3691,7 @@ class FileListPanel(QWidget):
     def _evict_offscreen_item_pixmaps(self, visible_range: "ThumbViewportRange") -> int:
         """Release QPixmap objects stored on items that are well outside the current
         viewport.  This is the primary guard against unbounded RAM growth: the
-        ThumbnailMemoryCache (QImage, bounded at 512 MB) survives, so re-entering
+        ThumbnailMemoryCache (QImage, bounded by its memory budget) survives, so re-entering
         the viewport reloads from memory cache without any disk I/O.
 
         Keeps a buffer of 4 extra rows on each side of the visible range so that
@@ -3708,7 +3706,7 @@ class FileListPanel(QWidget):
         keep_start = max(0, visible_range.start_row - buffer)
         keep_end = min(total - 1, visible_range.end_row + buffer)
         evicted = 0
-        for i in range(total):
+        for i in self._thumb_list_model.pixmap_rows():
             if keep_start <= i <= keep_end:
                 continue
             if self._thumb_list_model.clear_pixmap_for_row(i):
@@ -5028,6 +5026,7 @@ class FileListPanel(QWidget):
             return
         timer = QTimer(self)
         timer.setSingleShot(True)
+        timer.setTimerType(_PreciseTimer)
         timer.timeout.connect(self._update_visible_thumbnail_range)
         self._thumb_viewport_timer = timer
 
@@ -5148,7 +5147,9 @@ class FileListPanel(QWidget):
             return
         self._thumb_profile_add("schedule_calls", 1)
         self._ensure_thumb_viewport_timer()
-        if self._thumb_viewport_timer is not None:
+        # Coalesce to the latest viewport without moving the deadline on every
+        # scroll event; continuous scrolling must keep requesting new images.
+        if self._thumb_viewport_timer is not None and not self._thumb_viewport_timer.isActive():
             self._thumb_viewport_timer.start(25)
 
     def _collect_prefetch_paths(

@@ -963,6 +963,8 @@ class ThumbnailListModel(_BurstGroupMixin, QAbstractListModel):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._entries: list[ThumbnailListEntry] = []
+        # Track identities, not row numbers: sorting/insertion must retain images.
+        self._pixmap_paths: set[str] = set()
         self._row_by_path: dict[str, int] = {}
         self._row_by_path_stale = False
         self._tooltip_fn = None
@@ -1094,6 +1096,7 @@ class ThumbnailListModel(_BurstGroupMixin, QAbstractListModel):
         self.beginResetModel()
         self._entries = []
         self._row_by_path = {}
+        self._pixmap_paths.clear()
         self._mark_burst_groups_dirty()
         self.endResetModel()
 
@@ -1185,6 +1188,8 @@ class ThumbnailListModel(_BurstGroupMixin, QAbstractListModel):
             return 0
         for start, end in reversed(_contiguous_row_ranges(rows)):
             self.beginRemoveRows(QModelIndex(), start, end)
+            for entry in self._entries[start:end + 1]:
+                self._pixmap_paths.discard(os.path.normpath(entry.path))
             del self._entries[start:end + 1]
             self._row_by_path_stale = True
             self._mark_burst_groups_dirty()
@@ -1219,6 +1224,7 @@ class ThumbnailListModel(_BurstGroupMixin, QAbstractListModel):
         self.beginResetModel()
         self._entries = entries
         self._row_by_path = row_by_path
+        self._pixmap_paths.clear()
         self._mark_burst_groups_dirty()
         self.endResetModel()
 
@@ -1393,13 +1399,28 @@ class ThumbnailListModel(_BurstGroupMixin, QAbstractListModel):
         self.dataChanged.emit(self.index(range_start, 0), self.index(range_end, 0), roles)
         return len(changed_rows)
 
+    def pixmap_rows(self) -> tuple[int, ...]:
+        """Snapshot resident image rows without scanning unmaterialized entries."""
+        return tuple(
+            row for path in self._pixmap_paths
+            if (row := self.row_for_path(path)) is not None
+        )
+
+    def _set_pixmap_on_entry(self, entry: ThumbnailListEntry, pixmap: QPixmap | None, thumb_size: int) -> None:
+        entry.pixmap = pixmap if isinstance(pixmap, QPixmap) and not pixmap.isNull() else None
+        entry.thumb_size = int(thumb_size if entry.pixmap is not None else 0)
+        path = os.path.normpath(entry.path)
+        if entry.pixmap is None:
+            self._pixmap_paths.discard(path)
+        else:
+            self._pixmap_paths.add(path)
+
     def set_pixmap_for_path(self, path: str, pixmap: QPixmap | None, thumb_size: int) -> int | None:
         row = self.row_for_path(path)
         if row is None:
             return None
         entry = self._entries[row]
-        entry.pixmap = pixmap if isinstance(pixmap, QPixmap) and not pixmap.isNull() else None
-        entry.thumb_size = int(thumb_size if entry.pixmap is not None else 0)
+        self._set_pixmap_on_entry(entry, pixmap, thumb_size)
         idx = self.index(row, 0)
         self.dataChanged.emit(idx, idx, [_ThumbPixmapRole, _ThumbSizeRole])
         return row
@@ -1416,8 +1437,7 @@ class ThumbnailListModel(_BurstGroupMixin, QAbstractListModel):
             if row is None:
                 continue
             entry = self._entries[row]
-            entry.pixmap = pixmap if isinstance(pixmap, QPixmap) and not pixmap.isNull() else None
-            entry.thumb_size = int(thumb_size if entry.pixmap is not None else 0)
+            self._set_pixmap_on_entry(entry, pixmap, thumb_size)
             changed_rows.append(row)
         if not changed_rows:
             return []
@@ -1457,18 +1477,19 @@ class ThumbnailListModel(_BurstGroupMixin, QAbstractListModel):
             return False
         entry.pixmap = None
         entry.thumb_size = 0
+        self._pixmap_paths.discard(os.path.normpath(entry.path))
         idx = self.index(row, 0)
         self.dataChanged.emit(idx, idx, [_ThumbPixmapRole, _ThumbSizeRole])
         return True
 
     def clear_all_pixmaps(self) -> int:
         changed = 0
-        for row, entry in enumerate(self._entries):
-            if entry.pixmap is None and int(entry.thumb_size or 0) == 0:
-                continue
+        for row in self.pixmap_rows():
+            entry = self._entries[row]
             entry.pixmap = None
             entry.thumb_size = 0
             changed += 1
+        self._pixmap_paths.clear()
         if changed and self._entries:
             self.dataChanged.emit(
                 self.index(0, 0),

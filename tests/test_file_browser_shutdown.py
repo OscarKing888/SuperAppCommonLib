@@ -69,7 +69,7 @@ def test_metadata_bursts_coalesce_before_model_updates(panel, monkeypatch):
     updates = []
     monkeypatch.setattr(panel._file_table_model, "set_meta_for_paths", lambda items, **kw: updates.append(list(items)) or len(items))
     panel._view_mode = panel._MODE_LIST
-    paths = [f"中文/photo-{i}.jpg" for i in range(24)]
+    paths = [os.path.normpath(f"中文/photo-{i}.jpg") for i in range(24)]
     panel._begin_meta_apply_session(len(paths), ordered_paths=paths)
     for start in range(0, len(paths), 8):
         panel._enqueue_meta_apply({p: {"rating": 4} for p in paths[start:start + 8]})

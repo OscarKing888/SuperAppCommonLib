@@ -90,6 +90,8 @@ def test_refresh_failure_and_cancellation_keep_old_cache(tmp_path, monkeypatch):
 
 
 def test_refresh_without_scope_uses_local_cache(tmp_path, monkeypatch):
+    # A developer's home may contain .superpicky above pytest's temporary root.
+    monkeypatch.setattr(core, "_find_cache_superpicky_dir_for_file", lambda *_a, **_k: "")
     monkeypatch.setattr(core, "_thumb_disk_cache_dir", lambda: str(tmp_path / "local"))
     task = task_for(tmp_path, refresh=True, scoped=False)
     assert thumbs.PersistentThumbCacheWorker._process_task(task, threading.Event())[1:] == (1, 0, 0)
