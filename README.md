@@ -14,6 +14,7 @@ submodule 使用。共享代码改动必须同时保持两个应用的行为兼�
   - `config.py`：`load_about_info(override_path=None)` 从 about.cfg 加载，可选外部文件覆盖
   - `dialog.py`：`show_about_dialog(parent, about_info, logo_path=..., banner_path=...)`
 - **exif_io**：EXIF/XMP 读取和 XMP sidecar 写入
+- **exif_io.export_xmp**：只读提取原图 XMP（含扩展段）、侧车优先合并及成片侧车几何校正；未知 RDF 属性与命名空间完整保留。
   - `exiftools_mac`：macOS 下的 exiftools 工具
   - `exiftools_win`：Windows 下的 exiftools 工具
 - **file_browser**：可排序/过滤的列表与缩略图浏览器
@@ -40,6 +41,7 @@ submodule 使用。共享代码改动必须同时保持两个应用的行为兼�
   原图，也不回写 `report.db`。宽松的 DxO 派生 stem 或父目录 XMP 回退只用于
   读取；复制、移动、粘贴、删除及写入使用
   `exif_io.find_same_stem_xmp_sidecar()`。
+- 降噪、照片编辑和 BirdStamp 的成片/中间帧也使用独立 XMP；`image_export` 仅向图片写入既有 EXIF/ICC，不把侧车字段重新内嵌到 JPEG/PNG/TIFF。成片侧车先合并只读内嵌字段，再按流程校正几何与配方/来源。
 - 文件粘贴把一个 clipboard payload 中的主图和 XMP 作为一次事务：全部先
   stage，再提交；任一异常会回滚全部已复制/移动的文件。
 - `report.db` 缓存按完整路径、root-relative 路径和 root-scoped 唯一 stem

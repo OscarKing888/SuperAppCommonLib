@@ -61,9 +61,10 @@ def test_real_export_bakes_once_preserves_chinese_and_originals(photo,format):
     assert not any(n.tag.startswith("{"+CRS+"}") or any(k.startswith("{"+CRS+"}") for k in n.attrib) for n in tree.iter())
     assert "保留" in output.with_suffix(".xmp").read_text("utf-8")
     embedded = json.loads(exiftool("-j","-G1","-n",str(output)))[0]
-    assert embedded["XMP-dc:Title"]=="白鹭调色"
-    assert not any(key.startswith("XMP-crs:") for key in embedded)
-    assert embedded["XMP-tiff:Orientation"]==1
+    assert not any(key.startswith("XMP-") for key in embedded)
+    sidecar = json.loads(exiftool("-j","-G1","-n",str(output.with_suffix('.xmp'))))[0]
+    assert sidecar["XMP-dc:Title"]=="白鹭调色"
+    assert sidecar["XMP-tiff:Orientation"]==1
     if format != "jpeg":
         pixels = tifffile.imread(output) if format=="tiff" else imagecodecs.png_decode(output.read_bytes())
         assert pixels.dtype==np.uint16 and np.unique(pixels[0,:,0]).size>1000

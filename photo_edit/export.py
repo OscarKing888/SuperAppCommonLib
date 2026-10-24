@@ -7,6 +7,7 @@ import xml.etree.ElementTree as ET
 import numpy as np
 
 from app_common.exif_io.photo_meta import PhotoMetaDataXMP
+from app_common.exif_io.export_xmp import read_export_xmp
 from app_common.exif_io.xmp_sidecar import _photo_descriptions
 from app_common.image_export import export_pixels, copy_output_metadata
 from app_common.image_output_paths import ImageOutputOptions, allocate_outputs, validate_output_options
@@ -27,7 +28,7 @@ CRS = "http://ns.adobe.com/camera-raw-settings/1.0/"
 def _prepare(state, staged, width, height, camera_crop=None):
     metadata = PhotoMetaDataXMP()
     source_sidecar = metadata.sidecar_path_for(state.source)
-    tree = ET.parse(source_sidecar) if source_sidecar.exists() else metadata._new_xmp_tree()
+    tree = ET.ElementTree(ET.fromstring(read_export_xmp(Path(state.source))))
     metadata._hydrate_report_db_fields_if_needed(state.source, tree)
     descriptions = _photo_descriptions(tree.getroot(),state.source,sidecar_path=str(source_sidecar))
     if not descriptions:

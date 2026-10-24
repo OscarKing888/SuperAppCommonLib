@@ -115,20 +115,15 @@ def copy_output_metadata(source: Path, staged_image: Path, staged_sidecar: Path,
     # 不块拷贝 RAW/TIFF 的 IFD0 或 MakerNotes：其中隐藏数据和偏移属于原始布局。
     # ExifIFD:all 本身也会带入 MakerNotes，必须显式排除整个二进制块；
     # 仅排除 MakerNotes:all（组内字段）仍会产生损坏的 Sony TIFF 隐藏数据引用。
-    exclusions = ["--XMP-crs:all"] if strip_edit_settings else []
+    # XMP 只存于 staged_sidecar；禁止在成片中再次内嵌（JPEG 有单段容量限制）。
     _exiftool(["-TagsFromFile", str(source), "-ExifIFD:all", "-GPS:all", "-InteropIFD:all",
                "--MakerNotes", "-IFD0:Make", "-IFD0:Model", "-IFD0:Artist", "-IFD0:Copyright",
-               "-IFD0:ImageDescription", "-IFD0:ModifyDate", "-XMP:all", "-IPTC:all",
-               *exclusions, str(staged_image)],
+               "-IFD0:ImageDescription", "-IFD0:ModifyDate", "-IPTC:all", str(staged_image)],
               allow_empty=True)
     check_cancelled(cancelled)
-    # 用户侧车中的标准字段优先；未知 namespace 完整保留在配套侧车中。
-    _exiftool(["-TagsFromFile", str(staged_sidecar), "-XMP:all", str(staged_image)])
     height, width = rgb.shape[:2]
-    args = ["-IFD0:Orientation#=1", "-XMP-tiff:Orientation#=1", "-ExifIFD:ColorSpace#=1",
+    args = ["-IFD0:Orientation#=1", "-ExifIFD:ColorSpace#=1",
             f"-ExifIFD:ExifImageWidth={width}", f"-ExifIFD:ExifImageHeight={height}",
-            f"-XMP-tiff:ImageWidth={width}", f"-XMP-tiff:ImageHeight={height}",
-            f"-XMP-exif:ExifImageWidth={width}", f"-XMP-exif:ExifImageHeight={height}",
             f"-ICC_Profile<={icc_path}"]
     if staged_image.suffix.lower() in (".jpg", ".jpeg"):
         # 只制作元数据小图，TIFF 主像素始终通过 uint16 数组写出。
