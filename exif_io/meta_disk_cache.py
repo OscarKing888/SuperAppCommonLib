@@ -16,8 +16,10 @@
 from __future__ import annotations
 
 import atexit
+from contextlib import contextmanager
 import json
 import os
+from pathlib import Path
 import sqlite3
 import threading
 
@@ -41,6 +43,11 @@ def _get_connection(db_path: str) -> tuple["sqlite3.Connection | None", "threadi
         if conn is not None and lock is not None:
             return conn, lock
         try:
+            # 已被改名/移走的照片目录不能被迟到的缓存写入重新创建。
+            parent = Path(os.path.abspath(norm_db)).parent
+            for ancestor in (parent, *parent.parents):
+                if ancestor.name == ".superpicky" and not ancestor.parent.is_dir():
+                    return None, None
             os.makedirs(os.path.dirname(norm_db), exist_ok=True)
             conn = sqlite3.connect(norm_db, check_same_thread=False)
             conn.execute("PRAGMA journal_mode=WAL")
@@ -138,6 +145,18 @@ def put_many(
     return len(rows)
 
 
+@contextmanager
+def directory_file_operation(directory):
+    """短暂释放目录内缓存句柄，并在文件系统操作期间阻止重新打开。"""
+    root = Path(os.path.abspath(directory))
+    with _POOL_LOCK:
+        for path in list(_CONNECTIONS):
+            if Path(os.path.abspath(path)).is_relative_to(root):
+                with _DB_LOCKS.pop(path):
+                    _CONNECTIONS.pop(path).close()
+        yield
+
+
 def close_all() -> None:
     """关闭所有连接（应用退出或测试清理时调用）。"""
     with _POOL_LOCK:
@@ -157,4 +176,5 @@ __all__ = [
     "get_many",
     "put_many",
     "close_all",
+    "directory_file_operation",
 ]

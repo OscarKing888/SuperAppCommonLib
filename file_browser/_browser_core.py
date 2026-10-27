@@ -1950,6 +1950,11 @@ def _report_row_candidate_paths(row: dict, report_root: str) -> list[str]:
             candidates.append(os.path.normpath(str(Path(current_full).with_suffix(original_ext))))
         except Exception:
             pass
+    # 文件系统操作只登记会话内的真实路径，不改写报告中的原始字段。
+    for candidate in tuple(candidates):
+        actual = _get_cached_actual_path(candidate)
+        if actual and actual not in candidates:
+            candidates.append(actual)
     return candidates
 
 
@@ -2410,10 +2415,18 @@ def _thumbnail_loader_batch_size(worker_count: int) -> int:
 def _get_cached_actual_path(path: str) -> str | None:
     if not path:
         return None
-    actual = _ACTUAL_PATH_CACHE.get(_path_key(path))
-    if actual:
-        return os.path.normpath(actual)
-    return None
+    actual = None
+    seen = {_path_key(path)}
+    # 连续目录改名保留原报告路径，经会话别名追到最新位置；循环或异常长链有界退出。
+    for _ in range(32):
+        next_path = _ACTUAL_PATH_CACHE.get(_path_key(actual or path))
+        if not next_path:
+            break
+        if _path_key(next_path) in seen:
+            return actual or os.path.normpath(next_path)
+        actual = os.path.normpath(next_path)
+        seen.add(_path_key(actual))
+    return actual
 
 
 def _set_cached_actual_path(source_path: str, actual_path: str) -> None:
