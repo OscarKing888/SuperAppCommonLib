@@ -88,13 +88,13 @@ def apply_fields(record, fields, subject_states=None):
                                "IFD0:XPComment", "IFD0:ImageDescription", "EXIF:UserComment", "ExifIFD:UserComment",
                                "EXIF:ImageDescription", "UserComment", "IPTC:Caption-Abstract"),
         "xmp-xmp:rating": ("rating",), "xmp-xmpdm:pick": ("pick",),
-        "xmp-tiff:model": ("camera_model", "EXIF:Model", "IFD0:Model"),
-        "xmp-aux:lens": ("lens_model", "XMP-aux:LensModel", "ExifIFD:LensModel"),
+        "xmp-tiff:model": ("Model", "camera_model", "EXIF:Model", "IFD0:Model"),
+        "xmp-aux:lens": ("Lens", "LensModel", "lens_model", "XMP-aux:LensModel", "ExifIFD:LensModel"),
         "xmp-exif:isospeedratings": ("iso", "ISO", "ExifIFD:ISO", "XMP-exif:PhotographicSensitivity"),
-        "xmp-exif:exposuretime": ("shutter", "ExifIFD:ExposureTime"),
-        "xmp-exif:fnumber": ("aperture", "ExifIFD:FNumber"),
-        "xmp-exif:focallength": ("focal_length", "ExifIFD:FocalLength"),
-        "xmp-exif:datetimeoriginal": ("date_time_original", "ExifIFD:DateTimeOriginal"),
+        "xmp-exif:exposuretime": ("ExposureTime", "shutter", "ExifIFD:ExposureTime"),
+        "xmp-exif:fnumber": ("FNumber", "aperture", "ExifIFD:FNumber"),
+        "xmp-exif:focallength": ("FocalLength", "focal_length", "ExifIFD:FocalLength"),
+        "xmp-exif:datetimeoriginal": ("DateTimeOriginal", "date_time_original", "ExifIFD:DateTimeOriginal"),
     }
     for key, value in fields.items():
         for previous in list(result):

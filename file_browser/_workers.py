@@ -45,6 +45,68 @@ _REPORT_FAST_PATH_BROWSER_COLUMNS = (
 )
 
 
+def _merge_browser_metadata(previous: dict | None, incoming: dict) -> dict:
+    """Partial reads are patches; successful complete reads replace old fields."""
+    return {**(previous or {}), **incoming} if incoming.get("_metadata_complete") is False else incoming
+
+
+def _sparse_browser_metadata(rec: dict, meta: dict) -> dict:
+    """Do not turn absent fields in a pending/failed read into explicit clears.
+
+    Match semantic names across EXIF, XMP, report and parsed aliases. Presence,
+    rather than truthiness, retains an explicit empty string, list, zero or False.
+    """
+    names = {str(key).split(":")[-1].removeprefix("report.").lower() for key in rec}
+    aliases = {
+        "title": {"title", "xptitle", "objectname"},
+        "comment": {"comment", "description", "imagedescription", "usercomment", "xpcomment", "caption-abstract", "caption"},
+        "tags": {"tags", "photo_tags", "subject", "subjects", "keywords"},
+        "color": {"label", "color"},
+        "pick": {"pick", "picklabel"},
+        "shutter": {"shutter", "shutter_speed", "exposuretime", "shutterspeed"},
+        "aperture": {"aperture", "fnumber"},
+        "iso": {"iso", "photographicsensitivity", "isospeedratings"},
+        "focal_length": {"focal_length", "focallength"},
+        "camera_model": {"camera_model", "model", "cameramodelname"},
+        "lens_model": {"lens_model", "lensmodel", "lens"},
+        "date_time_original": {"date_time_original", "datetimeoriginal", "subsecdatetimeoriginal", "createdate"},
+        "city": {"city"},
+        "state": {"state", "province-state"},
+        "country": {"country", "country-primarylocationname"},
+        "sharpness": {"sharpness", "city", "adj_sharpness", "head_sharp"},
+        "aesthetic": {"aesthetic", "state", "province-state", "adj_topiq", "state_province"},
+        "focus_status": {"focus_status", "country", "country-primarylocationname"},
+        "gbif_rarity_100": {"gbif_rarity_100", "event", "birdid_rarity_missing", "birdid_rarity_source"},
+        "iucn_category": {"iucn_category", "intellectualgenre", "birdid_rarity_missing", "birdid_rarity_source"},
+        "pinyin_name": {"pinyin_name", "bird_species_pinyin", "bird_pinyin", "pinyin"},
+    }
+    result = {key: value for key, value in meta.items()
+              if key == "_metadata_revision" or names.intersection(aliases.get(key, {key.lower()}))}
+    result["_metadata_complete"] = False
+    # A pending edit says nothing about whether focus extraction ran. Preserve
+    # an actual box or explicit RAW check, but do not invent a checked miss.
+    result.pop("focus_box_checked", None)
+    if meta.get("focus_box") is not None:
+        result["focus_box"] = meta["focus_box"]
+        result["focus_box_checked"] = True
+    elif rec.get(_RAW_FOCUS_CHECKED_KEY):
+        result["focus_box_checked"] = True
+    if "rating" in names and meta.get("pick") == -1:
+        result["pick"] = -1
+    if "bird_species_cn" in names:
+        result["bird_species_cn"] = _metadata_text_from_candidates(rec, "bird_species_cn")
+    # Optional values are omitted by the complete-row parser when empty. A
+    # partial row must retain their explicit reset so old values are removed.
+    from app_common.bird_sharpness_fields import (
+        FIELD_VERDICT, FIELD_HEAD_SIGMA, FIELD_BODY_SIGMA, FIELD_SIGMA, FIELD_REGION, FIELD_BIRD_COUNT,
+    )
+    for key in ("burst_id", "burst_position", FIELD_VERDICT, FIELD_HEAD_SIGMA,
+                FIELD_BODY_SIGMA, FIELD_SIGMA, FIELD_REGION, FIELD_BIRD_COUNT):
+        if key in names:
+            result.setdefault(key, None)
+    return result
+
+
 def _metadata_has_value(value) -> bool:
     return value is not None and (not isinstance(value, str) or value.strip() != "")
 
@@ -1090,6 +1152,9 @@ class MetadataLoader(QThread):
                     _log.warning("Video metadata failed path=%r: %s", path, exc)
                     result[norm]["video_info"] = {}
                     failed_paths.add(norm)
+        for norm in failed_paths:
+            if norm in result:
+                result[norm]["_metadata_complete"] = False
         return result
 
     @staticmethod
@@ -1347,7 +1412,7 @@ class MetadataLoader(QThread):
             if value is not None:
                 meta[key] = value
         meta.update(_bird_sharpness_browser_meta_fields(rec))
-        return meta
+        return _sparse_browser_metadata(rec, meta) if rec.get("_metadata_complete") is False else meta
 
     def _resolve_focus_source_path(self, display_path: str) -> str:
         norm_display = os.path.normpath(display_path) if display_path else ""

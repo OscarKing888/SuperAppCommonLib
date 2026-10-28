@@ -636,3 +636,20 @@ def test_file_barriers_in_all_pool_slots_sync_inline_without_starvation(store, t
     finally:
         store.detach_pool(pool)
         assert pool.shutdown(timeout=5)
+
+
+@pytest.mark.parametrize("field, old, new, aliases", [
+    ("XMP-tiff:Model", "旧相机", "新相机", ("Model", "camera_model", "IFD0:Model")),
+    ("XMP-aux:Lens", "旧镜头", "新镜头", ("Lens", "LensModel", "lens_model")),
+    ("XMP-exif:FNumber", 2.8, 5.6, ("FNumber", "aperture", "ExifIFD:FNumber")),
+    ("XMP-exif:ExposureTime", "1/100", "1/200", ("ExposureTime", "shutter")),
+    ("XMP-exif:FocalLength", 100, 200, ("FocalLength", "focal_length")),
+    ("XMP-exif:DateTimeOriginal", "2020:01:01 00:00:00", "2026:10:28 01:02:03",
+     ("DateTimeOriginal", "date_time_original")),
+])
+def test_pending_camera_edits_replace_bare_full_metadata_aliases(store, tmp_path, field, old, new, aliases):
+    path = photo(tmp_path)
+    store.remember_many({path: {alias: old for alias in aliases}}, profile="full-pillow").result(3)
+    store.submit_edit(path, {field: new}).result(3)
+    for record in (store.peek(path, profile="full-pillow"), store.read_many([path], profile="full-pillow")[path]):
+        assert all(record[alias] == new for alias in aliases)

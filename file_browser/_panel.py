@@ -1123,7 +1123,9 @@ class FileListPanel(QWidget):
                 continue
             record = store.peek(path, profile="browser")
             if record is not None:
-                self._meta_cache[norm] = MetadataLoader._parse_rec(record)
+                self._meta_cache[norm] = _merge_browser_metadata(
+                    self._meta_cache.get(norm), MetadataLoader._parse_rec(record),
+                )
         self._applying_directory_snapshot = True
         try:
             self._apply_directory_listing_result(
@@ -1158,7 +1160,7 @@ class FileListPanel(QWidget):
         SuperViewer 会先把自定义标签同步到 _meta_cache；仅有 tags 时不能视为
         浏览器 metadata 已加载，否则会跳过 XMP 星级/Pick/注释读取。
         """
-        if not isinstance(meta, dict) or not meta:
+        if not isinstance(meta, dict) or not meta or meta.get("_metadata_complete") is False:
             return False
         if "focus_box" not in meta and not bool(meta.get("focus_box_checked")):
             return False
@@ -7343,7 +7345,8 @@ class FileListPanel(QWidget):
         _log.debug("[_on_metadata_batch_ready] START entries=%s", len(meta_dict))
         t0 = _time.perf_counter()
         total = len(meta_dict)
-        meta_dict = {path: metadata for path, metadata in meta_dict.items()
+        meta_dict = {path: _merge_browser_metadata(self._meta_cache.get(path), metadata)
+                     for path, metadata in meta_dict.items()
                      if int(metadata.get("_metadata_revision", 0)) >=
                         int(self._meta_cache.get(path, {}).get("_metadata_revision", 0))}
         self._meta_cache.update(meta_dict)

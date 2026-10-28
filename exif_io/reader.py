@@ -463,6 +463,28 @@ def read_full_metadata_snapshot(paths, source_reader, *, profile="full", cancell
                         out[Path(path)].update(current)
         except Exception:
             pass
+    # A changed source/sidecar cannot be cached, but its provisional display
+    # must still include accepted edits. In particular, synchronization can
+    # change the fingerprint after XML was read and consume the pending patch.
+    for path in fresh.keys() - stable.keys():
+        record = out[Path(path)]
+        if store is not None:
+            try:
+                if store.current_revision(path) > expected.get(path, 0):
+                    current = store.read_many([path], profile=profile).get(path) or store.peek(path)
+                    if current:
+                        record.update(current)
+                pending = store.pending_edits(path)
+                if pending:
+                    from .metadata_store import apply_fields, resource_key
+                    record = apply_fields(record, pending["fields"], pending["subject_states"])
+                    record["_metadata_revision"] = pending["revision"]
+                    record["_metadata_resource"] = resource_key(path)
+            except Exception:
+                pass
+        # Do not label a mixture of two file versions as a complete snapshot.
+        record.update(_metadata_read_ok=False, _metadata_complete=False, _metadata_refresh_failed=True)
+        out[Path(path)] = record
     if failed and store is not None:
         try:
             # A transient ExifTool/Pillow failure cannot erase an earlier full

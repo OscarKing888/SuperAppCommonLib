@@ -180,3 +180,91 @@ def test_listed_sidecar_siblings_group_raw_and_jpeg_of_one_shot(tmp_path) -> Non
     assert FileListPanel.listed_sidecar_siblings(panel, other) == [other]
     assert FileListPanel.listed_sidecar_siblings(panel, elsewhere) == []
     assert FileListPanel.listed_sidecar_siblings(panel, "") == []
+
+
+def test_pending_only_snapshot_preserves_unrelated_browser_fields(tmp_path):
+    from types import SimpleNamespace
+    from app_common.exif_io.metadata_store import get_store
+    from app_common.file_browser._workers import MetadataLoader
+
+    path = str(tmp_path / "白鹭.jpg")
+    store = get_store()
+    store.remember_many({path: {"ExifIFD:ISO": 800, "XMP-dc:Subject": ["飞行"],
+                               "XMP-dc:Description": "原备注"}}).result(3)
+    old = MetadataLoader._parse_rec(store.read_many([path])[path])
+    store.invalidate_paths([path]).result(3)
+    store.submit_edit(path, {"description": "新中文备注"}).result(3)
+    partial = MetadataLoader._parse_rec(store.read_many([path])[path])
+    assert partial.get("_metadata_complete") is False
+    assert "focus_box_checked" not in partial
+    queued = []
+    panel = SimpleNamespace(_meta_cache={path: old}, _is_current_metadata_sender=lambda: True,
+                            _remember_directory_snapshot=lambda **kwargs: None,
+                            _enqueue_meta_apply=queued.append)
+    FileListPanel._on_metadata_batch_ready(panel, {path: partial})
+    assert panel._meta_cache[path]["comment"] == "新中文备注"
+    assert panel._meta_cache[path]["iso"] == "800"
+    assert panel._meta_cache[path]["tags"] == ["飞行"]
+    assert queued[-1][path] == panel._meta_cache[path]
+
+
+def test_partial_browser_snapshot_preserves_explicit_clears_and_zero():
+    from types import SimpleNamespace
+    from app_common.file_browser._workers import MetadataLoader
+    partial = MetadataLoader._parse_rec({"_metadata_complete": False, "_metadata_revision": 2,
+                                         "XMP-dc:Description": "", "XMP-dc:Subject": [],
+                                         "XMP-xmp:Rating": 0, "XMP-xmpDM:pick": False})
+    panel = SimpleNamespace(_meta_cache={"photo": {"comment": "旧备注", "tags": ["飞行"],
+                                                  "rating": 5, "pick": 1, "iso": "800"}},
+                            _is_current_metadata_sender=lambda: True,
+                            _remember_directory_snapshot=lambda **kwargs: None,
+                            _enqueue_meta_apply=lambda batch: None)
+    FileListPanel._on_metadata_batch_ready(panel, {"photo": partial})
+    result = panel._meta_cache["photo"]
+    assert (result["comment"], result["tags"], result["rating"], result["pick"]) == ("", [], 0, 0)
+    assert result["iso"] == "800"
+    # A completed empty read must still replace and clear previous values.
+    FileListPanel._on_metadata_batch_ready(panel, {"photo": MetadataLoader._parse_rec({"_metadata_revision": 3})})
+    assert panel._meta_cache["photo"]["iso"] == ""
+
+
+def test_pending_only_directory_snapshot_keeps_previous_camera_and_tags(tmp_path):
+    from types import SimpleNamespace
+    from app_common.exif_io.metadata_store import get_store
+
+    path = str(tmp_path / "白鹭.jpg")
+    store = get_store()
+    store.submit_edit(path, {"description": "新备注"}).result(3)
+    old = {"iso": "800", "tags": ["飞行"], "comment": "旧备注", "_metadata_revision": 0}
+    panel = SimpleNamespace(_meta_cache={}, _current_dir=str(tmp_path), _include_subdirectories=False,
+                            _apply_directory_listing_result=lambda *args, **kwargs: None)
+    FileListPanel._show_directory_snapshot(panel, {"files": [path], "metadata": {path: old}})
+    assert panel._meta_cache[path]["comment"] == "新备注"
+    assert panel._meta_cache[path]["iso"] == "800"
+    assert panel._meta_cache[path]["tags"] == ["飞行"]
+    assert not FileListPanel._metadata_cache_has_browser_fields(panel._meta_cache[path])
+
+
+def test_stale_partial_browser_update_cannot_override_newer_metadata():
+    from types import SimpleNamespace
+    old = {"iso": "800", "comment": "新备注", "_metadata_revision": 3}
+    panel = SimpleNamespace(_meta_cache={"photo": old.copy()}, _is_current_metadata_sender=lambda: True,
+                            _remember_directory_snapshot=lambda **kwargs: None,
+                            _enqueue_meta_apply=lambda batch: None)
+    FileListPanel._on_metadata_batch_ready(panel, {"photo": {"_metadata_complete": False,
+                                                           "_metadata_revision": 2, "comment": "迟到旧备注"}})
+    assert panel._meta_cache["photo"] == old
+
+
+def test_partial_browser_snapshot_keeps_optional_explicit_resets():
+    from app_common.file_browser._workers import MetadataLoader, _merge_browser_metadata
+    partial = MetadataLoader._parse_rec({"_metadata_complete": False,
+                                         "XMP-superpicky:burst_id": "",
+                                         "XMP-superpicky:bird_species_cn": "",
+                                         "XMP-superpicky:bird_sharpness_sigma": ""})
+    result = _merge_browser_metadata({"burst_id": 4, "bird_species_cn": "白鹭",
+                                       "bird_sharpness_sigma": 2.0, "iso": "800"}, partial)
+    assert result["burst_id"] is None
+    assert result["bird_species_cn"] == ""
+    assert result["bird_sharpness_sigma"] is None
+    assert result["iso"] == "800"

@@ -132,3 +132,45 @@ def test_cancelled_read_does_not_publish_partial_complete_snapshot(store, photo)
 
     assert reader.read_full_metadata_snapshot([photo], source, cancelled=stopped.is_set) == {}
     assert store.read_many([os.path.normpath(str(photo))], profile="full") == {}
+
+
+def test_changed_source_during_read_still_overlays_accepted_edit(store, photo):
+    def changing_source(paths):
+        photo.write_bytes(photo.read_bytes() + b"external source change")
+        store.submit_edit(str(photo), {"title": "已提交的新鸟名"}).result(3)
+        return {photo: {"SourceFile": str(photo), "Title": "读取开始时的旧鸟名"}}
+
+    result = reader.read_full_metadata_snapshot([photo], changing_source)[photo]
+    assert result["Title"] == "已提交的新鸟名"
+    assert result["_metadata_revision"] == store.current_revision(str(photo))
+    # Unstable source data cannot become a validated full snapshot.
+    assert store.peek(str(photo), profile="full") is None
+
+
+def test_sidecar_sync_after_xml_read_cannot_return_pre_edit_metadata(store, photo, monkeypatch):
+    from app_common.exif_io import xmp_sidecar
+    original = xmp_sidecar.read_xmp_sidecar
+    edited = False
+
+    def read_then_edit(path):
+        nonlocal edited
+        rows = original(path)
+        if not edited:
+            edited = True
+            store.submit_edit(str(photo), {"title": "已同步的新鸟名"}).result(3)
+            assert store.flush_paths([str(photo)])
+        return rows
+
+    monkeypatch.setattr(xmp_sidecar, "read_xmp_sidecar", read_then_edit)
+    result = reader.read_full_metadata_snapshot(
+        [photo], lambda paths: {photo: {"SourceFile": str(photo), "Title": "旧鸟名"}},
+    )[photo]
+    assert result["Title"] == "已同步的新鸟名"
+    assert result["_metadata_complete"] is False
+    assert store.pending_edits(str(photo)) is None
+    assert PhotoMetaDataXMP().read(str(photo))["Title"] == "已同步的新鸟名"
+    refreshed = reader.read_full_metadata_snapshot(
+        [photo], lambda paths: {photo: {"SourceFile": str(photo), "Title": "原图鸟名"}},
+    )[photo]
+    assert refreshed["Title"] == "已同步的新鸟名"
+    assert refreshed["_metadata_complete"] is True
