@@ -21,6 +21,9 @@ METADATA_MEMORY_MAX_MB = 4096
 # Birds measured per photo by bird sharpness; 0 = no limit (birds on the focus box go first when limited).
 KEY_BIRD_SHARPNESS_MAX_BIRDS = "bird_sharpness_max_birds"
 BIRD_SHARPNESS_MAX_BIRDS_LIMIT = 999
+# 调度选项不参与图像分析参数或算法版本；0 沿用自动并发。
+KEY_BIRD_SHARPNESS_WORKERS = "bird_sharpness_workers"
+BIRD_SHARPNESS_WORKERS_MAX = 64
 # How bird sharpness reads blur from the strongest edges: "standard" (default) or "dense".
 KEY_BIRD_SHARPNESS_EDGE_ESTIMATOR = "bird_sharpness_edge_estimator"
 BIRD_SHARPNESS_EDGE_ESTIMATORS = ("standard", "dense")
@@ -157,6 +160,7 @@ _DEFAULT_OPTIONS = {
     "keep_view_on_switch": 1,
     KEY_PERF_PROBES_ENABLED: 0,
     KEY_BIRD_SHARPNESS_MAX_BIRDS: 0,
+    KEY_BIRD_SHARPNESS_WORKERS: 0,
     KEY_BIRD_SHARPNESS_EDGE_ESTIMATOR: "standard",
     **{key: limits[0] for key, limits in BIRD_SHARPNESS_INT_LIMITS.items()},
     **{key: choice[0] for key, choice in BIRD_SHARPNESS_TEXT_CHOICES.items()},
@@ -277,6 +281,11 @@ def normalize_user_options(data: dict | None) -> dict[str, int | str]:
     except (TypeError, ValueError, OverflowError):
         value = 0
     normalized[KEY_BIRD_SHARPNESS_MAX_BIRDS] = max(0, min(BIRD_SHARPNESS_MAX_BIRDS_LIMIT, value))
+    try:
+        value = int(source.get(KEY_BIRD_SHARPNESS_WORKERS, 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        value = 0
+    normalized[KEY_BIRD_SHARPNESS_WORKERS] = max(0, min(BIRD_SHARPNESS_WORKERS_MAX, value))
     value = source.get(KEY_BIRD_SHARPNESS_EDGE_ESTIMATOR)
     if isinstance(value, str) and value in BIRD_SHARPNESS_EDGE_ESTIMATORS:
         normalized[KEY_BIRD_SHARPNESS_EDGE_ESTIMATOR] = value
@@ -460,6 +469,24 @@ def get_bird_sharpness_max_birds() -> int:
     """Birds measured per photo by bird sharpness; 0 means no limit."""
     with _OPTIONS_LOCK:
         return int(_RUNTIME_OPTIONS[KEY_BIRD_SHARPNESS_MAX_BIRDS])
+
+
+def get_bird_sharpness_workers() -> int:
+    """Resolved analysis concurrency for the next batch; environment overrides settings.
+
+    A positive ``SuperViewer_ANALYSIS_WORKERS`` keeps its existing precedence.
+    Both explicit sources are bounded to 64; zero/invalid environment values
+    fall through to the setting, whose zero means CPU/2 (at most six).
+    """
+    try:
+        override = int(os.environ.get("SuperViewer_ANALYSIS_WORKERS", "0"))
+    except (TypeError, ValueError, OverflowError):
+        override = 0
+    if override > 0:
+        return min(BIRD_SHARPNESS_WORKERS_MAX, override)
+    with _OPTIONS_LOCK:
+        workers = int(_RUNTIME_OPTIONS[KEY_BIRD_SHARPNESS_WORKERS])
+    return workers or min(6, max(1, (os.cpu_count() or 2) // 2))
 
 
 def get_bird_sharpness_edge_estimator() -> str:

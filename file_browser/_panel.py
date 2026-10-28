@@ -5915,15 +5915,19 @@ class FileListPanel(QWidget):
         get_store().attach_pool(self._metadata_edit_pool)
         return self._metadata_edit_pool
 
-    def background_work_pool(self):
+    def background_work_pool(self, *, analysis_workers: int | None = None):
         """Shared pool for host-app ``WorkKind.ANALYSIS`` actions, or ``None`` when unavailable.
 
         Actions submitted here are owned by the browser: shutdown cancels queued
         work and waits for running actions (see ``has_pending_pool_work``).
+        Only a new analysis batch passes ``analysis_workers``; other consumers
+        reuse the current quota. Busy analysis batches keep their existing limit.
         """
         if self._background_shutdown_requested:
             return None
         pool = self._get_browser_work_pool()
+        if pool is not None and analysis_workers is not None:
+            pool.configure_analysis_workers(analysis_workers)
         if pool is None or getattr(pool, "analysis_workers", 0) <= 0:
             return None
         return pool

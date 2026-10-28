@@ -472,3 +472,291 @@ def test_queued_analysis_is_cancelled_on_shutdown_and_pool_without_capacity_reje
             plain.submit_action(_Action(lambda: None), kind=WorkKind.ANALYSIS)
     finally:
         assert plain.shutdown(timeout=3)
+
+
+def test_twelve_analysis_workers_keep_two_metadata_slots_and_one_thumbnail_slot():
+    from app_common.file_browser._work_action import CallableAction
+
+    pool = BrowserWorkPool(12, 2, analysis_workers=6)
+    original_threads = tuple(pool._threads)
+    release = threading.Event()
+    entered = threading.Barrier(13)
+    metadata_entered = threading.Barrier(3)
+    thumbnail_entered = threading.Event()
+
+    def analysis():
+        entered.wait(timeout=3)
+        assert release.wait(5)
+
+    def metadata():
+        metadata_entered.wait(timeout=3)
+        assert release.wait(5)
+
+    def thumbnail():
+        thumbnail_entered.set()
+        assert release.wait(5)
+
+    try:
+        assert pool.configure_analysis_workers(12) == 12
+        assert tuple(pool._threads[:12]) == original_threads
+        assert pool.snapshot()['total'] == 15
+        futures = [pool.submit_action(CallableAction(analysis), kind=WorkKind.ANALYSIS) for _ in range(12)]
+        entered.wait(timeout=3)
+        futures.extend(pool.submit(metadata) for _ in range(2))
+        metadata_entered.wait(timeout=3)
+        futures.append(pool.submit(thumbnail, priority=VISIBLE))
+        assert thumbnail_entered.wait(2)
+        state = pool.snapshot()
+        assert (state['analysis_active'], state['metadata_active'], state['thumbnail_active']) == (12, 2, 1)
+        release.set()
+        for future in futures:
+            future.result(timeout=3)
+    finally:
+        release.set()
+        assert pool.shutdown(timeout=5)
+
+
+def test_analysis_reconfiguration_waits_for_next_batch_and_lower_quota_reuses_threads():
+    from app_common.file_browser._work_action import CallableAction
+
+    pool = BrowserWorkPool(6, 2, analysis_workers=3)
+    first_release, second_release = threading.Event(), threading.Event()
+    first_started, second_started = threading.Event(), threading.Event()
+    count_condition = threading.Condition()
+    count = [0]
+    token = pool.begin_producer(WorkKind.ANALYSIS)
+
+    def first():
+        first_started.set()
+        assert first_release.wait(5)
+
+    def second():
+        with count_condition:
+            count[0] += 1
+            if count[0] == 2:
+                second_started.set()
+        assert second_release.wait(5)
+
+    try:
+        # A coordinator between submit windows still owns its lane budget.
+        assert pool.configure_analysis_workers(12) == 3
+        assert pool.snapshot()['total'] == 6
+        future = pool.submit_action(CallableAction(first), kind=WorkKind.ANALYSIS)
+        assert first_started.wait(2)
+        assert pool.configure_analysis_workers(12) == 3  # the batch still owns its lanes
+        first_release.set()
+        future.result(timeout=2)
+        with pool._condition:
+            assert pool._condition.wait_for(lambda: not pool._active['analysis'], timeout=2)
+        pool.end_producer(WorkKind.ANALYSIS, token)
+        assert pool.configure_analysis_workers(12) == 12
+        expanded_threads = tuple(pool._threads)
+        assert pool.configure_analysis_workers(2) == 2
+        assert tuple(pool._threads) == expanded_threads
+        token = pool.begin_producer(WorkKind.ANALYSIS)
+        futures = [pool.submit_action(CallableAction(second), kind=WorkKind.ANALYSIS) for _ in range(6)]
+        assert second_started.wait(2)
+        assert pool.configure_analysis_workers(12) == 2
+        assert pool.snapshot()['analysis_queued'] == 4
+        second_release.set()
+        for future in futures:
+            future.result(timeout=2)
+        with pool._condition:
+            assert pool._condition.wait_for(lambda: not pool._active['analysis'], timeout=2)
+        pool.end_producer(WorkKind.ANALYSIS, token)
+        assert pool.configure_analysis_workers(12) == 12
+        assert tuple(pool._threads) == expanded_threads
+    finally:
+        first_release.set()
+        second_release.set()
+        pool.end_producer(WorkKind.ANALYSIS, token)
+        assert pool.shutdown(timeout=5)
+
+
+def test_standalone_queued_analysis_does_not_block_the_next_batch_quota():
+    from app_common.file_browser._work_action import CallableAction
+
+    pool = BrowserWorkPool(4, 2, analysis_workers=1)
+    pool.set_thumbnail_mode(False)
+    release = threading.Event()
+    entered = threading.Barrier(5)
+
+    def metadata():
+        entered.wait(timeout=3)
+        assert release.wait(5)
+
+    try:
+        futures = [pool.submit(metadata) for _ in range(4)]
+        entered.wait(timeout=3)
+        queued = pool.submit_action(CallableAction(lambda: 'analysis'), kind=WorkKind.ANALYSIS)
+        assert pool.snapshot()['analysis_active'] == 0
+        assert pool.configure_analysis_workers(12) == 12
+        assert pool.snapshot()['total'] == 15
+        # Expansion starts the queued standalone action before metadata releases.
+        assert queued.result(timeout=2) == 'analysis'
+        release.set()
+        for future in futures:
+            future.result(timeout=2)
+    finally:
+        release.set()
+        assert pool.shutdown(timeout=5)
+
+
+def test_expansion_preserves_active_metadata_and_still_shuts_down_every_worker():
+    pool = BrowserWorkPool(3, 2)
+    started, release = threading.Event(), threading.Event()
+
+    def metadata():
+        started.set()
+        assert release.wait(5)
+        return 'original task'
+
+    try:
+        future = pool.submit(metadata)
+        assert started.wait(2)
+        assert pool.configure_analysis_workers(12) == 12
+        assert len(pool._threads) == 15
+        release.set()
+        assert future.result(timeout=2) == 'original task'
+        pool.request_shutdown()
+        from app_common.file_browser._work_pool import BrowserPoolClosed
+        with pytest.raises(BrowserPoolClosed):
+            pool.configure_analysis_workers(2)
+    finally:
+        release.set()
+        assert pool.shutdown(timeout=5)
+        assert all(not thread.is_alive() for thread in pool._threads)
+
+
+def test_background_pool_reconfigures_before_testing_initial_zero_capacity():
+    from types import SimpleNamespace
+    from app_common.file_browser._panel import FileListPanel
+
+    pool = BrowserWorkPool(3, 2)
+    panel = SimpleNamespace(_background_shutdown_requested=False, _get_browser_work_pool=lambda: pool)
+    try:
+        assert FileListPanel.background_work_pool(panel) is None
+        assert FileListPanel.background_work_pool(panel, analysis_workers=12) is pool
+        assert pool.analysis_workers == 12 and pool.max_workers == 15
+        assert FileListPanel.background_work_pool(panel) is pool  # other consumers do not reset it
+        assert pool.analysis_workers == 12
+    finally:
+        assert pool.shutdown(timeout=5)
+
+
+def test_partial_expansion_failure_keeps_a_usable_pool_and_joins_started_workers(monkeypatch):
+    from app_common.file_browser._work_action import CallableAction
+
+    pool = BrowserWorkPool(3, 2)
+    real_start = threading.Thread.start
+    created = [0]
+
+    def limited_start(thread):
+        created[0] += 1
+        if created[0] == 2:
+            raise RuntimeError('thread resource unavailable')
+        return real_start(thread)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(threading.Thread, 'start', limited_start)
+            with pytest.raises(RuntimeError, match='thread resource unavailable'):
+                pool.configure_analysis_workers(12)
+        assert pool.snapshot()['total'] == 4
+        assert pool.snapshot()['analysis_limit'] == 1
+        assert pool.submit_action(CallableAction(lambda: 'still usable'),
+                                  kind=WorkKind.ANALYSIS).result(timeout=2) == 'still usable'
+        assert pool.submit(lambda: 'metadata').result(timeout=2) == 'metadata'
+    finally:
+        assert pool.shutdown(timeout=5)
+        assert all(not thread.is_alive() for thread in pool._threads)
+
+
+def test_only_owner_can_expand_the_shared_pool():
+    pool = BrowserWorkPool(3, 2)
+    try:
+        attempt = pool.submit(lambda: pool.configure_analysis_workers(12))
+        with pytest.raises(RuntimeError, match='Only the browser owner'):
+            attempt.result(timeout=2)
+        assert pool.max_workers == 3
+    finally:
+        assert pool.shutdown(timeout=3)
+
+
+def test_running_trace_does_not_leave_a_new_twelve_worker_batch_at_the_old_quota():
+    from app_common.file_browser._work_action import CallableAction
+
+    pool = BrowserWorkPool(6, 2, analysis_workers=3)
+    trace_started, trace_release, batch_release = threading.Event(), threading.Event(), threading.Event()
+    condition = threading.Condition()
+    entered = [0]
+    token = None
+
+    def trace():
+        trace_started.set()
+        assert trace_release.wait(5)
+
+    def analyse():
+        with condition:
+            entered[0] += 1
+            condition.notify_all()
+        assert batch_release.wait(5)
+
+    try:
+        trace_future = pool.submit_action(CallableAction(trace), kind=WorkKind.ANALYSIS)
+        assert trace_started.wait(2)
+        assert pool.configure_analysis_workers(12) == 12
+        token = pool.begin_producer(WorkKind.ANALYSIS)
+        futures = [pool.submit_action(CallableAction(analyse), kind=WorkKind.ANALYSIS) for _ in range(12)]
+        with condition:
+            assert condition.wait_for(lambda: entered[0] == 11, timeout=2)
+        assert pool.snapshot()['analysis_active'] == 12  # eleven batch actions plus the existing trace
+        trace_release.set()
+        trace_future.result(timeout=2)
+        with condition:
+            assert condition.wait_for(lambda: entered[0] == 12, timeout=2)
+        assert pool.snapshot()['analysis_active'] == 12
+        batch_release.set()
+        for future in futures:
+            future.result(timeout=2)
+    finally:
+        trace_release.set()
+        batch_release.set()
+        pool.end_producer(WorkKind.ANALYSIS, token)
+        assert pool.shutdown(timeout=5)
+
+
+def test_lower_quota_lets_running_standalone_actions_finish_before_starting_more():
+    from app_common.file_browser._work_action import CallableAction
+
+    pool = BrowserWorkPool(6, 2, analysis_workers=3)
+    releases = [threading.Event() for _ in range(3)]
+    entered = threading.Barrier(4)
+    next_started = threading.Event()
+
+    def standalone(index):
+        entered.wait(timeout=3)
+        assert releases[index].wait(5)
+        return index
+
+    try:
+        running = [pool.submit_action(CallableAction(standalone, index), kind=WorkKind.ANALYSIS)
+                   for index in range(3)]
+        entered.wait(timeout=3)
+        assert pool.configure_analysis_workers(2) == 2
+        queued = pool.submit_action(CallableAction(next_started.set), kind=WorkKind.ANALYSIS)
+        assert not next_started.wait(.05)
+        releases[0].set()
+        assert running[0].result(timeout=2) == 0
+        with pool._condition:
+            assert pool._condition.wait_for(lambda: pool._active['analysis'] == 2, timeout=2)
+        assert not next_started.wait(.05)
+        releases[1].set()
+        assert next_started.wait(2)
+        queued.result(timeout=2)
+        releases[2].set()
+        assert [future.result(timeout=2) for future in running] == [0, 1, 2]
+    finally:
+        for release in releases:
+            release.set()
+        assert pool.shutdown(timeout=5)

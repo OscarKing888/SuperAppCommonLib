@@ -13,6 +13,7 @@ from app_common.file_browser._work_action import WorkerAction, CallableAction
 from app_common.file_browser._work_policy import BrowserWorkPolicy, WorkKind
 from app_common.log import get_logger
 from app_common.exif_io.exiftool_runner import exiftool_worker_session, exiftool_read_request
+from app_common.superviewer_user_options import BIRD_SHARPNESS_WORKERS_MAX
 
 _log = get_logger('file_browser.pool')
 VISIBLE = 0
@@ -69,6 +70,46 @@ class BrowserWorkPool:
         _log.info('[browser.pool] started total=%s metadata_reserved=%s thumbnails=%s analysis_limit=%s',
                   self.max_workers, self.metadata_workers, self.thumbnail_workers, self.analysis_workers)
 
+    def configure_analysis_workers(self, workers: int) -> int:
+        """Apply a next-batch quota without replacing a live pool; return its actual limit.
+
+        An analysis producer owns its lane budget even between submitted windows.
+        Only that producer lease prevents reconfiguration. Standalone preview or
+        trace actions have no fixed lane budget: they keep running when the quota
+        changes, and queued actions follow the new quota. The caller tries again
+        for the next batch; no delayed change can alter a running producer's budget.
+        Thread capacity only grows, bounded by the largest requested quota plus
+        browsing reservations. Lower quotas reuse those threads without retiring
+        any worker or closing its ExifTool session during unrelated browser work.
+        """
+        if threading.get_ident() != self._owner:
+            raise RuntimeError('Only the browser owner may configure its worker pool')
+        requested = max(0, min(BIRD_SHARPNESS_WORKERS_MAX, int(workers)))
+        with self._condition:
+            if self._closed:
+                raise BrowserPoolClosed('Browser worker pool is closed')
+            if self._producers['analysis']:
+                return self.analysis_workers
+            target = max(self.max_workers, requested + self.metadata_workers + 1)
+            try:
+                for index in range(len(self._threads), target):
+                    worker = threading.Thread(target=self._run,
+                                              name=f'browser-worker-{index + 1}', daemon=True)
+                    worker.start()
+                    self._threads.append(worker)
+            finally:
+                # If the OS cannot create another thread, retain every started
+                # worker and an honest capacity; the creation error still reaches
+                # the caller. Existing metadata/thumbnail jobs remain intact.
+                self.max_workers = len(self._threads)
+                self.thumbnail_workers = self.max_workers - self.metadata_workers
+                self._policy = BrowserWorkPolicy(self.max_workers, self.metadata_workers, requested)
+                self.analysis_workers = self._policy.analysis_limit
+                self._condition.notify_all()
+            _log.info('[browser.pool] configured total=%s metadata_reserved=%s analysis_limit=%s',
+                      self.max_workers, self.metadata_workers, self.analysis_workers)
+            return self.analysis_workers
+
     def set_thumbnail_mode(self, enabled: bool):
         with self._condition:
             if enabled and not self._thumbnail_mode:
@@ -102,12 +143,12 @@ class BrowserWorkPool:
         if not isinstance(action, WorkerAction):
             raise TypeError('Expected WorkerAction')
         kind = WorkKind(kind)
-        if kind == WorkKind.ANALYSIS and self.analysis_workers <= 0:
-            raise ValueError('This pool has no analysis capacity')
         future = Future()
         with self._condition:
             if self._closed:
                 raise BrowserPoolClosed('Browser worker pool is closed')
+            if kind == WorkKind.ANALYSIS and self.analysis_workers <= 0:
+                raise ValueError('This pool has no analysis capacity')
             self._seen[kind] = True
             heapq.heappush(self._queues[kind], _Job(priority, next(self._sequence), future, action))
             self._condition.notify_all()

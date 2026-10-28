@@ -340,3 +340,46 @@ def test_bird_detection_options_mapping_normalization_and_runtime():
         assert normalized[opts.KEY_BIRD_SHARPNESS_FLOCK_MODE] == 'auto'
     finally:
         opts.apply_runtime_user_options(before)
+
+
+def test_sharpness_worker_setting_roundtrips_without_changing_analysis_params(tmp_path, monkeypatch):
+    options = superviewer_user_options
+    key = options.KEY_BIRD_SHARPNESS_WORKERS
+    monkeypatch.delenv('SuperViewer_ANALYSIS_WORKERS', raising=False)
+    previous = options.get_runtime_user_options()
+    try:
+        assert normalize_user_options({})[key] == 0
+        for value in (None, 'invalid', [], float('inf')):
+            assert normalize_user_options({key: value})[key] == 0
+        for value, expected in ((-1, 0), (0, 0), ('12', 12), (64, 64), (999, 64)):
+            assert normalize_user_options({key: value})[key] == expected
+        before = options.get_bird_sharpness_params()
+        path = str(tmp_path / '中文并发设置.cfg')
+        options.save_user_options({**previous, key: 12}, path)
+        options.apply_runtime_user_options(options.load_user_options(path))
+        assert options.get_bird_sharpness_workers() == 12
+        assert options.get_bird_sharpness_params() == before
+        assert key not in options.BIRD_SHARPNESS_PARAM_KEYS.values()
+        assert options.bird_sharpness_params_to_options({'workers': 12}) == {}
+        assert _browser_core._analysis_worker_count() == 12
+    finally:
+        options.apply_runtime_user_options(previous)
+
+
+def test_sharpness_worker_auto_and_environment_precedence(monkeypatch):
+    options = superviewer_user_options
+    previous = options.get_runtime_user_options()
+    monkeypatch.delenv('SuperViewer_ANALYSIS_WORKERS', raising=False)
+    try:
+        options.apply_runtime_user_options({options.KEY_BIRD_SHARPNESS_WORKERS: 0})
+        for cpus, expected in ((None, 1), (1, 1), (4, 2), (12, 6), (128, 6)):
+            monkeypatch.setattr(options.os, 'cpu_count', lambda n=cpus: n)
+            assert options.get_bird_sharpness_workers() == expected
+        options.apply_runtime_user_options({options.KEY_BIRD_SHARPNESS_WORKERS: 12})
+        for environment, expected in (('4', 4), ('64', 64), ('1000', 64), ('0', 12),
+                                      ('-1', 12), ('invalid', 12), ('', 12)):
+            monkeypatch.setenv('SuperViewer_ANALYSIS_WORKERS', environment)
+            assert options.get_bird_sharpness_workers() == expected
+            assert _browser_core._analysis_worker_count() == expected
+    finally:
+        options.apply_runtime_user_options(previous)

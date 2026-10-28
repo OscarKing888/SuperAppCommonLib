@@ -103,6 +103,7 @@ from app_common.superviewer_user_options import (
     get_runtime_user_options,
     get_thumbnail_loader_workers,
     get_metadata_loader_workers,
+    get_bird_sharpness_workers,
     save_user_options,
 )
 from app_common.ui_style.styles import COLORS
@@ -1447,10 +1448,7 @@ def _analysis_worker_count() -> int:
     default stays small; the pool further caps it to leave metadata and
     thumbnail capacity free. ``SuperViewer_ANALYSIS_WORKERS`` overrides it.
     """
-    override = _env_int("SuperViewer_ANALYSIS_WORKERS", 0)
-    if override > 0:
-        return override
-    return min(6, max(1, (os.cpu_count() or 2) // 2))
+    return get_bird_sharpness_workers()
 
 
 def _metadata_loader_idle_worker_count() -> int:
