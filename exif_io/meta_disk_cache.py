@@ -16,14 +16,12 @@
 from __future__ import annotations
 
 import atexit
-from collections import OrderedDict
 from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
 import sqlite3
 import threading
-from time import monotonic
 
 from app_common.log import get_logger
 
@@ -36,45 +34,10 @@ _POOL_LOCK = threading.Lock()
 _CONNECTIONS: dict[str, "sqlite3.Connection"] = {}
 _DB_LOCKS: dict[str, threading.Lock] = {}
 
-# This is an optional cache: a failed disk must not serialize every browser worker.
-_SQLITE_TIMEOUT = 0.05
-_RETRY_SECONDS = 60.0
-_MAX_FAILED_DATABASES = 128
-_FAILURE_LOCK = threading.Lock()
-_RETRY_AFTER: OrderedDict[str, float] = OrderedDict()
-
-
-def _cooling_down(db_path: str) -> bool:
-    with _FAILURE_LOCK:
-        deadline = _RETRY_AFTER.get(db_path)
-        if deadline is None:
-            return False
-        if monotonic() < deadline:
-            return True
-        del _RETRY_AFTER[db_path]
-        return False
-
-
-def _record_failure(db_path: str, exc: Exception) -> None:
-    norm_db = os.path.normpath(db_path)
-    with _FAILURE_LOCK:
-        first = norm_db not in _RETRY_AFTER
-        _RETRY_AFTER[norm_db] = monotonic() + _RETRY_SECONDS
-        _RETRY_AFTER.move_to_end(norm_db)
-        while len(_RETRY_AFTER) > _MAX_FAILED_DATABASES:
-            _RETRY_AFTER.popitem(last=False)
-    if first:
-        _log.warning("[meta_disk_cache] unavailable; bypass for %.0fs db=%r err=%s",
-                     _RETRY_SECONDS, norm_db, exc)
-
 
 def _get_connection(db_path: str) -> tuple["sqlite3.Connection | None", "threading.Lock | None"]:
     norm_db = os.path.normpath(db_path)
-    if _cooling_down(norm_db) or not _POOL_LOCK.acquire(blocking=False):
-        return None, None
-    try:
-        if _cooling_down(norm_db):
-            return None, None
+    with _POOL_LOCK:
         conn = _CONNECTIONS.get(norm_db)
         lock = _DB_LOCKS.get(norm_db)
         if conn is not None and lock is not None:
@@ -86,7 +49,7 @@ def _get_connection(db_path: str) -> tuple["sqlite3.Connection | None", "threadi
                 if ancestor.name == ".superpicky" and not ancestor.parent.is_dir():
                     return None, None
             os.makedirs(os.path.dirname(norm_db), exist_ok=True)
-            conn = sqlite3.connect(norm_db, check_same_thread=False, timeout=_SQLITE_TIMEOUT)
+            conn = sqlite3.connect(norm_db, check_same_thread=False)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute(
@@ -99,19 +62,12 @@ def _get_connection(db_path: str) -> tuple["sqlite3.Connection | None", "threadi
             )
             conn.commit()
         except Exception as exc:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-            _record_failure(norm_db, exc)
+            _log.debug("[meta_disk_cache] open failed db=%r err=%s", norm_db, exc)
             return None, None
         lock = threading.Lock()
         _CONNECTIONS[norm_db] = conn
         _DB_LOCKS[norm_db] = lock
         return conn, lock
-    finally:
-        _POOL_LOCK.release()
 
 
 def get_many(
@@ -125,36 +81,35 @@ def get_many(
     if not db_path or not stats:
         return {}
     conn, lock = _get_connection(db_path)
-    if conn is None or lock is None or not lock.acquire(blocking=False):
+    if conn is None or lock is None:
         return {}
     norms = list(stats.keys())
     out: dict[str, dict] = {}
     try:
-        for start in range(0, len(norms), 500):
-            chunk = norms[start : start + 500]
-            placeholders = ",".join("?" * len(chunk))
-            rows = conn.execute(
-                f"SELECT path, mtime, size, schema, payload FROM meta WHERE path IN ({placeholders})",
-                chunk,
-            ).fetchall()
-            for path, mtime, size, schema, payload in rows:
-                expected = stats.get(path)
-                if expected is None or int(schema) != _SCHEMA_VERSION:
-                    continue
-                exp_mtime, exp_size = expected
-                if int(size) != int(exp_size) or abs(float(mtime) - float(exp_mtime)) > 1e-6:
-                    continue
-                try:
-                    rec = json.loads(payload)
-                except Exception:
-                    continue
-                if isinstance(rec, dict):
-                    out[path] = rec
+        with lock:
+            for start in range(0, len(norms), 500):
+                chunk = norms[start : start + 500]
+                placeholders = ",".join("?" * len(chunk))
+                rows = conn.execute(
+                    f"SELECT path, mtime, size, schema, payload FROM meta WHERE path IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                for path, mtime, size, schema, payload in rows:
+                    expected = stats.get(path)
+                    if expected is None or int(schema) != _SCHEMA_VERSION:
+                        continue
+                    exp_mtime, exp_size = expected
+                    if int(size) != int(exp_size) or abs(float(mtime) - float(exp_mtime)) > 1e-6:
+                        continue
+                    try:
+                        rec = json.loads(payload)
+                    except Exception:
+                        continue
+                    if isinstance(rec, dict):
+                        out[path] = rec
     except Exception as exc:
-        _record_failure(db_path, exc)
+        _log.debug("[meta_disk_cache] get_many failed db=%r err=%s", db_path, exc)
         return {}
-    finally:
-        lock.release()
     return out
 
 
@@ -177,23 +132,16 @@ def put_many(
             continue
     if not rows:
         return 0
-    if not lock.acquire(blocking=False):
-        return 0
     try:
-        conn.executemany(
-            "INSERT OR REPLACE INTO meta (path, mtime, size, schema, payload) VALUES (?, ?, ?, ?, ?)",
-            rows,
-        )
-        conn.commit()
+        with lock:
+            conn.executemany(
+                "INSERT OR REPLACE INTO meta (path, mtime, size, schema, payload) VALUES (?, ?, ?, ?, ?)",
+                rows,
+            )
+            conn.commit()
     except Exception as exc:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        _record_failure(db_path, exc)
+        _log.debug("[meta_disk_cache] put_many failed db=%r err=%s", db_path, exc)
         return 0
-    finally:
-        lock.release()
     return len(rows)
 
 
@@ -219,8 +167,6 @@ def close_all() -> None:
                 pass
         _CONNECTIONS.clear()
         _DB_LOCKS.clear()
-        with _FAILURE_LOCK:
-            _RETRY_AFTER.clear()
 
 
 atexit.register(close_all)
