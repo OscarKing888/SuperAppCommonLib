@@ -1093,18 +1093,20 @@ class FileListPanel(QWidget):
             "report_row_by_path": dict(report_row_by_path),
         }
 
-    def _remember_directory_snapshot(self, *, persist=False):
+    def _remember_directory_snapshot(self, *, metadata_updates=None):
         if not self._current_dir or self._applying_directory_snapshot:
             return
         if self._loaded_directory_recursive not in self._directory_scope_cache:
             return  # Never replace a complete snapshot with an interrupted empty model.
-        self._directory_snapshots.remember(
-            self._current_dir, self._loaded_directory_recursive,
-            {"files": self._all_files, "report_root": self._report_root_dir,
-             "report_cache": self._report_cache, "report_row_by_path": self._report_row_by_path,
-             "metadata": self._meta_cache}, include_videos=self.include_videos,
-            use_report_db=self._use_report_db, persist=persist,
-        )
+        options = dict(include_videos=self.include_videos, use_report_db=self._use_report_db)
+        # The scan worker owns full listing copies. GUI updates touch the LRU
+        # and copy only this batch, avoiding an O(directory size) edit path.
+        if metadata_updates:
+            self._directory_snapshots.update_metadata(
+                self._current_dir, self._loaded_directory_recursive, metadata_updates, **options,
+            )
+        else:
+            self._directory_snapshots.touch(self._current_dir, self._loaded_directory_recursive, **options)
 
     def _show_directory_snapshot(self, snapshot):
         self._directory_snapshot_shown = True
@@ -7345,6 +7347,7 @@ class FileListPanel(QWidget):
                      if int(metadata.get("_metadata_revision", 0)) >=
                         int(self._meta_cache.get(path, {}).get("_metadata_revision", 0))}
         self._meta_cache.update(meta_dict)
+        self._remember_directory_snapshot(metadata_updates=meta_dict)
         comment_cnt = 0
         tag_cnt = 0
         rating_pos_cnt = 0

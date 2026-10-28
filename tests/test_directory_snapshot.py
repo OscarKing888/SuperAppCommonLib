@@ -91,3 +91,84 @@ def test_failed_source_read_does_not_poison_sql_snapshot(tmp_path, monkeypatch):
     monkeypatch.setattr(loader, "_read_metadata_batch_uncached", failed)
     loader._read_metadata_batch([path])
     assert metadata_store.get_store().read_many([path]) == {}
+
+
+def test_single_gui_update_in_ten_thousand_rows_copies_only_changed_record(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from time import perf_counter
+    from app_common.file_browser import _metadata_memory
+    from app_common.file_browser._panel import FileListPanel
+
+    files = [str(tmp_path / f"白鹭-{index}.JPG") for index in range(10_000)]
+    records = {path: {"title": "白鹭", "tags": ["飞行"]} for path in files}
+    memory = MetadataMemoryCache()
+    cache = DirectorySnapshotCache(memory)
+    cache.remember(str(tmp_path), True, {"files": files, "metadata": records})
+    panel = SimpleNamespace(_current_dir=str(tmp_path), _applying_directory_snapshot=False,
+                            _loaded_directory_recursive=True, _directory_scope_cache={True: {}},
+                            _directory_snapshots=cache, include_videos=False, _use_report_db=True)
+    copied = []
+    original = _metadata_memory.deepcopy
+
+    def copy(value):
+        copied.append(value)
+        return original(value)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("GUI directory snapshot must not inspect the photo volume")
+
+    monkeypatch.setattr(_metadata_memory, "deepcopy", copy)
+    with monkeypatch.context() as blocked:
+        blocked.setattr(os, "stat", forbidden)
+        blocked.setattr(os, "scandir", forbidden)
+        start = perf_counter()
+        for index in range(100):
+            FileListPanel._remember_directory_snapshot(panel, metadata_updates={files[0]: {"title": f"更新-{index}"}})
+        FileListPanel._remember_directory_snapshot(panel)
+        elapsed = (perf_counter() - start) * 1000
+    assert len(copied) == 100
+    assert all(set(value) == {"title"} for value in copied)
+    print(f"10,000 cached rows: 100 GUI metadata patches {elapsed:.2f} ms")
+    snapshot = cache.peek(str(tmp_path), True)
+    assert snapshot["metadata"][files[0]]["title"] == "更新-99"
+    assert snapshot["metadata"][files[1]] == records[files[1]]
+    assert memory.stats()["bytes"] <= memory.max_bytes
+
+
+def test_listing_replacement_retains_updates_and_removes_deleted_rows(tmp_path):
+    a, b, c = [str(tmp_path / name) for name in ("a.jpg", "b.jpg", "c.jpg")]
+    cache = DirectorySnapshotCache(MetadataMemoryCache())
+    cache.remember(str(tmp_path), True, {"files": [a, b], "metadata": {a: {"title": "初始"}}})
+    update = {a: {"title": "已提交", "tags": ["飞行"]}, b: {"title": "已删除"}}
+    assert cache.update_metadata(str(tmp_path), True, update)
+    update[a]["tags"].clear()
+    cache.remember(str(tmp_path), True, {"files": [a, c], "metadata": {}})
+    result = cache.peek(str(tmp_path), True)
+    assert result["metadata"] == {a: {"title": "已提交", "tags": ["飞行"]}}
+    assert cache.update_metadata(str(tmp_path), True, {b: {"title": "迟到的批次"}})
+    assert b not in cache.peek(str(tmp_path), True)["metadata"]
+    result["metadata"][a]["tags"].clear()
+    assert cache.peek(str(tmp_path), True)["metadata"][a]["tags"] == ["飞行"]
+
+
+def test_directory_patch_respects_budget_expiry_and_active_scope_lru(tmp_path):
+    now = [0.0]
+    memory = MetadataMemoryCache(max_entries=2, idle_seconds=10, clock=lambda: now[0])
+    cache = DirectorySnapshotCache(memory)
+    a, b, c = [str(tmp_path / name) for name in ("a", "b", "c")]
+    for folder in (a, b):
+        cache.remember(folder, True, {"files": [folder + "/bird.jpg"], "metadata": {}})
+    memory.set_scope(a)
+    now[0] = 5
+    cache.update_metadata(b, True, {b + "/bird.jpg": {"title": "较新但不在当前目录"}})
+    cache.remember(c, True, {"files": [], "metadata": {}})
+    assert cache.peek(b, True) is None
+    assert cache.peek(a, True) is not None
+    now[0] = 14
+    cache.touch(a, True)
+    now[0] = 16
+    assert cache.peek(c, True) is None
+    assert cache.peek(a, True) is not None
+    memory.set_max_bytes(memory.stats()["bytes"] + 100)
+    cache.update_metadata(a, True, {a + "/bird.jpg": {"title": "鸟" * 10_000}})
+    assert memory.stats() == {"entries": 0, "bytes": 0}

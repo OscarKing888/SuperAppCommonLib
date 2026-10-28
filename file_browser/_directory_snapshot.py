@@ -54,14 +54,17 @@ class DirectorySnapshotCache:
                 return None
         except (KeyError, TypeError, ValueError):
             return None
-        return {"files": files, "report_root": header.get("report_root"),
-                "report_cache": {}, "report_row_by_path": {}, "metadata": {}}
+        snapshot = {"files": files, "report_root": header.get("report_root"),
+                    "report_cache": {}, "report_row_by_path": {}, "metadata": {}}
+        self.remember(directory, recursive, snapshot, **options)
+        return snapshot
 
     def remember(self, directory, recursive, snapshot, *, include_videos=False,
                  use_report_db=True, persist=False):
         key = self._key(directory, recursive, include_videos, use_report_db)
-        _, generation = self.memory.lookup(key, _SIGNATURE)
-        self.memory.store(key, _SIGNATURE, snapshot, generation)
+        _, generation = self.memory.touch(key, _SIGNATURE)
+        self.memory.store_with_mapping(key, _SIGNATURE, snapshot, generation,
+                                       field="metadata", keys=snapshot.get("files", ()))
         if not persist:
             return
         files = snapshot.get("files", [])
@@ -75,3 +78,11 @@ class DirectorySnapshotCache:
                                   "report_root": snapshot.get("report_root")}, None)
         disk = metadata_sqlite.get_cache()
         disk.put_many(_NAMESPACE, items, disk.revision())
+
+    def touch(self, directory, recursive, *, include_videos=False, use_report_db=True):
+        key = self._key(directory, recursive, include_videos, use_report_db)
+        return self.memory.touch(key, _SIGNATURE)[0]
+
+    def update_metadata(self, directory, recursive, updates, *, include_videos=False, use_report_db=True):
+        key = self._key(directory, recursive, include_videos, use_report_db)
+        return self.memory.patch_mapping(key, _SIGNATURE, updates, field="metadata")

@@ -207,11 +207,12 @@ def _overlay_generic_aliases(merged: dict[str, Any]) -> None:
 def extract_pillow_metadata(path: Path | str) -> dict[str, Any]:
     """使用 Pillow 读取 EXIF，返回平坦字典（键为 tag 名，与 normalize 兼容）。"""
     path = Path(path)
-    metadata: dict[str, Any] = {"SourceFile": str(path)}
+    metadata: dict[str, Any] = {"SourceFile": str(path), "_metadata_read_ok": False}
     try:
         with Image.open(path) as image:
             exif = image.getexif()
             if not exif:
+                metadata["_metadata_read_ok"] = True
                 return metadata
             for tag_id, value in exif.items():
                 tag = ExifTags.TAGS.get(tag_id, str(tag_id))
@@ -235,6 +236,7 @@ def extract_pillow_metadata(path: Path | str) -> dict[str, Any]:
             interop_ifd = _load_ifd(exif, _INTEROP_IFD_TAG_ID)
             if interop_ifd:
                 _merge_ifd_tags(metadata, interop_ifd)
+            metadata["_metadata_read_ok"] = True
     except Exception:
         pass
     return metadata
@@ -293,6 +295,9 @@ def _batch_read_exiftool_full(
             if not src:
                 continue
             norm = os.path.normpath(src)
+            item["_metadata_read_ok"] = not any(
+                key == "Error" or key.endswith(":Error") for key in item
+            )
             result[norm] = item
     return result
 
@@ -342,7 +347,7 @@ def extract_many(
             if cancelled is not None and cancelled():
                 break
             norm = os.path.normpath(str(p))
-            if norm in raw:
+            if norm in raw and raw[norm].get("_metadata_read_ok") is not False:
                 out[p] = raw[norm]
             else:
                 out[p] = extract_pillow_metadata(p)
@@ -390,13 +395,17 @@ def read_full_metadata_snapshot(paths, source_reader, *, profile="full", cancell
     store = get_store()
     signatures = full_metadata_signatures(names, profile)
     try:
-        cached = store.read_many(names, profile=profile, signatures=signatures)
+        cached = {path: record for path, record in
+                  store.read_many(names, profile=profile, signatures=signatures).items()
+                  if record.get("_metadata_read_ok") is True and _metadata_read_succeeded(record)}
         expected = store.revisions(names, signatures=signatures)
     except Exception:
         # A rebuildable read cache failure must not hide source metadata.
         store, cached, expected = None, {}, {}
     missing = [path for path in resolved if os.path.normpath(str(path)) not in cached]
-    base_map = source_reader(missing) if missing else {}
+    base_map = dict(source_reader(missing) or {}) if missing else {}
+    for path in missing:
+        base_map.setdefault(path, {"SourceFile": str(path), "_metadata_read_ok": False})
     out = {path: dict(cached[os.path.normpath(str(path))]) for path in resolved
            if os.path.normpath(str(path)) in cached}
     if not base_map:
@@ -408,10 +417,12 @@ def read_full_metadata_snapshot(paths, source_reader, *, profile="full", cancell
         read_xmp_sidecar = None
 
     fresh = {}
+    failed = []
     for resolved_path, base_rec in base_map.items():
         if cancelled is not None and cancelled():
             break
         merged = dict(base_rec or {})
+        read_ok = _metadata_read_succeeded(merged)
         merged.setdefault("SourceFile", str(resolved_path))
         if callable(read_xmp_sidecar):
             try:
@@ -423,8 +434,14 @@ def read_full_metadata_snapshot(paths, source_reader, *, profile="full", cancell
                 _overlay_xmp_aliases(sidecar)
                 merged.update(sidecar)
         _overlay_generic_aliases(merged)
+        merged["_metadata_read_ok"] = read_ok
+        merged["_metadata_complete"] = read_ok
         out[resolved_path] = merged
-        fresh[os.path.normpath(str(resolved_path))] = merged
+        norm_path = os.path.normpath(str(resolved_path))
+        if read_ok:
+            fresh[norm_path] = merged
+        else:
+            failed.append(norm_path)
     if cancelled is not None and cancelled():
         return out
     after = full_metadata_signatures(list(fresh), profile)
@@ -446,14 +463,61 @@ def read_full_metadata_snapshot(paths, source_reader, *, profile="full", cancell
                         out[Path(path)].update(current)
         except Exception:
             pass
+    if failed and store is not None:
+        try:
+            # A transient ExifTool/Pillow failure cannot erase an earlier full
+            # snapshot or publish a placeholder that permanently suppresses retry.
+            previous = store.read_many(failed, profile=profile)
+            for path in failed:
+                record = previous.get(path)
+                if _metadata_read_succeeded(record):
+                    record = dict(record, _metadata_refresh_failed=True)
+                    if record.get("_metadata_read_ok") is not True:
+                        # Legacy rows may contain XMP fields despite a failed
+                        # source read. They remain useful as provisional values,
+                        # but need one successful revalidation after upgrading.
+                        record.update(_metadata_read_ok=False, _metadata_complete=False)
+                    out[Path(path)] = record
+                else:
+                    # Accepted edits remain readable even when there has never
+                    # been a successful full source read. Keep the incomplete
+                    # status so this temporary result cannot suppress retries.
+                    pending = store.pending_edits(path)
+                    if pending:
+                        from .metadata_store import apply_fields, resource_key
+                        record = apply_fields(out[Path(path)], pending["fields"], pending["subject_states"])
+                        record["_metadata_revision"] = pending["revision"]
+                        record["_metadata_resource"] = resource_key(path)
+                        out[Path(path)] = record
+        except Exception:
+            pass
     return out
+
+
+def _metadata_read_succeeded(record):
+    """Keep successful empty EXIF separate from failed/unknown placeholders."""
+    if not isinstance(record, dict) or record.get("_metadata_complete") is False:
+        return False
+    if record.get("_metadata_read_ok") is not None:
+        return record["_metadata_read_ok"] is True
+    if any(key == "Error" or str(key).endswith(":Error") for key in record):
+        return False
+    # Compatibility for injected/provider readers that return real metadata but
+    # predate the explicit status. SourceFile alone never proves a source read.
+    return any(key != "SourceFile" and not str(key).startswith("_metadata_")
+               for key in record)
 
 
 def full_metadata_signatures(paths, profile="full"):
     """Source/sidecar validation for complete snapshots, without Qt imports."""
     from .metadata_sqlite import file_stamp, sidecar_stamp
     from .xmp_sidecar import find_xmp_sidecars
+    from .metadata_store import get_store
 
+    # Only the worker's actual validation may resolve source-volume aliases.
+    # SQLite first-paint reads remain independent of filesystem availability.
+    paths = tuple(paths)
+    get_store().prepare_paths(paths, refresh=True)
     sidecars = find_xmp_sidecars(paths)
     result = {}
     for path in paths:

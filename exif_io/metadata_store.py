@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import atexit
 from collections import OrderedDict
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
@@ -24,6 +24,7 @@ import uuid
 from app_common.log import get_logger
 from app_common.perf_probe import elapsed_ms, perf_counter, perf_log
 from .sidecar_lock import data_directory
+from .metadata_identity import path_key, lexical_key, resolve_path, register_alias
 
 _log = get_logger("metadata.store")
 _write_context = threading.local()
@@ -31,10 +32,6 @@ _write_context = threading.local()
 
 class _SourceBusy(RuntimeError):
     pass
-
-
-def path_key(path):
-    return os.path.normcase(os.path.abspath(os.fspath(path)))
 
 
 def resource_key(path):
@@ -155,10 +152,13 @@ class MetadataStore:
         self._active_sources = {}
         self._active_operations = {}
         self._active_sync = 0
+        self._prepared_aliases = {}
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._sql = threading.Thread(target=self._sql_loop, name="metadata-store-sql", daemon=True)
         self._sql.start()
+        self._identity = ThreadPoolExecutor(max_workers=1, thread_name_prefix="metadata-identity")
+        self._identity_ready = self._identity.submit(self._prepare_existing)
         self._scheduler = None
         if start_scheduler:
             self._scheduler = threading.Thread(target=self._coordinate, name="metadata-store-sync", daemon=True)
@@ -223,8 +223,24 @@ class MetadataStore:
             CREATE TABLE IF NOT EXISTS source_write_leases (
                 owner TEXT PRIMARY KEY, path TEXT NOT NULL, resource TEXT NOT NULL,
                 pid INTEGER NOT NULL, operation_owner TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS identity_aliases (path TEXT PRIMARY KEY, canonical TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS edit_intents (
+                resource TEXT NOT NULL, kind TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
+                seq INTEGER NOT NULL, PRIMARY KEY(resource,kind,key));
+            CREATE TABLE IF NOT EXISTS identity_conflicts (
+                resource TEXT PRIMARY KEY, conflicts TEXT NOT NULL, original_tasks TEXT NOT NULL);
             PRAGMA user_version=1;
         """)
+        if "last_seq" not in {row[1] for row in conn.execute("PRAGMA table_info(outbox)")}:
+            try:
+                conn.execute("ALTER TABLE outbox ADD COLUMN last_seq INTEGER NOT NULL DEFAULT 0")
+            except sqlite3.OperationalError:
+                # Another process may have finished the same additive migration.
+                if "last_seq" not in {row[1] for row in conn.execute("PRAGMA table_info(outbox)")}:
+                    raise
+        conn.execute("UPDATE outbox SET last_seq=coalesce((SELECT max(seq) FROM changes WHERE changes.resource=outbox.resource AND kind='edit'),0) WHERE last_seq=0")
+        for original, canonical in conn.execute("SELECT path,canonical FROM identity_aliases"):
+            register_alias(original, canonical)
         with self._lock:
             self._pending = {r: (json.loads(f), json.loads(s), revision)
                              for r, f, s, revision in conn.execute("SELECT resource,fields,subjects,revision FROM outbox")}
@@ -282,11 +298,141 @@ class MetadataStore:
             raise RuntimeError("Do not wait for a metadata SQL job from the SQL owner thread")
         return self.submit_sql(callback, write=write).result()
 
+    def _prepare_existing(self):
+        # Resolve pending legacy paths before any replay. Filesystem work stays
+        # off both Qt and the SQL transaction owner.
+        paths = self._call(lambda conn: [row[0] for row in conn.execute("SELECT path FROM outbox")])
+        self._prepare_paths_impl(paths)
+
+    def prepare_paths(self, paths, *, refresh=False):
+        """Worker-only identity barrier; returns canonical paths, without writes to photos."""
+        paths = tuple(paths)
+        return self._identity.submit(self._prepare_paths_impl, paths, refresh).result()
+
+    def _after_identity(self, paths, operation, *, refresh=False):
+        result = Future()
+        def prepare():
+            try:
+                self._prepare_paths_impl(paths, refresh)
+                pending = operation()
+                def completed(future):
+                    try:
+                        result.set_result(future.result())
+                    except BaseException as exc:
+                        result.set_exception(exc)
+                pending.add_done_callback(completed)
+            except BaseException as exc:
+                result.set_exception(exc)
+        try:
+            self._identity.submit(prepare)
+        except RuntimeError as exc:
+            result.set_exception(exc)
+        return result
+
+    @staticmethod
+    def _merge_identity_tasks(conn, canonical, rows):
+        candidates = {}
+        originals = []
+        for resource, path, revision, fields_text, subjects_text, last_seq in rows:
+            fields, subjects = json.loads(fields_text), json.loads(subjects_text)
+            originals.append(dict(resource=resource, path=path, revision=revision, fields=fields,
+                                  subject_states=subjects, seq=last_seq))
+            recorded = {(kind, key): (seq, json.loads(value)) for kind, key, value, seq in
+                        conn.execute("SELECT kind,key,value,seq FROM edit_intents WHERE resource=?", (resource,))}
+            for kind, values in (("field", fields), ("subject", subjects)):
+                for key, value in values.items():
+                    # A legacy aggregate containing several fields does not
+                    # reveal when each field changed. Never invent that order.
+                    seq = recorded.get((kind, key), (last_seq if len(fields) + len(subjects) == 1 else 0, value))[0]
+                    candidates.setdefault((kind, key), []).append((seq, value))
+        merged, conflicts = {}, {}
+        for item, values in candidates.items():
+            distinct = {_json(value) for _, value in values}
+            if len(distinct) > 1 and (any(seq == 0 for seq, _ in values)
+                                     or len({seq for seq, _ in values}) != len(values)):
+                conflicts[":".join(item)] = values
+            else:
+                merged[item] = max(values, key=lambda entry: entry[0])
+        subject_reset = merged.get(("field", "XMP-dc:Subject"), (-1, None))[0]
+        fields, subjects = {}, {}
+        for (kind, key), (seq, value) in merged.items():
+            if kind == "subject" and seq < subject_reset:
+                continue
+            (fields if kind == "field" else subjects)[key] = value
+        return fields, subjects, merged, conflicts, originals
+
+    def _prepare_paths_impl(self, paths, refresh=False):
+        pairs = [resolve_path(path, refresh=refresh) for path in paths]
+        aliases = [(old, new) for old, new in pairs if old != new and self._prepared_aliases.get(old) != new]
+        if not aliases:
+            return [new for _, new in pairs]
+        def migrate(conn):
+            changed = set()
+            for original, canonical in aliases:
+                old_resource = os.path.splitext(original)[0].casefold()
+                resource = os.path.splitext(canonical)[0].casefold()
+                conn.execute("INSERT OR REPLACE INTO identity_aliases VALUES(?,?)", (original, canonical))
+                if old_resource == resource:
+                    continue
+                old_exists = conn.execute("SELECT 1 FROM resources WHERE resource=? UNION SELECT 1 FROM snapshots WHERE resource=? UNION SELECT 1 FROM outbox WHERE resource=?",
+                                          (old_resource, old_resource, old_resource)).fetchone()
+                if not old_exists:
+                    continue
+                keys = (old_resource, resource)
+                rows = list(conn.execute("SELECT resource,path,revision,fields,subjects,last_seq FROM outbox WHERE resource IN (?,?)", keys))
+                revision = max([row[0] for row in conn.execute("SELECT revision FROM resources WHERE resource IN (?,?)", keys)] + [0]) + 1
+                if rows:
+                    fields, subjects, intents, conflicts, originals = self._merge_identity_tasks(conn, resource, rows)
+                    for existing_conflicts, existing_originals in conn.execute(
+                            "SELECT conflicts,original_tasks FROM identity_conflicts WHERE resource IN (?,?)", keys):
+                        conflicts.update(json.loads(existing_conflicts))
+                        originals.extend(json.loads(existing_originals))
+                    for item in conflicts:
+                        kind, key = item.split(":", 1)
+                        (fields if kind == "field" else subjects).pop(key, None)
+                        intents.pop((kind, key), None)
+                    conn.execute("DELETE FROM identity_conflicts WHERE resource IN (?,?)", keys)
+                    conn.execute("DELETE FROM outbox WHERE resource IN (?,?)", keys)
+                    conn.execute("INSERT INTO outbox(resource,path,revision,fields,subjects,last_seq,error) VALUES(?,?,?,?,?,?,?)",
+                                 (resource, canonical, revision, _json(fields), _json(subjects), max(row[5] for row in rows),
+                                  "旧路径编辑存在字段冲突，请重新编辑冲突字段" if conflicts else ""))
+                    conn.execute("DELETE FROM edit_intents WHERE resource IN (?,?)", keys)
+                    for (kind, key), (seq, value) in intents.items():
+                        conn.execute("INSERT INTO edit_intents VALUES(?,?,?,?,?)", (resource, kind, key, _json(value), seq))
+                    if conflicts:
+                        conn.execute("INSERT OR REPLACE INTO identity_conflicts VALUES(?,?,?)", (resource, _json(conflicts), _json(originals)))
+                conn.execute("DELETE FROM snapshots WHERE resource IN (?,?)", keys)
+                conn.execute("UPDATE read_aliases SET resource=? WHERE resource=?", (resource, old_resource))
+                conn.execute("DELETE FROM resources WHERE resource=?", (old_resource,))
+                conn.execute("INSERT INTO resources(resource,path,revision) VALUES(?,?,?) ON CONFLICT(resource) DO UPDATE SET path=excluded.path,revision=excluded.revision",
+                             (resource, canonical, revision))
+                self._change(conn, canonical, resource, "external")
+                changed.update(keys)
+            return changed
+        changed = self._call(migrate, write=True)
+        self._prepared_aliases.update(aliases)
+        if changed:
+            def publish(conn):
+                # Read and publish on the SQL owner so a newer commit callback
+                # cannot be replaced by an earlier migration's pending map.
+                pending = {r: (json.loads(f), json.loads(s), revision) for r, f, s, revision in
+                           conn.execute("SELECT resource,fields,subjects,revision FROM outbox")}
+                with self._lock:
+                    self._pending = pending
+                    for key in [key for key, (record, _) in self._memory.items() if record.get("_metadata_resource") in changed]:
+                        self._memory_size -= self._memory.pop(key)[1]
+                    for key in changed:
+                        self._versions.pop(key, None)
+            self._call(publish)
+        return [new for _, new in pairs]
+
     @staticmethod
     def _change(conn, path, resource, kind):
         conn.execute("INSERT INTO changes(path,resource,kind) VALUES(?,?,?)", (path, resource, kind))
         # Gaps are explicitly signalled to polling consumers, which reload a snapshot.
+        seq = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.execute("DELETE FROM changes WHERE seq < (SELECT max(seq)-50000 FROM changes)")
+        return seq
 
     def _remember_memory(self, profile, path, record):
         key = (profile, path_key(path))
@@ -356,22 +502,40 @@ class MetadataStore:
                        pending[2] if pending else 0)
 
     @staticmethod
-    def _read_resource(path, signatures=None):
+    def _read_resource(path, signatures=None, *, canonical=None):
         signature = signatures.get(os.path.normpath(path)) if signatures is not None else None
         if isinstance(signature, (tuple, list)) and len(signature) > 1 and signature[1]:
             dependency = signature[1]
             if isinstance(dependency, (tuple, list)) and isinstance(dependency[0], str):
                 return resource_key(dependency[0])
-        return resource_key(path)
+        return resource_key(canonical if canonical is not None else path)
+
+    @staticmethod
+    def _cached_path_keys(conn, paths):
+        """Restore evicted durable aliases using only the local database."""
+        lexical = {os.path.normpath(path): lexical_key(path) for path in paths}
+        resolved = {key: path_key(key) for key in lexical.values()}
+        missing = [key for key, canonical in resolved.items() if key == canonical]
+        for start in range(0, len(missing), 300):
+            chunk = missing[start:start + 300]
+            for key, canonical in conn.execute(
+                    f"SELECT path,canonical FROM identity_aliases WHERE path IN ({','.join('?' for _ in chunk)})", chunk):
+                resolved[key] = canonical
+                register_alias(key, canonical)
+        # Keep the complete lookup local even when one batch exceeds the alias
+        # LRU capacity; registering later rows must not undo earlier SQL hits.
+        return {path: resolved[key] for path, key in lexical.items()}
 
     def revisions(self, paths, signatures=None):
         paths = tuple(paths)
         def read(conn):
             result = {}
+            keys = self._cached_path_keys(conn, paths)
             for path in paths:
-                resource = self._read_resource(path, signatures)
+                key = keys[os.path.normpath(path)]
+                resource = self._read_resource(path, signatures, canonical=key)
                 if signatures is None:
-                    alias = conn.execute("SELECT resource FROM read_aliases WHERE path=?", (path_key(path),)).fetchone()
+                    alias = conn.execute("SELECT resource FROM read_aliases WHERE path=?", (key,)).fetchone()
                     resource = alias[0] if alias else resource
                 result[os.path.normpath(path)] = (conn.execute("SELECT revision FROM resources WHERE resource=?", (resource,)).fetchone() or (0,))[0]
             return result
@@ -379,10 +543,14 @@ class MetadataStore:
 
     def read_many(self, paths, profile="browser", signatures=None):
         started = perf_counter()
-        originals = {path_key(p): os.path.normpath(p) for p in paths}
-        if not originals:
+        paths = tuple(paths)
+        if not paths:
             return {}
         def read(conn):
+            # Connection initialization loads persisted aliases before this
+            # SQL-only lookup. Never wait for identity/source-disk validation.
+            canonical = self._cached_path_keys(conn, paths)
+            originals = {key: path for path, key in canonical.items()}
             result = {}
             keys = list(originals)
             for start in range(0, len(keys), 300):
@@ -416,10 +584,11 @@ class MetadataStore:
                                               json.loads(pending[1]), json.loads(pending[2]))
                         record["_metadata_revision"], record["_metadata_resource"] = pending[0], resource
                         result[original] = record
-            return result
+            return result, canonical
         future = self.submit_sql(read, write=False)
-        result = future.result()
+        result, canonical = future.result()
         for path, record in list(result.items()):
+            register_alias(path, canonical[path])
             if not self._remember_memory(profile, path, record):
                 current = self.peek(path, profile)
                 if current is not None:
@@ -429,9 +598,9 @@ class MetadataStore:
         if result:
             touched = time.time_ns()
             self.submit_sql(lambda conn: conn.executemany("UPDATE snapshots SET touched=? WHERE profile=? AND path=?",
-                [(touched, profile, path_key(path)) for path in result]))
+                [(touched, profile, canonical[path]) for path in result]))
         perf_log(_log, "[metadata.store.read] profile=%s paths=%s hits=%s sql_ms=%.1f total_ms=%.1f validated=%s",
-                 profile, len(originals), len(result), getattr(future, "_metadata_sql_elapsed_ms", 0),
+                 profile, len(paths), len(result), getattr(future, "_metadata_sql_elapsed_ms", 0),
                  elapsed_ms(started), int(signatures is not None))
         return result
 
@@ -450,9 +619,13 @@ class MetadataStore:
         conn.executemany("DELETE FROM snapshots WHERE profile=? AND path=?", victims)
 
     def remember_many(self, records, profile="browser", signatures=None, expected_revisions=None):
+        return self._after_identity(tuple(records), lambda: self._remember_many(
+            records, profile, signatures, expected_revisions))
+
+    def _remember_many(self, records, profile="browser", signatures=None, expected_revisions=None):
         items = [(os.path.normpath(p), deepcopy(record)) for p, record in records.items()]
         def write(conn):
-            accepted = {}
+            accepted, invalidated = {}, []
             baseline, advanced = {}, set()
             for path, record in items:
                 resource = self._read_resource(path, signatures)
@@ -468,8 +641,36 @@ class MetadataStore:
                 record["_metadata_resource"] = resource
                 record.setdefault("_metadata_complete", True)
                 signature = _json(signatures.get(path)) if signatures is not None else None
-                previous = conn.execute("SELECT payload FROM snapshots WHERE profile=? AND path=?", (profile, path_key(path))).fetchone()
+                previous = conn.execute("SELECT payload,signature FROM snapshots WHERE profile=? AND path=?", (profile, path_key(path))).fetchone()
                 changed = previous is None or _snapshot_content(json.loads(previous[0])) != _snapshot_content(record)
+                # Compare the common source/sidecar part, excluding requested
+                # tags/profile names. Browser stamps use a historical ordering.
+                def common_signature(value, name):
+                    if not isinstance(value, (list, tuple)) or len(value) < 2:
+                        return None
+                    source, sidecar = value[:2]
+                    if name == "browser" and isinstance(source, (list, tuple)) and len(source) == 5:
+                        source = [source[4], source[3], source[2], source[0], source[1]]
+                    return _json(source), _json(sidecar)
+                incoming = common_signature(signatures.get(path), profile) if signatures is not None else None
+                peers = conn.execute("SELECT profile,path,signature FROM snapshots WHERE resource=?", (resource,)).fetchall()
+                stale = set()
+                for peer_profile, peer_path, peer_signature in peers:
+                    if peer_profile == profile and peer_path == path_key(path):
+                        continue
+                    known = common_signature(json.loads(peer_signature), peer_profile) if peer_signature else None
+                    if incoming is not None and known is not None:
+                        if incoming[1] != known[1] or (peer_path == path_key(path) and incoming[0] != known[0]):
+                            stale.add((peer_profile, peer_path))
+                    elif previous and changed and signatures is None and peer_path == path_key(path):
+                        stale.add((peer_profile, peer_path))
+                if stale:
+                    invalidated.extend(stale)
+                    conn.executemany("DELETE FROM snapshots WHERE profile=? AND path=?", stale)
+                # A browser projection can remain identical while EXIF-only
+                # fields change. Its invalidation must still reach subscribers.
+                signature_changed = previous is not None and signature != previous[1]
+                changed = changed or bool(stale) or signature_changed
                 known_path = previous is not None or conn.execute("SELECT 1 FROM read_aliases WHERE path=?", (path_key(path),)).fetchone()
                 if changed and known_path and resource not in advanced:
                     revision += 1
@@ -497,14 +698,17 @@ class MetadataStore:
                 pending = conn.execute("SELECT fields,subjects,revision FROM outbox WHERE resource=?", (resource,)).fetchone()
                 if pending:
                     overlays[resource] = (json.loads(pending[0]), json.loads(pending[1]), pending[2])
-            return accepted, overlays
+            return accepted, overlays, invalidated
         future = self.submit_sql(write)
         result = Future()
         def done(completed):
             try:
-                accepted, overlays = completed.result()
+                accepted, overlays, invalidated = completed.result()
                 with self._lock:
                     self._pending.update(overlays)
+                    for key in invalidated:
+                        if key in self._memory:
+                            self._memory_size -= self._memory.pop(key)[1]
                 for path, record in accepted.items():
                     self._remember_memory(profile, path, record)
                 result.set_result(accepted)
@@ -514,6 +718,9 @@ class MetadataStore:
         return result
 
     def submit_edit(self, path, fields, subject_states=None):
+        return self._after_identity([path], lambda: self._submit_edit(path, fields, subject_states), refresh=True)
+
+    def _submit_edit(self, path, fields, subject_states=None):
         started = perf_counter()
         path = os.path.normpath(os.path.abspath(path))
         try:
@@ -550,9 +757,9 @@ class MetadataStore:
             record["_metadata_complete"] = any(profile in ("browser", "full", "full-pillow") and json.loads(payload).get("_metadata_complete", True)
                                                 for profile, _, payload, _ in rows)
             conn.execute("INSERT INTO resources(resource,path,revision) VALUES(?,?,?) ON CONFLICT(resource) DO UPDATE SET path=excluded.path,revision=excluded.revision",
-                         (resource, path, revision))
+                         (resource, path_key(path), revision))
             conn.execute("INSERT INTO outbox(resource,path,revision,fields,subjects) VALUES(?,?,?,?,?) ON CONFLICT(resource) DO UPDATE SET path=excluded.path,revision=excluded.revision,fields=excluded.fields,subjects=excluded.subjects,attempts=0,next_attempt=0,error=''",
-                         (resource, path, revision, _json(patch), _json(states)))
+                         (resource, path_key(path), revision, _json(patch), _json(states)))
             conn.execute("INSERT INTO read_aliases VALUES(?,?,?) ON CONFLICT(path) DO UPDATE SET resource=excluded.resource,touched=excluded.touched",
                          (path_key(path), resource, time.time_ns()))
             if not rows:
@@ -565,7 +772,22 @@ class MetadataStore:
                 text = _json(updated)
                 conn.execute("INSERT INTO snapshots VALUES(?,?,?,?,?,?,?) ON CONFLICT(profile,path) DO UPDATE SET resource=excluded.resource,payload=excluded.payload,signature=excluded.signature,touched=excluded.touched,bytes=excluded.bytes",
                              (profile, cached_path, resource, text, signature, time.time_ns(), len(text.encode("utf-8")) + 256))
-            self._change(conn, path, resource, "edit")
+            seq = self._change(conn, path, resource, "edit")
+            conn.execute("UPDATE outbox SET last_seq=? WHERE resource=?", (seq, resource))
+            if "XMP-dc:Subject" in fields:
+                conn.execute("DELETE FROM edit_intents WHERE resource=? AND kind='subject'", (resource,))
+            for kind, values in (("field", fields), ("subject", subjects)):
+                for key, value in values.items():
+                    conn.execute("INSERT OR REPLACE INTO edit_intents VALUES(?,?,?,?,?)", (resource, kind, key, _json(value), seq))
+            conflict = conn.execute("SELECT conflicts FROM identity_conflicts WHERE resource=?", (resource,)).fetchone()
+            if conflict:
+                remaining = json.loads(conflict[0])
+                for key in fields: remaining.pop("field:" + key, None)
+                for key in subjects: remaining.pop("subject:" + key, None)
+                if remaining:
+                    conn.execute("UPDATE identity_conflicts SET conflicts=? WHERE resource=?", (_json(remaining), resource))
+                else:
+                    conn.execute("DELETE FROM identity_conflicts WHERE resource=?", (resource,))
             return EditReceipt(path, fields, revision, record, before), patch, states
         result = Future()
         future = self.submit_sql(write)
@@ -593,6 +815,9 @@ class MetadataStore:
         return result
 
     def refresh_scope(self, directory):
+        return self._after_identity([directory], lambda: self._refresh_scope(directory), refresh=True)
+
+    def _refresh_scope(self, directory):
         prefix = path_key(directory).rstrip(os.sep) + os.sep
         with self._lock:
             for key in [key for key in self._memory if key[1].startswith(prefix)]:
@@ -615,6 +840,7 @@ class MetadataStore:
 
     def note_sidecar_write(self, path):
         """Notify a successful low-level write; SQL work never rereads the XML."""
+        self.prepare_paths([path])
         path, resource = os.path.normpath(path), resource_key(path)
         def invalidate(conn):
             revision = (conn.execute("SELECT revision FROM resources WHERE resource=?", (resource,)).fetchone() or (0,))[0] + 1
@@ -659,6 +885,7 @@ class MetadataStore:
         during file I/O. A file operation waits for earlier writes before moving
         anything, while later writes fail before creating a sidecar.
         """
+        self.prepare_paths([path])
         resource = resource_key(path)
         held = getattr(self._direct_local, "held", None)
         if held is None:
@@ -732,7 +959,7 @@ class MetadataStore:
             if pool in self._pools:
                 self._pools.remove(pool)
 
-    def _schedule_sync(self, path, pool):
+    def _schedule_sync(self, path, pool, *, deadline=None):
         from app_common.file_browser._work_action import CallableAction
         from app_common.file_browser._work_policy import WorkKind
         resource = resource_key(path)
@@ -740,12 +967,13 @@ class MetadataStore:
             running = self._running.get(resource)
             if running is not None and not running[0].done():
                 return running[0]
-            action = SidecarSyncAction(self, path)
+            action = SidecarSyncAction(self, path, deadline=deadline)
             future = pool.submit_action(CallableAction(action.execute), kind=WorkKind.METADATA, priority=-5)
             self._running[resource] = (future, pool)
             return future
 
     def _coordinate(self):
+        self._identity_ready.result()
         seq = 0
         while not self._stop.is_set():
             try:
@@ -795,7 +1023,8 @@ class MetadataStore:
             self._wake.wait(.5)
             self._wake.clear()
 
-    def _sync_one(self, path):
+    def _sync_one(self, path, deadline=None):
+        path = self.prepare_paths([path])[0]
         with self._source_condition:
             if self._closing:
                 return False
@@ -803,17 +1032,22 @@ class MetadataStore:
         previous = getattr(_write_context, "value", None)
         _write_context.value = (self, True)
         try:
-            return self._sync_one_locked(path)
+            return self._sync_one_locked(path, deadline=deadline)
         finally:
             _write_context.value = previous
             with self._source_condition:
                 self._active_sync -= 1
                 self._source_condition.notify_all()
 
-    def _sync_one_locked(self, path):
+    def _sync_one_locked(self, path, deadline=None):
         from .photo_meta import PhotoMetaDataXMP, xmp_sidecar_write_lock
         resource = resource_key(path)
-        with xmp_sidecar_write_lock(path):
+        lock = xmp_sidecar_write_lock(path)
+        if not lock.acquire(timeout=max(0, deadline - time.monotonic()) if deadline is not None else -1):
+            return False
+        try:
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
             row = self._call(lambda conn: conn.execute(
                 "SELECT path,revision,fields,subjects FROM outbox WHERE resource=?", (resource,)).fetchone())
             if row is None:
@@ -821,6 +1055,9 @@ class MetadataStore:
             source, revision, text, subject_text = row
             fields, states = json.loads(text), json.loads(subject_text)
             try:
+                conflict = self._call(lambda conn: conn.execute("SELECT conflicts FROM identity_conflicts WHERE resource=?", (resource,)).fetchone())
+                if conflict:
+                    raise ValueError("同一照片存在无法确定先后顺序的旧路径编辑，请重新编辑这些字段：" + ", ".join(json.loads(conflict[0])))
                 if not Path(source).is_file():
                     raise FileNotFoundError(f"找不到照片原文件：{source}")
                 writer = PhotoMetaDataXMP()
@@ -832,6 +1069,8 @@ class MetadataStore:
                 def acknowledge(conn):
                     conn.execute("UPDATE resources SET synced_revision=max(synced_revision,?) WHERE resource=?", (revision, resource))
                     conn.execute("DELETE FROM outbox WHERE resource=? AND revision=?", (resource, revision))
+                    if not conn.execute("SELECT 1 FROM outbox WHERE resource=?", (resource,)).fetchone():
+                        conn.execute("DELETE FROM edit_intents WHERE resource=?", (resource,))
                     updated_records = []
                     # The strict subject read may have discovered unknown tags
                     # absent from the cached base. Keep those in every snapshot.
@@ -877,9 +1116,13 @@ class MetadataStore:
                 _log.warning("[metadata.store] sidecar pending path=%r revision=%s error=%s", source, revision, message)
                 return False
 
+        finally:
+            lock.release()
+
     def flush_paths(self, paths, timeout=10):
         # Worker/CLI barrier only; never call this from a GUI event handler.
         paths = list(paths)
+        self.prepare_paths(paths)
         scopes = [(path_key(path), resource_key(path)) for path in paths]
         pending = self._call(lambda conn: conn.execute("SELECT resource,path FROM outbox").fetchall())
         resources = {resource: path for resource, path in pending
@@ -898,11 +1141,11 @@ class MetadataStore:
                     # worker. A file-operation action already in an attached
                     # pool must not wait for another job in a fully occupied
                     # pool; the sidecar lock still makes duplicate syncs safe.
-                    if not self._sync_one(path):
+                    if not self._sync_one(path, deadline=deadline):
                         return False
                 else:
                     try:
-                        if not self._schedule_sync(path, pool).result(timeout=max(0, deadline - time.monotonic())):
+                        if not self._schedule_sync(path, pool, deadline=deadline).result(timeout=max(0, deadline - time.monotonic())):
                             return False
                     except TimeoutError:
                         return False
@@ -954,6 +1197,7 @@ class MetadataStore:
     @contextmanager
     def file_operation(self, paths, timeout=10):
         paths = list(dict.fromkeys(os.path.normpath(os.path.abspath(p)) for p in paths))
+        self.prepare_paths(paths, refresh=True)
         owner = getattr(self._operation_local, "owner", None)
         outer = owner is None
         if outer:
@@ -1009,6 +1253,7 @@ class MetadataStore:
                         self._source_condition.notify_all()
 
     def pending_edits(self, path):
+        self.prepare_paths([path])
         row = self._call(lambda conn: conn.execute("SELECT fields,subjects,revision FROM outbox WHERE resource=?",
                                                   (resource_key(path),)).fetchone())
         return None if row is None else {"fields": json.loads(row[0]), "subject_states": json.loads(row[1]), "revision": row[2]}
@@ -1018,6 +1263,10 @@ class MetadataStore:
         return pending["fields"] if pending else {}
 
     def pending_status(self, paths=None):
+        self._identity_ready.result()
+        if paths is not None:
+            paths = tuple(paths)
+            self.prepare_paths(paths)
         resources = {resource_key(path) for path in paths} if paths is not None else None
         return self._call(lambda conn: [dict(zip(("resource", "path", "revision", "attempts", "next_attempt", "error"), row))
             for row in conn.execute("SELECT resource,path,revision,attempts,next_attempt,error FROM outbox")
@@ -1048,6 +1297,7 @@ class MetadataStore:
         with self._source_condition:
             while self._active_sources or self._active_sync or self._active_operations:
                 self._source_condition.wait(.1)
+        self._identity.shutdown(wait=True)
         # Accepted SQL jobs always drain; queued synchronization remains durable.
         with self._lock:
             self._closed = True
@@ -1059,12 +1309,16 @@ class MetadataStore:
 # The coordinator wraps this operation in the pool's CallableAction lazily;
 # importing the durable store must not import the Qt file-browser package.
 class SidecarSyncAction:
-    def __init__(self, store, path, *, cancelled=lambda: False):
+    def __init__(self, store, path, *, cancelled=lambda: False, deadline=None):
         self._cancelled = cancelled
         self.store, self.path = store, path
+        self.deadline = deadline
 
     def execute(self):
-        return None if self._cancelled() else self.store._sync_one(self.path)
+        # Background contention must eventually release this pool worker and
+        # allow shutdown; pending edits are retried by the coordinator.
+        deadline = self.deadline if self.deadline is not None else time.monotonic() + 10
+        return None if self._cancelled() else self.store._sync_one(self.path, deadline=deadline)
 
 
 _default = None

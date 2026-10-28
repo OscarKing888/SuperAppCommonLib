@@ -10,6 +10,8 @@ import threading
 import time
 import weakref
 
+from .metadata_identity import resolve_path
+
 
 def data_directory() -> Path:
     override = os.environ.get("SUPERBIRD_METADATA_STORE_DIR")
@@ -29,6 +31,7 @@ class _SidecarLock:
         self._local = threading.local()
 
     def acquire(self, blocking=True, timeout=-1):
+        deadline = None if timeout < 0 else time.monotonic() + timeout
         acquired = self._mutex.acquire(blocking) if timeout == -1 else self._mutex.acquire(blocking, timeout)
         if not acquired:
             return False
@@ -45,7 +48,6 @@ class _SidecarLock:
             if stream.seek(0, os.SEEK_END) == 0:
                 stream.write(b"\0")
                 stream.flush()
-            deadline = None if timeout < 0 else time.monotonic() + timeout
             while True:
                 try:
                     stream.seek(0)
@@ -63,7 +65,7 @@ class _SidecarLock:
                         stream.close()
                         self._mutex.release()
                         return False
-                    time.sleep(.02)
+                    time.sleep(.02 if deadline is None else min(.02, max(0, deadline - time.monotonic())))
             self._local.stream = stream
             self._local.depth = 1
             return True
@@ -107,9 +109,10 @@ _LOCK_STRIPES = 1024
 
 
 def xmp_sidecar_write_lock(path):
-    # Resolve the sidecar stem, not a symlink to the source image. Idle lock
-    # objects disappear from this weak registry; active transactions own them.
-    stem = os.path.realpath(os.path.splitext(os.path.abspath(os.fspath(path)))[0])
+    # Resolve the existing complete filename first: stripping a Windows 8.3
+    # extension makes the short stem nonexistent and hides its long-name alias.
+    # Idle locks disappear from the registry; active transactions own them.
+    stem = os.path.splitext(resolve_path(path, refresh=True)[1])[0]
     identity = os.path.normcase(stem).casefold()
     # A deterministic stripe bounds both lock objects and on-disk lock files.
     # Rare collisions only serialize unrelated writes; they cannot mix data.

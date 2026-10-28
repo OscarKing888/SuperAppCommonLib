@@ -108,3 +108,19 @@ def test_failed_pending_sync_keeps_source_and_durable_edit(tmp_path, monkeypatch
     assert source.read_bytes() == b"original"
     assert not destination.exists()
     assert store.pending_edits(str(source))["fields"]["XMP-dc:Description"] == "不能丢失"
+
+
+def test_removed_destination_pending_edit_blocks_name_reuse(tmp_path):
+    from app_common.exif_io.metadata_store import get_store
+    source, destination = tmp_path / "source.jpg", tmp_path / "dest/photo.jpg"
+    source.write_bytes(b"new photo")
+    destination.parent.mkdir()
+    destination.write_bytes(b"old photo")
+    store = get_store()
+    store.submit_edit(str(destination), {"title": "旧照片尚未同步的鸟名"}).result(3)
+    destination.unlink()  # Removed outside the app; its durable edit survives.
+    with pytest.raises(OSError, match="元数据未同步"):
+        tx.transfer_file_pairs([(str(source), str(destination))], action="copy")
+    assert source.read_bytes() == b"new photo"
+    assert not destination.exists()
+    assert store.pending_edits(str(destination))["fields"]["XMP-dc:Title"] == "旧照片尚未同步的鸟名"

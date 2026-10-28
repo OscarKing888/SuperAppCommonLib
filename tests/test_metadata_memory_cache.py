@@ -271,3 +271,47 @@ def test_raw_report_fast_path_reuses_embedded_focus(tmp_path, loader_factory, mo
     first = make([path], rows=rows)._read_metadata_batch([path])
     second = make([path], rows=rows)._read_metadata_batch([path])
     assert first == second and focus_reads == [path] and reads == []
+
+
+@pytest.mark.parametrize("profile", ["browser", "full"])
+def test_fingerprints_refresh_retargeted_alias_before_sidecar_lookup(tmp_path, profile):
+    import os
+    from app_common.exif_io.reader import full_metadata_signatures
+
+    a, b, alias_dir = tmp_path / "a", tmp_path / "b", tmp_path / "current"
+    for directory, content in ((a, "原目标侧车"), (b, "新目标侧车")):
+        directory.mkdir()
+        (directory / "bird.jpg").write_bytes(b"photo")
+        (directory / "bird.xmp").write_text(content, encoding="utf-8")
+    try:
+        alias_dir.symlink_to(a, target_is_directory=True)
+    except OSError:
+        pytest.skip("Directory aliases are unavailable on this volume")
+    alias = str(alias_dir / "bird.jpg")
+    fingerprint = (lambda: metadata_signatures([alias], [], {})) if profile == "browser" else (
+        lambda: full_metadata_signatures([alias]))
+    old = fingerprint()[alias]
+    assert old[1][0] == os.path.normcase(str(a / "bird.xmp"))
+    alias_dir.unlink()
+    alias_dir.symlink_to(b, target_is_directory=True)
+    new = fingerprint()[alias]
+    assert new[1][0] == os.path.normcase(str(b / "bird.xmp"))
+    assert new != old
+
+
+def test_sql_first_paint_never_resolves_or_stats_photo_alias(tmp_path, monkeypatch):
+    import os
+    from app_common.exif_io.metadata_store import get_store
+
+    path = str(tmp_path / "offline.jpg")
+    store = get_store()
+    store.remember_many({path: {"Title": "离线缓存"}}, profile="full").result(3)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Cached first paint must not resolve or stat source paths")
+
+    with monkeypatch.context() as blocked:
+        blocked.setattr(os.path, "realpath", forbidden)
+        blocked.setattr(os, "stat", forbidden)
+        assert store.read_many([path], profile="full")[path]["Title"] == "离线缓存"
+        assert path in store.revisions([path])

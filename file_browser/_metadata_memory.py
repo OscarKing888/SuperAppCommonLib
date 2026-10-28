@@ -28,6 +28,12 @@ def _file_stamp(path: str) -> tuple | None:
 
 def metadata_signatures(paths, tags, report_rows, *, directory_index=None) -> dict:
     """保留共享侧车的大小写、派生文件及父目录查找语义，不解析 XML。"""
+    from app_common.exif_io.metadata_store import get_store
+
+    # This is the real worker validation pass, after cached first paint. Refresh
+    # aliases before sidecar lookup so a retargeted junction follows its photo.
+    paths = tuple(paths)
+    get_store().prepare_paths(paths, refresh=True)
     sidecars = find_xmp_sidecars(paths, directory_index=directory_index)
     signatures = {}
     for path in paths:
@@ -66,6 +72,9 @@ class _Entry:
     record: dict
     touched: float
     size: int
+    mapping_field: str | None = None
+    mapping_sizes: dict | None = None
+    mapping_keys: frozenset | None = None
 
 
 class MetadataMemoryCache:
@@ -177,6 +186,94 @@ class MetadataMemoryCache:
             queue[key] = _Entry(signature, record, now, size)
             self._bytes += size
             self._evict_to_limits()
+
+    def touch(self, path, signature):
+        """Touch an entry without copying its payload; safe for GUI bookkeeping."""
+        key = _path_key(path)
+        with self._lock:
+            now = self._clock()
+            self._expire(now)
+            queue = self._active if self._in_scope(key) else self._inactive
+            entry = queue.get(key)
+            found = entry is not None and entry.signature == signature
+            if found:
+                entry.touched = now
+                queue.move_to_end(key)
+            return found, self._generation
+
+    @staticmethod
+    def _mapping_item_size(key, value):
+        # Per-item accounting deliberately overcounts shared keys/values. That
+        # keeps the budget conservative while allowing O(changed rows) updates.
+        return _deep_size((key, value)) + 64
+
+    def store_with_mapping(self, path, signature, record, generation, *, field, keys):
+        """Worker-only listing replacement retaining concurrently updated rows.
+
+        Only this cache owns the retained mapping. Public reads still return
+        copies; no caller receives a mutable reference to a cached row.
+        """
+        key = _path_key(path)
+        base = deepcopy({k: v for k, v in record.items() if k != field})
+        allowed = frozenset(keys)
+        incoming = {k: deepcopy(v) for k, v in record.get(field, {}).items() if k in allowed}
+        incoming_sizes = {k: self._mapping_item_size(k, v) for k, v in incoming.items()}
+        base_size = _deep_size((key, signature, base, field, allowed)) + 256
+        with self._lock:
+            if generation != self._generation:
+                return
+            now = self._clock()
+            self._expire(now)
+            queue = self._active if self._in_scope(key) else self._inactive
+            old = queue.get(key)
+            if old is not None and old.signature == signature and old.mapping_field == field:
+                mapping, sizes = old.record[field], old.mapping_sizes
+                for removed in list(mapping):
+                    if removed not in allowed:
+                        mapping.pop(removed)
+                        sizes.pop(removed)
+            else:
+                mapping, sizes = {}, {}
+            mapping.update(incoming)
+            sizes.update(incoming_sizes)
+            base[field] = mapping
+            size = base_size + sys.getsizeof(mapping) + sys.getsizeof(sizes) + sum(sizes.values())
+            if old is not None:
+                self._drop(queue, key)
+            if size > self.max_bytes or not self.max_entries:
+                return
+            queue[key] = _Entry(signature, base, now, size, field, sizes, allowed)
+            self._bytes += size
+            self._evict_to_limits()
+
+    def patch_mapping(self, path, signature, updates, *, field):
+        """Copy/account only changed rows in a retained directory snapshot."""
+        key = _path_key(path)
+        rows = {k: deepcopy(v) for k, v in updates.items()}
+        row_sizes = {k: self._mapping_item_size(k, v) for k, v in rows.items()}
+        with self._lock:
+            now = self._clock()
+            self._expire(now)
+            queue = self._active if self._in_scope(key) else self._inactive
+            entry = queue.get(key)
+            if entry is None or entry.signature != signature or entry.mapping_field != field:
+                return False
+            mapping, sizes = entry.record[field], entry.mapping_sizes
+            before = sys.getsizeof(mapping) + sys.getsizeof(sizes)
+            delta = 0
+            for row_key, row in rows.items():
+                if row_key not in entry.mapping_keys:
+                    continue
+                delta += row_sizes[row_key] - sizes.get(row_key, 0)
+                mapping[row_key] = row
+                sizes[row_key] = row_sizes[row_key]
+            delta += sys.getsizeof(mapping) + sys.getsizeof(sizes) - before
+            entry.size += delta
+            self._bytes += delta
+            entry.touched = now
+            queue.move_to_end(key)
+            self._evict_to_limits()
+            return key in queue
 
     def invalidate_scope(self, directory):
         prefix = _path_key(directory).rstrip(os.sep) + os.sep

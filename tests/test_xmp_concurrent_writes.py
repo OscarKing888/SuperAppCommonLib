@@ -9,7 +9,7 @@ from app_common.exif_io.photo_meta import (
 )
 
 
-def test_photo_symlink_does_not_change_its_same_stem_sidecar_lock(tmp_path):
+def test_photo_symlink_uses_the_canonical_source_sidecar_lock(tmp_path):
     target = tmp_path / "different" / "target.jpg"
     target.parent.mkdir()
     target.write_bytes(b"photo")
@@ -18,7 +18,7 @@ def test_photo_symlink_does_not_change_its_same_stem_sidecar_lock(tmp_path):
         link.symlink_to(target)
     except OSError:
         pytest.skip("symlink creation unavailable")
-    assert xmp_sidecar_write_lock(str(link)) is xmp_sidecar_write_lock(str(link.with_suffix(".arw")))
+    assert xmp_sidecar_write_lock(str(link)) is xmp_sidecar_write_lock(str(target))
 
 
 @pytest.mark.parametrize("edit", ["title", "description", "subjects", "rating"])

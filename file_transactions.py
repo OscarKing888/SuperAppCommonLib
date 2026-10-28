@@ -57,8 +57,10 @@ def transfer_file_pairs(
     from app_common.exif_io.xmp_sidecar import find_same_stem_xmp_sidecar
 
     pairs = list(path_pairs)
-    sources = [source for source, _ in pairs]
-    with get_store().file_operation(sources):
+    # The destination may still own durable edits after its previous photo was
+    # removed externally. Flush/reserve both identities before reusing its name.
+    affected = [path for pair in pairs for path in pair]
+    with get_store().file_operation(affected):
         known = {os.path.normcase(os.path.abspath(source)) for source, _ in pairs}
         for source, destination in list(pairs):
             if Path(source).suffix.lower() == ".xmp":

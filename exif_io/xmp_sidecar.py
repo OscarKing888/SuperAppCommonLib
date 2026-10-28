@@ -70,7 +70,7 @@ def _candidate_sidecar_stems(image_path: Path) -> list[str]:
         return []
     stems: list[str] = [stem]
     for marker in _DERIVED_STEM_SPLIT_MARKERS:
-        pos = stem.find(marker)
+        pos = stem.casefold().find(marker.casefold())
         if pos <= 0:
             continue
         base = stem[:pos].rstrip(" _-")
@@ -118,7 +118,8 @@ def find_xmp_sidecar(image_path: str) -> str | None:
     查找图片旁边的 XMP sidecar 文件，不区分大小写。
     返回 sidecar 文件路径，找不到返回 None。
     """
-    p = Path(image_path)
+    from .metadata_identity import cached_path
+    p = Path(cached_path(image_path))
     stems = _candidate_sidecar_stems(p)
     if not stems:
         return None
@@ -135,7 +136,8 @@ def same_stem_key(image_path: str) -> tuple[str, str]:
 
     The stem compares case-insensitively, like :func:`find_same_stem_xmp_sidecar`.
     """
-    norm = os.path.normpath(image_path)
+    from .metadata_identity import cached_path
+    norm = os.path.normpath(cached_path(image_path))
     return os.path.normcase(os.path.dirname(norm)), os.path.splitext(os.path.basename(norm))[0].lower()
 
 
@@ -150,7 +152,8 @@ def find_same_stem_xmp_sidecar(image_path: str) -> str | None:
     """
     if not image_path:
         return None
-    path = Path(os.path.normpath(image_path))
+    from .metadata_identity import cached_path
+    path = Path(os.path.normpath(cached_path(image_path)))
     if path.suffix.lower() == ".xmp" or not path.stem:
         return None
     return _find_xmp_by_stem_in_dir(path.parent, path.stem)
@@ -221,7 +224,8 @@ def find_xmp_sidecars(image_paths: list[str], *, directory_index=None) -> dict[s
     for image_path in image_paths or []:
         lookup_t0 = perf_counter()
         norm = os.path.normpath(image_path)
-        p = Path(image_path)
+        from .metadata_identity import cached_path
+        p = Path(cached_path(image_path))
         stems = _candidate_sidecar_stems(p)
         if not stems:
             lookup_ms += elapsed_ms(lookup_t0)
@@ -494,6 +498,8 @@ def read_xmp_sidecar(image_path: str) -> list[tuple[str, str, str]]:
 
     找不到 sidecar 文件或解析失败时返回空列表。
     """
+    from .metadata_identity import resolve_path
+    image_path = resolve_path(image_path, refresh=True)[1]
     xmp_path = find_xmp_sidecar(image_path)
     if not xmp_path:
         return []

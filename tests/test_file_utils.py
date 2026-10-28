@@ -33,7 +33,8 @@ def test_move_to_trash_sends_sibling_xmp_sidecar_to_system_trash(monkeypatch, tm
     monkeypatch.setitem(sys.modules, "send2trash", SimpleNamespace(send2trash=fake_send2trash))
 
     assert move_to_trash(str(photo))
-    assert sent == [str(photo), str(sidecar)]
+    # Worker canonicalization may normalize Windows spelling/case.
+    assert [Path(path) for path in sent] == [photo, sidecar]
     assert not (superpicky / "deleted").exists()
 
 

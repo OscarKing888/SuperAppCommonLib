@@ -39,11 +39,13 @@ from .xmp_sidecar import _photo_descriptions, _extract_text_value
 
 from .sidecar_lock import xmp_sidecar_write_lock
 from .shared_read import read_shared_bytes
+from .metadata_identity import cached_path, resolve_path
 
 
 def _serialized_xmp_write(method):
     @wraps(method)
     def locked(self, path, *args, **kwargs):
+        path = resolve_path(path, refresh=True)[1]
         with xmp_sidecar_write_lock(path):
             if method.__name__ == "read_json_field":
                 return method(self, path, *args, **kwargs)
@@ -443,6 +445,7 @@ class PhotoMetaDataXMP(PhotoMetaData):
 
     def sidecar_path_for(self, path: str) -> Path:
         """Return only the strict same-stem sidecar or its default write path."""
+        path = cached_path(path)
         try:
             from .xmp_sidecar import find_same_stem_xmp_sidecar
             found = find_same_stem_xmp_sidecar(path)
@@ -780,6 +783,7 @@ class PhotoMetaDataXMP(PhotoMetaData):
         Strict reads expose I/O and XML errors instead of treating them as an
         empty tag set. A missing sidecar still has no subjects in either mode.
         """
+        path = resolve_path(path, refresh=True)[1]
         sidecar_path = self.sidecar_path_for(path)
         try:
             root = ET.fromstring(read_shared_bytes(sidecar_path))
