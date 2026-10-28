@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any, TextIO
@@ -208,6 +209,13 @@ class _Logger:
 
     def error(self, msg: str, *args: Any) -> None:
         self._write("ERROR", msg, *args)
+
+    def exception(self, msg: str, *args: Any) -> None:
+        """Log the active exception, including in windowed builds without stderr."""
+        if not _level_ok("ERROR"):
+            return
+        message = msg % args if args else msg
+        self._write("ERROR", "%s\n%s", message, traceback.format_exc().rstrip())
 
 
 def get_logger(name: str) -> _Logger:
