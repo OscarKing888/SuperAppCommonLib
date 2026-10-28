@@ -1,5 +1,6 @@
 """粘贴鸟名必须一并保存拼音，写失败时保留原有元数据。"""
 from pathlib import Path
+from concurrent.futures import Future
 import sqlite3
 import time
 
@@ -12,6 +13,7 @@ from app_common.bird_rarity import rarity_metadata
 from app_common.bird_species_copy import species_snapshot
 from app_common.shooting_location import shooting_location
 from app_common.exif_io.photo_meta import PhotoMetaDataXMP
+from app_common.exif_io.metadata_store import get_store
 from app_common.file_browser import FileListPanel
 from app_common.file_browser import _panel as panel_module
 from app_common.file_browser._workers import MetadataLoader
@@ -93,6 +95,7 @@ def test_paste_updates_real_xmp_and_cache_for_multiple_photos(panel, tmp_path, m
     panel._copied_species_payload = {"bird_species_cn": name}
     panel._paste_species_to_paths(paths + paths[:1])
     wait_actions(panel)
+    assert get_store().flush_paths(paths)
     loader = MetadataLoader([], meta_proxy=object())
     try:
         for path, original in zip(paths, originals):
@@ -121,19 +124,24 @@ def test_partial_failure_keeps_failed_photo_and_cache(panel, tmp_path, monkeypat
     previous = dict(panel._meta_cache[paths[0]])
     sidecar = Path(paths[0]).with_suffix(".xmp")
     before = sidecar.read_bytes()
-    write = panel._meta_proxy.write
+    sql_store = get_store()
+    submit = sql_store.submit_edit
 
-    def fail_one(path, fields):
+    def fail_one(path, fields, **kwargs):
         if path == paths[0]:
             if raises:
-                raise OSError("模拟写入失败")
-            return False
-        return write(path, fields)
+                raise OSError("模拟 SQLite 提交失败")
+            rejected = Future()
+            rejected.set_exception(OSError("模拟 SQLite 提交失败"))
+            return rejected
+        return submit(path, fields, **kwargs)
 
-    monkeypatch.setattr(panel._meta_proxy, "write", fail_one)
+    monkeypatch.setattr(sql_store, "submit_edit", fail_one)
     panel._copied_species_payload = {"bird_species_cn": "白头鹎"}
     panel._paste_species_to_paths(paths)
     wait_actions(panel)
+    assert panel._species_paste_controller._failed == 1
+    assert sql_store.flush_paths(paths)
     assert sidecar.read_bytes() == before
     assert panel._meta_cache[paths[0]] == previous
     assert stored_pinyin(store.read(paths[1])) == "bái tóu bēi"
@@ -161,7 +169,9 @@ def test_copy_paste_associated_metadata_snapshot(panel, tmp_path, monkeypatch, s
     panel._meta_cache[source] = dict(old)
     monkeypatch.setattr(panel, "_get_report_row_for_path", lambda _path: dict(old))
     display = str(tmp_path / "过期路径.jpg")
-    monkeypatch.setattr(panel, "_resolve_source_path_for_action", lambda path: source if path == display else path)
+    from app_common.file_browser._browser_core import _set_cached_actual_path
+    _set_cached_actual_path(display, source)
+    monkeypatch.setattr(panel, "_resolve_source_path_for_action", lambda *_: pytest.fail("GUI source lookup must use its cached repair"))
     monkeypatch.setattr(panel_module, "read_batch_metadata", lambda *_args: pytest.fail("unexpected EXIF read"))
     copied_text = []
     monkeypatch.setattr(panel, "_copy_text_to_clipboard", copied_text.append)
@@ -173,6 +183,7 @@ def test_copy_paste_associated_metadata_snapshot(panel, tmp_path, monkeypatch, s
     originals = [Path(path).read_bytes() for path in targets]
     panel._paste_species_to_paths(targets)
     wait_actions(panel)
+    assert get_store().flush_paths(targets)
     loader = MetadataLoader([], meta_proxy=object())
     try:
         for path, original in zip(targets, originals):
@@ -212,6 +223,7 @@ def test_missing_source_fields_clear_previous_species_data(panel, tmp_path, monk
     wait_actions(panel)
     panel._paste_species_to_paths([target])
     wait_actions(panel)
+    assert get_store().flush_paths([target])
     rec = store.read(target)
     # Marker fields prevent stale report values from being hydrated on reload.
     assert rarity_metadata({"report.gbif_rarity_100": 70, **rec}) == (None, "")

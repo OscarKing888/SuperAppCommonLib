@@ -6,7 +6,9 @@ JSON 仅作为数据库内的安全序列化格式，避免不可信缓存触发
 from __future__ import annotations
 
 import atexit
+from collections import deque
 from contextlib import closing
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -17,6 +19,7 @@ import threading
 import time
 
 from app_common.log import get_logger
+from .shared_read import open_shared_read
 
 _log = get_logger("metadata.sqlite")
 XMP_NAMESPACE = "xmp-v1"
@@ -31,6 +34,20 @@ def file_stamp(path):
     try:
         st = os.stat(path)
         return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
+    except OSError:
+        return None
+
+
+def sidecar_stamp(path):
+    """Worker-only strong fingerprint; Windows ctime is not a change counter."""
+    try:
+        with open_shared_read(path) as stream:
+            before = os.fstat(stream.fileno())
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+            after = os.fstat(stream.fileno())
+        stamp = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+        final = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+        return (*stamp, digest) if stamp == final else None
     except OSError:
         return None
 
@@ -65,33 +82,51 @@ class MetadataSQLiteCache:
         self._thread = None
         self._closed = False
         self._disabled = False
-        self._blocked = 0
         self._revision = 0
+        self._invalidations = deque(maxlen=4096)
+        self._pending_controls = {}
 
     def revision(self):
         with self._lock:
             return self._revision
 
+    @staticmethod
+    def _affected(kind, target, path, dependency):
+        if kind == "invalidate":
+            return path.startswith(target) or bool(dependency and dependency.startswith(target))
+        sidecar = os.path.splitext(target)[0] + ".xmp"
+        return path == target or dependency == sidecar or os.path.splitext(path)[0] == os.path.splitext(target)[0]
+
+    def _current(self, revision, path, dependency="", *, pending=False):
+        """Called under _lock. An edit must not discard another photo's work."""
+        if self._invalidations and revision < self._invalidations[0][0] - 1:
+            return False
+        events = [(r, k, t) for r, k, t in self._invalidations if r > revision]
+        if pending:
+            events.extend((self._revision, k, t) for k, t in self._pending_controls)
+        return not any(self._affected(k, t, path, dependency) for _, k, t in events)
+
     def get_many(self, namespace, signatures):
         """只读连接不等待写队列；调用者在 metadata worker 中调用。"""
         with self._lock:
-            if self._closed or self._disabled or self._blocked:
+            if self._closed or self._disabled:
                 return {}
             revision = self._revision
         expected = {path_key(p): (p, encode(s)) for p, s in signatures.items() if s is not None}
         if not expected:
             return {}
         result = {}
+        dependencies = {}
         try:
             with closing(sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=0.03)) as conn:
                 keys = list(expected)
                 for start in range(0, len(keys), 400):
                     chunk = keys[start:start + 400]
                     rows = conn.execute(
-                        f"SELECT path, signature, payload FROM entries WHERE namespace=? AND path IN ({','.join('?' for _ in chunk)})",
+                        f"SELECT path, signature, payload, dependency FROM entries WHERE namespace=? AND path IN ({','.join('?' for _ in chunk)})",
                         [namespace, *chunk],
                     )
-                    for key, signature, payload in rows:
+                    for key, signature, payload, dependency in rows:
                         original, wanted = expected[key]
                         if signature != wanted:
                             continue
@@ -99,33 +134,42 @@ class MetadataSQLiteCache:
                             value = json.loads(payload)
                             if isinstance(value, dict):
                                 result[original] = value
+                                dependencies[original] = dependency
                         except (ValueError, TypeError):
                             pass
         except (OSError, sqlite3.Error) as exc:
             _log.debug("[metadata.sqlite] read fallback path=%r error=%s", str(self.path), exc)
             return {}
         with self._lock:
-            return result if revision == self._revision and not self._blocked else {}
+            result = {p: value for p, value in result.items()
+                      if self._current(revision, path_key(p), dependencies[p], pending=True)}
+        if result:
+            self._enqueue("touch", [(time.time_ns(), namespace, path_key(p)) for p in result], len(result) * 128)
+        return result
 
     def _enqueue(self, kind, data, size=0, revision=None):
         with self._lock:
             if self._closed or self._disabled:
                 return False
-            if revision is not None and revision != self._revision:
-                return False
+            if kind == "put":
+                data = [row for row in data if self._current(revision, row[1], row[4])]
+                if not data:
+                    return False
             if size + self._pending_bytes > self._pending_limit:
                 return False  # 缓存背压只丢缓存写入，不阻塞照片读取。
             control = kind in ("refresh", "invalidate")
             if control:
                 self._revision += 1
-            if kind == "invalidate":
-                self._blocked += 1
+                self._invalidations.append((self._revision, kind, data))
+                key = (kind, data)
+                self._pending_controls[key] = self._pending_controls.get(key, 0) + 1
             try:
-                self._queue.put_nowait((kind, data, size, self._revision))
+                self._queue.put_nowait((kind, data, size, self._revision if revision is None else revision))
             except queue.Full:
                 if control:
-                    if kind == "invalidate":
-                        self._blocked -= 1
+                    self._pending_controls[key] -= 1
+                    if not self._pending_controls[key]:
+                        del self._pending_controls[key]
                     self._disabled = True  # 极端编辑洪峰降级为源文件读取，绝不返回旧值。
                 return False
             self._pending_bytes += size
@@ -192,7 +236,7 @@ class MetadataSQLiteCache:
         known = [row[0] for row in conn.execute(
             "SELECT path FROM entries WHERE namespace=? AND dependency=?", (XMP_NAMESPACE, dependency))]
         conn.execute("DELETE FROM entries WHERE dependency=? OR path=?", (dependency, source))
-        before = file_stamp(sidecar) if sidecar else None
+        before = sidecar_stamp(sidecar) if sidecar else None
         if before is None:
             return
         rows = []
@@ -205,7 +249,7 @@ class MetadataSQLiteCache:
             size = len(payload.encode("utf-8")) + len(signature.encode("utf-8")) + len(image.encode("utf-8")) + 256
             if size <= min(self.max_bytes, 2 * 1024 * 1024):
                 rows.append((XMP_NAMESPACE, image, signature, payload, dependency, time.time_ns(), size))
-        if file_stamp(sidecar) == before:
+        if sidecar_stamp(sidecar) == before:
             self._insert(conn, rows)
 
     def _prune(self, conn):
@@ -235,9 +279,11 @@ class MetadataSQLiteCache:
                     if conn is None:
                         conn = self._connect_writer()
                     if kind == "put":
-                        if revision != self.revision():
-                            continue
-                        self._insert(conn, data)
+                        with self._lock:
+                            current = [row for row in data if self._current(revision, row[1], row[4])]
+                        self._insert(conn, current)
+                    elif kind == "touch":
+                        conn.executemany("UPDATE entries SET touched=? WHERE namespace=? AND path=?", data)
                     elif kind == "refresh":
                         self._refresh(conn, data)
                     elif kind == "invalidate":
@@ -258,8 +304,11 @@ class MetadataSQLiteCache:
                 finally:
                     with self._lock:
                         self._pending_bytes -= size
-                        if kind == "invalidate":
-                            self._blocked -= 1
+                        if kind in ("invalidate", "refresh"):
+                            key = (kind, data)
+                            self._pending_controls[key] -= 1
+                            if not self._pending_controls[key]:
+                                del self._pending_controls[key]
                     self._queue.task_done()
         finally:
             if conn is not None:

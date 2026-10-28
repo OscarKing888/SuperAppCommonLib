@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-from pathlib import Path
 import xml.etree.ElementTree as ET
 
 import pytest
 
 from app_common.exif_io.photo_meta import PhotoMetaDataXMP
+from app_common.exif_io import photo_meta
 
 
 def test_strict_subject_read_preserves_chinese_and_literal_semicolons(tmp_path) -> None:
     source = tmp_path / "photo.jpg"
+    source.write_bytes(b"photo")
     metadata = PhotoMetaDataXMP()
     subjects = ["捕食", "行为;特殊", "Lightroom"]
     assert metadata.write_subjects(str(source), subjects)
@@ -64,14 +65,14 @@ def test_strict_subject_read_raises_for_corrupt_xml_without_modifying_it(tmp_pat
 def test_strict_subject_read_propagates_open_permission_error(tmp_path, monkeypatch) -> None:
     sidecar = tmp_path / "photo.xmp"
     sidecar.write_text("<xmp />", encoding="utf-8")
-    real_open = Path.open
+    real_read = photo_meta.read_shared_bytes
 
     def denied_open(path, *args, **kwargs):
         if path == sidecar:
             raise PermissionError("sidecar unavailable")
-        return real_open(path, *args, **kwargs)
+        return real_read(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", denied_open)
+    monkeypatch.setattr(photo_meta, "read_shared_bytes", denied_open)
     with pytest.raises(PermissionError, match="sidecar unavailable"):
         PhotoMetaDataXMP().read_subjects(str(sidecar), strict=True)
 
@@ -83,7 +84,7 @@ def test_default_subject_read_still_swallows_parser_io_errors(tmp_path, monkeypa
     def denied_parse(*args, **kwargs):
         raise PermissionError("sidecar unavailable")
 
-    monkeypatch.setattr(ET, "parse", denied_parse)
+    monkeypatch.setattr(ET, "fromstring", denied_parse)
     metadata = PhotoMetaDataXMP()
     assert metadata.read_subjects(str(sidecar)) == []
     with pytest.raises(PermissionError, match="sidecar unavailable"):

@@ -108,7 +108,7 @@ def _overlay_xmp_aliases(merged: dict[str, Any]) -> None:
 
     def first(*keys: str) -> Any | None:
         for key in keys:
-            if key in merged and merged.get(key) not in (None, "", " "):
+            if key in merged and merged.get(key) is not None:
                 return merged.get(key)
         return None
 
@@ -134,7 +134,7 @@ def _overlay_xmp_aliases(merged: dict[str, Any]) -> None:
     lens_val = first("XMP-aux:LensModel", "XMP-aux:Lens", "XMP-exifEX:LensModel")
     if lens_val is not None:
         merged["LensModel"] = lens_val
-        merged.setdefault("Lens", lens_val)
+        merged["Lens"] = lens_val
 
     title_val = first("XMP-dc:Title", "XMP-dc:title")
     if title_val is not None:
@@ -186,19 +186,19 @@ def _overlay_generic_aliases(merged: dict[str, Any]) -> None:
         "GPSLongitude": ("Composite:GPSLongitude", "XMP-exif:GPSLongitude"),
     }
     for target, candidates in common_key_map.items():
-        if merged.get(target) not in (None, "", " "):
+        if target in merged and merged[target] is not None:
             continue
         value = first(*candidates)
         if value not in (None, "", " "):
             merged[target] = value
 
-    if merged.get("ISO") in (None, "", " "):
+    if "ISO" not in merged or merged["ISO"] is None:
         iso_fallback = merged.get("PhotographicSensitivity")
         if iso_fallback in (None, "", " "):
             iso_fallback = merged.get("ISOSpeedRatings")
         if iso_fallback not in (None, "", " "):
             merged["ISO"] = iso_fallback
-    if merged.get("LensModel") in (None, "", " "):
+    if "LensModel" not in merged or merged["LensModel"] is None:
         lens_fallback = merged.get("Lens")
         if lens_fallback not in (None, "", " "):
             merged["LensModel"] = lens_fallback
@@ -366,16 +366,48 @@ def extract_many_with_xmp_priority(
     批量读取元数据：先读内嵌 EXIF（exiftool/Pillow），再用 sidecar XMP 覆盖同语义字段。
     返回键为 path.resolve(strict=False) 的字典，适合 GUI/CLI 直接喂给 normalize。
     """
-    base_map = extract_many(paths, mode=mode, chunk_size=chunk_size, cancelled=cancelled)
-    if not base_map:
+    profile = "full-pillow" if mode.lower() == "off" else "full"
+    return read_full_metadata_snapshot(
+        paths,
+        lambda missing: extract_many(missing, mode=mode, chunk_size=chunk_size, cancelled=cancelled),
+        profile=profile,
+        cancelled=cancelled,
+    )
+
+
+def read_full_metadata_snapshot(paths, source_reader, *, profile="full", cancelled=None):
+    """Read a complete, fingerprint-validated snapshot through the local store.
+
+    This is a worker API. Browser field subsets never satisfy this profile, and
+    a source read racing an accepted edit cannot replace the newer revision.
+    """
+    from app_common.exif_io.metadata_store import get_store
+
+    resolved = list(dict.fromkeys(Path(path).resolve(strict=False) for path in paths))
+    names = [os.path.normpath(str(path)) for path in resolved]
+    if not names or (cancelled is not None and cancelled()):
         return {}
+    store = get_store()
+    signatures = full_metadata_signatures(names, profile)
+    try:
+        cached = store.read_many(names, profile=profile, signatures=signatures)
+        expected = store.revisions(names, signatures=signatures)
+    except Exception:
+        # A rebuildable read cache failure must not hide source metadata.
+        store, cached, expected = None, {}, {}
+    missing = [path for path in resolved if os.path.normpath(str(path)) not in cached]
+    base_map = source_reader(missing) if missing else {}
+    out = {path: dict(cached[os.path.normpath(str(path))]) for path in resolved
+           if os.path.normpath(str(path)) in cached}
+    if not base_map:
+        return out
 
     try:
         from app_common.exif_io.xmp_sidecar import read_xmp_sidecar  # 局部导入避免循环
     except Exception:
         read_xmp_sidecar = None
 
-    out: dict[Path, dict[str, Any]] = {}
+    fresh = {}
     for resolved_path, base_rec in base_map.items():
         if cancelled is not None and cancelled():
             break
@@ -387,11 +419,55 @@ def extract_many_with_xmp_priority(
             except Exception:
                 xmp_rows = []
             if xmp_rows:
-                merged.update(_xmp_rows_to_flat_dict(resolved_path, xmp_rows))
-                _overlay_xmp_aliases(merged)
+                sidecar = _xmp_rows_to_flat_dict(resolved_path, xmp_rows)
+                _overlay_xmp_aliases(sidecar)
+                merged.update(sidecar)
         _overlay_generic_aliases(merged)
         out[resolved_path] = merged
+        fresh[os.path.normpath(str(resolved_path))] = merged
+    if cancelled is not None and cancelled():
+        return out
+    after = full_metadata_signatures(list(fresh), profile)
+    stable = {path: record for path, record in fresh.items()
+              if path in signatures and signatures[path] == after.get(path)}
+    if stable and store is not None:
+        try:
+            store.remember_many(stable, profile=profile, signatures=signatures,
+                                expected_revisions=expected).result()
+            latest = store.read_many(list(stable), profile=profile, signatures=signatures)
+            for path in stable:
+                if path in latest:
+                    out[Path(path)] = latest[path]
+                elif store.current_revision(path) > expected.get(path, 0):
+                    # The accepted edit may have synced while this older read was
+                    # running. Never return the pre-edit source snapshot to Qt.
+                    current = store.read_many([path], profile=profile).get(path) or store.peek(path)
+                    if current:
+                        out[Path(path)].update(current)
+        except Exception:
+            pass
     return out
+
+
+def full_metadata_signatures(paths, profile="full"):
+    """Source/sidecar validation for complete snapshots, without Qt imports."""
+    from .metadata_sqlite import file_stamp, sidecar_stamp
+    from .xmp_sidecar import find_xmp_sidecars
+
+    sidecars = find_xmp_sidecars(paths)
+    result = {}
+    for path in paths:
+        norm = os.path.normpath(str(path))
+        source = file_stamp(norm)
+        if source is None:
+            continue
+        sidecar = sidecars.get(norm)
+        stamp = sidecar_stamp(sidecar) if sidecar else None
+        if sidecar and stamp is None:
+            continue
+        result[norm] = (source, (os.path.normcase(os.path.abspath(sidecar)), stamp)
+                        if sidecar else None, profile)
+    return result
 
 
 def extract_metadata_with_xmp_priority(path: Path | str, mode: str = "auto") -> dict[str, Any]:

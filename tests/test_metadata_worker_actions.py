@@ -10,6 +10,7 @@ from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
 
 from app_common.exif_io.photo_meta import PhotoMetaDataXMP
+from app_common.exif_io.metadata_store import get_store
 from app_common.file_browser import FileListPanel
 from app_common.file_browser._metadata_actions import MetadataWriteAction, SpeciesCopyAction
 from app_common.file_browser._metadata_tasks import MetadataProgressDialog
@@ -24,6 +25,11 @@ def wait_for(predicate):
         assert time.monotonic() < end
         _APP.processEvents()
         time.sleep(.001)
+
+
+def sync_pending():
+    store = get_store()
+    assert store.flush_paths([row["path"] for row in store.pending_status()])
 
 
 @pytest.fixture
@@ -69,7 +75,14 @@ def test_writes_are_parallel_off_gui_and_deduplicate_sidecars(panel, tmp_path, m
     selected = []
     panel.file_selected.connect(selected.append)
     panel._selected_display_path = paths[0]
-    panel._paste_species_to_paths(paths + paths[:1])
+    with monkeypatch.context() as patch:
+        original_sidecar_path = PhotoMetaDataXMP.sidecar_path_for
+        gui_thread = threading.get_ident()
+        def worker_sidecar_path(meta, path):
+            assert threading.get_ident() != gui_thread, "batch submission must not stat sidecars on Qt"
+            return original_sidecar_path(meta, path)
+        patch.setattr(PhotoMetaDataXMP, "sidecar_path_for", worker_sidecar_path)
+        panel._paste_species_to_paths(paths + paths[:1])
     try:
         wait_for(lambda: len(entered) == 2)
         assert len({ident for _, ident in entered}) == 2
@@ -81,6 +94,7 @@ def test_writes_are_parallel_off_gui_and_deduplicate_sidecars(panel, tmp_path, m
     finally:
         gate.set()
     wait_for(lambda: paste_done(panel))
+    sync_pending()
     assert panel._species_paste_controller._done == 2
     for path in paths:
         saved = PhotoMetaDataXMP().read(path)
@@ -90,7 +104,7 @@ def test_writes_are_parallel_off_gui_and_deduplicate_sidecars(panel, tmp_path, m
     assert not selected  # A metadata paste must not reload the preview.
 
 
-def test_newer_sidecar_edit_is_not_overwritten_by_late_ui_result(panel, tmp_path, monkeypatch):
+def test_newer_sqlite_edit_is_not_overwritten_by_late_ui_result(panel, tmp_path, monkeypatch):
     from app_common.file_browser import _metadata_actions as actions
     path = photo(tmp_path, '中文.jpg')
     ready, gate = threading.Event(), threading.Event()
@@ -107,7 +121,7 @@ def test_newer_sidecar_edit_is_not_overwritten_by_late_ui_result(panel, tmp_path
     panel._paste_species_to_paths([path])
     try:
         assert ready.wait(5)
-        assert PhotoMetaDataXMP().write(path, {'XMP-dc:Title': '新编辑', 'XMP-superpicky:bird_species_cn': '新编辑'})
+        get_store().submit_edit(path, {'XMP-dc:Title': '新编辑', 'XMP-superpicky:bird_species_cn': '新编辑'}).result()
         panel.sync_metadata_edits_for_paths({path: {'bird_species_cn': '新编辑'}})
         worker = panel._species_paste_controller._worker
         panel._species_paste_controller._finished(object())
@@ -115,6 +129,7 @@ def test_newer_sidecar_edit_is_not_overwritten_by_late_ui_result(panel, tmp_path
     finally:
         gate.set()
     wait_for(lambda: paste_done(panel))
+    sync_pending()
     assert panel._meta_cache[path]['bird_species_cn'] == '新编辑'
     assert PhotoMetaDataXMP().read(path)['bird_species_cn'] == '新编辑'
 
@@ -144,6 +159,7 @@ def test_copy_uses_latest_request_and_respects_external_clipboard(panel, tmp_pat
         wait_for(lambda: QApplication.clipboard().text() == '白头鹎')
         # A cancelled older read must not hold up this newer copy/paste.
         wait_for(lambda: paste_done(panel))
+        sync_pending()
         assert PhotoMetaDataXMP().read(paths[0])['bird_species_cn'] == '白头鹎'
     finally:
         gate.set()
@@ -179,6 +195,7 @@ def test_immediate_paste_waits_for_new_copy_snapshot(panel, tmp_path, monkeypatc
     assert not Path(target).with_suffix('.xmp').exists()
     gate.set()
     wait_for(lambda: paste_done(panel))
+    sync_pending()
     assert PhotoMetaDataXMP().read(target)['bird_species_cn'] == '白头鹎'
 
 
@@ -207,6 +224,7 @@ def test_cancel_and_shutdown_keep_running_workers_owned(panel, tmp_path, monkeyp
     finally:
         gate.set()
     wait_for(controller.is_shutdown_done)
+    sync_pending()
     assert len(entered) == 4
     assert all(PhotoMetaDataXMP().read(path)['bird_species_cn'] == '白头鹎' for path in entered)
     assert all(not Path(path).with_suffix('.xmp').exists() for path in paths if path not in entered)
@@ -215,15 +233,15 @@ def test_cancel_and_shutdown_keep_running_workers_owned(panel, tmp_path, monkeyp
 
 def test_directory_switch_does_not_pollute_new_directory(panel, tmp_path, monkeypatch):
     path = photo(tmp_path, '旧目录.jpg')
-    original = panel._meta_proxy.write
+    original = MetadataWriteAction.execute
     gate, entered = threading.Event(), threading.Event()
 
-    def write(path, fields):
+    def execute(action):
         entered.set()
         assert gate.wait(5)
-        return original(path, fields)
+        return original(action)
 
-    monkeypatch.setattr(panel._meta_proxy, 'write', write)
+    monkeypatch.setattr(MetadataWriteAction, 'execute', execute)
     panel._copied_species_payload = {'bird_species_cn': '白头鹎'}
     panel._paste_species_to_paths([path])
     try:
@@ -234,19 +252,22 @@ def test_directory_switch_does_not_pollute_new_directory(panel, tmp_path, monkey
     finally:
         gate.set()
     wait_for(lambda: paste_done(panel))
+    sync_pending()
     assert PhotoMetaDataXMP().read(path)['bird_species_cn'] == '白头鹎'
     assert panel._meta_cache == {}
 
 
-def test_missing_source_fails_without_orphan_sidecar(panel, tmp_path):
+def test_missing_source_keeps_local_commit_pending_without_orphan_sidecar(panel, tmp_path):
     path = str(tmp_path / '已删除.jpg')
     panel._copied_species_payload = {'bird_species_cn': '白头鹎'}
     panel._paste_species_to_paths([path])
     wait_for(lambda: paste_done(panel))
-    assert panel._species_paste_controller._failed == 1
-    assert path in panel._species_paste_controller._dialog.details.toPlainText()
+    assert panel._species_paste_controller._failed == 0
+    store = get_store()
+    assert store.peek(path)['bird_species_cn'] == '白头鹎'
+    assert not store.flush_paths([path], timeout=.1)
+    assert store.pending_status([path])[0]['error']
     assert not Path(path).with_suffix('.xmp').exists()
-    assert panel._meta_cache == {}
 
 
 def test_copy_keeps_report_and_cache_layers_until_sidecar_species_is_known(panel, tmp_path, monkeypatch):

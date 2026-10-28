@@ -6,6 +6,7 @@ XMP 是基于 XML 的元数据格式，sidecar 文件与图像同名，扩展名
 from __future__ import annotations
 
 import os
+import json
 from collections import OrderedDict
 import threading
 import xml.etree.ElementTree as ET
@@ -16,6 +17,7 @@ from uuid import UUID
 
 from app_common.log import get_logger
 from app_common.perf_probe import elapsed_ms, perf_counter, perf_log
+from .shared_read import open_shared_read
 
 _log = get_logger("xmp_sidecar")
 
@@ -197,6 +199,10 @@ class XmpDirectoryIndex:
                     self._indexes.popitem(last=False)
             return index
 
+    def invalidate(self, directory):
+        with self._lock:
+            self._indexes.pop(os.path.normcase(os.path.abspath(directory)), None)
+
 
 def find_xmp_sidecars(image_paths: list[str], *, directory_index=None) -> dict[str, str]:
     """
@@ -235,6 +241,16 @@ def find_xmp_sidecars(image_paths: list[str], *, directory_index=None) -> dict[s
                 dir_indexes[dir_key] = index
             for stem in stems:
                 found = index.get(f"{stem.lower()}.xmp")
+                if found and not os.path.isfile(found):
+                    # Windows directory stamps can lag deletion. Never hand out
+                    # an absent candidate; refresh this directory once for peers.
+                    if directory_index is not None:
+                        directory_index.invalidate(dir_path)
+                        index = directory_index.get(dir_path)
+                    else:
+                        index = _build_xmp_dir_index(dir_path)
+                    dir_indexes[dir_key] = index
+                    found = index.get(f"{stem.lower()}.xmp")
                 if found:
                     result[norm] = found
                     break
@@ -393,8 +409,11 @@ def _extract_text_value(element) -> str | None:
 def read_xmp_file(xmp_path: str, *, image_path: str | None = None) -> list[tuple[str, str, str]]:
     """读取一个 XMP 文件，解析所有元数据标签。"""
     try:
-        tree = ET.parse(xmp_path)
-        root = tree.getroot()
+        with open_shared_read(xmp_path) as stream:
+            content = stream.read()
+        # Release the Windows handle before allocating/parsing the XML tree.
+        # Readers must not prolong a file move or atomic replacement for CPU work.
+        root = ET.fromstring(content)
     except Exception:
         return []
 
@@ -431,7 +450,36 @@ def read_xmp_file(xmp_path: str, *, image_path: str | None = None) -> list[tuple
                 group = f"XMP-{prefix}"
                 results.append((group, local, value))
 
-    return results
+    return _apply_cleared_fields(results)
+
+
+def _apply_cleared_fields(rows):
+    """Represent intentional clears independently of embedded/report fallback.
+
+    A later nonempty property from an external editor supersedes an old marker.
+    Only the selected photo resource's rows reach this function.
+    """
+    marker = "xmp-superpicky:metadata_cleared_fields"
+    cleared = {}
+    for group, name, value in rows:
+        if f"{group}:{name}".lower() != marker:
+            continue
+        try:
+            names = json.loads(value)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(names, list):
+            cleared.update({key.lower(): key for key in names if isinstance(key, str)
+                            and key.lower().startswith("xmp-") and ":" in key
+                            and key.lower() != marker})
+    nonempty = {f"{group}:{name}".lower() for group, name, value in rows if value not in (None, "")}
+    cleared = {key: name for key, name in cleared.items() if key not in nonempty}
+    result = [(group, name, value) for group, name, value in rows
+              if f"{group}:{name}".lower() not in {marker, *cleared}]
+    if cleared:
+        result.append(("XMP-superpicky", "metadata_cleared_fields", json.dumps(list(cleared.values()))))
+        result.extend((*name.split(":", 1), "") for name in cleared.values())
+    return result
 
 
 def read_xmp_sidecar(image_path: str) -> list[tuple[str, str, str]]:
@@ -454,11 +502,12 @@ def read_xmp_sidecar(image_path: str) -> list[tuple[str, str, str]]:
 
 def read_xmp_files(sidecars: dict[str, str]) -> dict[str, list]:
     """批量复用已解析 XMP；软件外修改、原子替换或删除均在读取时核验。"""
-    from .metadata_sqlite import get_cache, file_stamp, path_key, XMP_NAMESPACE
+    from .metadata_sqlite import get_cache, sidecar_stamp, path_key, XMP_NAMESPACE
     started = perf_counter()
     cache = get_cache()
     revision = cache.revision()
-    signatures = {image: (path_key(sidecar), file_stamp(sidecar)) for image, sidecar in sidecars.items()}
+    stamps = {sidecar: sidecar_stamp(sidecar) for sidecar in set(sidecars.values())}
+    signatures = {image: (path_key(sidecar), stamps[sidecar]) for image, sidecar in sidecars.items()}
     signatures = {image: signature for image, signature in signatures.items() if signature[1] is not None}
     hits = cache.get_many(XMP_NAMESPACE, signatures)
     result = {image: [tuple(row) for row in record["rows"]] for image, record in hits.items()
@@ -473,7 +522,7 @@ def read_xmp_files(sidecars: dict[str, str]) -> dict[str, list]:
         rows = read_xmp_file(sidecar, image_path=image)
         result[image] = rows
         signature = signatures.get(image)
-        if rows and signature is not None and file_stamp(sidecar) == signature[1]:
+        if rows and signature is not None and sidecar_stamp(sidecar) == signature[1]:
             pending[image] = (signature, {"rows": rows}, sidecar)
     cache.put_many(XMP_NAMESPACE, pending, revision)
     perf_log(_log, "[metadata.xmp.sqlite] paths=%s hits=%s misses=%s elapsed_ms=%.1f",

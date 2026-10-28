@@ -88,7 +88,11 @@ def test_replacement_removes_attributes_and_all_photo_duplicates(
 
     after = _descriptions(sidecar)
     assert _structure(after[0]) == foreign_before
-    assert [_structure(child) for child in after[1] if child.tag != tag] == unrelated_before
+    clear_marker = "{https://superbirdtools.local/xmp/superpicky/1.0/}metadata_cleared_fields"
+    assert [_structure(child) for child in after[1] if child.tag not in (tag, clear_marker)] == unrelated_before
+    if not value:
+        import json
+        assert json.loads(after[1].find(clear_marker).text) == [key]
     photo_descriptions = after[1:]
     assert all(tag not in desc.attrib for desc in photo_descriptions)
     assert sum(len(desc.findall(tag)) for desc in photo_descriptions) == (1 if value else 0)

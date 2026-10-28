@@ -17,6 +17,7 @@ from app_common.file_browser._thumbnail import *
 from app_common.file_browser._workers import *
 from app_common.file_browser._work_pool import BrowserWorkPool
 from app_common.file_browser._metadata_memory import MetadataMemoryCache
+from app_common.file_browser._directory_snapshot import DirectorySnapshotCache
 from app_common.superviewer_user_options import get_metadata_memory_mb
 from app_common.file_browser._cut_state import (
     FileCutState, _FILE_CLIPBOARD_ACTION_MIME, _FILE_CLIPBOARD_ENTRIES_MIME,
@@ -114,6 +115,10 @@ class FileListPanel(QWidget):
         self._thumb_list_model = self.thumbnail_model_class(self)
         self._meta_cache:    dict = {}   # norm_path → metadata dict
         self._metadata_memory_cache = MetadataMemoryCache(max_bytes=get_metadata_memory_mb() * 1024 * 1024)
+        self._directory_snapshots = DirectorySnapshotCache(self._metadata_memory_cache)
+        self._directory_snapshot_shown = False
+        self._applying_directory_snapshot = False
+        self._metadata_revalidate_pending = False
         self._directory_scope_cache: dict[bool, dict] = {}  # 当前目录 shallow/recursive 两个 scope 的文件列表缓存
         self._report_cache:  dict = {}   # legacy report row cache；sidecar/EXIF 模式下保持为空
         self._report_row_by_path: dict = {}
@@ -293,6 +298,8 @@ class FileListPanel(QWidget):
             except Exception:
                 pass
         self._sync_file_browser_probe_timer()
+        from ._metadata_watch import MetadataStoreWatch
+        self._metadata_store_watch = MetadataStoreWatch(self)
 
     # ── UI 初始化 ──────────────────────────────────────────────────────────────
     def _init_ui(self) -> None:
@@ -1086,6 +1093,51 @@ class FileListPanel(QWidget):
             "report_row_by_path": dict(report_row_by_path),
         }
 
+    def _remember_directory_snapshot(self, *, persist=False):
+        if not self._current_dir or self._applying_directory_snapshot:
+            return
+        if self._loaded_directory_recursive not in self._directory_scope_cache:
+            return  # Never replace a complete snapshot with an interrupted empty model.
+        self._directory_snapshots.remember(
+            self._current_dir, self._loaded_directory_recursive,
+            {"files": self._all_files, "report_root": self._report_root_dir,
+             "report_cache": self._report_cache, "report_row_by_path": self._report_row_by_path,
+             "metadata": self._meta_cache}, include_videos=self.include_videos,
+            use_report_db=self._use_report_db, persist=persist,
+        )
+
+    def _show_directory_snapshot(self, snapshot):
+        self._directory_snapshot_shown = True
+        self._metadata_revalidate_pending = True
+        self._report_root_dir = snapshot.get("report_root")
+        self._meta_cache.update(snapshot.get("metadata") or {})
+        # Committed edits may be newer than a directory's retained UI snapshot.
+        from app_common.exif_io.metadata_store import get_store
+        store = get_store()
+        for path in snapshot["files"]:
+            norm = os.path.normpath(path)
+            revision = store.peek_revision(path, profile="browser")
+            if revision is None or revision == self._meta_cache.get(norm, {}).get("_metadata_revision", 0):
+                continue
+            record = store.peek(path, profile="browser")
+            if record is not None:
+                self._meta_cache[norm] = MetadataLoader._parse_rec(record)
+        self._applying_directory_snapshot = True
+        try:
+            self._apply_directory_listing_result(
+                self._current_dir, snapshot["files"], snapshot.get("report_cache") or {}, None,
+                recursive=self._include_subdirectories,
+                report_row_by_path=snapshot.get("report_row_by_path") or {}, from_cache=True,
+            )
+        finally:
+            self._applying_directory_snapshot = False
+
+    def _on_directory_snapshot_ready(self, path, snapshot):
+        if (self._background_shutdown_requested or not self._is_current_directory_scan_sender()
+                or path != self._current_dir or self._directory_snapshot_shown):
+            return
+        self._show_directory_snapshot(snapshot)
+
     def _collect_uncached_metadata_paths(self, paths: list[str]) -> list[str]:
         uncached: list[str] = []
         for path in paths:
@@ -1308,6 +1360,7 @@ class FileListPanel(QWidget):
             pass
         self._probe_log("apply_listing.report_row_map", elapsed_ms=elapsed_ms(step_t0), rows=len(self._report_row_by_path))
         step_t0 = perf_counter()
+        unchanged_listing = self._all_files == list(files)
         self._all_files = list(files)
         self._loaded_directory_recursive = bool(recursive)
         self._store_directory_scope_cache(
@@ -1325,7 +1378,12 @@ class FileListPanel(QWidget):
             from_cache,
         )
         step_t0 = perf_counter()
-        self._rebuild_views()
+        if unchanged_listing and self._directory_snapshot_shown and not self._applying_directory_snapshot:
+            # Reconciliation must not restore/re-emit an already selected photo
+            # or replace an explicit selection queued after cached first paint.
+            self._sync_burst_group_display()
+        else:
+            self._rebuild_views()
         self._probe_log("apply_listing.rebuild_views", elapsed_ms=elapsed_ms(step_t0), mode=self._view_mode)
         step_t0 = perf_counter()
         self.files_loaded.emit(self.get_display_file_paths())
@@ -1343,10 +1401,21 @@ class FileListPanel(QWidget):
             self._select_first_file_if_needed(reason="directory_listing")
         self._probe_log("apply_listing.selection", elapsed_ms=elapsed_ms(step_t0), pending=bool(self._pending_selection_paths))
         step_t0 = perf_counter()
-        self._schedule_persistent_thumb_cache_build(self._all_files)
+        if not self._applying_directory_snapshot:
+            # Scope discovery probes the photo volume. Reconcile will schedule
+            # persistent work after the cached listing has already been shown.
+            self._schedule_persistent_thumb_cache_build(self._all_files)
         self._probe_log("apply_listing.schedule_persistent_thumbs", elapsed_ms=elapsed_ms(step_t0), files=len(self._all_files))
         step_t0 = perf_counter()
         uncached_meta_paths = self._collect_uncached_metadata_paths(self._all_files)
+        if self._applying_directory_snapshot:
+            # Refresh the RAM view from SQLite immediately, independently of a
+            # slow directory walk. The loader emits SQL records before stat.
+            uncached_meta_paths = list(self._all_files)
+        elif self._metadata_revalidate_pending:
+            active_paths = getattr(self._metadata_loader, "_paths", None)
+            uncached_meta_paths = [] if active_paths == self._all_files else list(self._all_files)
+            self._metadata_revalidate_pending = False
         self._probe_log("apply_listing.collect_uncached_meta", elapsed_ms=elapsed_ms(step_t0), uncached=len(uncached_meta_paths))
         if uncached_meta_paths:
             _log.info(
@@ -1364,10 +1433,16 @@ class FileListPanel(QWidget):
                 len(self._all_files),
             )
         self._probe_log("apply_listing.done", elapsed_ms=elapsed_ms(apply_t0), meta_uncached=len(uncached_meta_paths))
+        if not self._applying_directory_snapshot:
+            restored = getattr(self, "_snapshot_selected_path", "")
+            self._snapshot_selected_path = ""
+            if restored and restored == self._selected_display_path and self.is_listed_path(restored):
+                self._emit_file_selected_for_path(restored)
+        self._remember_directory_snapshot()
 
     def _refresh_filter_scope(self) -> None:
         probe_t0 = perf_counter()
-        if not self._current_dir or not os.path.isdir(self._current_dir):
+        if not self._current_dir:
             self._apply_filter()
             perf_log(_log, "[filter.scope] reason=no_current_dir elapsed_ms=%.1f", elapsed_ms(probe_t0))
             return
@@ -1462,34 +1537,32 @@ class FileListPanel(QWidget):
             _log.info("[load_directory] SKIP same dir")
             self._probe_set_phase("idle", reason="load_directory_skip_same_dir", elapsed_ms=elapsed_ms(load_t0))
             return
+        self._remember_directory_snapshot()
+        cached_snapshot = None if force_reload and not preserve_meta_cache else self._directory_snapshots.peek(
+            path, recursive, include_videos=self.include_videos, use_report_db=self._use_report_db,
+        )
+        self._directory_snapshot_shown = False
+        self._metadata_revalidate_pending = False
+        self._snapshot_selected_path = ""
         self._metadata_memory_cache.set_scope(path)
         if force_reload and not preserve_meta_cache:
             self._metadata_memory_cache.invalidate_scope(path)
             from app_common.exif_io.metadata_sqlite import get_cache
             get_cache().invalidate_scope(path)
+            from app_common.exif_io.metadata_store import get_store
+            get_store().refresh_scope(path)  # Durable pending edits survive refresh.
             self._report_full_cache = None
         self._current_dir = path
         if not same_dir:
             self._range_mark_start_path = ""
             self._directory_scope_cache.clear()
             self._loaded_directory_recursive = False
-        # Resolve an optional read-only report scope; no browser operation
-        # creates or mutates report.db.
-        if self._use_report_db:
-            probe_path = os.path.join(path, "__superviewer_scope_probe__.jpg")
-            new_report_root_dir = _report_root_dir_for_file(probe_path, path)
-            if not new_report_root_dir:
-                local_report_root = find_report_root(path, max_levels=0)
-                new_report_root_dir = local_report_root if local_report_root else None
-        else:
-            new_report_root_dir = None
-        if new_report_root_dir != self._report_root_dir:
-            _log.info(
-                "[load_directory] report_root_dir changed old=%r new=%r",
-                self._report_root_dir,
-                new_report_root_dir,
-            )
-        self._report_root_dir = new_report_root_dir
+        # Report discovery is filesystem I/O and belongs to DirectoryScanWorker.
+        # Keep a known same-root cache until that worker reconciles the scope.
+        if not self._use_report_db or (self._report_root_dir and not _is_same_or_child_path(self._report_root_dir, path)):
+            self._report_root_dir = None
+        if cached_snapshot is not None:
+            self._report_root_dir = cached_snapshot.get("report_root")
         if self._report_root_dir:
             if self._report_full_root_dir != self._report_root_dir:
                 _log.info(
@@ -1571,6 +1644,8 @@ class FileListPanel(QWidget):
                 recursive,
             )
         self._requested_directory_recursive = recursive
+        if cached_snapshot is not None:
+            self._show_directory_snapshot(cached_snapshot)
         _log.info(
             "[load_directory] starting DirectoryScanWorker recursive=%s report_root_dir=%r has_cached_full_report=%s",
             recursive,
@@ -1584,12 +1659,16 @@ class FileListPanel(QWidget):
             self._report_full_cache if self._report_root_dir and self._report_full_root_dir == self._report_root_dir else None,
             use_report_db=self._use_report_db,
             include_videos=self.include_videos,
+            snapshot_cache=self._directory_snapshots,
+            use_cached_snapshot=not (force_reload and not preserve_meta_cache),
+            discover_report_root=True,
             parent=self,
         )
         self._directory_scan_workers.add(self._directory_scan_worker)
         self._directory_scan_worker.scan_progress.connect(self._on_directory_scan_progress)
         self._directory_scan_worker.report_scope_progress.connect(self._on_report_scope_progress)
         self._directory_scan_worker.scan_finished.connect(self._on_directory_scan_finished)
+        self._directory_scan_worker.snapshot_ready.connect(self._on_directory_snapshot_ready)
         self._directory_scan_worker.finished.connect(self._on_directory_scan_thread_finished)
         self._directory_scan_worker.start()
         self._probe_set_phase("directory_scan_running", path=path, elapsed_ms=elapsed_ms(load_t0))
@@ -1606,6 +1685,7 @@ class FileListPanel(QWidget):
         self._directory_scan_worker = None
         for signal, slot in (
             (worker.scan_finished, self._on_directory_scan_finished),
+            (worker.snapshot_ready, self._on_directory_snapshot_ready),
             (worker.scan_progress, self._on_directory_scan_progress),
             (worker.report_scope_progress, self._on_report_scope_progress),
         ):
@@ -1690,6 +1770,9 @@ class FileListPanel(QWidget):
         if path != self._current_dir:
             _log.info("[_on_directory_scan_finished] IGNORE stale path")
             return
+        sender = self.sender()
+        if sender is not None:
+            self._report_root_dir = sender._report_root
         recursive = self._requested_directory_recursive
         self._probe_set_phase(
             "directory_scan_finished",
@@ -2027,7 +2110,7 @@ class FileListPanel(QWidget):
                 )
                 self._scroll_path_into_view(current_target, prefer_active=False)
             self._schedule_selection_visibility_restore(current_target, reason="apply_pending_selection")
-            self._emit_file_selected_for_path(current_target)
+            self._emit_restored_file_selection(current_target)
         self._update_selection_status()
 
     def _select_first_file_if_needed(self, *, reason: str = "") -> None:
@@ -2073,7 +2156,7 @@ class FileListPanel(QWidget):
             reason=reason,
         )
         self._schedule_selection_visibility_restore(target, reason=f"select_first:{reason}")
-        self._emit_file_selected_for_path(target)
+        self._emit_restored_file_selection(target)
 
     def _record_selection_scroll_debug(self, event: str, path: str = "", **fields) -> None:
         """缓存选中/滚动诊断信息，退出时统一汇总输出，避免运行中刷屏。"""
@@ -2334,7 +2417,7 @@ class FileListPanel(QWidget):
         payload = FileListPanel._get_species_payload_for_path(self, path, allow_metadata_read=False)
         if not payload:
             return
-        source = self._resolve_source_path_for_action(path) or path
+        source = _get_cached_actual_path(path) or path
         sources = (self._get_report_row_for_path(path) or {},
                    self._meta_cache.get(os.path.normpath(path), {}) or {})
         if self._metadata_copy_controller is None:
@@ -2388,13 +2471,12 @@ class FileListPanel(QWidget):
             return
         if self._species_paste_controller is None:
             self._species_paste_controller = MetadataBatchController(self)
-        aliases = [(path, self._resolve_source_path_for_action(path) or path)
+        aliases = [(path, _get_cached_actual_path(path) or path)
                    for path in self._unique_norm_paths(paths)]
-        writer = self._meta_proxy.write
         self._species_paste_controller.start_batch(
             aliases,
             lambda path, cancelled: MetadataWriteAction(
-                path, fields, updates, writer=writer, cancelled=cancelled,
+                path, fields, updates, cancelled=cancelled,
             ),
             "粘贴鸟名",
         )
@@ -2892,11 +2974,11 @@ class FileListPanel(QWidget):
         if self._filters_require_rebuild_after_metadata_refresh(unique_paths):
             self._apply_filter()
 
-        if self._selected_display_path:
+        if self._selected_display_path and not self.signalsBlocked():
             selected_norm = os.path.normpath(self._selected_display_path)
             path_keys = {os.path.normcase(os.path.normpath(p)) for p in unique_paths}
             if os.path.normcase(selected_norm) in path_keys:
-                refreshed_path = self._resolve_source_path_for_action(selected_norm)
+                refreshed_path = self._get_cached_actual_path(selected_norm)
                 self.file_selected.emit(refreshed_path or selected_norm)
 
     def _apply_rating_state_via_report_db(
@@ -2951,96 +3033,57 @@ class FileListPanel(QWidget):
         return updated_paths
 
     def _set_rating_state_for_paths(
-        self,
-        paths: list[str],
-        *,
-        rating: int | None = None,
-        pick: int | None = None,
+        self, paths: list[str], *, rating: int | None = None, pick: int | None = None,
     ) -> None:
         if not self._rating_writes_allowed("修改评级", warn=True):
             return
-        probe_t0 = perf_counter()
-        unique_paths = self._unique_norm_paths(paths)
-        if not unique_paths:
+        fields = {}
+        if rating is not None:
+            fields["rating"] = max(0, min(5, int(rating)))
+        if pick is not None:
+            fields["pick"] = max(-1, min(1, int(pick)))
+        paths = self._unique_norm_paths(paths)
+        if not fields or not paths:
             return
-        db_exists = False
-        db_dir = self._report_root_dir or self._current_dir
-        if self._use_report_db and db_dir:
-            db_probe = ReportDB.open_if_exists(db_dir)
-            db_exists = db_probe is not None
-            if db_probe is not None:
-                db_probe.close()
-        report_paths: list[str] = []
-        file_paths: list[str] = []
-        source_counts = {
-            "report_db": 0,
-            "xmp_sidecar": 0,
-            "source_exif": 0,
-        }
-        for path in unique_paths:
-            source_name = self._resolve_rating_write_source(path, report_db_available=db_exists)
-            source_counts[source_name] = source_counts.get(source_name, 0) + 1
-            if source_name == "report_db":
-                report_paths.append(path)
-            else:
-                file_paths.append(path)
-        updated_paths: list[str] = []
-        report_ms = 0.0
-        file_ms = 0.0
-        if report_paths:
-            apply_t0 = perf_counter()
-            updated_paths.extend(self._apply_rating_state_via_report_db(report_paths, rating=rating, pick=pick))
-            report_ms = elapsed_ms(apply_t0)
-        if file_paths:
-            apply_t0 = perf_counter()
-            updated_paths.extend(self._apply_rating_state_via_exif(file_paths, rating=rating, pick=pick))
-            file_ms = elapsed_ms(apply_t0)
-        source_summary = ", ".join(
-            f"{name}={count}" for name, count in source_counts.items() if count > 0
-        ) or "none"
-        if not updated_paths:
-            _log.info(
-                "[_set_rating_state_for_paths] skip sources=%s rating=%r pick=%r selected=%s",
-                source_summary,
-                rating,
-                pick,
-                len(unique_paths),
-            )
-            perf_log(
-                _log,
-                "[rating] updated=0 sources=%s selected=%s rating=%r pick=%r report_ms=%.1f file_ms=%.1f total_ms=%.1f",
-                source_summary,
-                len(unique_paths),
-                rating,
-                pick,
-                report_ms,
-                file_ms,
-                elapsed_ms(probe_t0),
-            )
-            return
-        refresh_t0 = perf_counter()
-        self._refresh_metadata_state_for_paths(updated_paths)
-        refresh_ms = elapsed_ms(refresh_t0)
-        _log.info(
-            "[_set_rating_state_for_paths] sources=%s rating=%r pick=%r selected=%s updated=%s",
-            source_summary,
-            rating,
-            pick,
-            len(unique_paths),
-            len(updated_paths),
-        )
-        perf_log(
-            _log,
-            "[rating] sources=%s selected=%s updated=%s rating=%r pick=%r report_ms=%.1f file_ms=%.1f refresh_ms=%.1f total_ms=%.1f",
-            source_summary,
-            len(unique_paths),
-            len(updated_paths),
-            rating,
-            pick,
-            report_ms,
-            file_ms,
-            refresh_ms,
-            elapsed_ms(probe_t0),
+        from app_common.file_browser._metadata_commit import get_metadata_commit_bridge
+        from app_common.exif_io.metadata_store import get_store
+        # Display paths already have source semantics. Actual-path repairs are
+        # memory lookups; SQLite commit must not wait for sidecar discovery.
+        aliases = {}
+        for path in paths:
+            source = os.path.normpath(_get_cached_actual_path(path) or path)
+            aliases.setdefault(source, []).append(path)
+        get_store().attach_pool(self.metadata_work_pool())
+
+        def committed(receipts):
+            if self._background_shutdown_requested:
+                return
+            updates = {}
+            for receipt in receipts:
+                candidates = self.listed_sidecar_siblings(receipt.path)
+                candidates.extend(aliases.get(receipt.path, ()))
+                for path in candidates:
+                    if self.is_listed_path(path):
+                        updates[path] = {**fields, "_metadata_revision": receipt.revision}
+            if not updates:
+                return
+            signal = getattr(self, "photo_metadata_cache_updated", None)
+            blocked = self.blockSignals(True) if signal is not None else None
+            try:
+                self.sync_metadata_edits_for_paths(updates)
+            finally:
+                if blocked is not None:
+                    self.blockSignals(blocked)
+            if signal is not None:
+                signal.emit(list(updates))
+
+        def failed(error):
+            _log.warning("[metadata.commit] rating failed: %s", error)
+            if not self._background_shutdown_requested:
+                self._show_meta_progress_status(f"元数据保存失败：{error}", busy=False)
+
+        get_metadata_commit_bridge(self).submit_edits(
+            [(source, fields, None) for source in aliases], committed, failed,
         )
 
     def _add_rating_menu_actions(self, menu: QMenu, paths: list[str]) -> None:
@@ -3193,6 +3236,8 @@ class FileListPanel(QWidget):
         return ""
 
     def _build_list_path_tooltip(self, path: str) -> str:
+        if self._metadata_revalidate_pending:
+            return html.escape(os.path.normpath(path))
         base_tooltip = self._build_path_tooltip(path)
         norm_path = os.path.normpath(path) if path else ""
         if not base_tooltip or not norm_path:
@@ -3378,6 +3423,9 @@ class FileListPanel(QWidget):
         norm_path = os.path.normpath(path) if path else ""
         if not norm_path:
             return False
+        if self._metadata_revalidate_pending:
+            actual = _get_cached_actual_path(norm_path)
+            return bool(actual and _path_key(actual) != _path_key(norm_path))
         actual_path = self._get_actual_path_for_display(norm_path)
         if actual_path and _path_key(actual_path) != _path_key(norm_path):
             return True
@@ -5859,6 +5907,8 @@ class FileListPanel(QWidget):
         if self._metadata_edit_pool is None:
             self._metadata_edit_pool = BrowserWorkPool(4, 2)
             self._metadata_edit_pool.set_thumbnail_mode(False)
+        from app_common.exif_io.metadata_store import get_store
+        get_store().attach_pool(self._metadata_edit_pool)
         return self._metadata_edit_pool
 
     def background_work_pool(self):
@@ -5881,16 +5931,20 @@ class FileListPanel(QWidget):
         loader.finished.connect(lambda owned=loader: self._live_pool_loaders.discard(owned))
 
     def _request_worker_pool_shutdown(self):
+        from app_common.exif_io.metadata_store import get_store
         for pool in (self._browser_work_pool, self._metadata_edit_pool):
             if pool is not None:
+                get_store().detach_pool(pool)
                 pool.request_shutdown()
 
     def has_pending_pool_work(self):
         pool = self._browser_work_pool
         edits = self._metadata_edit_pool
         species = self._species_paste_controller
+        bridge = getattr(self, "_metadata_commit_bridge", None)
         return bool(self._live_pool_loaders or (pool is not None and not pool.is_finished())
                     or (edits is not None and not edits.is_finished())
+                    or (bridge is not None and not bridge.is_idle)
                     or (species is not None and species.busy))
 
     def _start_metadata_loader(self, paths: list) -> None:
@@ -5920,6 +5974,9 @@ class FileListPanel(QWidget):
         )
         pool = self._get_browser_work_pool()
         self._sync_shared_pool_budget()
+        if pool is not None:
+            from app_common.exif_io.metadata_store import get_store
+            get_store().attach_pool(pool)
         if pool is not None:
             self._metadata_loader_workers = min(total, pool.metadata_workers if thumbnail_work_active else pool.max_workers)
         self._begin_meta_apply_session(total, ordered_paths=paths)
@@ -5976,39 +6033,37 @@ class FileListPanel(QWidget):
             self._metadata_loader = None
         self._meta_progress.hide()
 
-    def _build_metadata_focus_source_paths(self, paths: list[str]) -> dict[str, str]:
+    def _build_metadata_focus_source_paths(self, paths: list[str]) -> dict[str, tuple[str, ...]]:
         """
         为 metadata loader 构建“显示路径 -> 焦点源文件路径”的静态快照。
 
         这里故意不直接复用 _resolve_source_path_for_action() 的逐条日志版本，
         否则大目录批量加载时日志会被每个文件刷满。若将来改动解析规则，请同步两边逻辑。
         """
-        mapping: dict[str, str] = {}
+        # Build candidate paths only.  Network-volume existence checks belong
+        # to MetadataLoader, after its SQLite snapshot has reached the UI.
+        mapping: dict[str, tuple[str, ...]] = {}
         for raw_path in paths or []:
             norm_path = os.path.normpath(raw_path) if raw_path else ""
             if not norm_path:
                 continue
-            actual_path = self._get_actual_path_for_display(norm_path)
-            if actual_path and os.path.isfile(actual_path):
-                mapping[norm_path] = os.path.normpath(actual_path)
-                continue
-            if os.path.isfile(norm_path):
-                mapping[norm_path] = norm_path
-                continue
-            row = self._get_report_row_for_path(norm_path)
-            cp_abs = self._resolve_report_current_abs_path(norm_path)
+            actual_path = _get_cached_actual_path(norm_path)
+            candidates = [os.path.normpath(actual_path)] if actual_path else []
+            candidates.append(norm_path)
+            row = self._report_row_by_path.get(norm_path)
+            if not isinstance(row, dict):
+                row = _report_row_from_cache_for_path(norm_path, self._report_full_cache or self._report_cache or {})
+            current = str((row or {}).get("current_path") or "").strip()
+            base = str((row or {}).get("_report_root_dir") or self._report_root_dir or self._current_dir)
+            cp_abs = os.path.normpath(current if os.path.isabs(current) else os.path.join(base, current)) if current else ""
             if row and cp_abs:
                 op = str(row.get("original_path") or "").strip()
-                ext_orig = Path(op).suffix.lower() if op else ""
+                ext_orig = Path(op).suffix if op else ""
                 if ext_orig:
                     sibling_source = os.path.normpath(str(Path(cp_abs).with_suffix(ext_orig)))
-                    if os.path.isfile(sibling_source):
-                        mapping[norm_path] = sibling_source
-                        continue
-                if os.path.isfile(cp_abs):
-                    mapping[norm_path] = os.path.normpath(cp_abs)
-                    continue
-            mapping[norm_path] = norm_path
+                    candidates.append(sibling_source)
+                candidates.append(os.path.normpath(cp_abs))
+            mapping[norm_path] = tuple(dict.fromkeys(candidates))
         return mapping
 
     def _ensure_deferred_file_selected_timer(self) -> None:
@@ -6678,6 +6733,12 @@ class FileListPanel(QWidget):
         if self._background_shutdown_requested:
             return
         self._background_shutdown_requested = True
+        watch = getattr(self, "_metadata_store_watch", None)
+        if watch is not None:
+            watch.request_shutdown()
+        bridge = getattr(self, "_metadata_commit_bridge", None)
+        if bridge is not None:
+            bridge.request_shutdown()
         self._pending_species_paste = None
         for controller in (self._species_paste_controller, self._metadata_copy_controller):
             if controller is not None:
@@ -7196,7 +7257,58 @@ class FileListPanel(QWidget):
         if self._background_shutdown_requested:
             return False
         sender = self.sender()
-        return sender is None or sender is self._metadata_loader
+        return bool(getattr(self, "_applying_store_changes", False)
+                    or sender is None or sender is self._metadata_loader)
+
+    def _apply_store_metadata_snapshot(self, batch: dict) -> None:
+        """Apply committed/imported snapshots without selecting or decoding a photo."""
+        if self._background_shutdown_requested:
+            return
+        current = {path: metadata for path, metadata in batch.items()
+                   if self.is_listed_path(path)
+                   and int(metadata.get("_metadata_revision", 0)) >=
+                       int(self._meta_cache.get(path, {}).get("_metadata_revision", 0))
+                   and metadata != self._meta_cache.get(path)}
+        if not current:
+            return
+        self._applying_store_changes = True
+        try:
+            self._on_metadata_batch_ready(current)
+        finally:
+            self._applying_store_changes = False
+        self._remember_directory_snapshot()
+
+    def _update_metadata_sync_status(self, rows: list[dict]) -> None:
+        if self._background_shutdown_requested:
+            return
+        try:
+            from PyQt6.QtGui import QFontMetrics
+        except ImportError:  # pragma: no cover
+            from PyQt5.QtGui import QFontMetrics
+        # QSS can defer the inherited font change until the next paint; include
+        # the application font so the first status frame already has room.
+        self._meta_progress.setFixedHeight(max(
+            20, self._meta_progress.fontMetrics().height() + 4,
+            self.fontMetrics().height() + 4, QFontMetrics(QApplication.font()).height() + 4,
+        ))
+        failures = [row for row in rows if row.get("error")]
+        previous = getattr(self, "_metadata_sync_status_text", "")
+        if failures:
+            text = f"XMP 同步失败 {len(failures)} · 自动重试"
+            self._show_meta_progress_status(text)
+            self._meta_progress.setFormat(text)
+            self._meta_progress.setToolTip("元数据已保存在本地，将自动重试 XMP 同步。\n" + "\n".join(
+                f"{row['path']}\n{row['error']}" for row in failures[:20]))
+        elif rows:
+            text = f"XMP 待同步 {len(rows)}"
+            self._show_meta_progress_status(text)
+            self._meta_progress.setFormat(text)
+            self._meta_progress.setToolTip("元数据已保存在本地，等待后台同步到 XMP。")
+        else:
+            text = ""
+            if previous and self._meta_progress.format() == previous:
+                self._meta_progress.hide()
+        self._metadata_sync_status_text = text
 
     def _on_metadata_progress(self, current: int, total: int) -> None:
         """主线程槽：由 progress_updated 信号触发，更新 metadata 总量基线。"""
@@ -7229,6 +7341,9 @@ class FileListPanel(QWidget):
         _log.debug("[_on_metadata_batch_ready] START entries=%s", len(meta_dict))
         t0 = _time.perf_counter()
         total = len(meta_dict)
+        meta_dict = {path: metadata for path, metadata in meta_dict.items()
+                     if int(metadata.get("_metadata_revision", 0)) >=
+                        int(self._meta_cache.get(path, {}).get("_metadata_revision", 0))}
         self._meta_cache.update(meta_dict)
         comment_cnt = 0
         tag_cnt = 0
@@ -7299,6 +7414,16 @@ class FileListPanel(QWidget):
             self._ensure_persistent_thumb_cache_timer()
             self._persistent_thumb_cache_timer.start(0)
 
+    def _emit_restored_file_selection(self, path: str) -> None:
+        if self._applying_directory_snapshot or self._metadata_revalidate_pending:
+            # Automatic selection restores in memory while the photo volume is
+            # being reconciled. Explicit clicks still use the normal policy.
+            self._selected_display_path = os.path.normpath(path)
+            self._snapshot_selected_path = self._selected_display_path
+            self._update_selection_status()
+            return
+        self._emit_file_selected_for_path(path)
+
     def _emit_file_selected_for_path(self, path: str) -> None:
         """更新当前显示路径并发出 file_selected，供点击与键盘选择共用。"""
         t0 = _time.perf_counter()
@@ -7306,6 +7431,7 @@ class FileListPanel(QWidget):
         if not path:
             return
         self._selected_display_path = os.path.normpath(path)
+        self._snapshot_selected_path = ""
         status_t0 = _time.perf_counter()
         self._update_selection_status()
         status_ms = (_time.perf_counter() - status_t0) * 1000.0
@@ -7748,117 +7874,60 @@ class FileListPanel(QWidget):
         return transfer_file_pairs(path_pairs, action=action)
 
     def _paste_clipboard_to_current_dir(self) -> None:
-        """将剪贴板中的文件粘贴到当前目录；内部剪切会移动，复制会复制。"""
+        """Snapshot the UI request; metadata barriers and transfers run in workers."""
         if not self._file_writes_allowed("粘贴", warn=True):
             return
         dest_dir = self.get_current_dir()
-        if not dest_dir or not os.path.isdir(dest_dir):
-            _log.info("[_paste_clipboard_to_current_dir] skip reason=no_current_dir dir=%r", dest_dir)
-            return
         action, entries = self._clipboard_file_payload()
-        if not entries:
-            _log.info("[_paste_clipboard_to_current_dir] skip reason=no_clipboard_files")
+        if not dest_dir or not entries:
             return
+        def clipboard_identity():
+            mime = QApplication.clipboard().mimeData()
+            return (bytes(mime.data(_FILE_CLIPBOARD_ACTION_MIME)),
+                    bytes(mime.data(_FILE_CLIPBOARD_ENTRIES_MIME)),
+                    tuple(url.toString() for url in mime.urls())) if mime is not None else None
+        original_clipboard = clipboard_identity()
         source_paths = [str(entry.get("source") or "") for entry in entries]
-        if source_paths and not self._file_operation_paths_allowed(source_paths, "粘贴", warn=True):
+        if not self._file_operation_paths_allowed(source_paths, "粘贴", warn=True):
             return
+        from ._metadata_commit import get_metadata_commit_bridge
 
-        pasted_sources: list[str] = []
-        touched_paths: list[str] = []
-        failures: list[str] = []
-        paste_plans: list[tuple[str, list[str], str, list[str]]] = []
-        reserved_destinations: set[str] = set()
-        for entry in entries:
-            source_path = os.path.abspath(str(entry.get("source") or ""))
-            if not source_path or not os.path.isfile(source_path):
-                failures.append(source_path or "(empty)")
-                continue
-            declared_sidecars = {
-                os.path.normcase(os.path.normpath(os.path.abspath(path)))
-                for path in self._sidecar_paths_from_clipboard_entry(entry)
-                if path and os.path.isfile(path)
-            }
-            strict_sidecar = find_same_stem_xmp_sidecar(source_path)
-            sidecar_paths = []
-            if (
-                strict_sidecar
-                and os.path.normcase(os.path.normpath(os.path.abspath(strict_sidecar)))
-                in declared_sidecars
-            ):
-                sidecar_paths.append(os.path.abspath(strict_sidecar))
-            try:
-                dest_source, dest_sidecars = self._unique_paste_destinations(
-                    source_path,
-                    sidecar_paths,
-                    dest_dir,
-                    action=action,
-                    reserved_destinations=reserved_destinations,
-                )
-                paste_plans.append(
-                    (source_path, sidecar_paths, dest_source, dest_sidecars)
-                )
-            except Exception as exc:
-                _log.warning(
-                    "[_paste_clipboard_to_current_dir] action=%r source=%r sidecars=%s failed: %s",
-                    action,
-                    source_path,
-                    sidecar_paths,
-                    exc,
-                )
-                failures.append(source_path)
-
-        # One clipboard payload is one transaction.  Do not leave a cut
-        # payload half-valid when a later entry fails.
-        if paste_plans and not failures:
-            path_pairs: list[tuple[str, str]] = []
-            for source_path, sidecar_paths, dest_source, dest_sidecars in paste_plans:
-                path_pairs.append((source_path, dest_source))
-                path_pairs.extend(zip(sidecar_paths, dest_sidecars))
-            try:
-                touched_paths = self._paste_path_pairs_transaction(
-                    path_pairs,
-                    action=action,
-                )
-                pasted_sources = [plan[2] for plan in paste_plans]
-                for source_path, sidecar_paths, dest_source, dest_sidecars in paste_plans:
-                    _log.info(
-                        "[_paste_clipboard_to_current_dir] action=%r source=%r sidecars=%s dest=%r dest_sidecars=%s",
-                        action,
-                        source_path,
-                        sidecar_paths,
-                        dest_source,
-                        dest_sidecars,
-                    )
-            except Exception as exc:
-                failures = [plan[0] for plan in paste_plans]
-                _log.warning(
-                    "[_paste_clipboard_to_current_dir] action=%r transaction failed entries=%s: %s",
-                    action,
-                    len(paste_plans),
-                    exc,
-                )
-
-        if touched_paths:
-            try:
+        def transfer():
+            from app_common.exif_io.metadata_store import get_store
+            with get_store().file_operation(source_paths):
+                if not os.path.isdir(dest_dir):
+                    raise FileNotFoundError(dest_dir)
+                plans, reserved = [], set()
+                for source in source_paths:
+                    source = os.path.abspath(source)
+                    if not os.path.isfile(source):
+                        raise FileNotFoundError(source)
+                    sidecar = find_same_stem_xmp_sidecar(source)
+                    sidecars = [sidecar] if sidecar else []
+                    destination, side_targets = self._unique_paste_destinations(
+                        source, sidecars, dest_dir, action=action, reserved_destinations=reserved)
+                    plans.append((source, sidecars, destination, side_targets))
+                pairs = []
+                for source, sidecars, destination, side_targets in plans:
+                    pairs.append((source, destination))
+                    pairs.extend(zip(sidecars, side_targets))
+                touched = self._paste_path_pairs_transaction(pairs, action=action)
                 from app_common.exif_io.writer import invalidate_metadata_cache
-                invalidate_metadata_cache(touched_paths)
-            except Exception:
-                pass
-        if action == "cut" and pasted_sources and not failures:
-            try:
+                invalidate_metadata_cache(touched)
+                return [plan[2] for plan in plans]
+
+        def completed(pasted):
+            if action == "cut" and clipboard_identity() == original_clipboard:
                 QApplication.clipboard().clear()
-            except Exception:
-                pass
-        if pasted_sources:
-            self.load_directory(dest_dir, force_reload=True)
-            self.set_pending_selection(pasted_sources, current_path=pasted_sources[0], apply_immediately=True)
-        _log.info(
-            "[_paste_clipboard_to_current_dir] action=%r pasted=%s failed=%s dest_dir=%r",
-            action,
-            len(pasted_sources),
-            len(failures),
-            dest_dir,
-        )
+            if pasted and self.get_current_dir() == dest_dir:
+                self.load_directory(dest_dir, force_reload=True)
+                self.set_pending_selection(pasted, current_path=pasted[0], apply_immediately=True)
+            self._show_meta_progress_status(f"已粘贴 {len(pasted)} 个文件", busy=False)
+
+        self._show_meta_progress_status("正在同步元数据并粘贴文件…", busy=True)
+        get_metadata_commit_bridge(self).execute(
+            transfer, completed,
+            lambda exc: self._show_meta_progress_status(f"粘贴失败，原文件已保留：{exc}", busy=False))
 
     def _add_file_clipboard_menu_actions(self, menu: QMenu, paths: list[str]) -> None:
         act_copy = menu.addAction("复制")
@@ -8219,13 +8288,13 @@ class FileListPanel(QWidget):
         )
         return 0
 
-    def _collect_thumbnail_cache_paths_for_source(self, source_path: str) -> list[str]:
+    def _collect_thumbnail_cache_paths_for_source(self, source_path: str, *, preview_base_dir=None, report_cache=None) -> list[str]:
         """收集源文件对应的缩略图缓存路径；需在移动/删除源文件前调用。"""
         source_path = os.path.normpath(source_path) if source_path else ""
         if not source_path:
             return []
-        preview_base_dir = self._current_dir or os.path.dirname(source_path)
-        report_cache = self._report_full_cache or self._report_cache or {}
+        preview_base_dir = preview_base_dir or self._current_dir or os.path.dirname(source_path)
+        report_cache = report_cache if report_cache is not None else (self._report_full_cache or self._report_cache or {})
         try:
             thumb_source = _resolve_thumb_source_path(
                 source_path,
@@ -8293,48 +8362,58 @@ class FileListPanel(QWidget):
         return deleted
 
     def _move_paths_to_trash(self, paths: list) -> None:
-        """将选中路径及同 stem XMP 移到垃圾桶；report.db 始终只读。"""
-        if not paths:
+        """Keep accepted edits with each photo; never wait for sidecars on Qt."""
+        if not paths or not self._file_operation_paths_allowed(paths, "删除文件", warn=True):
             return
-        if not self._file_operation_paths_allowed(paths, "删除文件", warn=True):
-            return
-        ok_count = 0
-        deleted_thumb_cache_count = 0
-        moved_display_paths: list[str] = []
-        moved_resolved_paths: list[str] = []
-        for p in paths:
-            norm_path = os.path.normpath(p) if p else ""
-            if not norm_path:
+        from ._metadata_commit import get_metadata_commit_bridge
+        origin_dir = self._current_dir
+        report_cache = dict(self._report_full_cache or self._report_cache or {})
+        entries = []
+        for path in paths:
+            if not path:
                 continue
-            target_path = self._resolve_source_path_for_action(norm_path)
-            target_path = os.path.normpath(target_path) if target_path else norm_path
-            if target_path and os.path.exists(target_path):
-                thumb_cache_paths = self._collect_thumbnail_cache_paths_for_source(target_path)
-                if move_to_trash(target_path):
-                    ok_count += 1
-                    moved_display_paths.append(norm_path)
-                    moved_resolved_paths.append(target_path)
-                    deleted_thumb_cache_count += self._delete_thumbnail_cache_paths(thumb_cache_paths)
-                    _log.info(
-                        "[_move_paths_to_trash] moved source=%r target=%r",
-                        norm_path,
-                        target_path,
-                    )
-            else:
-                _log.info(
-                    "[_move_paths_to_trash] skip source=%r target=%r reason=missing",
-                    norm_path,
-                    target_path,
-                )
-        if moved_display_paths:
-            self._delete_report_rows_for_paths(
-                moved_display_paths,
-                resolved_paths=moved_resolved_paths,
-            )
-        if deleted_thumb_cache_count:
-            _log.info("[_move_paths_to_trash] deleted_thumb_cache=%s", deleted_thumb_cache_count)
-        if ok_count and self._current_dir:
-            self._reload_after_trash(moved_display_paths)
+            display = os.path.normpath(path)
+            actual = self._resolve_source_path_for_action(display) or display
+            scope = self._report_scope_path_key(self._get_report_row_for_path(display))
+            entries.append((display, os.path.normpath(actual), scope))
+
+        def remove():
+            from app_common.exif_io.metadata_store import get_store
+            moved = []
+            failures = []
+            with get_store().file_operation([actual for _, actual, _ in entries]):
+                for display, actual, scope in entries:
+                    if not os.path.exists(actual):
+                        continue
+                    cache_paths = self._collect_thumbnail_cache_paths_for_source(
+                        actual, preview_base_dir=origin_dir, report_cache=report_cache)
+                    if not move_to_trash(actual):
+                        failures.append(actual)
+                        continue
+                    moved.append((display, actual, scope))
+                    for cache_path in cache_paths:
+                        try:
+                            if os.path.isfile(cache_path):
+                                os.remove(cache_path)
+                        except OSError as exc:
+                            _log.debug("[trash] thumbnail cleanup failed path=%r: %s", cache_path, exc)
+            return moved, failures
+
+        def completed(result):
+            moved, failures = result
+            if moved:
+                self._delete_report_rows_for_paths(
+                    [e[0] for e in moved], resolved_paths=[e[1] for e in moved],
+                    scope_keys=[e[2] for e in moved])
+                if self._current_dir == origin_dir:
+                    self._reload_after_trash([e[0] for e in moved])
+            detail = f"；{len(failures)} 个失败，原文件已保留" if failures else ""
+            self._show_meta_progress_status(f"已移入回收站 {len(moved)} 个文件{detail}", busy=False)
+
+        self._show_meta_progress_status("正在同步元数据并移入回收站…", busy=True)
+        get_metadata_commit_bridge(self).execute(
+            remove, completed,
+            lambda exc: self._show_meta_progress_status(f"删除未完成：{exc}", busy=False))
 
     def _reload_after_trash(self, moved_paths: list[str]) -> None:
         """Reload successful deletions; hosts may prepare a selection first."""

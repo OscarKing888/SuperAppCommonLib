@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import re
 from xml.dom import Node, minidom
 from xml.etree import ElementTree as ET
@@ -72,6 +73,29 @@ def _bind_to_export(description):
         description.setAttributeNS(_RDF, 'rdf:about', '')
 
 
+def _clear_keys(descriptions):
+    """Return active clear markers, allowing later external nonempty values."""
+    from .xmp_sidecar import _NS_PREFIXES, _apply_cleared_fields
+    rows = []
+    for description in descriptions:
+        for prop in _properties(description):
+            prefix = _NS_PREFIXES.get(prop.namespaceURI)
+            if prefix:
+                value = prop.value if prop.nodeType == Node.ATTRIBUTE_NODE else ''.join(
+                    node.data for node in prop.childNodes if node.nodeType in (Node.TEXT_NODE, Node.CDATA_SECTION_NODE))
+                # Container values are nonempty when they have a nonempty li.
+                if prop.nodeType == Node.ELEMENT_NODE and not value.strip():
+                    items = prop.getElementsByTagNameNS(_RDF, 'li')
+                    defaults = [node for node in items if node.getAttributeNS(_XML, 'lang') == 'x-default']
+                    value = ''.join(node.firstChild.data for node in (defaults or items)
+                                    if node.firstChild is not None and node.firstChild.nodeType == Node.TEXT_NODE)
+                rows.append(('XMP-' + prefix, prop.localName, value.strip()))
+    for group, name, value in _apply_cleared_fields(rows):
+        if group == 'XMP-superpicky' and name == 'metadata_cleared_fields':
+            return json.loads(value)
+    return []
+
+
 def merge_export_xmp(embedded: bytes, sidecar: bytes, *, source: Path) -> bytes:
     """整属性覆盖（包括数组/多语言/空值），不经 ExifTool 已知标签白名单。"""
     embedded = embedded.strip() or _EMPTY
@@ -84,6 +108,13 @@ def merge_export_xmp(embedded: bytes, sidecar: bytes, *, source: Path) -> bytes:
             edit_indices = _photo_indices(sidecar, source)
             keys = {(prop.namespaceURI, prop.localName)
                     for index in edit_indices for prop in _properties(edit_descriptions[index])}
+            from .xmp_sidecar import _NS_PREFIXES
+            namespaces = {prefix.lower(): uri for uri, prefix in _NS_PREFIXES.items()}
+            for key in _clear_keys([edit_descriptions[i] for i in edit_indices]):
+                group, name = key.split(':', 1)
+                namespace = namespaces.get(group.removeprefix('XMP-').lower())
+                if namespace:
+                    keys.add((namespace, name.lower() if group.lower() == 'xmp-dc' else name))
             for description in base_photos:
                 for prop in list(_properties(description)):
                     if (prop.namespaceURI, prop.localName) in keys:
@@ -141,13 +172,105 @@ def read_export_xmp(source: Path) -> bytes:
                         merged = merge_export_xmp(merged, node.toxml(encoding='utf-8'), source=source)
         except ExpatError as exc:
             raise ValueError(f'无法读取原图 XMP：{source}：{exc}') from exc
-    sidecar = find_same_stem_xmp_sidecar(str(source))
-    if not result.stdout.strip() and sidecar is None:
-        return _EMPTY.replace(b'/>', b'><rdf:Description rdf:about=""/></rdf:RDF>')
-    edits = Path(sidecar).read_bytes() if sidecar else b''
-    if sidecar and not edits.strip():
-        raise ValueError(f'原图 XMP 侧车为空：{sidecar}')
-    return merge_export_xmp(merged, edits, source=source)
+    from .photo_meta import xmp_sidecar_write_lock
+    from .metadata_store import get_store
+    # Capture one committed revision while publication is excluded. Export does
+    # not require the source volume to accept pending sidecar writes.
+    with xmp_sidecar_write_lock(str(source)):
+        sidecar = find_same_stem_xmp_sidecar(str(source))
+        edits = Path(sidecar).read_bytes() if sidecar else b''
+        pending = get_store().pending_edits(str(source))
+        if sidecar and not edits.strip():
+            raise ValueError(f'原图 XMP 侧车为空：{sidecar}')
+        if not result.stdout.strip() and sidecar is None:
+            merged = _EMPTY.replace(b'/>', b'><rdf:Description rdf:about=""/></rdf:RDF>')
+        snapshot = merge_export_xmp(merged, edits, source=source)
+    return apply_pending_export_edits(snapshot, pending, source=source)
+
+
+def apply_pending_export_edits(payload: bytes, pending: dict | None, *, source: Path) -> bytes:
+    """Apply a frozen SQLite patch to output XML, preserving unknown properties."""
+    if not pending:
+        return payload
+    from .photo_meta import _xmp_sidecar_write_key
+    from .xmp_sidecar import _NS_PREFIXES
+    namespaces = {prefix.lower(): uri for uri, prefix in _NS_PREFIXES.items()}
+    # Prefer canonical URI where historical aliases exist.
+    namespaces['xmp'] = 'http://ns.adobe.com/xap/1.0/'
+    fields = dict(pending.get('fields') or {})
+    with minidom.parseString(payload) as document:
+        rdf, descriptions = _descriptions(document)
+        photos = [descriptions[i] for i in sorted(_photo_indices(payload, source))]
+        if not photos:
+            description = document.createElementNS(_RDF, 'rdf:Description')
+            _bind_to_export(description)
+            rdf.appendChild(description)
+            photos = [description]
+        states = pending.get('subject_states') or {}
+        if states:
+            subjects = fields.get('XMP-dc:Subject')
+            if subjects is None:
+                subjects = []
+                for photo in photos:
+                    for prop in _properties(photo):
+                        if prop.namespaceURI == namespaces['dc'] and prop.localName.lower() == 'subject':
+                            if prop.nodeType == Node.ELEMENT_NODE:
+                                subjects.extend(''.join(child.data for child in li.childNodes
+                                                        if child.nodeType in (Node.TEXT_NODE, Node.CDATA_SECTION_NODE))
+                                                for li in prop.getElementsByTagNameNS(_RDF, 'li'))
+            subjects = list(dict.fromkeys(subjects))
+            for name, present in states.items():
+                subjects = [s for s in subjects if s != name]
+                if present:
+                    subjects.append(name)
+            fields['XMP-dc:Subject'] = subjects
+        cleared = {key.lower(): key for key in _clear_keys(photos)}
+        for key, value in fields.items():
+            canonical = _xmp_sidecar_write_key(key)
+            if value is None or value == '' or value == []:
+                cleared[canonical.lower()] = canonical
+            else:
+                cleared.pop(canonical.lower(), None)
+        fields['XMP-superpicky:metadata_cleared_fields'] = json.dumps(list(cleared.values())) if cleared else None
+        for key, value in fields.items():
+            key = _xmp_sidecar_write_key(key)
+            group, _, name = key.partition(':')
+            prefix = group.removeprefix('XMP-')
+            namespace = namespaces.get(prefix.lower())
+            if not namespace or not name:
+                raise ValueError(f'无法导出尚未同步的元数据字段：{key}')
+            if prefix.lower() == 'dc':
+                name = name.lower()
+            for photo in photos:
+                for prop in list(_properties(photo)):
+                    if prop.namespaceURI == namespace and prop.localName.lower() == name.lower():
+                        if prop.nodeType == Node.ATTRIBUTE_NODE:
+                            photo.removeAttributeNode(prop)
+                        else:
+                            photo.removeChild(prop)
+            if value is None:
+                continue
+            target = photos[0]
+            target.setAttributeNS(_XMLNS, 'xmlns:' + prefix, namespace)
+            prop = document.createElementNS(namespace, f'{prefix}:{name}')
+            target.appendChild(prop)
+            if prefix.lower() == 'dc' and name in ('title', 'description'):
+                container = document.createElementNS(_RDF, 'rdf:Alt')
+                item = document.createElementNS(_RDF, 'rdf:li')
+                item.setAttributeNS(_XML, 'xml:lang', 'x-default')
+                item.appendChild(document.createTextNode(str(value)))
+                container.appendChild(item)
+                prop.appendChild(container)
+            elif isinstance(value, (list, tuple)):
+                container = document.createElementNS(_RDF, 'rdf:Bag')
+                for entry in value:
+                    item = document.createElementNS(_RDF, 'rdf:li')
+                    item.appendChild(document.createTextNode(str(entry)))
+                    container.appendChild(item)
+                prop.appendChild(container)
+            else:
+                prop.appendChild(document.createTextNode(str(value)))
+        return document.documentElement.toxml(encoding='utf-8')
 
 
 def export_xmp_geometry(payload: bytes, *, source: Path, size: tuple[int, int]) -> bytes:

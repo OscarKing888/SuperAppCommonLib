@@ -39,6 +39,7 @@ def test_browser_reload_retains_saved_pinyin_and_source(tmp_path):
     from app_common.exif_io.photo_meta import PhotoMetaDataXMP
     from app_common.file_browser._workers import MetadataLoader
     path = str(tmp_path / '中文.jpg')
+    (tmp_path / '中文.jpg').write_bytes(b'photo')
     assert PhotoMetaDataXMP().write(path, {'XMP-dc:Title': '白头鹎',
         'XMP-superpicky:pinyin_name': 'bái tóu bēi', 'XMP-superpicky:pinyin_name_source': '白头鹎'})
     rec = PhotoMetaDataXMP().read(path)

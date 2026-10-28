@@ -2627,7 +2627,7 @@ def _load_thumbnail_image(path: str, size: int, selected_dir: str | None = None,
 
 # ── 可排序树节点 ───────────────────────────────────────────────────────────────
 
-def _collect_image_files_impl(dir_path: str, recursive: bool) -> list:
+def _collect_image_files_impl(dir_path: str, recursive: bool, *, cancelled=None) -> list:
     """
     收集目录下支持的图像文件路径。
     recursive=True 时递归遍历所有子目录；不进入以 . 开头的目录（如 .superpicky）。
@@ -2636,8 +2636,12 @@ def _collect_image_files_impl(dir_path: str, recursive: bool) -> list:
     try:
         if recursive:
             for root, dirs, names in os.walk(dir_path, topdown=True):
+                if cancelled is not None and cancelled():
+                    return []
                 dirs[:] = [d for d in dirs if not d.startswith(".")]
                 for name in sorted(names, key=str.lower):
+                    if cancelled is not None and cancelled():
+                        return []
                     if (
                         not is_apple_double_metadata_file(name)
                         and Path(name).suffix.lower() in IMAGE_EXTENSIONS
@@ -2645,6 +2649,8 @@ def _collect_image_files_impl(dir_path: str, recursive: bool) -> list:
                         files.append(os.path.join(root, name))
         else:
             for entry in sorted(os.scandir(dir_path), key=lambda e: e.name.lower()):
+                if cancelled is not None and cancelled():
+                    return []
                 if (
                     entry.is_file()
                     and not is_apple_double_metadata_file(entry.name)

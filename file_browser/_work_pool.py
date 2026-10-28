@@ -76,6 +76,10 @@ class BrowserWorkPool:
             self._thumbnail_mode = bool(enabled)
             self._condition.notify_all()
 
+    def is_worker_thread(self):
+        """Whether the caller already owns one of this pool's execution slots."""
+        return threading.current_thread() in self._threads
+
     def begin_producer(self, kind: WorkKind):
         kind = WorkKind(kind)
         token = object()

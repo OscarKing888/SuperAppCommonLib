@@ -34,6 +34,7 @@ class MetadataResult:
     message: str = ""
     updates: dict = field(default_factory=dict)
     saved_fingerprint: tuple | None = None
+    revision: int | None = None
 
 
 class MetadataWriteAction(WorkerAction):
@@ -42,9 +43,15 @@ class MetadataWriteAction(WorkerAction):
         super().__init__(cancelled=cancelled)
         self.path = os.path.normpath(os.path.abspath(path))
         self.fields, self.updates = copy.deepcopy(fields), copy.deepcopy(updates)
-        self.writer = writer or PhotoMetaDataXMP().write
+        self.writer = writer
 
     def execute(self):
+        if self.writer is None:
+            if self.is_cancelled():
+                return None
+            from app_common.exif_io.metadata_store import get_store
+            receipt = get_store().submit_edit(self.path, self.fields).result()
+            return MetadataResult(self.path, updates=self.updates, revision=receipt.revision)
         with xmp_sidecar_write_lock(self.path):
             if self.is_cancelled():
                 return None
@@ -66,7 +73,10 @@ class SpeciesCopyAction(WorkerAction):
     def execute(self):
         if self.is_cancelled():
             return None
-        sidecar = PhotoMetaDataXMP().read(self.path)
+        from app_common.exif_io.metadata_store import get_store
+        from app_common.exif_io.reader import extract_metadata_with_xmp_priority
+        sidecar = (get_store().read_many([self.path]).get(os.path.normpath(self.path))
+                   or extract_metadata_with_xmp_priority(self.path))
         payload = {**self.payload, **species_snapshot(*self.sources, sidecar)}
         if not payload["bird_species_cn"] and not self.is_cancelled():
             # The pool owns a reusable, thread-local ExifTool read session.
@@ -84,7 +94,11 @@ class LocationCopyAction(WorkerAction):
 
     def execute(self):
         from app_common.shooting_location import shooting_location
-        return shooting_location(PhotoMetaDataXMP().read(self.path))
+        from app_common.exif_io.metadata_store import get_store
+        from app_common.exif_io.reader import extract_metadata_with_xmp_priority
+        record = (get_store().read_many([self.path]).get(os.path.normpath(self.path))
+                  or extract_metadata_with_xmp_priority(self.path))
+        return shooting_location(record)
 
 
 class MetadataBatchWorker(QThread):

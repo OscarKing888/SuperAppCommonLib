@@ -123,6 +123,18 @@ def _find_sibling_xmp_sidecar_for_file(path):
 
 
 def move_to_trash(path):
+    """Keep accepted metadata with the photo through its recoverable deletion."""
+    from app_common.exif_io.metadata_store import get_store
+    try:
+        with get_store().file_operation([path]):
+            return _move_to_trash(path)
+    except Exception as exc:
+        from app_common.log import get_logger
+        get_logger("file_utils").warning("[trash] metadata/file operation failed path=%r: %s", path, exc)
+        return False
+
+
+def _move_to_trash(path):
     """
     将文件或目录移动到系统垃圾桶（回收站），可恢复。
 

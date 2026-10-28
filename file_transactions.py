@@ -52,6 +52,28 @@ def transfer_file_pairs(
     copy_sources: tuple[str, ...] = (),
     no_replace: bool = False,
 ) -> list[str]:
+    """Flush accepted edits before staging; reserve paths through publication."""
+    from app_common.exif_io.metadata_store import get_store
+    from app_common.exif_io.xmp_sidecar import find_same_stem_xmp_sidecar
+
+    pairs = list(path_pairs)
+    sources = [source for source, _ in pairs]
+    with get_store().file_operation(sources):
+        known = {os.path.normcase(os.path.abspath(source)) for source, _ in pairs}
+        for source, destination in list(pairs):
+            if Path(source).suffix.lower() == ".xmp":
+                continue
+            sidecar = find_same_stem_xmp_sidecar(source)
+            if sidecar and os.path.normcase(os.path.abspath(sidecar)) not in known:
+                pairs.append((sidecar, str(Path(destination).with_suffix(Path(sidecar).suffix))))
+                known.add(os.path.normcase(os.path.abspath(sidecar)))
+        return _transfer_file_pairs(pairs, action=action, copy_sources=copy_sources, no_replace=no_replace)
+
+
+def _transfer_file_pairs(
+    path_pairs: list[tuple[str, str]], *, action: str,
+    copy_sources: tuple[str, ...] = (), no_replace: bool = False,
+) -> list[str]:
     """Atomically stage/commit every pair in one clipboard paste."""
     if action not in {"copy", "cut"}:
         raise ValueError(f"Unsupported clipboard action: {action!r}")

@@ -84,6 +84,7 @@ class DirectoryScanWorker(QThread):
     scan_finished = pyqtSignal(str, object, object, object, object)  # (path, files_list, selected_report_cache, full_report_cache_or_none, report_row_by_path)
     scan_progress = pyqtSignal(str, int, int, str)  # (path, found_files, scanned_dirs, current_dir)
     report_scope_progress = pyqtSignal(str, int, int, str)  # (path, processed, total, report_root)
+    snapshot_ready = pyqtSignal(str, object)
 
     def __init__(
         self,
@@ -94,6 +95,9 @@ class DirectoryScanWorker(QThread):
         use_report_db: bool = False,
         parent=None,
         include_videos: bool = False,
+        snapshot_cache=None,
+        use_cached_snapshot: bool = True,
+        discover_report_root: bool = False,
     ) -> None:
         super().__init__(parent)
         self._path = path
@@ -102,9 +106,28 @@ class DirectoryScanWorker(QThread):
         self._report_cache_full = report_cache_full
         self._use_report_db = bool(use_report_db)
         self._include_videos = bool(include_videos)
+        self._snapshot_cache = snapshot_cache
+        self._use_cached_snapshot = use_cached_snapshot
+        self._discover_report_root = discover_report_root
 
     def run(self) -> None:
         started_at = _time.perf_counter()
+        if self._snapshot_cache is not None and self._use_cached_snapshot:
+            snapshot = self._snapshot_cache.load(
+                self._path, self._recursive, include_videos=self._include_videos,
+                use_report_db=self._use_report_db,
+            )
+            if snapshot is not None and not self.isInterruptionRequested():
+                self.snapshot_ready.emit(self._path, snapshot)
+        if self.isInterruptionRequested():
+            return
+        if self._discover_report_root and self._use_report_db:
+            root = _report_root_dir_for_file(os.path.join(self._path, "__superviewer_scope_probe__.jpg"), self._path)
+            if not root:
+                root = find_report_root(self._path, max_levels=0)
+            if root != self._report_root:
+                self._report_cache_full = None
+            self._report_root = root or None
         _log.info(
             "[DirectoryScanWorker.run] START path=%r recursive=%s report_root=%r use_report_db=%s has_cached_full_report=%s",
             self._path,
@@ -199,12 +222,14 @@ class DirectoryScanWorker(QThread):
                 len(files), len(report_cache), selected_dir, selected_rel_norm or ".", report_root,
             )
             _log.info(
-                "[DirectoryScanWorker.run] 使用 DB current_path 拼出完整路径构建文件列表 files=%s（跳过文件系统扫描）",
+                "[DirectoryScanWorker.run] 使用 DB current_path 构建文件列表 files=%s，后台校验实际路径",
                 len(files),
             )
             try:
                 # 旧报告路径的实际文件补充也必须遵守当前目录范围。
-                actual_files = _collect_image_files_impl(self._path, self._recursive)
+                actual_files = _collect_image_files_impl(
+                    self._path, self._recursive, cancelled=self.isInterruptionRequested,
+                )
                 if self.isInterruptionRequested():
                     return
                 full_cache = full_report_cache or report_cache or {}
@@ -373,6 +398,14 @@ class DirectoryScanWorker(QThread):
         _log.info("[DirectoryScanWorker.run] 目录扫描完成：列出 %s 个媒体文件，report_cache %s 条，即将通知主线程加载 EXIF", len(files), len(report_cache))
         _log.info("[DirectoryScanWorker.run] scan done files=%s", len(files))
         if not self.isInterruptionRequested():
+            if self._snapshot_cache is not None:
+                self._snapshot_cache.remember(
+                    self._path, self._recursive,
+                    {"files": files, "report_root": self._report_root,
+                     "report_cache": report_cache, "report_row_by_path": report_row_by_path,
+                     "metadata": {}}, include_videos=self._include_videos,
+                    use_report_db=self._use_report_db, persist=True,
+                )
             self.scan_finished.emit(self._path, files, report_cache, full_report_cache, report_row_by_path)
             _log.info("[DirectoryScanWorker.run] emit scan_finished END")
 
@@ -476,7 +509,7 @@ class MetadataLoader(QThread):
         self,
         paths: list,
         meta_proxy: PhotoMetaDataProxy,
-        focus_source_paths: dict[str, str] | None = None,
+        focus_source_paths: dict[str, str | tuple[str, ...]] | None = None,
         metadata_tags: list[str] | None = None,
         report_rows_by_path: dict[str, dict] | None = None,
         worker_count: int | None = None,
@@ -494,7 +527,8 @@ class MetadataLoader(QThread):
         self._meta_proxy = meta_proxy
         self._selected_dir = str(selected_dir or "") or None
         self._focus_source_paths = {
-            os.path.normpath(display_path): os.path.normpath(source_path)
+            os.path.normpath(display_path): tuple(os.path.normpath(path) for path in
+                ((source_path,) if isinstance(source_path, str) else source_path) if path)
             for display_path, source_path in (focus_source_paths or {}).items()
             if display_path and source_path
         }
@@ -509,6 +543,7 @@ class MetadataLoader(QThread):
         except Exception:
             self._worker_count = 1
         self._stop_flag = False
+        self._emitted_records = {}
 
     def stop(self) -> None:
         self._stop_flag = True
@@ -569,6 +604,7 @@ class MetadataLoader(QThread):
                       processed, len(self._paths), elapsed_ms(started), self._work_pool.snapshot())
 
     def run(self) -> None:
+        self._emit_cached_snapshot()
         if self._work_pool is not None:
             self._run_shared()
             return
@@ -660,6 +696,39 @@ class MetadataLoader(QThread):
             )
             _log.info("[MetadataLoader.run] END")
 
+    def _emit_cached_snapshot(self):
+        """Deliver saved metadata before any stat, scan, XML or EXIF work."""
+        if self._memory_cache is None or self._stopped():
+            return
+        from app_common.exif_io.metadata_store import get_store
+        store = get_store()
+        started = perf_counter()
+        emitted = 0
+        for start in range(0, len(self._paths), 256):
+            if self._stopped():
+                return
+            paths = self._paths[start:start + 256]
+            cached = self._memory_cache.peek_many(paths)
+            # SQLite snapshots include committed edits even before XMP sync.
+            try:
+                saved = store.read_many(paths, profile="browser")
+            except Exception as exc:
+                _log.warning("[metadata.snapshot] SQLite read failed: %s", exc)
+                saved = {}
+            for path, record in saved.items():
+                cached[path] = {**cached.get(path, {}), **record}
+            parsed = {}
+            for path, record in cached.items():
+                meta = self._parse_rec(record)
+                species = str(record.get("XMP-superpicky:bird_species_cn") or record.get("bird_species_cn") or "").strip()
+                if species:
+                    meta["bird_species_cn"] = species
+                parsed[path] = meta
+            self._emit_metadata_chunk(parsed, {})
+            emitted += len(parsed)
+        _log.info("[metadata.snapshot] files=%s cached=%s elapsed_ms=%.1f",
+                  len(self._paths), emitted, elapsed_ms(started))
+
     def _read_parse_chunk(self, chunk: list[str]) -> tuple[dict, dict, int]:
         if self._stopped():
             return {}, {}, 0
@@ -709,6 +778,10 @@ class MetadataLoader(QThread):
         if focus_batch and not self._stopped():
             _log.debug("[MetadataLoader.run] emit focus_cache_batch_ready batch=%s", len(focus_batch))
             self.focus_cache_batch_ready.emit(focus_batch)
+        if self._memory_cache is not None:
+            parsed_batch = {path: record for path, record in parsed_batch.items()
+                            if self._emitted_records.get(path) != record}
+            self._emitted_records.update(parsed_batch)
         if parsed_batch and not self._stopped():
             _log.debug("[MetadataLoader.run] emit metadata_batch_ready batch=%s", len(parsed_batch))
             self.metadata_batch_ready.emit(parsed_batch)
@@ -726,9 +799,16 @@ class MetadataLoader(QThread):
         cache = self._memory_cache
         if cache is None:
             return self._read_metadata_batch_uncached(paths)
+        from app_common.exif_io.metadata_store import get_store
+        store = get_store()
         started = perf_counter()
         signatures = metadata_signatures(paths, self._metadata_tags, self._report_rows_by_path,
                                          directory_index=self._sidecar_index)
+        try:
+            expected_revisions = store.revisions(paths, signatures=signatures)
+        except Exception as exc:
+            _log.warning("[metadata.snapshot] SQLite revision read failed: %s", exc)
+            store, expected_revisions = None, None
         disk = self._sqlite_cache
         revision = disk.revision()
         result, missing, generations = {}, [], {}
@@ -745,6 +825,8 @@ class MetadataLoader(QThread):
         for norm, record in disk_hits.items():
             cache.store(norm, signatures[norm], record, generations[norm])
         result.update(disk_hits)
+        persistable = dict(result)
+        validated_cache_paths = list(result)
         missing = [p for p in missing if os.path.normpath(p) not in disk_hits]
         if missing and not self._stopped():
             failed = set()
@@ -763,12 +845,28 @@ class MetadataLoader(QThread):
                     if cache.generation_is_current(generations[norm]):
                         sidecar = signatures[norm][1]
                         pending[norm] = (signatures[norm], record, sidecar[0] if sidecar else None)
+                        persistable[norm] = record
             if not self._stopped():
                 disk.put_many(metadata_sqlite.BROWSER_NAMESPACE, pending, revision)
             result.update(fresh)
         stats = cache.stats()
         _log.info("[metadata.memory] paths=%s hits=%s sqlite_hits=%s misses=%s entries=%s bytes=%s elapsed_ms=%.1f",
                   len(paths), hits, len(disk_hits), len(missing), stats["entries"], stats["bytes"], elapsed_ms(started))
+        if store is not None and not self._stopped() and result:
+            try:
+                if validated_cache_paths:
+                    after_hits = metadata_signatures(validated_cache_paths, self._metadata_tags,
+                                                     self._report_rows_by_path, directory_index=self._sidecar_index)
+                    persistable = {path: record for path, record in persistable.items()
+                                   if path not in validated_cache_paths or after_hits.get(path) == signatures.get(path)}
+                if persistable:
+                    store.remember_many(persistable, profile="browser", signatures=signatures,
+                                        expected_revisions=expected_revisions).result()
+                # A newer SQL commit wins even when its XMP synchronization finished
+                # while this source read was in flight.
+                result.update(store.read_many(paths, profile="browser"))
+            except Exception as exc:
+                _log.warning("[metadata.snapshot] SQLite cache update failed: %s", exc)
         return result
 
     def _read_metadata_batch_uncached(self, paths: list[str], *, failed_paths=None,
@@ -1117,7 +1215,8 @@ class MetadataLoader(QThread):
             return None
         return cls._build_report_focus_box(rec)
 
-    def _parse_rec(self, rec: dict) -> dict:
+    @classmethod
+    def _parse_rec(cls, rec: dict) -> dict:
         # 注释、标签、星级等支持 XMP sidecar（由 read_batch_metadata 合并），勿删以下键名。
         comment = _metadata_comment_from_meta(rec)
         tags = _metadata_tags_from_meta(rec)
@@ -1192,11 +1291,12 @@ class MetadataLoader(QThread):
         sharpness = _metadata_sharpness_text(rec)
         aesthetic = _metadata_aesthetic_text(rec)
         focus_status = _metadata_focus_status_text(rec)
-        focus_box = self._build_focus_box_from_metadata(rec)
+        focus_box = cls._build_focus_box_from_metadata(rec)
         burst_id = _parse_optional_int(_metadata_value_from_candidates(rec, "burst_id"))
         burst_position = _parse_optional_int(_metadata_value_from_candidates(rec, "burst_position"))
 
         meta = {
+            "_metadata_revision": rec.get("_metadata_revision", 0),
             "title":   str(title).strip(),
             "comment": comment,
             "tags":    tags,
@@ -1253,7 +1353,10 @@ class MetadataLoader(QThread):
         norm_display = os.path.normpath(display_path) if display_path else ""
         if not norm_display:
             return ""
-        return self._focus_source_paths.get(norm_display) or norm_display
+        for candidate in self._focus_source_paths.get(norm_display, (norm_display,)):
+            if os.path.isfile(candidate):
+                return candidate
+        return norm_display
 
     def _build_focus_cache_batch(self, chunk: list[str]) -> dict[str, dict]:
         """

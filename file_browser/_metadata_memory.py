@@ -10,6 +10,7 @@ import threading
 from time import monotonic
 
 from app_common.exif_io.xmp_sidecar import find_xmp_sidecars
+from app_common.exif_io.metadata_sqlite import sidecar_stamp
 from app_common.superviewer_user_options import METADATA_MEMORY_DEFAULT_MB
 
 
@@ -35,12 +36,12 @@ def metadata_signatures(paths, tags, report_rows, *, directory_index=None) -> di
         if source_stamp is None:
             continue  # 缺失/不可读的源文件不可成为长期命中。
         sidecar = sidecars.get(norm)
-        sidecar_stamp = _file_stamp(sidecar) if sidecar else None
-        if sidecar and sidecar_stamp is None:
+        sidecar_signature = sidecar_stamp(sidecar) if sidecar else None
+        if sidecar and sidecar_signature is None:
             continue
         row = report_rows.get(norm, {})
         signatures[norm] = (
-            source_stamp, (_path_key(sidecar), sidecar_stamp) if sidecar else None,
+            source_stamp, (_path_key(sidecar), sidecar_signature) if sidecar else None,
             tuple(sorted(tags)), tuple(sorted((str(k), repr(v)) for k, v in row.items())),
         )
     return signatures
@@ -140,6 +141,22 @@ class MetadataMemoryCache:
                     return deepcopy(entry.record), self._generation
                 self._drop(queue, key)
             return None, self._generation
+
+    def peek_many(self, paths):
+        """Last known snapshots for first paint; validation belongs to workers."""
+        result = {}
+        with self._lock:
+            now = self._clock()
+            self._expire(now)
+            for path in paths:
+                key = _path_key(path)
+                queue = self._active if self._in_scope(key) else self._inactive
+                entry = queue.get(key)
+                if entry is not None:
+                    entry.touched = now
+                    queue.move_to_end(key)
+                    result[os.path.normpath(path)] = deepcopy(entry.record)
+        return result
 
     def store(self, path, signature, record, generation):
         if signature is None:

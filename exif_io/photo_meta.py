@@ -27,37 +27,34 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable
 from functools import wraps
 from pathlib import Path
 from typing import Any
 
-from .xmp_sidecar import _photo_descriptions
+from .xmp_sidecar import _photo_descriptions, _extract_text_value
 
 
-# 固定数量的可重入锁避免自动后台缓存与用户编辑同时读改写同一侧车，
-# 也避免按浏览过的照片累积永久锁。锁覆盖整个事务，而不只是 os.replace。
-_XMP_WRITE_LOCKS = tuple(threading.RLock() for _ in range(64))
-
-
-def xmp_sidecar_write_lock(path: str):
-    """In-process write lock shared by same-stem RAW/JPEG/XMP paths.
-
-    The bounded striped registry may serialize unrelated sidecars occasionally;
-    unrelated stripes never wait for a global metadata or ExifTool write lock.
-    """
-    # 先取侧车 stem 再解析目录别名；源 JPEG 自身是符号链接时，侧车仍在
-    # 用户浏览的目录，不能跟着照片链接跳到另一目录而错开同名 RAW 的锁。
-    stem = os.path.realpath(os.path.splitext(os.path.abspath(os.fspath(path)))[0])
-    return _XMP_WRITE_LOCKS[hash(os.path.normcase(stem).casefold()) % len(_XMP_WRITE_LOCKS)]
+from .sidecar_lock import xmp_sidecar_write_lock
+from .shared_read import read_shared_bytes
 
 
 def _serialized_xmp_write(method):
     @wraps(method)
     def locked(self, path, *args, **kwargs):
         with xmp_sidecar_write_lock(path):
-            return method(self, path, *args, **kwargs)
+            if method.__name__ == "read_json_field":
+                return method(self, path, *args, **kwargs)
+            from .metadata_store import sidecar_write_guard
+            try:
+                with sidecar_write_guard(path):
+                    return method(self, path, *args, **kwargs)
+            except (OSError, RuntimeError):
+                if method.__name__ == "update_json_field":
+                    raise
+                return False
     return locked
 
 
@@ -484,7 +481,8 @@ class PhotoMetaDataXMP(PhotoMetaData):
             return None
         if sidecar.stat().st_size > 64 * 1024 * 1024:
             raise ValueError("XMP sidecar exceeds the structured metadata read limit")
-        return self._structured_field_value(ET.parse(sidecar), path, sidecar, tag)
+        tree = ET.ElementTree(ET.fromstring(read_shared_bytes(sidecar)))
+        return self._structured_field_value(tree, path, sidecar, tag)
 
     @_serialized_xmp_write
     def update_json_field(self, path: str, name: str, update):
@@ -510,6 +508,7 @@ class PhotoMetaDataXMP(PhotoMetaData):
             raise ValueError("Structured XMP property exceeds 2 MiB; store large resources separately")
         self._replace_text_node(self._ensure_descriptions(tree.getroot(), path), tag, text)
         self._hydrate_report_db_fields_if_needed(path, tree, protected_report_fields={name: text})
+        self._update_metadata_clear_markers(tree, path, {f"XMP-superpicky:{name}": text})
         # Other application processes don't use our in-process lock. Detect any
         # change observed during the transaction instead of publishing stale XML.
         latest = sidecar.read_bytes() if sidecar.exists() else None
@@ -583,7 +582,9 @@ class PhotoMetaDataXMP(PhotoMetaData):
                 superpicky_values[superpicky_name] = "" if value is None else str(value)
             elif _is_xmp_subject_key(write_key):
                 subject_seen = True
-                subject_values.extend(_normalise_subject_value(value, split_strings=True))
+                # Explicit arrays already represent individual RDF subjects;
+                # punctuation inside an unknown subject must remain literal.
+                subject_values.extend(_normalise_subject_value(value, split_strings=isinstance(value, (str, bytes))))
             elif _is_xmp_title_key(write_key):
                 title_seen = True
                 title_value = "" if value is None else str(value)
@@ -641,6 +642,7 @@ class PhotoMetaDataXMP(PhotoMetaData):
                 self._replace_text_node(descriptions, _XMP_DM_PICK_TAG, str(pick_value))
             for name, value in superpicky_values.items():
                 self._replace_text_node(descriptions, f"{{{_SUPERPICKY_NS}}}{name}", value)
+            self._update_metadata_clear_markers(tree, path, fields)
             sidecar_path.parent.mkdir(parents=True, exist_ok=True)
             ok = self._write_tree_atomic(tree, sidecar_path)
             if ok:
@@ -690,6 +692,20 @@ class PhotoMetaDataXMP(PhotoMetaData):
                     existing_tree.write(staged_path, encoding="utf-8", xml_declaration=True)
             else:
                 staged_path.unlink()  # ExifTool -o requires a new output path.
+                # First convert camera metadata to XMP, then apply the user's
+                # assignments to that XMP. Combining these operations lets
+                # ExifTool's EXIF-to-XMP conversion overwrite explicit camera
+                # assignments (e.g. TIFF:Model) while still returning success.
+                cp = run_exiftool_once(
+                    [et, "-@", "-"],
+                    input="\n".join(["-charset", "filename=UTF8", "-o", str(staged_path), os.path.normpath(path)]) + "\n",
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
+                )
+                if cp.returncode != 0 or not staged_path.is_file() or any(
+                    line.lstrip().lower().startswith(("warning:", "error:"))
+                    for line in (cp.stderr or "").splitlines()
+                ):
+                    return False
             # ExifTool calls the standard XML exif:ISOSpeedRatings property ISO.
             assignments = [
                 f"-{'XMP-exif:ISO' if key == 'XMP-exif:ISOSpeedRatings' else key}={value}"
@@ -697,10 +713,7 @@ class PhotoMetaDataXMP(PhotoMetaData):
             ]
             with utf8_safe_exiftool_assignments(assignments) as safe_assignments:
                 all_args = ["-overwrite_original", "-charset", "filename=UTF8", *safe_assignments]
-                if exists:
-                    all_args.append(str(staged_path))
-                else:
-                    all_args.extend(["-o", str(staged_path), os.path.normpath(path)])
+                all_args.append(str(staged_path))
                 # A one-shot process yields complete stderr. Stay-open's ready
                 # marker is on stdout and may race assignment warnings.
                 cp = run_exiftool_once(
@@ -740,8 +753,14 @@ class PhotoMetaDataXMP(PhotoMetaData):
                     self._replace_text_node(descriptions, tag, str(direct_fields[key]))
             for name, text in (direct_fields.get("superpicky") or {}).items():
                 self._replace_text_node(descriptions, f"{{{_SUPERPICKY_NS}}}{name}", text)
+            edited_fields = dict(fields)
+            direct_keys = {"subject": "XMP-dc:Subject", "title": "XMP-dc:Title",
+                           "description": "XMP-dc:Description", "rating": "XMP-xmp:Rating", "pick": "XMP-xmpDM:pick"}
+            edited_fields.update({direct_keys[key]: value for key, value in direct_fields.items() if key in direct_keys})
+            edited_fields.update({f"XMP-superpicky:{name}": value for name, value in (direct_fields.get("superpicky") or {}).items()})
             ok = self._write_tree_with_report_hydration(
                 path, tree, sidecar_path, protected_report_fields=protected_report_fields,
+                edited_fields=edited_fields,
             )
             if ok:
                 self._invalidate_metadata_cache(path)
@@ -762,19 +781,14 @@ class PhotoMetaDataXMP(PhotoMetaData):
         empty tag set. A missing sidecar still has no subjects in either mode.
         """
         sidecar_path = self.sidecar_path_for(path)
-        if strict:
-            try:
-                with sidecar_path.open("rb") as stream:
-                    root = ET.parse(stream).getroot()
-            except FileNotFoundError:
-                return []
-        else:
-            if not sidecar_path.is_file():
-                return []
-            try:
-                root = ET.parse(sidecar_path).getroot()
-            except Exception:
-                return []
+        try:
+            root = ET.fromstring(read_shared_bytes(sidecar_path))
+        except FileNotFoundError:
+            return []
+        except Exception:
+            if strict:
+                raise
+            return []
 
         values: list[str] = []
         for desc in _photo_descriptions(root, path):
@@ -815,6 +829,7 @@ class PhotoMetaDataXMP(PhotoMetaData):
                 tree,
                 sidecar_path,
                 protected_report_fields=_protected_report_fields,
+                edited_fields={"XMP-dc:Subject": clean_subjects},
             )
             if ok:
                 self._invalidate_metadata_cache(path)
@@ -870,6 +885,7 @@ class PhotoMetaDataXMP(PhotoMetaData):
                 tree,
                 sidecar_path,
                 protected_report_fields=protected,
+                edited_fields={"XMP-dc:Description": text},
             )
             if ok:
                 self._invalidate_metadata_cache(path)
@@ -903,6 +919,7 @@ class PhotoMetaDataXMP(PhotoMetaData):
                 tree,
                 sidecar_path,
                 protected_report_fields=protected,
+                edited_fields={"XMP-dc:Title": text},
             )
             if ok:
                 self._invalidate_metadata_cache(path)
@@ -943,6 +960,8 @@ class PhotoMetaDataXMP(PhotoMetaData):
                 tree,
                 sidecar_path,
                 protected_report_fields=protected,
+                edited_fields={**({"XMP-xmp:Rating": _normalise_rating_value(rating)} if rating is not None else {}),
+                               **({"XMP-xmpDM:pick": _normalise_pick_value(pick)} if pick is not None else {})},
             )
             if ok:
                 self._invalidate_metadata_cache(path)
@@ -984,6 +1003,7 @@ class PhotoMetaDataXMP(PhotoMetaData):
                 tree,
                 sidecar_path,
                 protected_report_fields=protected,
+                edited_fields={f"XMP-superpicky:{name}": value for name, value in cleaned.items()},
             )
             if ok:
                 self._invalidate_metadata_cache(path)
@@ -998,13 +1018,62 @@ class PhotoMetaDataXMP(PhotoMetaData):
         sidecar_path: Path,
         *,
         protected_report_fields: dict[str, Any] | None = None,
+        edited_fields: dict[str, Any] | None = None,
     ) -> bool:
         self._hydrate_report_db_fields_if_needed(
             path,
             tree,
             protected_report_fields=protected_report_fields,
         )
+        if edited_fields:
+            self._update_metadata_clear_markers(tree, path, edited_fields)
         return self._write_tree_atomic(tree, sidecar_path)
+
+    @classmethod
+    def _update_metadata_clear_markers(cls, tree, path, fields):
+        """Persist explicit clears so source/report fallbacks cannot resurrect them."""
+        marker = f"{{{_SUPERPICKY_NS}}}metadata_cleared_fields"
+        descriptions = cls._ensure_descriptions(tree.getroot(), path)
+        cleared = set()
+        for desc in descriptions:
+            values = [desc.attrib.get(marker, ""), *(node.text or "" for node in desc.findall(marker))]
+            for value in values:
+                if value.strip():
+                    decoded = json.loads(value)
+                    if not isinstance(decoded, list) or not all(isinstance(key, str) for key in decoded):
+                        raise ValueError("Invalid metadata clear markers; original sidecar retained")
+                    cleared.update(decoded)
+        for raw_key, value in fields.items():
+            key = _xmp_sidecar_write_key(raw_key)
+            if _is_xmp_title_key(key):
+                key = "XMP-dc:Title"
+            elif _is_xmp_description_key(key):
+                key = "XMP-dc:Description"
+            elif _is_xmp_subject_key(key):
+                key = "XMP-dc:Subject"
+            elif _is_xmp_rating_key(key):
+                key = "XMP-xmp:Rating"
+                value = _normalise_rating_value(value)
+            elif _is_xmp_pick_key(key):
+                key = "XMP-xmpDM:pick"
+                value = _normalise_pick_value(value)
+            if not key.lower().startswith(("xmp-", "xmp:")) or key.lower() == "xmp-superpicky:metadata_cleared_fields":
+                continue
+            cleared = {existing for existing in cleared if existing.lower() != key.lower()}
+            empty = value is None or value == "" or isinstance(value, (tuple, list, set)) and not value
+            if empty:
+                cleared.add(key)
+                # Hydration may have filled the just-cleared property again.
+                # Preserve language alternatives but keep their empty default.
+                if key == "XMP-dc:Title":
+                    cls._replace_alt_text_node(descriptions, _XMP_DC_TITLE_TAG, "")
+                elif key == "XMP-dc:Description":
+                    cls._replace_alt_text_node(descriptions, _XMP_DC_DESCRIPTION_TAG, "")
+                else:
+                    tag = _xmp_group_tag_to_xml_tag(key)
+                    if tag:
+                        cls._remove_property(descriptions, tag)
+        cls._replace_text_node(descriptions, marker, json.dumps(sorted(cleared), ensure_ascii=False) if cleared else "")
 
     def _hydrate_report_db_sidecar_if_needed(
         self,
@@ -1045,11 +1114,31 @@ class PhotoMetaDataXMP(PhotoMetaData):
             if not isinstance(row, dict) or not row:
                 return False
             desc = self._ensure_descriptions(root, path)[0]
+            protected = dict(protected_report_fields or {})
+            marker = f"{{{_SUPERPICKY_NS}}}metadata_cleared_fields"
+            descriptions = self._ensure_descriptions(root, path)
+            for source in descriptions:
+                values = [source.attrib.get(marker, ""), *(node.text or "" for node in source.findall(marker))]
+                for value in values:
+                    cleared = json.loads(value) if value.strip() else []
+                    if not isinstance(cleared, list):
+                        continue
+                    for key in cleared:
+                        if not isinstance(key, str):
+                            continue
+                        tag = _xmp_group_tag_to_xml_tag(key)
+                        # An external editor's later nonempty property outranks
+                        # the old marker, just as it does in the sidecar reader.
+                        nonempty = tag and any(item.attrib.get(tag, "").strip() or any(
+                            _extract_text_value(node) not in (None, "") for node in item.findall(tag)) for item in descriptions)
+                        if not nonempty:
+                            for column in self._report_columns_for_write_key(key):
+                                protected.setdefault(column, "")
             changed = self._apply_report_row_to_sidecar_desc(
                 desc,
                 row,
                 path,
-                protected_report_fields=protected_report_fields,
+                protected_report_fields=protected,
             )
             return changed
         except Exception:
@@ -1390,7 +1479,17 @@ class PhotoMetaDataXMP(PhotoMetaData):
         tmp_path = Path(tmp_name)
         try:
             tree.write(tmp_path, encoding="utf-8", xml_declaration=True)
-            os.replace(tmp_path, sidecar_path)
+            for attempt in range(6):
+                try:
+                    os.replace(tmp_path, sidecar_path)
+                    break
+                except PermissionError:
+                    # Windows replacement can require a brief reader's final
+                    # handle to close, even with delete sharing. Keep the old
+                    # complete sidecar until the atomic replacement succeeds.
+                    if os.name != "nt" or attempt == 5:
+                        raise
+                    time.sleep(.005 * (2 ** attempt))
             return True
         finally:
             try:
@@ -1411,6 +1510,11 @@ class PhotoMetaDataXMP(PhotoMetaData):
             get_cache().refresh_xmp(path)
         except Exception:
             pass  # 缓存失败不影响已成功写入的 XMP。
+        try:
+            from .metadata_store import notify_sidecar_write
+            notify_sidecar_write(path)
+        except Exception:
+            pass  # The source is already saved; a later reconcile can rebuild snapshots.
 
     def supports_write(self) -> bool:
         return True

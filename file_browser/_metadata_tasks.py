@@ -147,11 +147,12 @@ class MetadataBatchController(QObject):
     def start_batch(self, aliases, factory, title):
         if self._shutdown_requested or self.busy or self._files._background_shutdown_requested:
             return False
+        from app_common.exif_io.metadata_store import resource_key
         unique = {}
         self._aliases = {}
         for display, source in aliases:
             source = os.path.normpath(os.path.abspath(source))
-            key = os.path.normcase(os.path.abspath(PhotoMetaDataXMP().sidecar_path_for(source)))
+            key = resource_key(source)
             canonical = unique.setdefault(key, source)
             self._aliases.setdefault(canonical, []).append(display)
         if not unique:
@@ -178,8 +179,13 @@ class MetadataBatchController(QObject):
         files = self._files
         updates = {}
         for result in results:
-            if not result.updates or result.saved_fingerprint != sidecar_fingerprint(
-                    PhotoMetaDataXMP().sidecar_path_for(result.source)):
+            if not result.updates:
+                continue
+            if result.revision is not None:
+                from app_common.exif_io.metadata_store import get_store
+                if get_store().current_revision(result.source) != result.revision:
+                    continue
+            elif result.saved_fingerprint != sidecar_fingerprint(PhotoMetaDataXMP().sidecar_path_for(result.source)):
                 continue
             paths = files.listed_sidecar_siblings(result.source)
             paths.extend(path for path in self._aliases.get(result.source, ())

@@ -129,7 +129,10 @@ def test_write_plan_round_trips_xmp_and_is_idempotent(tmp_path, monkeypatch) -> 
     assert xmp.read(p["鹰鹃_2.jpg"])[bi.BURST_ID_FIELD] == "1"
     assert xmp.read(p["鹰鹃_2.jpg"])[bi.BURST_POSITION_FIELD] == "2"
     old = xmp.read(p["旧连拍.jpg"])
-    assert bi.BURST_ID_FIELD not in old and old["XMP-dc:Title"] == "保留标题"
+    assert old.get(bi.BURST_ID_FIELD, "") == "" and old["XMP-dc:Title"] == "保留标题"
+    # Clearing remains explicit in reads so an old report value cannot return.
+    import json
+    assert bi.BURST_ID_FIELD in json.loads(old["XMP-superpicky:metadata_cleared_fields"])
     assert xmp.read(p["报告连拍.jpg"])[bi.BURST_ID_FIELD] == "0"
     assert not os.path.exists(os.path.splitext(p["单张.jpg"])[0] + ".xmp")
     assert bi.write_burst_plan(plan, xmp=xmp, report=report) == 0

@@ -77,3 +77,34 @@ def test_staging_error_preserves_complete_copy_even_if_source_reappears(tmp_path
     staging, = destination.parent.glob("*.tmp")
     assert staging.read_bytes() == b"complete"
     assert str(staging) in str(error.value)
+
+
+def test_pending_metadata_is_synced_and_new_sidecar_moves_with_photo(tmp_path):
+    from app_common.exif_io.metadata_store import get_store
+    from app_common.exif_io.photo_meta import PhotoMetaDataXMP
+    source, destination = tmp_path / "白鹭.jpg", tmp_path / "dest/白鹭.jpg"
+    source.write_bytes(b"original")
+    store = get_store()
+    store.submit_edit(str(source), {"title": "湿地白鹭", "rating": 4}).result(3)
+    assert not source.with_suffix(".xmp").exists()
+    tx.transfer_file_pairs([(str(source), str(destination))], action="cut", no_replace=True)
+    assert not source.exists()
+    assert not source.with_suffix(".xmp").exists()
+    assert destination.read_bytes() == b"original"
+    assert PhotoMetaDataXMP().read(str(destination))["Title"] == "湿地白鹭"
+    assert not store.pending_status()
+
+
+def test_failed_pending_sync_keeps_source_and_durable_edit(tmp_path, monkeypatch):
+    from app_common.exif_io.metadata_store import get_store
+    from app_common.exif_io.photo_meta import PhotoMetaDataXMP
+    source, destination = tmp_path / "白鹭.jpg", tmp_path / "dest/白鹭.jpg"
+    source.write_bytes(b"original")
+    store = get_store()
+    store.submit_edit(str(source), {"description": "不能丢失"}).result(3)
+    monkeypatch.setattr(PhotoMetaDataXMP, "write", lambda *_args, **_kw: False)
+    with pytest.raises(OSError, match="元数据未同步"):
+        tx.transfer_file_pairs([(str(source), str(destination))], action="cut", no_replace=True)
+    assert source.read_bytes() == b"original"
+    assert not destination.exists()
+    assert store.pending_edits(str(source))["fields"]["XMP-dc:Description"] == "不能丢失"

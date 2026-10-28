@@ -74,6 +74,26 @@ def test_iso_aliases_use_exiftool_iso_name(photo, key) -> None:
     assert metadata.read(str(photo))["XMP-exif:ISOSpeedRatings"] == "800"
 
 
+@pytest.mark.parametrize("mixed", [False, True])
+def test_first_sidecar_camera_edit_overrides_original_exif(photo, mixed):
+    jpeg = photo.with_suffix(".jpg")
+    exif = Image.Exif()
+    exif[272] = "CameraBefore"
+    exif[270] = "Original camera comment"
+    Image.new("RGB", (8, 8), "green").save(jpeg, exif=exif)
+    original = jpeg.read_bytes()
+    fields = {"XMP-tiff:Model": "中文新相机 Ω"}
+    if mixed:
+        fields.update({"XMP-dc:Title": "新鸟名", "XMP-dc:Description": "新注释"})
+    store = PhotoMetaDataXMP()
+    assert store.write(str(jpeg), fields)
+    assert store.read(str(jpeg))["XMP-tiff:Model"] == "中文新相机 Ω"
+    if mixed:
+        assert store.read(str(jpeg))["Title"] == "新鸟名"
+        assert store.read(str(jpeg))["Description"] == "新注释"
+    assert jpeg.read_bytes() == original
+
+
 @pytest.mark.parametrize("existing", [False, True])
 @pytest.mark.parametrize("fields", [
     {"XMP-exif:NotARealWritableTag": "value"},

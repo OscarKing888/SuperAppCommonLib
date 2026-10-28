@@ -110,7 +110,10 @@ def test_v10_hydration_and_manual_edits_only_write_xmp(tmp_path, monkeypatch, ma
 
     def traced_connect(*args, **kwargs):
         connection = real_connect(*args, **kwargs)
-        connection.set_trace_callback(statements.append)
+        # The local edit/cache store is writable; only the compatibility report
+        # connection must remain strictly read-only.
+        if "report.db" in str(args[0]):
+            connection.set_trace_callback(statements.append)
         return connection
 
     monkeypatch.setattr(sqlite3, "connect", traced_connect)

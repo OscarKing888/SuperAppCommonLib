@@ -126,6 +126,16 @@ def test_state_survives_rebuild_and_source_resolution_without_io(panel_factory, 
 
 
 def test_failed_paste_retains_state_and_success_clears_all_panels(panel_factory, tmp_path, monkeypatch):
+    import time
+    from PyQt6.QtTest import QTest
+
+    def wait_for_paste():
+        deadline = time.monotonic() + 5
+        while not panel._metadata_commit_bridge.is_idle and time.monotonic() < deadline:
+            _APP.processEvents()
+            QTest.qWait(1)
+        assert panel._metadata_commit_bridge.is_idle
+
     source = tmp_path / "source"
     dest = tmp_path / "dest"
     source.mkdir()
@@ -147,9 +157,11 @@ def test_failed_paste_retains_state_and_success_clears_all_panels(panel_factory,
             raise OSError("injected move failure")
         patch.setattr(panel, "_paste_path_pairs_transaction", fail)
         panel._paste_clipboard_to_current_dir()
+        wait_for_paste()
     assert pending(panel) == pending(second) == [True]
     assert photo.exists() and sidecar.exists()
     panel._paste_clipboard_to_current_dir()
+    wait_for_paste()
     assert pending(panel) == pending(second) == [False]
     assert not photo.exists() and not sidecar.exists()
     assert (dest / photo.name).read_bytes() == b"photo"
