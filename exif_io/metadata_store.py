@@ -88,6 +88,7 @@ def apply_fields(record, fields, subject_states=None):
                                "IFD0:XPComment", "IFD0:ImageDescription", "EXIF:UserComment", "ExifIFD:UserComment",
                                "EXIF:ImageDescription", "UserComment", "IPTC:Caption-Abstract"),
         "xmp-xmp:rating": ("rating",), "xmp-xmpdm:pick": ("pick",),
+        "xmp-photoshop:city": ("XMP:City", "city", "sharpness"),
         "xmp-tiff:model": ("Model", "camera_model", "EXIF:Model", "IFD0:Model"),
         "xmp-aux:lens": ("Lens", "LensModel", "lens_model", "XMP-aux:LensModel", "ExifIFD:LensModel"),
         "xmp-exif:isospeedratings": ("iso", "ISO", "ExifIFD:ISO", "XMP-exif:PhotographicSensitivity"),
@@ -103,6 +104,12 @@ def apply_fields(record, fields, subject_states=None):
         result[key] = deepcopy(value)
         for alias in aliases.get(key.lower(), ()):
             result[alias] = deepcopy(value)
+        if key.lower() == "xmp-photoshop:city" and value == "":
+            # 明确清空锐度后，不能从原图/报告/归档字段重新显示旧分；XML归档仍保留。
+            for alias in ("IPTC:City", "adj_sharpness", "head_sharp", "report.adj_sharpness",
+                          "report.head_sharp", "report.city", "XMP-superpicky:adj_sharpness",
+                          "XMP-superpicky:head_sharp", "XMP-superpicky:city"):
+                result[alias] = ""
         if key.lower().startswith("xmp-superpicky:"):
             name = key.split(":", 1)[1]
             result[name] = deepcopy(value)

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import abc
 import json
+import math
 import os
 import re
 import shutil
@@ -40,6 +41,19 @@ from .xmp_sidecar import _photo_descriptions, _extract_text_value
 from .sidecar_lock import xmp_sidecar_write_lock
 from .shared_read import read_shared_bytes
 from .metadata_identity import cached_path, resolve_path
+
+
+def _normalise_report_sharpness_clear(record):
+    """An explicit City clear hides fallback scores without deleting their archive."""
+    if record.get("XMP-photoshop:City") != "":
+        return
+    try:
+        names = json.loads(record.get("XMP-superpicky:metadata_cleared_fields", "[]"))
+    except (ValueError, TypeError):
+        return
+    if isinstance(names, list) and any(str(name).lower() == "xmp-photoshop:city" for name in names):
+        from .metadata_store import apply_fields
+        record.update(apply_fields(record, {"XMP-photoshop:City": ""}))
 
 
 def _serialized_xmp_write(method):
@@ -550,6 +564,7 @@ class PhotoMetaDataXMP(PhotoMetaData):
                 elif _is_xmp_pick_key(key):
                     rec["XMP-xmpDM:pick"] = value
                     rec["pick"] = _normalise_pick_value(value)
+            _normalise_report_sharpness_clear(rec)
             return rec
         except Exception:
             return {}
@@ -996,12 +1011,13 @@ class PhotoMetaDataXMP(PhotoMetaData):
             if tree is None:
                 return False
             descriptions = self._ensure_descriptions(tree.getroot(), path)
-            for name, text in cleaned.items():
-                self._replace_text_node(descriptions, f"{{{_SUPERPICKY_NS}}}{name}", text)
-            sidecar_path.parent.mkdir(parents=True, exist_ok=True)
             protected = dict(_protected_report_fields or {})
             for name, text in cleaned.items():
                 protected.setdefault(name, text)
+            self._hydrate_report_db_fields_if_needed(path, tree, protected_report_fields=protected)
+            for name, text in cleaned.items():
+                self._replace_text_node(descriptions, f"{{{_SUPERPICKY_NS}}}{name}", text)
+            sidecar_path.parent.mkdir(parents=True, exist_ok=True)
             ok = self._write_tree_with_report_hydration(
                 path,
                 tree,
@@ -1102,6 +1118,123 @@ class PhotoMetaDataXMP(PhotoMetaData):
         except Exception:
             return False
 
+    @_serialized_xmp_write
+    def ensure_report_sharpness(self, path: str) -> bool:
+        """Preserve/repair only report sharpness in a same-stem sidecar.
+
+        This is an explicit worker-side migration, never a read-time write. No
+        decode or report update is performed, and an unchanged file is not saved.
+        """
+        if not Path(path).is_file():
+            return False
+        try:
+            sidecar = self.sidecar_path_for(path)
+            tree = self._load_or_create_xmp_tree(sidecar)
+            if tree is None:
+                return False
+            protected = self._report_hydration_protected_fields(path, tree, {})
+            changed = self._preserve_report_sharpness(path, tree, None, protected)
+            if not changed:
+                return True
+            sidecar.parent.mkdir(parents=True, exist_ok=True)
+            ok = self._write_tree_atomic(tree, sidecar)
+            if ok:
+                self._invalidate_metadata_cache(path)
+            return ok
+        except Exception:
+            return False
+
+    def _preserve_report_sharpness(self, path, tree, row, protected) -> bool:
+        """Keep City/report scores independent of detector scores (storage v2)."""
+        from app_common.bird_sharpness_fields import FIELD_STORAGE_VERSION, STORAGE_VERSION
+
+        descriptions = self._ensure_descriptions(tree.getroot(), path)
+        city_tag = f"{{{_PHOTOSHOP_NS}}}City"
+        sp = lambda name: f"{{{_SUPERPICKY_NS}}}{name}"
+
+        def value(tag):
+            found = None
+            for desc in descriptions:
+                for item in [desc.attrib.get(tag), *(_extract_text_value(n) for n in desc.findall(tag))]:
+                    if _metadata_value_has_content(item):
+                        found = str(item)
+            return found
+
+        def number(text):
+            try:
+                result = float(text)
+                return result if math.isfinite(result) else None
+            except (ValueError, TypeError):
+                return None
+
+        changed = False
+
+        def replace(tag, text):
+            nonlocal changed
+            text = "" if text is None else str(text)
+            if (value(tag) or "") != text:
+                self._replace_text_node(descriptions, tag, text)
+                changed = True
+
+        old_version = value(sp("bird_sharpness_version")) or ""
+        score = number(value(sp("bird_sharpness_score")))
+        storage = value(sp(FIELD_STORAGE_VERSION))
+        legacy_storage = storage in (None, "1")
+        new_detection = str(protected.get("bird_sharpness_version") or "").startswith("sbt-blur-")
+        # 本次明确编辑/清除锐度优先；也阻止日后把恰好相同的手工值当旧检测值。
+        if "city" in protected or "adj_sharpness" in protected:
+            if legacy_storage and (old_version.startswith("sbt-blur-") or new_detection):
+                replace(sp(FIELD_STORAGE_VERSION), STORAGE_VERSION)
+            return changed
+
+        old_detector = legacy_storage and old_version.startswith("sbt-blur-") and score is not None
+        city, archive = value(city_tag), value(sp("adj_sharpness"))
+        polluted_city = old_detector and number(city) == score
+        polluted_archive = old_detector and number(archive) == score
+        polluted_raw_city = old_detector and number(value(sp("city"))) == score
+        if row is None:
+            # 已分离且字段齐全时不重新打开 report；仅缺失/旧污染需要只读回查。
+            needs_report = city is None or archive is None or polluted_city or polluted_archive or polluted_raw_city
+            row = (PhotoMetaDataReportDB()._row_for(path) or {}) if needs_report else {}
+        archived = None if polluted_archive else number(archive)
+        reported = number(row.get("adj_sharpness"))
+        # 旧版本首次 hydration 也可能把 adj_sharpness 污染，因此优先用只读 report 恢复。
+        source = row.get("adj_sharpness") if reported is not None else archive if archived is not None else None
+        if polluted_city:
+            replace(city_tag, source)
+        elif city is None:
+            replace(city_tag, archive if archived is not None else source)
+        if polluted_archive or archive is None:
+            replace(sp("adj_sharpness"), source)
+        if polluted_raw_city:
+            replace(sp("city"), source)
+        if legacy_storage and (old_detector or new_detection):
+            # 无恢复来源时清掉已确认的检测分；不写用户 clear marker，稍后可补回 report 值。
+            replace(sp(FIELD_STORAGE_VERSION), STORAGE_VERSION)
+        return changed
+
+    def _report_hydration_protected_fields(self, path, tree, fields):
+        protected = dict(fields or {})
+        marker = f"{{{_SUPERPICKY_NS}}}metadata_cleared_fields"
+        descriptions = self._ensure_descriptions(tree.getroot(), path)
+        for source in descriptions:
+            values = [source.attrib.get(marker, ""), *(node.text or "" for node in source.findall(marker))]
+            for value in values:
+                cleared = json.loads(value) if value.strip() else []
+                if not isinstance(cleared, list):
+                    continue
+                for key in cleared:
+                    if not isinstance(key, str):
+                        continue
+                    tag = _xmp_group_tag_to_xml_tag(key)
+                    # An external editor's later nonempty property outranks the old marker.
+                    nonempty = tag and any(item.attrib.get(tag, "").strip() or any(
+                        _extract_text_value(node) not in (None, "") for node in item.findall(tag)) for item in descriptions)
+                    if not nonempty:
+                        for column in self._report_columns_for_write_key(key):
+                            protected.setdefault(column, "")
+        return protected
+
     def _hydrate_report_db_fields_if_needed(
         self,
         path: str,
@@ -1111,40 +1244,19 @@ class PhotoMetaDataXMP(PhotoMetaData):
     ) -> bool:
         try:
             root = tree.getroot()
-            for existing_desc in _photo_descriptions(root, path):
-                if self._has_bird_species_marker(existing_desc):
-                    return False
-            row = PhotoMetaDataReportDB()._row_for(path)
+            protected = self._report_hydration_protected_fields(path, tree, protected_report_fields)
+            has_species = any(self._has_bird_species_marker(desc) for desc in _photo_descriptions(root, path))
+            row = None if has_species else PhotoMetaDataReportDB()._row_for(path) or {}
+            changed = self._preserve_report_sharpness(path, tree, row, protected)
+            # 锐度单独补齐，不再被已有鸟名阻挡；其余报告字段仍遵守原 hydration 门槛。
+            if has_species:
+                return changed
             if not isinstance(row, dict) or not row:
-                return False
+                return changed
             desc = self._ensure_descriptions(root, path)[0]
-            protected = dict(protected_report_fields or {})
-            marker = f"{{{_SUPERPICKY_NS}}}metadata_cleared_fields"
-            descriptions = self._ensure_descriptions(root, path)
-            for source in descriptions:
-                values = [source.attrib.get(marker, ""), *(node.text or "" for node in source.findall(marker))]
-                for value in values:
-                    cleared = json.loads(value) if value.strip() else []
-                    if not isinstance(cleared, list):
-                        continue
-                    for key in cleared:
-                        if not isinstance(key, str):
-                            continue
-                        tag = _xmp_group_tag_to_xml_tag(key)
-                        # An external editor's later nonempty property outranks
-                        # the old marker, just as it does in the sidecar reader.
-                        nonempty = tag and any(item.attrib.get(tag, "").strip() or any(
-                            _extract_text_value(node) not in (None, "") for node in item.findall(tag)) for item in descriptions)
-                        if not nonempty:
-                            for column in self._report_columns_for_write_key(key):
-                                protected.setdefault(column, "")
-            changed = self._apply_report_row_to_sidecar_desc(
-                desc,
-                row,
-                path,
-                protected_report_fields=protected,
-            )
-            return changed
+            return self._apply_report_row_to_sidecar_desc(
+                desc, row, path, protected_report_fields=protected,
+            ) or changed
         except Exception:
             return False
 

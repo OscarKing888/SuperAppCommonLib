@@ -420,6 +420,8 @@ def _apply_browser_metadata_aliases(rec: dict) -> None:
     """
     if not isinstance(rec, dict):
         return
+    from .photo_meta import _normalise_report_sharpness_clear
+    _normalise_report_sharpness_clear(rec)
     def has_value(value) -> bool:
         return value is not None and str(value).strip() != ""
 

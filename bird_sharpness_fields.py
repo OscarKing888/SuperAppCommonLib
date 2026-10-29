@@ -23,6 +23,9 @@ FIELD_BODY_SIGMA = "bird_sharpness_body_sigma"
 FIELD_MOTION_RATIO = "bird_sharpness_motion_ratio"
 FIELD_EYE_VISIBILITY = "bird_sharpness_eye_visibility"
 FIELD_VERSION = "bird_sharpness_version"
+# Storage migration only; deliberately not in ALL_FIELDS or the algorithm version.
+FIELD_STORAGE_VERSION = "bird_sharpness_storage_version"
+STORAGE_VERSION = "2"
 # v2: blur radius behind the score, which pixels it came from, and how many birds were measured.
 FIELD_SIGMA = "bird_sharpness_sigma"
 FIELD_REGION = "bird_sharpness_region"
@@ -51,7 +54,7 @@ REGION_FULL = "full"     # no bird and no focus point: whole image
 REGION_MANUAL = "manual"  # no bird, manual focus: the focal plane (sharpest small tiles of the centre), not a bird
 REGION_LABELS = {REGION_BIRD: "鸟体", REGION_FOCUS: "焦点", REGION_FULL: "全图", REGION_MANUAL: "手动对焦焦平面"}
 
-# Existing SuperPicky sharpness slot (0..1000, written as "%06.2f").
+# Legacy SuperPicky report sharpness slot; detector results must never write it.
 SHARPNESS_XMP_KEY = "XMP-photoshop:City"
 
 VERDICT_SHARP = "sharp"
