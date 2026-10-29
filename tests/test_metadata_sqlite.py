@@ -65,6 +65,40 @@ def test_restart_reuses_merged_xmp_and_source_metadata(tmp_path, monkeypatch, di
         reopened.close()
 
 
+def test_part_scores_survive_restart_and_successful_clear(tmp_path, monkeypatch, disk, source_reads):
+    from app_common import bird_sharpness_fields as bsf
+
+    paths = sources(tmp_path, (".ARW", ".JPG"))
+    store = PhotoMetaDataXMP()
+    values = {bsf.FIELD_HEAD_SCORE: "0", bsf.FIELD_BODY_SCORE: "501", bsf.FIELD_MEAN_SCORE: "250.5"}
+    assert store.write(paths[0], {
+        "XMP-dc:Title": "白鹭三分", bsf.xmp_key(bsf.FIELD_VERDICT): "soft",
+        **{bsf.xmp_key(key): value for key, value in values.items()},
+    })
+    assert disk.flush()
+    first = loader(paths)._read_parse_chunk(paths)[0]
+    assert all({key: record[key] for key in values} == values for record in first.values())
+    assert disk.flush()
+    disk.close()
+    reopened = sql.MetadataSQLiteCache(disk.path)
+    monkeypatch.setattr(sql, "_default", reopened)
+    try:
+        with monkeypatch.context() as cached:
+            cached.setattr(_workers, "_batch_read_xmp_sidecar", lambda *a, **kw: pytest.fail("SQL hit must skip XML"))
+            assert loader(paths)._read_parse_chunk(paths)[0] == first
+        assert store.write(paths[0], {bsf.xmp_key(key): "" for key in values})
+        assert reopened.flush()
+        refreshed = loader(paths)._read_parse_chunk(paths)[0]
+        assert len(refreshed) == len(paths)
+        for record in refreshed.values():
+            assert not any(key in record for key in values)
+            assert record["title"] == "白鹭三分"
+            display = bsf.bird_sharpness_from_meta(record)
+            assert (display.head_score, display.body_score, display.mean_score) == (None, None, None)
+    finally:
+        reopened.close()
+
+
 @pytest.mark.parametrize("title", ["休息白鹭", ""])
 def test_write_refreshes_sql_for_raw_jpeg_and_derived_resource(tmp_path, monkeypatch, disk, source_reads, title):
     paths = sources(tmp_path, (".HIF", ".JPG"))

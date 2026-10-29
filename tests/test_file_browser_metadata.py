@@ -268,3 +268,43 @@ def test_partial_browser_snapshot_keeps_optional_explicit_resets():
     assert result["bird_species_cn"] == ""
     assert result["bird_sharpness_sigma"] is None
     assert result["iso"] == "800"
+
+
+def test_partial_part_scores_clear_explicit_fields_and_preserve_absent_fields():
+    from app_common import bird_sharpness_fields as bsf
+    from app_common.file_browser._workers import MetadataLoader, _merge_browser_metadata
+
+    previous = {bsf.FIELD_HEAD_SCORE: 900, bsf.FIELD_BODY_SCORE: 501,
+                bsf.FIELD_MEAN_SCORE: 700.5, "iso": "800"}
+    for prefix in ("", "XMP-superpicky:", "report."):
+        partial = MetadataLoader._parse_rec({
+            "_metadata_complete": False, prefix + bsf.FIELD_HEAD_SCORE: 0,
+            prefix + bsf.FIELD_MEAN_SCORE: "",
+        })
+        result = _merge_browser_metadata(previous, partial)
+        assert result[bsf.FIELD_HEAD_SCORE] == 0
+        assert result[bsf.FIELD_BODY_SCORE] == 501
+        assert result[bsf.FIELD_MEAN_SCORE] is None
+        assert result["iso"] == "800"
+
+        clear = MetadataLoader._parse_rec({
+            "_metadata_complete": False,
+            **{prefix + key: "" for key in (bsf.FIELD_HEAD_SCORE, bsf.FIELD_BODY_SCORE, bsf.FIELD_MEAN_SCORE)},
+        })
+        cleared = _merge_browser_metadata(previous, clear)
+        assert all(cleared[key] is None for key in (bsf.FIELD_HEAD_SCORE, bsf.FIELD_BODY_SCORE, bsf.FIELD_MEAN_SCORE))
+
+
+def test_complete_browser_reload_keeps_part_scores_and_replaces_old_missing_values():
+    from app_common import bird_sharpness_fields as bsf
+    from app_common.file_browser._workers import MetadataLoader, _merge_browser_metadata
+
+    complete = MetadataLoader._parse_rec({
+        bsf.xmp_key(bsf.FIELD_HEAD_SCORE): "0", bsf.xmp_key(bsf.FIELD_BODY_SCORE): "501",
+        bsf.xmp_key(bsf.FIELD_MEAN_SCORE): "250.5",
+    })
+    assert complete[bsf.FIELD_HEAD_SCORE] == "0"
+    assert complete[bsf.FIELD_BODY_SCORE] == "501"
+    assert complete[bsf.FIELD_MEAN_SCORE] == "250.5"
+    refreshed = _merge_browser_metadata(complete, MetadataLoader._parse_rec({"ExifIFD:ISO": 800}))
+    assert not any(key in refreshed for key in (bsf.FIELD_HEAD_SCORE, bsf.FIELD_BODY_SCORE, bsf.FIELD_MEAN_SCORE))

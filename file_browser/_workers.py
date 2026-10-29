@@ -99,9 +99,11 @@ def _sparse_browser_metadata(rec: dict, meta: dict) -> dict:
     # partial row must retain their explicit reset so old values are removed.
     from app_common.bird_sharpness_fields import (
         FIELD_VERDICT, FIELD_HEAD_SIGMA, FIELD_BODY_SIGMA, FIELD_SIGMA, FIELD_REGION, FIELD_BIRD_COUNT,
+        FIELD_HEAD_SCORE, FIELD_BODY_SCORE, FIELD_MEAN_SCORE,
     )
     for key in ("burst_id", "burst_position", FIELD_VERDICT, FIELD_HEAD_SIGMA,
-                FIELD_BODY_SIGMA, FIELD_SIGMA, FIELD_REGION, FIELD_BIRD_COUNT):
+                FIELD_BODY_SIGMA, FIELD_SIGMA, FIELD_REGION, FIELD_BIRD_COUNT,
+                FIELD_HEAD_SCORE, FIELD_BODY_SCORE, FIELD_MEAN_SCORE):
         if key in names:
             result.setdefault(key, None)
     return result

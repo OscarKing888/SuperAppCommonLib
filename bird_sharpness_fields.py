@@ -15,6 +15,9 @@ XMP_GROUP = "XMP-superpicky"
 
 FIELD_VERDICT = "bird_sharpness_verdict"
 FIELD_SCORE = "bird_sharpness_score"
+FIELD_HEAD_SCORE = "bird_sharpness_head_score"
+FIELD_BODY_SCORE = "bird_sharpness_body_score"
+FIELD_MEAN_SCORE = "bird_sharpness_mean_score"
 FIELD_HEAD_SIGMA = "bird_sharpness_head_sigma"
 FIELD_BODY_SIGMA = "bird_sharpness_body_sigma"
 FIELD_MOTION_RATIO = "bird_sharpness_motion_ratio"
@@ -28,6 +31,9 @@ FIELD_BIRD_COUNT = "bird_sharpness_bird_count"
 ALL_FIELDS = (
     FIELD_VERDICT,
     FIELD_SCORE,
+    FIELD_HEAD_SCORE,
+    FIELD_BODY_SCORE,
+    FIELD_MEAN_SCORE,
     FIELD_HEAD_SIGMA,
     FIELD_BODY_SIGMA,
     FIELD_MOTION_RATIO,
@@ -105,6 +111,9 @@ class BirdSharpnessDisplay:
     final_sigma: float | None = None
     region: str = ""
     bird_count: int | None = None
+    head_score: float | None = None
+    body_score: float | None = None
+    mean_score: float | None = None
 
     @property
     def style(self) -> VerdictStyle | None:
@@ -160,13 +169,17 @@ def bird_sharpness_from_meta(meta: Mapping[str, Any] | None) -> BirdSharpnessDis
         _optional_float(_meta_value(meta, FIELD_SIGMA)),
         str(_meta_value(meta, FIELD_REGION) or "").strip().lower(),
         None if count is None else int(count),
+        _optional_float(_meta_value(meta, FIELD_HEAD_SCORE)),
+        _optional_float(_meta_value(meta, FIELD_BODY_SCORE)),
+        _optional_float(_meta_value(meta, FIELD_MEAN_SCORE)),
     )
 
 
 def browser_meta_fields(meta: Mapping[str, Any] | None) -> dict[str, Any]:
     """Raw-key subset kept in the file browser's per-path metadata cache."""
     result: dict[str, Any] = {}
-    for field in (FIELD_VERDICT, FIELD_HEAD_SIGMA, FIELD_BODY_SIGMA, FIELD_SIGMA, FIELD_REGION, FIELD_BIRD_COUNT):
+    for field in (FIELD_VERDICT, FIELD_HEAD_SIGMA, FIELD_BODY_SIGMA, FIELD_SIGMA, FIELD_REGION, FIELD_BIRD_COUNT,
+                  FIELD_HEAD_SCORE, FIELD_BODY_SCORE, FIELD_MEAN_SCORE):
         value = _meta_value(meta, field)
         if value is not None:
             result[field] = value

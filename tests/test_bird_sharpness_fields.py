@@ -4,6 +4,7 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from pathlib import Path
+import sqlite3
 import xml.etree.ElementTree as ET
 
 from PIL import Image
@@ -92,6 +93,62 @@ def test_superpicky_fields_write_directly_without_exiftool(photo, monkeypatch) -
     assert writer.write(str(photo), {"XMP-superpicky:bird_sharpness_head_sigma": ""})
     assert _superpicky_text(sidecar, "bird_sharpness_head_sigma") is None
     assert _superpicky_text(sidecar, "bird_sharpness_verdict") == "soft"
+
+
+@pytest.mark.parametrize("prefix", ["", "XMP-superpicky:", "report."])
+def test_part_scores_keep_zero_and_mean_fraction_without_changing_display_or_sort(prefix) -> None:
+    meta = {bsf.FIELD_VERDICT: "sharp", bsf.FIELD_SIGMA: "0.66"}
+    original = bsf.bird_sharpness_from_meta(meta)
+    values = {bsf.FIELD_HEAD_SCORE: 0, bsf.FIELD_BODY_SCORE: "501", bsf.FIELD_MEAN_SCORE: "250.5"}
+    meta.update({prefix + key: value for key, value in values.items()})
+    display = bsf.bird_sharpness_from_meta(meta)
+    assert (display.head_score, display.body_score, display.mean_score) == (0, 501, 250.5)
+    assert display.text() == original.text()
+    assert display.sort_key() == original.sort_key()
+    assert {key: bsf.browser_meta_fields(meta)[key] for key in values} == values
+    assert (original.head_score, original.body_score, original.mean_score) == (None, None, None)
+
+
+def test_part_score_prefixed_zero_wins_and_missing_mean_is_not_invented() -> None:
+    display = bsf.bird_sharpness_from_meta({
+        bsf.FIELD_VERDICT: "sharp", bsf.FIELD_HEAD_SCORE: 700,
+        bsf.xmp_key(bsf.FIELD_HEAD_SCORE): 0, bsf.FIELD_BODY_SCORE: 600,
+    })
+    assert display.head_score == 0
+    assert display.body_score == 600
+    assert display.mean_score is None
+
+
+def test_part_scores_roundtrip_and_clear_without_changing_photo_or_report(photo) -> None:
+    original_photo = photo.read_bytes()
+    report = photo.parent / ".superpicky" / "report.db"
+    report.parent.mkdir()
+    with sqlite3.connect(report) as connection:
+        connection.execute("CREATE TABLE legacy (title TEXT)")
+        connection.execute("INSERT INTO legacy VALUES (?)", ("旧报告白鹭",))
+    original_report = report.read_bytes()
+    writer = PhotoMetaDataXMP()
+    values = {bsf.FIELD_HEAD_SCORE: "0", bsf.FIELD_BODY_SCORE: "501", bsf.FIELD_MEAN_SCORE: "250.5"}
+    assert writer.write(str(photo), {
+        "XMP-dc:Title": "白鹭 中文标题", bsf.xmp_key(bsf.FIELD_VERDICT): "soft",
+        **{bsf.xmp_key(key): value for key, value in values.items()},
+    })
+    record = writer.read(str(photo))
+    for key, value in values.items():
+        assert record[bsf.xmp_key(key)] == record[key] == record[f"report.{key}"] == value
+    assert record["Title"] == "白鹭 中文标题"
+
+    # 成功重算但无可用区域时删除旧分；清除标记阻止旧来源再次填入。
+    assert writer.write(str(photo), {bsf.xmp_key(key): "" for key in values})
+    record = writer.read(str(photo))
+    for key in values:
+        assert _superpicky_text(photo.with_suffix(".xmp"), key) is None
+        assert record[bsf.xmp_key(key)] == record[key] == ""
+    display = bsf.bird_sharpness_from_meta(record)
+    assert (display.head_score, display.body_score, display.mean_score) == (None, None, None)
+    assert record["Title"] == "白鹭 中文标题"
+    assert photo.read_bytes() == original_photo
+    assert report.read_bytes() == original_report
 
 
 def test_superpicky_field_names_must_be_safe_xml_names(photo) -> None:
