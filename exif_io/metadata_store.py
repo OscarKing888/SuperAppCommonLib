@@ -835,15 +835,57 @@ class MetadataStore:
         return self.submit_sql(invalidate)
 
     def invalidate_paths(self, paths):
+        """Forget exact snapshots and reject source reads started before removal.
+
+        Pending edits remain durable. File-operation callers wait for this
+        future while still holding their source/sidecar barrier.
+        """
         keys = {path_key(path) for path in paths}
         with self._lock:
             for key in [key for key in self._memory if key[1] in keys]:
                 self._memory_size -= self._memory.pop(key)[1]
         def invalidate(conn):
+            resources = {}
+            for key in keys:
+                aliases = conn.execute("SELECT resource FROM read_aliases WHERE path=? UNION SELECT resource FROM snapshots WHERE path=?",
+                                       (key, key)).fetchall()
+                for (resource,) in aliases or [(resource_key(key),)]:
+                    resources.setdefault(resource, key)
+            versions, pending = {}, {}
+            for resource, key in resources.items():
+                revision = (conn.execute("SELECT revision FROM resources WHERE resource=?", (resource,)).fetchone() or (0,))[0] + 1
+                conn.execute("INSERT INTO resources(resource,path,revision) VALUES(?,?,?) ON CONFLICT(resource) DO UPDATE SET revision=excluded.revision",
+                             (resource, key, revision))
+                conn.execute("UPDATE outbox SET revision=? WHERE resource=?", (revision, resource))
+                versions[resource] = revision
+                row = conn.execute("SELECT fields,subjects,revision FROM outbox WHERE resource=?", (resource,)).fetchone()
+                if row:
+                    pending[resource] = (json.loads(row[0]), json.loads(row[1]), row[2])
             conn.executemany("DELETE FROM snapshots WHERE path=?", [(key,) for key in keys])
             for key in keys:
                 self._change(conn, key, resource_key(key), "refresh")
-        return self.submit_sql(invalidate)
+            return versions, pending
+        future = self.submit_sql(invalidate)
+        published = Future()
+        def done(completed):
+            try:
+                versions, pending = completed.result()
+                with self._lock:
+                    self._pending.update(pending)
+                    for resource, revision in versions.items():
+                        self._versions[resource] = revision
+                        self._versions.move_to_end(resource)
+                    while len(self._versions) > self._memory_entries:
+                        self._versions.popitem(last=False)
+                    # A SQL reader may have returned between the first memory
+                    # purge and this transaction. Remove its publication too.
+                    for key in [key for key in self._memory if key[1] in keys]:
+                        self._memory_size -= self._memory.pop(key)[1]
+                published.set_result(None)
+            except BaseException as exc:
+                published.set_exception(exc)
+        future.add_done_callback(done)
+        return published
 
     def note_sidecar_write(self, path):
         """Notify a successful low-level write; SQL work never rereads the XML."""

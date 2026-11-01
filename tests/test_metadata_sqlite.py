@@ -28,6 +28,24 @@ def sources(tmp_path, suffixes=(".HIF",)):
     return paths
 
 
+def test_delete_paths_keeps_other_records_and_rejects_late_put(tmp_path, disk, monkeypatch):
+    removed, kept = [str(tmp_path / name) for name in ("删除_%.JPG", "保留.JPG")]
+    signatures = {path: (1,) for path in (removed, kept)}
+    initial = {path: ((1,), {"title": "白鹭"}, None) for path in signatures}
+    old_revision = disk.revision()
+    for namespace in (sql.XMP_NAMESPACE, sql.BROWSER_NAMESPACE):
+        assert disk.put_many(namespace, initial, old_revision)
+    assert disk.flush()
+    monkeypatch.setattr(xmp, "read_xmp_file", lambda *a, **kw: pytest.fail("deletion must not reread XMP"))
+    assert disk.invalidate_paths([removed])
+    # The control also protects reads before the asynchronous DELETE commits.
+    assert disk.get_many(sql.BROWSER_NAMESPACE, signatures) == {kept: {"title": "白鹭"}}
+    assert disk.put_many(sql.BROWSER_NAMESPACE, initial, old_revision)
+    assert disk.flush()
+    for namespace in (sql.XMP_NAMESPACE, sql.BROWSER_NAMESPACE):
+        assert disk.get_many(namespace, signatures) == {kept: {"title": "白鹭"}}
+
+
 def loader(paths, **kwargs):
     return _workers.MetadataLoader(paths, object(), memory_cache=MetadataMemoryCache(), **kwargs)
 

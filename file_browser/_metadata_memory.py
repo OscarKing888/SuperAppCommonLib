@@ -284,6 +284,21 @@ class MetadataMemoryCache:
                     if key.startswith(prefix):
                         self._drop(queue, key)
 
+    def invalidate_paths(self, paths):
+        """只清除指定条目；提升代次，阻止删除前的读取重新填回缓存。"""
+        keys = {_path_key(path) for path in paths if path}
+        if not keys:
+            return
+        with self._lock:
+            self._generation += 1
+            for queue in (self._active, self._inactive):
+                for key in keys.intersection(queue):
+                    self._drop(queue, key)
+
+    def generation(self):
+        with self._lock:
+            return self._generation
+
     def generation_is_current(self, generation):
         with self._lock:
             return generation == self._generation

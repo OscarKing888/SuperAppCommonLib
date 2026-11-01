@@ -589,6 +589,20 @@ class FileTableModel(_BurstGroupMixin, QAbstractTableModel):
         self._mark_burst_groups_dirty()
         self.endResetModel()
 
+    def remove_paths_not_in(self, keep_paths) -> int:
+        """Remove contiguous row ranges without resetting surviving entries."""
+        keep = {os.path.normpath(path) for path in keep_paths if path}
+        rows = [row for row, entry in enumerate(self._entries)
+                if os.path.normpath(entry.path) not in keep]
+        for start, end in reversed(_contiguous_row_ranges(rows)):
+            self.beginRemoveRows(QModelIndex(), start, end)
+            del self._entries[start:end + 1]
+            self._row_by_path = {os.path.normpath(entry.path): row
+                                 for row, entry in enumerate(self._entries)}
+            self._mark_burst_groups_dirty()
+            self.endRemoveRows()
+        return len(rows)
+
     def append_paths(
         self,
         paths: list[str],

@@ -32,6 +32,34 @@ def test_incomplete_persistent_listing_is_a_miss(tmp_path, isolated_metadata_sql
     assert DirectorySnapshotCache(MetadataMemoryCache()).load(str(tmp_path), True) is None
 
 
+def test_delete_invalidates_ancestor_listings_but_keeps_photo_metadata(tmp_path, monkeypatch,
+                                                                       isolated_metadata_sqlite_cache):
+    memory = MetadataMemoryCache()
+    cache = DirectorySnapshotCache(memory)
+    removed = str(tmp_path / "sub" / "删除.JPG")
+    kept = str(tmp_path / "sub" / "保留.JPG")
+    unrelated = str(tmp_path / "other")
+    old_generation = cache.generation()
+    for directory in (str(tmp_path), str(tmp_path / "sub"), unrelated):
+        files = [kept] if directory == unrelated else [removed, kept]
+        cache.remember(directory, True, {"files": files, "metadata": {}}, persist=True)
+    _, generation = memory.lookup(kept, (1,))
+    memory.store(kept, (1,), {"title": "保留白鹭"}, generation)
+    assert isolated_metadata_sqlite_cache.flush()
+    with monkeypatch.context() as no_source:
+        no_source.setattr(os, "stat", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("source I/O")))
+        cache.remove_paths([removed])
+    # A scan begun before the deletion cannot republish its stale listing.
+    cache.remember(str(tmp_path), True, {"files": [removed, kept]}, persist=True,
+                   generation=old_generation)
+    assert isolated_metadata_sqlite_cache.flush()
+    assert memory.lookup(kept, (1,))[0] == {"title": "保留白鹭"}
+    assert cache.peek(unrelated, True)["files"] == [kept]
+    for directory in (str(tmp_path), str(tmp_path / "sub")):
+        assert cache.peek(directory, True) is None
+        assert DirectorySnapshotCache(MetadataMemoryCache()).load(directory, True) is None
+
+
 def test_directory_worker_publishes_snapshot_before_enumeration(tmp_path, monkeypatch):
     seen = []
     cache = DirectorySnapshotCache(MetadataMemoryCache())
@@ -47,6 +75,23 @@ def test_directory_worker_publishes_snapshot_before_enumeration(tmp_path, monkey
     monkeypatch.setattr(_workers.os, "walk", walk)
     worker.run()
     assert seen == [[path]]
+
+
+def test_scan_started_before_delete_cannot_restore_persistent_listing(tmp_path, monkeypatch,
+                                                                      isolated_metadata_sqlite_cache):
+    cache = DirectorySnapshotCache(MetadataMemoryCache())
+    path = str(tmp_path / "删除.JPG")
+
+    def walk(*args, **kwargs):
+        yield str(tmp_path), [], ["删除.JPG"]
+        cache.remove_paths([path])
+
+    monkeypatch.setattr(_workers.os, "walk", walk)
+    worker = _workers.DirectoryScanWorker(str(tmp_path), True, use_report_db=False, snapshot_cache=cache)
+    worker.run()
+    assert isolated_metadata_sqlite_cache.flush()
+    assert cache.peek(str(tmp_path), True, use_report_db=False) is None
+    assert DirectorySnapshotCache(MetadataMemoryCache()).load(str(tmp_path), True, use_report_db=False) is None
 
 
 def test_metadata_snapshot_does_not_validate_source_files(tmp_path, monkeypatch):

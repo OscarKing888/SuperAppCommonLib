@@ -175,6 +175,7 @@ class DirectoryScanWorker(QThread):
         self._discover_report_root = discover_report_root
 
     def run(self) -> None:
+        snapshot_generation = self._snapshot_cache.generation() if self._snapshot_cache is not None else None
         started_at = _time.perf_counter()
         if self._snapshot_cache is not None and self._use_cached_snapshot:
             snapshot = self._snapshot_cache.load(
@@ -469,6 +470,7 @@ class DirectoryScanWorker(QThread):
                      "report_cache": report_cache, "report_row_by_path": report_row_by_path,
                      "metadata": {}}, include_videos=self._include_videos,
                     use_report_db=self._use_report_db, persist=True,
+                    generation=snapshot_generation,
                 )
             self.scan_finished.emit(self._path, files, report_cache, full_report_cache, report_row_by_path)
             _log.info("[DirectoryScanWorker.run] emit scan_finished END")

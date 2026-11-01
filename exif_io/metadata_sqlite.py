@@ -92,6 +92,8 @@ class MetadataSQLiteCache:
 
     @staticmethod
     def _affected(kind, target, path, dependency):
+        if kind == "remove":
+            return path in target or dependency in target
         if kind == "invalidate":
             return path.startswith(target) or bool(dependency and dependency.startswith(target))
         sidecar = os.path.splitext(target)[0] + ".xmp"
@@ -157,7 +159,7 @@ class MetadataSQLiteCache:
                     return False
             if size + self._pending_bytes > self._pending_limit:
                 return False  # 缓存背压只丢缓存写入，不阻塞照片读取。
-            control = kind in ("refresh", "invalidate")
+            control = kind in ("refresh", "invalidate", "remove")
             if control:
                 self._revision += 1
                 self._invalidations.append((self._revision, kind, data))
@@ -202,6 +204,11 @@ class MetadataSQLiteCache:
 
     def invalidate_scope(self, directory):
         return self._enqueue("invalidate", path_key(directory).rstrip(os.sep) + os.sep)
+
+    def invalidate_paths(self, paths):
+        """删除成功后的精确失效；仅入队，不读取照片或重新解析侧车。"""
+        keys = tuple(sorted({path_key(path) for path in paths if path}))
+        return bool(keys) and self._enqueue("remove", keys)
 
     def _connect_writer(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -289,6 +296,9 @@ class MetadataSQLiteCache:
                     elif kind == "invalidate":
                         # substr 避免中文路径中的 %/_ 被 SQL LIKE 当成通配符。
                         conn.execute("DELETE FROM entries WHERE substr(path,1,?)=?", (len(data), data))
+                    elif kind == "remove":
+                        conn.executemany("DELETE FROM entries WHERE path=? OR dependency=?",
+                                         [(path, path) for path in data])
                     self._prune(conn)
                     conn.commit()
                 except Exception as exc:
@@ -297,14 +307,14 @@ class MetadataSQLiteCache:
                             conn.rollback()
                         except sqlite3.Error:
                             pass
-                    if kind in ("invalidate", "refresh"):
+                    if kind in ("invalidate", "refresh", "remove"):
                         with self._lock:
                             self._disabled = True
                     _log.debug("[metadata.sqlite] write fallback path=%r error=%s", str(self.path), exc)
                 finally:
                     with self._lock:
                         self._pending_bytes -= size
-                        if kind in ("invalidate", "refresh"):
+                        if kind in ("invalidate", "refresh", "remove"):
                             key = (kind, data)
                             self._pending_controls[key] -= 1
                             if not self._pending_controls[key]:

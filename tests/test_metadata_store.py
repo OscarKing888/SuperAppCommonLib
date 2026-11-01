@@ -594,6 +594,54 @@ def test_late_sql_read_cannot_replace_newer_committed_and_synced_memory(store, t
     assert store.peek(path)["Title"] == "新值"
 
 
+def test_delete_paths_removes_snapshots_and_rejects_late_import(store, tmp_path):
+    removed, kept = photo(tmp_path, "删除.JPG"), photo(tmp_path, "保留.JPG")
+    initial = {removed: {"Title": "删除白鹭"}, kept: {"Title": "保留白鹭"}}
+    store.remember_many(initial).result(3)
+    store.remember_many(initial, profile="full").result(3)
+    versions = store.revisions(initial)
+    store.invalidate_paths([removed]).result(3)
+    assert store.peek(removed) is None
+    assert store.peek(kept)["Title"] == "保留白鹭"
+    assert store.remember_many(initial, expected_revisions=versions).result(3).keys() == {kept}
+    for profile in ("browser", "full"):
+        records = store.read_many(initial, profile=profile)
+        assert set(records) == {kept}
+        assert records[kept]["Title"] == "保留白鹭"
+
+
+def test_path_invalidation_preserves_durable_pending_edit(store, tmp_path):
+    path = photo(tmp_path)
+    store.submit_edit(path, {"title": "待同步白鹭"}).result(3)
+    store.invalidate_paths([path]).result(3)
+    assert store.pending_edits(path)["fields"]["XMP-dc:Title"] == "待同步白鹭"
+    assert store.peek(path)["Title"] == "待同步白鹭"
+    assert store.flush_paths([path])
+    assert PhotoMetaDataXMP().read(path)["XMP-dc:Title"] == "待同步白鹭"
+
+
+def test_late_sql_read_cannot_repopulate_deleted_memory(store, tmp_path, monkeypatch):
+    path = photo(tmp_path)
+    store.remember_many({path: {"Title": "已删除"}}).result(3)
+    read_ready, release = threading.Event(), threading.Event()
+    original = store._remember_memory
+
+    def publish(profile, source, record):
+        if threading.current_thread().name.startswith("late-delete-read"):
+            read_ready.set()
+            assert release.wait(3)
+        return original(profile, source, record)
+
+    monkeypatch.setattr(store, "_remember_memory", publish)
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="late-delete-read") as pool:
+        old = pool.submit(store.read_many, [path])
+        assert read_ready.wait(3)
+        store.invalidate_paths([path]).result(3)
+        release.set()
+        assert old.result(3) == {}
+    assert store.peek(path) is None
+
+
 def test_changed_alias_import_advances_once_and_keeps_pending_version(store, tmp_path):
     raw, jpeg = photo(tmp_path, "one.ARW"), photo(tmp_path, "one.JPG")
     store.remember_many({path: {"ISO": 100} for path in (raw, jpeg)}).result(3)

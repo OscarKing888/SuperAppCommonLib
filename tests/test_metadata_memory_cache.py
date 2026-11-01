@@ -81,6 +81,22 @@ def test_refresh_and_shutdown_reject_late_stores(tmp_path):
     assert cache.stats() == {"entries": 0, "bytes": 0}
 
 
+def test_delete_paths_preserves_other_metadata_and_rejects_old_read(tmp_path):
+    cache = MetadataMemoryCache()
+    removed, kept = [str(tmp_path / name) for name in ("删除.jpg", "保留.jpg")]
+    for path in (removed, kept):
+        put(cache, path)
+    _, old_generation = cache.lookup(removed, (1,))
+    cache.invalidate_paths([removed])
+    cache.store(removed, (1,), {"title": "迟到结果"}, old_generation)
+    assert get(cache, removed) is None
+    assert get(cache, kept)["title"] == "白鹭"
+    assert cache.stats()["entries"] == 1
+    # 新一轮读取仍可缓存同一路径重新创建的照片。
+    put(cache, removed, {"title": "新照片"})
+    assert get(cache, removed)["title"] == "新照片"
+
+
 def test_resize_retains_active_entries_and_inflight_reads_obey_new_limit(tmp_path):
     cache = MetadataMemoryCache()
     a, b = [str(tmp_path / "active" / name) for name in ("a", "b")]

@@ -113,6 +113,7 @@ class FileListPanel(QWidget):
         self._file_table_proxy = FileTableSortProxyModel(self)
         self._file_table_proxy.setSourceModel(self._file_table_model)
         self._thumb_list_model = self.thumbnail_model_class(self)
+        self._trashed_metadata_paths: set[str] = set()
         self._meta_cache:    dict = {}   # norm_path → metadata dict
         self._metadata_memory_cache = MetadataMemoryCache(max_bytes=get_metadata_memory_mb() * 1024 * 1024)
         self._directory_snapshots = DirectorySnapshotCache(self._metadata_memory_cache)
@@ -1109,6 +1110,11 @@ class FileListPanel(QWidget):
             self._directory_snapshots.touch(self._current_dir, self._loaded_directory_recursive, **options)
 
     def _show_directory_snapshot(self, snapshot):
+        snapshot = dict(snapshot)
+        removed = getattr(self, "_trashed_metadata_paths", ())
+        snapshot["files"] = [p for p in snapshot["files"] if _path_key(p) not in removed]
+        snapshot["metadata"] = {p: m for p, m in (snapshot.get("metadata") or {}).items()
+                                if _path_key(p) not in removed}
         self._directory_snapshot_shown = True
         self._metadata_revalidate_pending = True
         self._report_root_dir = snapshot.get("report_root")
@@ -1285,6 +1291,7 @@ class FileListPanel(QWidget):
             _log.info("[_apply_directory_listing_result] IGNORE stale path=%r current=%r", path, self._current_dir)
             self._probe_set_phase("idle", reason="apply_listing_stale", elapsed_ms=elapsed_ms(apply_t0))
             return
+        files = [p for p in files if _path_key(p) not in self._trashed_metadata_paths]
         step_t0 = perf_counter()
         if not self._use_report_db:
             report_cache = {}
@@ -1418,6 +1425,8 @@ class FileListPanel(QWidget):
             uncached_meta_paths = list(self._all_files)
         elif self._metadata_revalidate_pending:
             active_paths = getattr(self._metadata_loader, "_paths", None)
+            if active_paths is not None:
+                active_paths = [p for p in active_paths if _path_key(p) not in self._trashed_metadata_paths]
             uncached_meta_paths = [] if active_paths == self._all_files else list(self._all_files)
             self._metadata_revalidate_pending = False
         self._probe_log("apply_listing.collect_uncached_meta", elapsed_ms=elapsed_ms(step_t0), uncached=len(uncached_meta_paths))
@@ -1541,6 +1550,7 @@ class FileListPanel(QWidget):
             _log.info("[load_directory] SKIP same dir")
             self._probe_set_phase("idle", reason="load_directory_skip_same_dir", elapsed_ms=elapsed_ms(load_t0))
             return
+        self._trashed_metadata_paths.clear()
         self._remember_directory_snapshot()
         cached_snapshot = None if force_reload and not preserve_meta_cache else self._directory_snapshots.peek(
             path, recursive, include_videos=self.include_videos, use_report_db=self._use_report_db,
@@ -7164,6 +7174,8 @@ class FileListPanel(QWidget):
             self._thumb_profile_add("stale_ready", 1)
             return
         norm = os.path.normpath(path)
+        if _path_key(norm) in self._trashed_metadata_paths:
+            return
         self._thumb_profile_add("ready_signals", 1)
         self._thumb_profile_ready_received_at[norm] = _time.perf_counter()
         self._thumb_pending_batch[norm] = qimg
@@ -7351,7 +7363,8 @@ class FileListPanel(QWidget):
         total = len(meta_dict)
         meta_dict = {path: _merge_browser_metadata(self._meta_cache.get(path), metadata)
                      for path, metadata in meta_dict.items()
-                     if int(metadata.get("_metadata_revision", 0)) >=
+                     if _path_key(path) not in getattr(self, "_trashed_metadata_paths", ())
+                     and int(metadata.get("_metadata_revision", 0)) >=
                         int(self._meta_cache.get(path, {}).get("_metadata_revision", 0))}
         self._meta_cache.update(meta_dict)
         self._remember_directory_snapshot(metadata_updates=meta_dict)
@@ -7396,7 +7409,10 @@ class FileListPanel(QWidget):
         if not focus_dict:
             return
         _log.debug("[_on_metadata_focus_cache_batch_ready] 收到 focus 批次 %s 条", len(focus_dict))
-        self.focus_cache_batch_ready.emit(focus_dict)
+        focus_dict = {path: value for path, value in focus_dict.items()
+                      if _path_key(path) not in self._trashed_metadata_paths}
+        if focus_dict:
+            self.focus_cache_batch_ready.emit(focus_dict)
 
     def _on_metadata_loader_finished(self) -> None:
         if self._background_shutdown_requested:
@@ -8391,7 +8407,9 @@ class FileListPanel(QWidget):
             from app_common.exif_io.metadata_store import get_store
             moved = []
             failures = []
-            with get_store().file_operation([actual for _, actual, _ in entries]):
+            cache_errors = []
+            store = get_store()
+            with store.file_operation([actual for _, actual, _ in entries]):
                 for display, actual, scope in entries:
                     if not os.path.exists(actual):
                         continue
@@ -8407,23 +8425,104 @@ class FileListPanel(QWidget):
                                 os.remove(cache_path)
                         except OSError as exc:
                             _log.debug("[trash] thumbnail cleanup failed path=%r: %s", cache_path, exc)
-            return moved, failures
+                if moved:
+                    # 只清除成功移走照片的本机记录；数据库等待留在文件操作 worker。
+                    from app_common.exif_io.metadata_sqlite import get_cache
+                    removed = [path for display, actual, _ in moved for path in (display, actual)]
+                    try:
+                        store.invalidate_paths(removed).result()
+                    except Exception as exc:
+                        cache_errors.append(str(exc))
+                        _log.warning("[trash] metadata store cleanup failed paths=%r: %s", removed, exc)
+                    try:
+                        get_cache().invalidate_paths(removed)
+                    except Exception as exc:
+                        cache_errors.append(str(exc))
+                        _log.warning("[trash] metadata cache cleanup failed paths=%r: %s", removed, exc)
+            return moved, failures, cache_errors
 
         def completed(result):
-            moved, failures = result
+            moved, failures, cache_errors = result
             if moved:
+                removed = [path for display, actual, _ in moved for path in (display, actual)]
                 self._delete_report_rows_for_paths(
                     [e[0] for e in moved], resolved_paths=[e[1] for e in moved],
                     scope_keys=[e[2] for e in moved])
-                if self._current_dir == origin_dir:
-                    self._reload_after_trash([e[0] for e in moved])
+                self._forget_trashed_metadata(removed)
+                if self._current_dir == origin_dir or any(self.is_listed_path(p) for p in removed):
+                    self._reload_after_trash(removed)
             detail = f"；{len(failures)} 个失败，原文件已保留" if failures else ""
+            if cache_errors:
+                detail += "；本地元数据缓存清理失败，详见日志"
             self._show_meta_progress_status(f"已移入回收站 {len(moved)} 个文件{detail}", busy=False)
 
         self._show_meta_progress_status("正在同步元数据并移入回收站…", busy=True)
         get_metadata_commit_bridge(self).execute(
             remove, completed,
             lambda exc: self._show_meta_progress_status(f"删除未完成：{exc}", busy=False))
+
+    def _forget_trashed_metadata(self, paths: list[str]) -> None:
+        """Evict only deleted identities, including work queued before trash finished."""
+        removed = {_path_key(path) for path in paths}
+        self._trashed_metadata_paths.update(removed)
+        self._metadata_memory_cache.invalidate_paths(paths)
+        self._directory_snapshots.remove_paths(paths)
+        self._thumb_memory_cache.invalidate(paths)
+        for cache in (self._meta_cache, self._thumb_pending_batch, self._report_row_by_path):
+            for path in list(cache):
+                if _path_key(path) in removed:
+                    cache.pop(path, None)
+        # 已应用的队列前缀不用再保留；未删除照片继续原来的后台读取及分批显示。
+        self._meta_apply_items = [(p, m) for p, m in self._meta_apply_items[self._meta_apply_index:]
+                                  if _path_key(p) not in removed]
+        self._meta_apply_index = 0
+        self._meta_apply_total = len(self._meta_apply_items)
+        self._meta_apply_order_by_path = {}
+        for cached in self._directory_scope_cache.values():
+            cached["files"] = [p for p in cached["files"] if _path_key(p) not in removed]
+            cached["report_cache"] = _index_report_cache({
+                key: row for key, row in cached["report_cache"].items()
+                if not self._report_row_is_tombstoned(row)})
+            cached["report_row_by_path"] = {p: row for p, row in cached["report_row_by_path"].items()
+                                              if _path_key(p) not in removed}
+        self._persistent_thumb_cache_pending_paths = [
+            p for p in self._persistent_thumb_cache_pending_paths if _path_key(p) not in removed]
+
+    def _remove_trashed_paths_from_view(self, paths: list[str]) -> None:
+        """Remove rows in place; keep surviving metadata, pixmaps and background reads."""
+        removed = {_path_key(path) for path in paths}
+        self.stop_key_navigation_playback(commit=False)
+        self._cancel_deferred_file_selected()
+        self._all_files = [p for p in self._all_files if _path_key(p) not in removed]
+        self._filtered_files = [p for p in self._filtered_files if _path_key(p) not in removed]
+        self._tree_model_pending_paths = [
+            p for p in self._tree_model_pending_paths[self._tree_model_pending_index:]
+            if _path_key(p) not in removed]
+        self._tree_model_pending_index = 0
+        self._thumb_model_pending_paths = [
+            p for p in self._thumb_model_pending_paths[self._thumb_model_pending_index:]
+            if _path_key(p) not in removed]
+        self._thumb_model_pending_index = 0
+        self._set_thumb_model_target(self._sorted_thumbnail_paths(self._filtered_files))
+        # Qt 删除当前行时会自动选相邻行；屏蔽这次临时选择，只提交宿主计算的目标。
+        objects = (self._tree_widget, self._list_widget,
+                   self._tree_widget.selectionModel(), self._list_widget.selectionModel())
+        previous = [obj.blockSignals(True) for obj in objects]
+        try:
+            self._file_table_model.remove_paths_not_in(self._filtered_files)
+            self._thumb_list_model.remove_paths_not_in(self._filtered_files)
+        finally:
+            for obj, blocked in zip(objects, previous):
+                obj.blockSignals(blocked)
+        if _path_key(self._selected_display_path) in removed:
+            self._selected_display_path = ""
+        self._refresh_tree_row_numbers()
+        self._sync_burst_group_display()
+        self._invalidate_visible_thumbnail_signature()
+        self._relayout_thumb_view_now()
+        if self._view_mode == self._MODE_THUMB:
+            self._schedule_visible_thumbnail_update()
+        self._update_selection_status()
 
     def _reload_after_trash(self, moved_paths: list[str]) -> None:
         """Reload successful deletions; hosts may prepare a selection first."""
