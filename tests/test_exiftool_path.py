@@ -9,6 +9,37 @@ import pytest
 from app_common.exif_io import exiftool_path
 
 
+@pytest.mark.parametrize("failure", [
+    subprocess.TimeoutExpired("exiftool", 3),
+    OSError("temporary startup failure"),
+    subprocess.CompletedProcess([], 1, "", "startup failed"),
+    subprocess.CompletedProcess([], 0, "", ""),
+])
+def test_failed_probe_recovers_and_success_remains_cached(tmp_path, failure):
+    executable = tmp_path / "exiftool.exe"
+    executable.touch()
+    healthy = subprocess.CompletedProcess([], 0, "13.49\n", "")
+    with patch.object(exiftool_path, "run_exiftool_once", side_effect=[failure, healthy]) as run:
+        assert not exiftool_path._is_usable_exiftool(str(executable))
+        assert exiftool_path._is_usable_exiftool(str(executable))
+        assert exiftool_path._is_usable_exiftool(str(executable))
+        assert run.call_count == 2
+
+
+def test_cancelled_worker_probe_does_not_poison_next_request(tmp_path):
+    from app_common.exif_io.exiftool_runner import exiftool_read_request, exiftool_worker_session
+
+    executable = tmp_path / "exiftool.exe"
+    executable.touch()
+    with exiftool_worker_session(), exiftool_read_request(lambda: True):
+        assert not exiftool_path._is_usable_exiftool(str(executable))
+    healthy = subprocess.CompletedProcess([], 0, "13.49\n", "")
+    with patch.object(exiftool_path, "run_exiftool_once", return_value=healthy) as run:
+        with exiftool_worker_session(), exiftool_read_request(lambda: False):
+            assert exiftool_path._is_usable_exiftool(str(executable))
+        run.assert_called_once()
+
+
 def test_bundled_windows_exiftool_has_matching_perl_library() -> None:
     bundle = Path(exiftool_path.__file__).resolve().parent / "exiftools_win"
     library = bundle / "exiftool_files" / "lib" / "Image" / "ExifTool.pm"

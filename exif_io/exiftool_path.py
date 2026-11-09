@@ -64,6 +64,25 @@ def _sibling_app_exiftool_candidates() -> list[str]:
 
 
 @lru_cache(maxsize=32)
+def _probe_exiftool(executable_path: str) -> None:
+    """Cache successful probes only; lru_cache does not retain exceptions.
+
+    A cancelled preview request (or a transient startup timeout) must not mark
+    a healthy executable unavailable for every later export in this process.
+    """
+    cp = run_exiftool_once(
+        [executable_path, "-ver"],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=3,
+    )
+    if cp.returncode != 0 or not (cp.stdout or "").strip():
+        raise RuntimeError(f"ExifTool health check failed: {cp.stderr or 'no version returned'}")
+
+
 def _is_usable_exiftool(executable_path: str) -> bool:
     """
     轻量健康检查：验证 exiftool 可执行文件能正常启动并返回版本号。
@@ -73,21 +92,10 @@ def _is_usable_exiftool(executable_path: str) -> bool:
     if not p or not os.path.isfile(p):
         return False
     try:
-        cp = run_exiftool_once(
-            [p, "-ver"],
-            check=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=3,
-        )
+        _probe_exiftool(p)
     except Exception:
         return False
-    if cp.returncode != 0:
-        return False
-    version_text = (cp.stdout or "").strip()
-    return bool(version_text)
+    return True
 
 
 def get_exiftool_executable_path() -> str | None:
