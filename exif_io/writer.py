@@ -11,6 +11,7 @@ import threading
 
 import piexif
 
+from app_common.canon_focus import CANON_FOCUS_TAGS
 from app_common.exif_io.exiftool_runner import run_exiftool
 from app_common.exif_io.exiftool_path import get_exiftool_executable_path
 from app_common.log import get_logger
@@ -385,6 +386,7 @@ FOCUS_METADATA_TAGS: list[str] = [
     "-RegionAreaH",
     "-MakernoteTag0x2027",
     "-MakernoteTag0x204a",
+    *CANON_FOCUS_TAGS,
 ]
 
 

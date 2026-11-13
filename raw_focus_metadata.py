@@ -1,17 +1,24 @@
 # -*- coding: utf-8 -*-
 """Lightweight RAW embedded focus metadata reader.
 
-This module intentionally avoids exiftool.  It uses exifread to read the
-camera MakerNote / focus tags needed by ``focus_calc`` so RAW focus overlays
-can be resolved from the file's embedded metadata first.
+TIFF-based RAW uses ExifRead. Canon uses a focused, read-only ExifTool query:
+ExifRead cannot read CR3's container or newer Canon AFInfo arrays. Call from
+owned metadata/focus workers only, never from held-navigation GUI callbacks.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
+from app_common.canon_focus import CANON_FOCUS_TAGS
+from app_common.exif_io.exiftool_path import get_exiftool_executable_path
+from app_common.exif_io.exiftool_runner import run_exiftool
 from app_common.image_formats import RAW_IMAGE_EXTENSIONS
 from app_common.exif_io.tiff_reader import read_tiff_exif_tags
+from app_common.log import get_logger
+
+_log = get_logger("raw_focus_metadata")
 
 try:
     import exifread
@@ -53,9 +60,36 @@ def _should_keep_focus_tag(key: str) -> bool:
     )
 
 
+def _read_canon_focus_metadata(path: str | Path) -> dict[str, object]:
+    executable = get_exiftool_executable_path()
+    if not executable:
+        return {}
+    try:
+        result = run_exiftool(
+            executable,
+            ["-j", "-G1", "-n", "-a", "-charset", "filename=UTF8",
+             "-api", "largefilesupport=1", "-Make", "-Model", "-Orientation",
+             "-ExifImageWidth", "-ExifImageHeight", *CANON_FOCUS_TAGS, str(path)],
+            text=True, encoding="utf-8", errors="replace", timeout=20,
+        )
+        if result.returncode != 0:
+            _log.warning("Canon focus read failed path=%r: %s", str(path), result.stderr)
+            return {}
+        payload = json.loads(result.stdout)
+        if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+            return payload[0]
+    except Exception as exc:
+        _log.warning("Canon focus read failed path=%r: %s", str(path), exc)
+    return {}
+
+
 def read_raw_embedded_focus_metadata(path: str | Path) -> dict[str, object]:
-    """Read RAW focus metadata directly from the file without exiftool."""
-    if exifread is None or not is_raw_image_path(path):
+    """Read embedded camera focus fields; never consult or write sidecars."""
+    if not is_raw_image_path(path):
+        return {}
+    if Path(path).suffix.lower() in {".cr3", ".cr2", ".crw"}:
+        return _read_canon_focus_metadata(path)
+    if exifread is None:
         return {}
     try:
         with open(path, "rb") as handle:
@@ -85,6 +119,11 @@ def read_raw_embedded_focus_metadata(path: str | Path) -> dict[str, object]:
     if "EXIF ExifImageLength" in out:
         out.setdefault("ExifImageHeight", out["EXIF ExifImageLength"])
 
+    # Canon DNG 等 TIFF 容器也可能只有基础字段，不能将其误判成已取得 AF 信息。
+    make = str(out.get("Make", "")).lower()
+    model = str(out.get("Model", "")).lower()
+    if "canon" in make or "canon" in model:
+        out.update(_read_canon_focus_metadata(path))
     return out
 
 

@@ -10,6 +10,8 @@ from enum import Enum
 import re
 from typing import Any, Callable
 
+from app_common.canon_focus import extract_canon_focus_box, extract_canon_focus_point
+
 DEFAULT_FOCUS_BOX_SHORT_EDGE_RATIO = 0.12
 
 
@@ -17,6 +19,7 @@ class CameraFocusType(str, Enum):
     """Camera focus metadata parsing strategy / camera family discriminator."""
 
     UNKNOWN = "unknown"
+    CANON_GENERIC = "canon_generic"
     SONY_GENERIC = "sony_generic"
     ILCE_A1M2 = "ilce_a1m2"
 
@@ -275,6 +278,8 @@ def resolve_focus_camera_type(camera_model: Any, *, camera_make: Any = None) -> 
         return _CAMERA_MODEL_TO_FOCUS_TYPE[model_key]
 
     make_key = _normalize_camera_model_key(camera_make)
+    if make_key == "CANON" or model_key.startswith("CANON_"):
+        return CameraFocusType.CANON_GENERIC
     # Conservative family fallback: Sony mirrorless/compact model prefixes.
     if make_key == "SONY" or model_key.startswith(("ILCE_", "ILME_", "DSC_", "ZV_")):
         return CameraFocusType.SONY_GENERIC
@@ -736,17 +741,37 @@ def _extract_focus_box_sony(raw: dict[str, Any], width: int, height: int) -> tup
     )
 
 
+def _has_canon_af_coordinates(raw: dict[str, Any]) -> bool:
+    lookup = normalize_lookup(raw)
+    return "afareaxpositions" in lookup or "afareaypositions" in lookup
+
+
+def _extract_focus_box_canon(raw: dict[str, Any], width: int, height: int):
+    if _has_canon_af_coordinates(raw):
+        return extract_canon_focus_box(raw, width, height)
+    # 派生 JPEG 可能只保留标准 SubjectArea 等字段，仍沿用通用兼容路径。
+    return _extract_focus_box_sony(raw, width, height)
+
+
+def _extract_focus_point_canon(raw: dict[str, Any], width: int, height: int):
+    if _has_canon_af_coordinates(raw):
+        return extract_canon_focus_point(raw, width, height)
+    return _extract_focus_point_sony(raw, width, height)
+
+
 _FocusPointExtractor = Callable[[dict[str, Any], int, int], tuple[float, float] | None]
 _FocusBoxExtractor = Callable[[dict[str, Any], int, int], tuple[float, float, float, float] | None]
 
-# 当前仅实现 Sony 系列元数据提取；未知机型暂时走相同算法以保持兼容。
+# 按相机家族解析；未知机型保留原来的 Sony/通用字段兼容路径。
 _FOCUS_POINT_EXTRACTORS: dict[CameraFocusType, _FocusPointExtractor] = {
     CameraFocusType.UNKNOWN: _extract_focus_point_sony,
+    CameraFocusType.CANON_GENERIC: _extract_focus_point_canon,
     CameraFocusType.SONY_GENERIC: _extract_focus_point_sony,
     CameraFocusType.ILCE_A1M2: _extract_focus_point_sony,
 }
 _FOCUS_BOX_EXTRACTORS: dict[CameraFocusType, _FocusBoxExtractor] = {
     CameraFocusType.UNKNOWN: _extract_focus_box_sony,
+    CameraFocusType.CANON_GENERIC: _extract_focus_box_canon,
     CameraFocusType.SONY_GENERIC: _extract_focus_box_sony,
     CameraFocusType.ILCE_A1M2: _extract_focus_box_sony,
 }

@@ -23,7 +23,7 @@ from .shared_read import open_shared_read
 
 _log = get_logger("metadata.sqlite")
 XMP_NAMESPACE = "xmp-v1"
-BROWSER_NAMESPACE = "browser-v1"
+BROWSER_NAMESPACE = "browser-v2"  # Canon AF 解析升级，失效旧的“无焦点”来源缓存。
 
 
 def path_key(path):
