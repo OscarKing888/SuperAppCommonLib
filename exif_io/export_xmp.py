@@ -161,10 +161,12 @@ def read_export_xmp(source: Path) -> bytes:
         input=('\n'.join(args) + '\n').encode('utf-8'), capture_output=True, timeout=60)
     if result.returncode:
         raise RuntimeError(f'导出 XMP 读取失败：{result.stderr.decode("utf-8", errors="replace")}')
+    # 部分 RAW 的内嵌 XMP 在 XML 末尾带有 NUL 填充；不改动 XML 内容或侧车。
+    embedded = result.stdout.rstrip(b'\0 \t\r\n')
     merged = _EMPTY
-    if result.stdout.strip():
+    if embedded:
         # -a 输出主包与扩展包；用临时 XML 容器解析，不能只保留第一个包。
-        packets = re.sub(br'<\?xml\s+[^?]*\?>', b'', result.stdout)
+        packets = re.sub(br'<\?xml\s+[^?]*\?>', b'', embedded)
         try:
             with minidom.parseString(b'<packets>' + packets + b'</packets>') as document:
                 for node in document.documentElement.childNodes:
@@ -182,7 +184,7 @@ def read_export_xmp(source: Path) -> bytes:
         pending = get_store().pending_edits(str(source))
         if sidecar and not edits.strip():
             raise ValueError(f'原图 XMP 侧车为空：{sidecar}')
-        if not result.stdout.strip() and sidecar is None:
+        if not embedded and sidecar is None:
             merged = _EMPTY.replace(b'/>', b'><rdf:Description rdf:about=""/></rdf:RDF>')
         snapshot = merge_export_xmp(merged, edits, source=source)
     return apply_pending_export_edits(snapshot, pending, source=source)
