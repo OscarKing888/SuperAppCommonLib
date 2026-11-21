@@ -827,7 +827,8 @@ class PreviewCanvas(QLabel):
         if self._source_pixmap is None:
             super().wheelEvent(event)
             return
-        delta = event.angleDelta().y()
+        # 精细滚轮和触控板有时只提供像素增量。两个增量同时存在时沿用滚轮刻度。
+        delta = event.angleDelta().y() or event.pixelDelta().y()
         if delta == 0:
             event.ignore()
             return

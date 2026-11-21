@@ -3,8 +3,8 @@ from __future__ import annotations
 import time
 
 import pytest
-from PyQt6.QtCore import QRect, QRectF
-from PyQt6.QtGui import QColor, QImage, QPainter, QPixmap
+from PyQt6.QtCore import QPoint, QPointF, QRect, QRectF, Qt
+from PyQt6.QtGui import QColor, QImage, QPainter, QPixmap, QWheelEvent
 from PyQt6.QtWidgets import QApplication
 
 from app_common.preview_canvas import PreviewCanvas, draw_checker_background
@@ -71,6 +71,25 @@ def test_checker_paint_is_not_a_python_per_cell_loop() -> None:
     draw_checker_background(painter, QRect(0, 0, 1400, 1000))
     painter.end()
     assert len(calls) <= 1  # was ~22k per-cell calls for this size
+
+
+@pytest.mark.parametrize("pixels,angle,delta", [
+    (QPoint(0, 32), QPoint(), 32),
+    (QPoint(0, 32), QPoint(0, 120), 120),
+    (QPoint(32, 0), QPoint(), 0),
+])
+def test_wheel_zoom_uses_one_vertical_delta(pixels, angle, delta):
+    canvas = PreviewCanvas()
+    pixmap = QPixmap(640, 480)
+    pixmap.fill(QColor("gray"))
+    canvas.set_source_pixmap(pixmap, reset_view=True)
+    before = canvas.current_display_scale_percent()
+    event = QWheelEvent(QPointF(30, 40), QPointF(30, 40), pixels, angle, Qt.MouseButton.NoButton,
+                        Qt.KeyboardModifier.NoModifier, Qt.ScrollPhase.NoScrollPhase, False)
+    canvas.wheelEvent(event)
+    assert event.isAccepted() == bool(delta)
+    assert canvas.current_display_scale_percent() == pytest.approx(before * 1.0015 ** delta)
+    canvas.close()
 
 
 def test_canvas_paint_keeps_checker_image_and_overlays() -> None:
