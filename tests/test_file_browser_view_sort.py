@@ -20,6 +20,7 @@ from app_common.file_browser._browser_core import (
     _ThumbPixmapRole,
 )
 from app_common.file_browser._panel import FileListPanel
+from app_common.file_browser._workers import MetadataLoader
 
 
 _APP = QApplication.instance() or QApplication([])
@@ -117,6 +118,33 @@ def test_thumbnail_order_survives_filter_clear_and_metadata_refresh(panel, tmp_p
     assert panel.sync_metadata_edits_for_paths({paths[0]: {"rating": 5}}) == 1
     expected = [paths[0], paths[2], paths[1]]
     assert panel._thumb_list_model.all_paths() == expected
+    panel._btn_list.click()
+    assert _tree_paths(panel) == expected
+
+
+@pytest.mark.parametrize("order", [_ASCENDING, _DESCENDING])
+def test_species_xmp_refresh_preserves_capture_time_order(panel, tmp_path, order) -> None:
+    names = ["earlier.ARW", "DSC05521.ARW", "DSC05522.ARW", "DSC05523.ARW", "later.ARW"]
+    times = ["15:31:00", "15:32:39", "15:32:39", "15:32:39", "15:33:00"]
+    camera = [{"EXIF:DateTimeOriginal": f"2026:11:22 {time}"} for time in times]
+    paths = _load(panel, tmp_path, names, [MetadataLoader._parse_rec(row) for row in camera],
+                  thumbnail_mode=True)
+    expected = paths if order == _ASCENDING else paths[::-1]
+    _sort_header(panel, _TREE_COL_CAPTURE_TIME, order)
+    assert panel._thumb_list_model.all_paths() == expected
+    target = paths[2]
+    panel.set_pending_selection([target])
+
+    # 识鸟后重新读取侧车，同一拍摄时刻可能由 XMP 的 ISO 字符串提供。
+    refreshed = MetadataLoader._parse_rec({
+        **camera[2], "XMP-dc:Title": "大天鹅",
+        "XMP-exif:DateTimeOriginal": "2026-11-22T15:32:39.134+08:00",
+    })
+    panel._apply_store_metadata_snapshot({target: refreshed})
+    panel._apply_meta_batch_tick()
+    assert panel._meta_cache[target]["title"] == "大天鹅"
+    assert panel._thumb_list_model.all_paths() == expected
+    assert panel._thumb_path_from_index(panel._list_widget.currentIndex()) == target
     panel._btn_list.click()
     assert _tree_paths(panel) == expected
 

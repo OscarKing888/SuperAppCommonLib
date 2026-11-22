@@ -116,7 +116,6 @@ _SORT_TEXT_FIELDS = {
     _TREE_COL_FOCAL: "focal_length",
     _TREE_COL_CAMERA: "camera_model",
     _TREE_COL_LENS: "lens_model",
-    _TREE_COL_CAPTURE_TIME: "capture_time",
     _TREE_COL_FOCUS: "focus_status",
 }
 _SORT_NUMERIC_FIELDS = {
@@ -178,6 +177,12 @@ def _file_sort_value(name: str, column: int, field_value):
         if pick == -1:
             return -1
         return field_value("rating")
+    if column == _TREE_COL_CAPTURE_TIME:
+        stamp = field_value("capture_time")
+        # EXIF、XMP 和旧缓存混用斜杠与连字符。统一到同一拍摄分钟，同值沿用文件名和路径排序。
+        if len(stamp) >= 16 and stamp[4] in "/-" and stamp[7] == stamp[4] and stamp[10] == " ":
+            return stamp[:16].replace("/", "-")
+        return stamp.lower()
     if column in _SORT_TEXT_FIELDS:
         return field_value(_SORT_TEXT_FIELDS[column]).lower()
     if column in _SORT_NUMERIC_FIELDS:
