@@ -74,7 +74,7 @@ def test_mouse_open_routes_native_keyboard_to_filter_and_commits_once(controls, 
     assert search.text() == 'iso'
     assert combo.currentText() == '拍摄时间'
     assert not activated
-    assert combo._filter_popup_list.count() == 1
+    assert combo._filter_popup_list.model().rowCount() == 1
     QTest.keyClick(_APP.focusWindow(), Qt.Key.Key_Down)
     assert _APP.focusWidget() is combo._filter_popup_list
     QTest.keyClick(_APP.focusWindow(), Qt.Key.Key_Return)
@@ -91,7 +91,7 @@ def test_input_method_commit_escape_and_reopen(controls):
     ime.setCommitString('鸟')
     QCoreApplication.sendEvent(_APP.focusWindow().focusObject(), ime)
     assert search.text() == '鸟'
-    assert combo._filter_popup_list.count() == 1
+    assert combo._filter_popup_list.model().rowCount() == 1
     assert combo.currentText() == '拍摄时间'
     QTest.keyClick(_APP.focusWindow(), Qt.Key.Key_Escape)
     assert combo._filter_popup is None
@@ -99,7 +99,7 @@ def test_input_method_commit_escape_and_reopen(controls):
     _APP.processEvents()
     search = open_with_mouse(combo)
     assert search.text() == ''
-    assert combo._filter_popup_list.count() == 3
+    assert combo._filter_popup_list.model().rowCount() == 3
 
 
 def test_outside_click_and_parent_close_dismiss_popup(controls):
@@ -143,7 +143,7 @@ def test_no_match_disabled_item_and_same_selection_activation(controls):
     QTest.keyClick(_APP.focusWindow(), Qt.Key.Key_Return)
     assert not activated and combo._filter_popup is not None
     search.setText('AUTO ISO')
-    assert combo._filter_popup_list.count() == 1
+    assert combo._filter_popup_list.model().rowCount() == 1
     QTest.keyClick(_APP.focusWindow(), Qt.Key.Key_Return)
     assert not activated and combo.currentIndex() == 0
     search.clear()
@@ -165,3 +165,25 @@ def test_destroying_combo_with_open_popup_does_not_call_deleted_owner(controls, 
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
     _APP.processEvents()
     assert not errors
+
+
+def test_large_popup_samples_width_and_follows_live_model(controls, monkeypatch):
+    _host, combo, _other = controls
+    combo.addItems([f"字体 {row}" for row in range(3000)])
+    measured = []
+    item_text = combo.itemText
+
+    def count_text(row):
+        measured.append(row)
+        return item_text(row)
+
+    monkeypatch.setattr(combo, "itemText", count_text)
+    search = open_with_mouse(combo)
+    assert len(measured) <= 24
+    search.setText("new font")
+    popup = combo._filter_popup
+    assert popup.empty.isVisible()
+    combo.addItem("New Font", "external")
+    assert popup.results.model().rowCount() == 1 and not popup.empty.isVisible()
+    QTest.keyClick(search, Qt.Key.Key_Return)
+    assert combo.currentData() == "external"
