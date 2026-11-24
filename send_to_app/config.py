@@ -128,8 +128,10 @@ def _candidate_birdstamp_paths() -> list[str]:
     elif sys.platform == "win32":
         relative_candidates = (
             "SuperBirdStamp.exe",
+            os.path.join("SuperBirdTools", "SuperBirdStamp.exe"),
             os.path.join("SuperBirdStamp", "SuperBirdStamp.exe"),
             os.path.join("dist", "SuperBirdStamp.exe"),
+            os.path.join("dist", "SuperBirdTools", "SuperBirdStamp.exe"),
             os.path.join("dist", "SuperBirdStamp", "SuperBirdStamp.exe"),
         )
     else:
